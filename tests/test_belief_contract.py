@@ -30,7 +30,7 @@ def test_proposition_normalization_and_literal_golden_digest() -> None:
     proposition = BeliefProposition("  Alice\tlikes  tea ")
     assert proposition.canonical_text == "Alice likes tea"
     assert proposition.proposition_digest == (
-        "cefd66d195cffa9a08fb839a9da2bcebaae42ba8cca2a1fce01c753e7f977972"
+        "331aea1232ff8d052daa0306cb04da981acf0a557ba595dca91701862c1da6af"
     )
     with pytest.raises(AttributeError):
         proposition.canonical_text = "changed"  # type: ignore[misc]
@@ -81,7 +81,7 @@ def test_admission_is_reference_only_and_has_stable_digest() -> None:
         AdmissionReason.SUBJECT_ENDORSEMENT,
     )
     assert admission.admission_digest == (
-        "58604d8bc29dbd2962fa48edeaf2eb5605dbb0075ed48847a52395db7296773b"
+        "c61cde1aae5d6529d8fd1eed23d013dfebb260504c6054679b5e3eafcde6561f"
     )
     assert admission.evidence_refs == ("event:1",)
     with pytest.raises(ValueError):

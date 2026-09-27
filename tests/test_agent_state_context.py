@@ -138,7 +138,7 @@ def test_v2_nonempty_working_memory_canonical_bytes_and_hash_remain_exact() -> N
     item = {
         "activation": 0.7,
         "created_revision": 2,
-        "item_id": "wm-6e5ff5f0ffb5e82bc7174a955ecf100d5801157f6eff3367ad7d11b62925de0e",
+        "item_id": "wm-953c9a68e1d2cc7700a6522910f9f9bad29ed7800990e780f84431367ede6a13",
         "last_activated_revision": 5,
         "retention_reason": "reactivated",
         "salience": 0.8,
@@ -163,14 +163,14 @@ def test_v2_nonempty_working_memory_canonical_bytes_and_hash_remain_exact() -> N
         b'{"emotion_state":{"arousal":0.6,"optimal_loss":0.8,"valence":-0.4},'
         b'"last_processed_event_sequence":9,"saved_at":"2026-01-02T03:04:05Z",'
         b'"schema_version":2,"working_memory":{"items":[{"activation":0.7,'
-        b'"created_revision":2,"item_id":"wm-6e5ff5f0ffb5e82bc7174a955ecf100d5801157f6eff3367ad7d11b62925de0e",'
+        b'"created_revision":2,"item_id":"wm-953c9a68e1d2cc7700a6522910f9f9bad29ed7800990e780f84431367ede6a13",'
         b'"last_activated_revision":5,"retention_reason":"reactivated","salience":0.8,'
         b'"source_id":"episode-wm","source_kind":"episodic"}],"revision":5}}'
     )
 
     assert AgentStateStore._canonical_bytes(snapshot) == fixture
     assert hashlib.sha256(fixture).hexdigest() == (
-        "237b970ca3326b84cef9f12ea34efb9f26fbd7e1cc0b801f1aa271311f0340af"
+        "9e1b316795747c317ed302a637a356ede9eb7461bac907d09553a63e93327f88"
     )
 
 

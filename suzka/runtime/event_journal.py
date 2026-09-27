@@ -31,11 +31,11 @@ from suzka.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEvent
 
 CURRENT_EVENT_JOURNAL_SCHEMA_VERSION: Literal[3] = 3
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-_HASH_DOMAIN_V1 = b"PROJECT-KAGYA:event-journal:v1\0"
-_HASH_DOMAIN_V2 = b"PROJECT-KAGYA:event-journal:v2\0"
-_HASH_DOMAIN_V3 = b"PROJECT-KAGYA:event-journal:v3\0"
+_HASH_DOMAIN_V1 = b"PROJECT-SUZKA:event-journal:v1\0"
+_HASH_DOMAIN_V2 = b"PROJECT-SUZKA:event-journal:v2\0"
+_HASH_DOMAIN_V3 = b"PROJECT-SUZKA:event-journal:v3\0"
 _STARTUP_AGGREGATE_DOMAIN = (
-    b"PROJECT-KAGYA:R07:STARTUP-PARTICIPANT-AGGREGATE:V1\x00"
+    b"PROJECT-SUZKA:R07:STARTUP-PARTICIPANT-AGGREGATE:V1\x00"
 )
 _PARTICIPANT_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:\.[a-z0-9]+)*$")
 

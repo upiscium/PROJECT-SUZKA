@@ -46,7 +46,7 @@ class ValueAdmissionStatus(_ClosedStrEnum):
     UNCERTAIN = "uncertain"
 
 
-_ORIGIN_DOMAIN: Final = "kagya.identity.origin/v1"
+_ORIGIN_DOMAIN: Final = "suzka.identity.origin/v1"
 _ACTIVE: Final = frozenset(
     {ValueAdmissionStatus.SELF_ENDORSED, ValueAdmissionStatus.SYSTEM_AUTHORIZED}
 )

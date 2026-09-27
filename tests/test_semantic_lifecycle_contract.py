@@ -45,7 +45,7 @@ def edge(
 def test_content_normalization_and_literal_golden_digest() -> None:
     assert normalize_semantic_content(" \r\n fact \r") == "fact"
     assert semantic_content_digest(" fact ") == (
-        "6f1741f2f777d35a552efba91260b8788d69bfa12534eceb0c377d529d0d2afc"
+        "ab0c7207ad4dfab356b03ac2275fe812ff259f0f494a5533b515f2423f38f725"
     )
     with pytest.raises(ValueError):
         normalize_semantic_content("\x00fact")

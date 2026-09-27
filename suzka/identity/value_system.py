@@ -109,11 +109,11 @@ _MAX_APPLIED_EVIDENCE_REFS: Final = 512
 _MAX_OPPOSITION_COUNT: Final = 6
 _PROMPT_CONCEPT_MAX_BYTES: Final = 256
 _EVENT_UPDATE_BUDGET: Final = 0.10
-_SEED_DOMAIN: Final = "kagya.identity.value-seed/v1"
-_STATE_DOMAIN: Final = "kagya.identity.value-state/v1"
-_RECORD_DOMAIN: Final = "kagya.identity.value-revision/v1"
-_GENESIS_DOMAIN: Final = "kagya.identity.value-genesis/v1"
-_LEDGER_DOMAIN: Final = "kagya.identity.value-evidence-ledger/v1"
+_SEED_DOMAIN: Final = "suzka.identity.value-seed/v1"
+_STATE_DOMAIN: Final = "suzka.identity.value-state/v1"
+_RECORD_DOMAIN: Final = "suzka.identity.value-revision/v1"
+_GENESIS_DOMAIN: Final = "suzka.identity.value-genesis/v1"
+_LEDGER_DOMAIN: Final = "suzka.identity.value-evidence-ledger/v1"
 
 
 _ValueEnum = TypeVar("_ValueEnum", bound=Enum)

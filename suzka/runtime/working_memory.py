@@ -22,7 +22,7 @@ MAX_ITEM_CAPACITY = 4_096
 MAX_PROJECTION_BYTES = 16 * 1024 * 1024
 MAX_SOURCE_ID_BYTES = 128
 REACTIVATION_BONUS = 0.2
-_ITEM_ID_DOMAIN = b"kagya-working-memory-item-v1\0"
+_ITEM_ID_DOMAIN = b"suzka-working-memory-item-v1\0"
 _SOURCE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 
 

@@ -1291,10 +1291,10 @@ def test_v1_v2_hash_and_byte_semantics_match_pre_v3_golden_values() -> None:
     )
 
     assert EventJournal._record_hash(v1) == (
-        "a4cec00324ac08ebf043a6e5b3ece3bf8f83482e847409fceb0214d0def5169b"
+        "1bfaadebc3d2012d5b16810ac51319deb2cd5690065cd8a06026447070d24784"
     )
     assert EventJournal._record_hash(v2) == (
-        "85fe822fa2841e479979ffead740bcbbcd7bd0bb3796b937092b69063d21cf64"
+        "ac4520b06240182a5b8468fe5b68ec0d13b6488050418c36dd115c45dcc0a1c5"
     )
     assert hashlib.sha256(EventJournal._record_bytes(v1)).hexdigest() == (
         "0b979ab3aeec278248c86d81647346522cb3e0a48e7064f1786bfbc4ad4caf30"

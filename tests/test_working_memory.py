@@ -509,7 +509,7 @@ def test_identity_and_selection_are_tokenizer_and_provider_independent() -> None
 
     assert item.item_id == item_id
     assert item_id == (
-        "wm-1124c114ab7bce9a9e865907f3d1247b5f88adc25407c4cabdec7a804eff67ce"
+        "wm-5a2ef2f7e237f8fae733f1e3e562b9e84c3809fd9484e1493547e2b7376c22fa"
     )
     assert view.projected_bytes == 3
     assert not hasattr(memory, "tokenizer")

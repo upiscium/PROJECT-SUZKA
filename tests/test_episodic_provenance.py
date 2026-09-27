@@ -46,8 +46,8 @@ LEGACY_V1_OPERATION = {
     "record_type": "episodic_log",
     "created_at": "2026-01-01T00:00:00+00:00",
 }
-LEGACY_V1_DIGEST = "83ea382a927616e30c6d01603753c6ced9740c170da1df69c8ec2db6adc1c2f3"
-LEGACY_V1_EPISODE_ID = "episode-d5020bc7-9ee9-5409-8c7a-4af6dd665bf1"
+LEGACY_V1_DIGEST = "a9203ddc839f3628fe4da7f12bb65a877c8a3db94d53a8d82349c3b17a66cd4a"
+LEGACY_V1_EPISODE_ID = "episode-49716101-b445-508d-b841-5718fdb36511"
 LEGACY_V2_OPERATION = {
     "schema_version": 2,
     "user_input": "staged user",
@@ -61,7 +61,7 @@ LEGACY_V2_OPERATION = {
     "source_channel": "api.chat",
     "source_session_id": "session-a",
 }
-LEGACY_V2_DIGEST = "b9a25fa3352abcd57f5eed93c3f8ec68493167c8ef7b6e6ebb9f82df252d4463"
+LEGACY_V2_DIGEST = "f6029a751e305c17f089534bf7785c6f9b4788fb02eddc97b56478b56f13dce6"
 
 
 def _settings(tmp_path: Path) -> Settings:
