@@ -9,7 +9,7 @@ import json
 import re
 from uuid import UUID, uuid5
 
-from kagya.experience import (
+from suzka.experience import (
     ExperienceLifecycle,
     ExperienceRecord,
     ExperienceRevisionRecord,
@@ -17,17 +17,17 @@ from kagya.experience import (
     ExperienceRevisionReason,
     experience_record_digest,
 )
-from kagya.memory.dual_memory_system import (
+from suzka.memory.dual_memory_system import (
     DualMemorySystem,
     EpisodicMemoryFormatError,
     EpisodicMemoryReadError,
 )
-from kagya.memory.episodic_participant import (
+from suzka.memory.episodic_participant import (
     MEMORY_EPISODIC_PARTICIPANT_ID,
     MemoryEpisodicParticipant,
     episodic_episode_id,
 )
-from kagya.memory.experience_store import (
+from suzka.memory.experience_store import (
     EXPERIENCE_PENDING_SCHEMA_VERSION,
     EXPERIENCE_RECEIPT_SCHEMA_VERSION,
     ExperienceStore,
@@ -39,25 +39,25 @@ from kagya.memory.experience_store import (
     experience_record_from_dict,
     experience_record_to_dict,
 )
-from kagya.runtime.event_journal import (
+from suzka.runtime.event_journal import (
     AbortOutcome,
     ParticipantCapability,
     ParticipantOutcome,
     StartupParticipantOutcome,
 )
-from kagya.runtime.transaction_coordinator import (
+from suzka.runtime.transaction_coordinator import (
     ParticipantDivergedError,
     ParticipantUnavailableError,
     TransactionBinding,
     UnsupportedParticipantReconciliationError,
     validate_transaction_binding,
 )
-from kagya.identifiers import validate_identifier
+from suzka.identifiers import validate_identifier
 
 
 MEMORY_EXPERIENCE_PARTICIPANT_ID = "memory.experience"
 _EXPERIENCE_ID_NAMESPACE = UUID("0f23fc3b-5b8a-5ea1-9701-e4c8f7a5a5ee")
-_OPERATION_DOMAIN = b"PROJECT-KAGYA:R12:EXPERIENCE-PARTICIPANT:V1\0"
+_OPERATION_DOMAIN = b"PROJECT-SUZKA:R12:EXPERIENCE-PARTICIPANT:V1\0"
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 

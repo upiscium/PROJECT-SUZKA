@@ -1,6 +1,6 @@
 """Memory selection helpers for consolidation."""
 
-from kagya.memory.memory_schema import EpisodicMemoryRecord
+from suzka.memory.memory_schema import EpisodicMemoryRecord
 
 
 class MemoryEvaluator:
