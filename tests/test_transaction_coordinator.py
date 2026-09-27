@@ -7,7 +7,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
-from kagya.runtime import (
+from suzka.runtime import (
     AbortOutcome,
     AgentEvent,
     AgentEventSource,

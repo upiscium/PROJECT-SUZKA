@@ -3,7 +3,7 @@ import math
 
 import pytest
 
-from kagya.cognition import (
+from suzka.cognition import (
     CalibrationEntry,
     LossCalibration,
     LossInvalidReason,
@@ -11,7 +11,7 @@ from kagya.cognition import (
     SurprisalCalculator,
     model_key,
 )
-from kagya.models import DummyProvider
+from suzka.models import DummyProvider
 
 
 class RecordingProvider(DummyProvider):

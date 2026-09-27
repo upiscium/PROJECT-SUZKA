@@ -11,23 +11,23 @@ from threading import Thread
 import pytest
 import yaml
 
-from kagya.body import EmotionEngineAllostasis, EmotionState
-from kagya.cognition import LossCalibration
-from kagya.config import Settings, load_settings
-from kagya.identity import ValueSystem
-from kagya.memory import DualMemorySystem, MemoryRecordType
-from kagya.memory.dual_memory_system import (
+from suzka.body import EmotionEngineAllostasis, EmotionState
+from suzka.cognition import LossCalibration
+from suzka.config import Settings, load_settings
+from suzka.identity import ValueSystem
+from suzka.memory import DualMemorySystem, MemoryRecordType
+from suzka.memory.dual_memory_system import (
     EpisodicMemoryFormatError,
     EpisodicMemoryReadError,
     SemanticMemoryFormatError,
     SemanticMemoryReadError,
 )
-from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
-from kagya.models import DummyProvider
-from kagya.persona import PromptBuilder
-from kagya.runtime import (
+from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
+from suzka.models import DummyProvider
+from suzka.persona import PromptBuilder
+from suzka.runtime import (
     AgentStateStore,
-    KagyaMainLoop,
+    SuzkaMainLoop,
     StateWAL,
     WorkingMemory,
     WorkingMemoryAdmissionReason,
@@ -39,8 +39,8 @@ from kagya.runtime import (
     WorkingMemorySourceKind,
     working_memory_item_id,
 )
-from kagya.runtime.context import ContextRegistry
-from kagya.runtime.event_journal import EventJournal
+from suzka.runtime.context import ContextRegistry
+from suzka.runtime.event_journal import EventJournal
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -189,7 +189,7 @@ def test_memory_resolver_imports_cleanly_before_runtime_package() -> None:
         [
             sys.executable,
             "-c",
-            "from kagya.memory.working_memory_resolver import "
+            "from suzka.memory.working_memory_resolver import "
             "MemoryWorkingMemoryResolver",
         ],
         check=False,
@@ -666,7 +666,7 @@ def test_invalid_typed_result_is_resolver_failure() -> None:
 def test_memory_resolver_dispatches_committed_reads_and_maps_outcomes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import kagya.memory.dual_memory_system as dual_memory_system
+    import suzka.memory.dual_memory_system as dual_memory_system
 
     class EpisodicReadError(Exception):
         pass
@@ -1097,7 +1097,7 @@ def test_resolved_body_never_enters_agent_state_or_wal(tmp_path: Path) -> None:
     semantic_id = source.save_legacy_semantic(sentinel)
     working = WorkingMemory(item_capacity=1, projection_max_bytes=100)
     admit(working, semantic_id, kind=WorkingMemorySourceKind.SEMANTIC)
-    loop = KagyaMainLoop(settings, DummyProvider(), source, working_memory=working)
+    loop = SuzkaMainLoop(settings, DummyProvider(), source, working_memory=working)
     state_store = AgentStateStore(
         tmp_path / "agent-state.json", settings.emotion.baseline_surprisal
     )
