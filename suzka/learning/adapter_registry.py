@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from kagya.config import Settings
+from suzka.config import Settings
 
 
 class AdapterStatus(StrEnum):

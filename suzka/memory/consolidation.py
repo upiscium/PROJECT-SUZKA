@@ -1,6 +1,6 @@
 """Helpers for transforming episodic records into semantic prompts."""
 
-from kagya.memory.memory_schema import EpisodicMemoryRecord
+from suzka.memory.memory_schema import EpisodicMemoryRecord
 
 
 def build_consolidation_prompt(record: EpisodicMemoryRecord) -> str:

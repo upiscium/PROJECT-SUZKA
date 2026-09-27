@@ -12,25 +12,25 @@ from uuid import uuid4
 import chromadb
 from chromadb.api.types import Metadata
 
-from kagya.config import Settings
-from kagya.identifiers import validate_identifier
-from kagya.memory.consolidation import build_consolidation_prompt
-from kagya.memory.memory_evaluator import MemoryEvaluator
-from kagya.memory.memory_schema import (
+from suzka.config import Settings
+from suzka.identifiers import validate_identifier
+from suzka.memory.consolidation import build_consolidation_prompt
+from suzka.memory.memory_evaluator import MemoryEvaluator
+from suzka.memory.memory_schema import (
     EpisodicMemoryRecord,
     MemoryContext,
     MemoryRecordType,
     SemanticMemoryRecord,
 )
-from kagya.memory.semantic_lifecycle import SemanticLifecycle, SemanticRevision
-from kagya.memory.semantic_store import (
+from suzka.memory.semantic_lifecycle import SemanticLifecycle, SemanticRevision
+from suzka.memory.semantic_store import (
     SemanticStore,
     SemanticStoreCorrupt,
     SemanticStoreError,
     SemanticStoreUnavailable,
 )
-from kagya.models import ModelProvider
-from kagya.privacy import PRIVATE_FIELD_KEYS, normalize_private_key, reject_private_fields, scrub_private_fields
+from suzka.models import ModelProvider
+from suzka.privacy import PRIVATE_FIELD_KEYS, normalize_private_key, reject_private_fields, scrub_private_fields
 
 
 class DeterministicEmbeddingFunction:

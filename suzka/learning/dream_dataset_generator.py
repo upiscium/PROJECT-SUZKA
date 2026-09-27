@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 
-from kagya.memory import EpisodicMemoryRecord
+from suzka.memory import EpisodicMemoryRecord
 
 
 @dataclass(frozen=True)
