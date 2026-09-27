@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from kagya.tools.tool_schema import ToolDefinition
+from suzka.tools.tool_schema import ToolDefinition
 
 
 @dataclass(frozen=True)

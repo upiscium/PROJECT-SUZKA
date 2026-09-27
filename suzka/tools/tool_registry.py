@@ -1,6 +1,6 @@
 """In-memory tool registry skeleton."""
 
-from kagya.tools.tool_schema import ToolDefinition, ToolStatus
+from suzka.tools.tool_schema import ToolDefinition, ToolStatus
 
 
 class ToolRegistry:
