@@ -7,13 +7,13 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
-from kagya.memory.semantic_lifecycle import (
+from suzka.memory.semantic_lifecycle import (
     SemanticRevision,
     SemanticRevisionOperation,
     SemanticRevisionReason,
     semantic_content_digest,
 )
-from kagya.memory.semantic_store import (
+from suzka.memory.semantic_store import (
     SEMANTIC_MAX_RECEIPTS,
     SEMANTIC_REVISION_RETENTION,
     SemanticStore,

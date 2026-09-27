@@ -9,14 +9,14 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from kagya.config import Settings, load_settings
-from kagya.runtime.agent_state import (
+from suzka.config import Settings, load_settings
+from suzka.runtime.agent_state import (
     AgentStateSnapshotV2,
     AgentStateSnapshotV1,
     EmotionStateSnapshot,
     WorkingMemorySnapshot,
 )
-from kagya.runtime.state_wal import (
+from suzka.runtime.state_wal import (
     RecoveryReason,
     Manifest,
     StateWAL,
@@ -58,15 +58,15 @@ def make_wal(tmp_path: Path) -> StateWAL:
 
 def test_wal_config_is_strict_and_backward_compatible() -> None:
     settings = load_settings(CONFIG_PATH)
-    assert settings.state_wal.directory == Path(".kagya/private/state_wal")
+    assert settings.state_wal.directory == Path(".suzka/private/state_wal")
 
     pre_r06 = settings.model_dump(mode="python")
     pre_r06.pop("state_wal")
     compatible = Settings.model_validate(pre_r06)
-    assert compatible.state_wal.directory == Path(".kagya/private/state_wal")
+    assert compatible.state_wal.directory == Path(".suzka/private/state_wal")
     with pytest.raises(ValidationError):
         type(settings.state_wal).model_validate(
-            {"directory": ".kagya/private/state_wal", "unexpected": True}
+            {"directory": ".suzka/private/state_wal", "unexpected": True}
         )
 
 
@@ -739,7 +739,7 @@ def test_permissive_private_parent_is_hardened(tmp_path: Path) -> None:
 
 
 def test_missing_private_parent_chain_is_created_and_durable(tmp_path: Path) -> None:
-    private = tmp_path / "state" / ".kagya" / "private"
+    private = tmp_path / "state" / ".suzka" / "private"
     wal = StateWAL(private / "state_wal")
 
     wal.bootstrap(make_snapshot(0), 0)

@@ -7,17 +7,17 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
-from kagya.config import Settings, load_settings
-from kagya.memory import DualMemorySystem, MemoryRecordType
-from kagya.memory.episodic_participant import (
+from suzka.config import Settings, load_settings
+from suzka.memory import DualMemorySystem, MemoryRecordType
+from suzka.memory.episodic_participant import (
     EpisodicWrite,
     MemoryEpisodicParticipant,
 )
-from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
-from kagya.models import ModelProvider
-from kagya.persona.prompt_builder import PromptBuilder
-from kagya.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
-from kagya.runtime.agent_state import (
+from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
+from suzka.models import ModelProvider
+from suzka.persona.prompt_builder import PromptBuilder
+from suzka.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
+from suzka.runtime.agent_state import (
     AgentStateSnapshotV2,
     AgentStateSnapshotV3,
     AgentStateStore,
@@ -27,8 +27,8 @@ from kagya.runtime.agent_state import (
     WorkingMemoryItemSnapshot,
     WorkingMemorySnapshot,
 )
-from kagya.runtime.context import ContextRegistry
-from kagya.runtime.event_journal import (
+from suzka.runtime.context import ContextRegistry
+from suzka.runtime.event_journal import (
     EventJournal,
     EventJournalAppendError,
     EventJournalAppendStage,
@@ -36,18 +36,18 @@ from kagya.runtime.event_journal import (
     ParticipantOutcome,
     TransactionKind,
 )
-from kagya.runtime.startup_reconciliation import (
+from suzka.runtime.startup_reconciliation import (
     StartupReconciliationCoordinator,
     StartupReconciliationError,
 )
-from kagya.runtime.state_recovery import StateRecoveryCoordinator, StateRecoveryError
-from kagya.runtime.state_wal import StateWAL
-from kagya.runtime.transaction_coordinator import (
+from suzka.runtime.state_recovery import StateRecoveryCoordinator, StateRecoveryError
+from suzka.runtime.state_wal import StateWAL
+from suzka.runtime.transaction_coordinator import (
     CoordinatedResult,
     TransactionBinding,
     TransactionCoordinator,
 )
-from kagya.runtime.working_memory import (
+from suzka.runtime.working_memory import (
     WorkingMemory,
     WorkingMemorySourceKind,
     working_memory_item_id,

@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from kagya.config import Settings, load_settings
-from kagya.learning import (
+from suzka.config import Settings, load_settings
+from suzka.learning import (
     AdapterRegistry,
     AdapterStatus,
     DreamDatasetGenerator,
@@ -14,9 +14,9 @@ from kagya.learning import (
     SleepCycleManager,
     format_training_text,
 )
-from kagya.memory import DualMemorySystem
-from kagya.models import DummyProvider
-from kagya.runtime import (
+from suzka.memory import DualMemorySystem
+from suzka.models import DummyProvider
+from suzka.runtime import (
     AgentEvent,
     AgentEventSource,
     AgentEventType,

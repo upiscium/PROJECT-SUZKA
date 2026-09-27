@@ -3,12 +3,12 @@ import os
 
 from fastapi.testclient import TestClient
 
-from kagya.api.server import create_app
-from kagya.config import Settings, load_settings
-from kagya.learning import AdapterRegistry
-from kagya.memory import DualMemorySystem
-from kagya.models import DummyProvider
-from kagya.tools import (
+from suzka.api.server import create_app
+from suzka.config import Settings, load_settings
+from suzka.learning import AdapterRegistry
+from suzka.memory import DualMemorySystem
+from suzka.models import DummyProvider
+from suzka.tools import (
     ToolDefinition,
     ToolExecutionRequest,
     ToolExecutor,
@@ -52,7 +52,7 @@ def test_debug_chat_rejects_non_empty_attachments_with_clear_v1_message(tmp_path
     with _client(tmp_path) as client:
         response = client.post(
             "/api/chat/debug",
-            headers={"X-KAGYA-Admin-Token": ADMIN_TOKEN},
+            headers={"X-SUZKA-Admin-Token": ADMIN_TOKEN},
             json={
                 "message": "hello",
                 "attachments": [{"type": "image", "url": "file:///tmp/image.png"}],
@@ -115,7 +115,7 @@ def test_tool_registry_rejects_unapproved_generated_registration() -> None:
 
 def _client(tmp_path: Path) -> TestClient:
     settings = _settings(tmp_path)
-    os.environ["KAGYA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
+    os.environ["SUZKA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
     app = create_app(settings)
     app.state.model_provider = DummyProvider()
     app.state.memory_system = DualMemorySystem(settings)
@@ -150,6 +150,6 @@ def _settings(tmp_path: Path) -> Settings:
             "state_wal": settings.state_wal.model_copy(
                 update={"directory": tmp_path / "private" / "state_wal"}
             ),
-            "api": settings.api.model_copy(update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}),
+            "api": settings.api.model_copy(update={"admin_token_env": "SUZKA_TEST_ADMIN_TOKEN"}),
         }
     )

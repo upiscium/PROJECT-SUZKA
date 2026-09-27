@@ -2103,7 +2103,7 @@ wheels = [
 ]
 
 [[package]]
-name = "project-kagya"
+name = "project-suzka"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

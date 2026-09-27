@@ -5,14 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from kagya.config import Settings, load_settings
-from kagya.memory import DualMemorySystem, MemoryRecordType
-from kagya.memory.dual_memory_system import (
+from suzka.config import Settings, load_settings
+from suzka.memory import DualMemorySystem, MemoryRecordType
+from suzka.memory.dual_memory_system import (
     EpisodicMemoryFormatError,
     EpisodicMemoryReadError,
     SemanticMemoryFormatError,
 )
-from kagya.models import DummyProvider
+from suzka.models import DummyProvider
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
