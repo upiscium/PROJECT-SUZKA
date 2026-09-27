@@ -7,24 +7,24 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
-from kagya.config import Settings, load_settings
-from kagya.learning import AdapterRegistry, SleepCycleManager
-from kagya.memory import DualMemorySystem, MemorySemanticParticipant
-from kagya.memory.dual_memory_system import SemanticMemoryFormatError
-from kagya.memory.semantic_store import (
+from suzka.config import Settings, load_settings
+from suzka.learning import AdapterRegistry, SleepCycleManager
+from suzka.memory import DualMemorySystem, MemorySemanticParticipant
+from suzka.memory.dual_memory_system import SemanticMemoryFormatError
+from suzka.memory.semantic_store import (
     SEMANTIC_MAX_RECEIPTS,
     SemanticStore,
     SemanticStoreUnavailable,
 )
-from kagya.memory.semantic_lifecycle import (
+from suzka.memory.semantic_lifecycle import (
     SemanticLifecycle,
     SemanticRevision,
     SemanticRevisionOperation,
     SemanticRevisionReason,
     semantic_content_digest,
 )
-from kagya.models import DummyProvider
-from kagya.runtime import (
+from suzka.models import DummyProvider
+from suzka.runtime import (
     AgentEvent,
     AgentEventSource,
     AgentEventType,
@@ -34,7 +34,7 @@ from kagya.runtime import (
     TransactionCoordinator,
     TransactionKind,
 )
-from kagya.runtime.event_journal import (
+from suzka.runtime.event_journal import (
     EventLifecycle,
     EventJournal,
     EventJournalTransaction,
@@ -44,10 +44,10 @@ from kagya.runtime.event_journal import (
     ParticipantOutcome,
     ParticipantRequirement,
 )
-from kagya.runtime.semantic_receipt_retention import (
+from suzka.runtime.semantic_receipt_retention import (
     SemanticReceiptRetentionCoordinator,
 )
-from kagya.runtime.startup_reconciliation import StartupReconciliationCoordinator
+from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"

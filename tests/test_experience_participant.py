@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from kagya.config import Settings, load_settings
-from kagya.experience import (
+from suzka.config import Settings, load_settings
+from suzka.experience import (
     ExperienceAppraisalEvidence,
     ExperienceAppraisalReasonCode,
     ExperienceEmotionContributions,
@@ -22,21 +22,21 @@ from kagya.experience import (
     ExperienceRevisionRecord,
     experience_record_digest,
 )
-from kagya.memory import DualMemorySystem, MemoryRecordType
-from kagya.memory.episodic_participant import (
+from suzka.memory import DualMemorySystem, MemoryRecordType
+from suzka.memory.episodic_participant import (
     EpisodicWrite,
     MEMORY_EPISODIC_PARTICIPANT_ID,
     MemoryEpisodicParticipant,
 )
-from kagya.memory.experience_participant import (
+from suzka.memory.experience_participant import (
     ExperienceCreateIntent,
     ExperienceRevisionIntent,
     MEMORY_EXPERIENCE_PARTICIPANT_ID,
     MemoryExperienceParticipant,
     experience_id_for_event,
 )
-from kagya.memory.experience_store import ExperienceStore, ExperienceStoreCorrupt
-from kagya.runtime import (
+from suzka.memory.experience_store import ExperienceStore, ExperienceStoreCorrupt
+from suzka.runtime import (
     AgentEvent,
     AgentEventSource,
     AgentEventType,

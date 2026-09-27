@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from kagya.experience import (
+from suzka.experience import (
     ExperienceAppraisalEvidence,
     ExperienceAppraisalReasonCode,
     ExperienceEmotionContributions,
@@ -20,7 +20,7 @@ from kagya.experience import (
     ExperienceRevisionRecord,
     experience_record_digest,
 )
-from kagya.memory.experience_store import (
+from suzka.memory.experience_store import (
     ExperienceStore,
     ExperienceStoreConflict,
     ExperienceStoreCorrupt,
