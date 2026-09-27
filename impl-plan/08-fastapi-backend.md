@@ -2,24 +2,24 @@
 
 ## Goal
 
-Expose PROJECT-KAGYA runtime, memory, sleep, and adapter controls through FastAPI while preserving debug/normal data boundaries.
+Expose PROJECT-SUZKA runtime, memory, sleep, and adapter controls through FastAPI while preserving debug/normal data boundaries.
 
 ## Target Files
 
-- `kagya/api/server.py`
-- `kagya/api/dependencies.py`
-- `kagya/api/schemas/__init__.py`
-- `kagya/api/schemas/chat.py`
-- `kagya/api/schemas/debug.py`
-- `kagya/api/schemas/memory.py`
-- `kagya/api/schemas/adapter.py`
-- `kagya/api/schemas/sleep.py`
-- `kagya/api/routes/__init__.py`
-- `kagya/api/routes/chat.py`
-- `kagya/api/routes/debug.py`
-- `kagya/api/routes/memory.py`
-- `kagya/api/routes/sleep.py`
-- `kagya/api/routes/adapters.py`
+- `suzka/api/server.py`
+- `suzka/api/dependencies.py`
+- `suzka/api/schemas/__init__.py`
+- `suzka/api/schemas/chat.py`
+- `suzka/api/schemas/debug.py`
+- `suzka/api/schemas/memory.py`
+- `suzka/api/schemas/adapter.py`
+- `suzka/api/schemas/sleep.py`
+- `suzka/api/routes/__init__.py`
+- `suzka/api/routes/chat.py`
+- `suzka/api/routes/debug.py`
+- `suzka/api/routes/memory.py`
+- `suzka/api/routes/sleep.py`
+- `suzka/api/routes/adapters.py`
 
 ## Endpoint Requirements
 

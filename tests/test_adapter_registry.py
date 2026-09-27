@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from kagya.config import Settings, load_settings
-from kagya.learning import AdapterRegistry, AdapterStatus
+from suzka.config import Settings, load_settings
+from suzka.learning import AdapterRegistry, AdapterStatus
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"

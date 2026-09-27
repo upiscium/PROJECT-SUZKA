@@ -5,8 +5,8 @@ import traceback
 
 import pytest
 
-from kagya.config.schema import Settings
-from kagya.runtime import (
+from suzka.config.schema import Settings
+from suzka.runtime import (
     AgentEventOutcome,
     AgentEventSource,
     AgentEventType,
@@ -389,7 +389,7 @@ def test_concurrent_producers_share_one_consumer_and_preserve_local_order() -> N
 
     assert sorted(sequences) == list(range(1, event_count + 1))
     consumer_threads = {outcome.value[2] for outcome in all_outcomes}
-    assert consumer_threads == {"kagya-agent-runtime"}
+    assert consumer_threads == {"suzka-agent-runtime"}
     assert consumer_threads.isdisjoint({producer.name for producer in producers})
 
     for producer_id, outcomes in producer_outcomes.items():
@@ -568,7 +568,7 @@ def test_current_event_is_only_visible_during_the_active_handler() -> None:
 
     assert outcome.value == "done"
     assert outcome.event is observed["event"]
-    assert observed["worker"] == "kagya-agent-runtime"
+    assert observed["worker"] == "suzka-agent-runtime"
     assert runtime.current_event() is None
 
 

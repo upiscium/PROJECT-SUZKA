@@ -10,10 +10,10 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
-from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
-from kagya.cognition.surprisal_calculator import LossCalibration
-from kagya.config import Settings, load_settings
-from kagya.identity import (
+from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
+from suzka.cognition.surprisal_calculator import LossCalibration
+from suzka.config import Settings, load_settings
+from suzka.identity import (
     IdentityOrigin,
     OriginActor,
     OriginInputKind,
@@ -27,7 +27,7 @@ from kagya.identity import (
     ValueState,
     ValueSystem,
 )
-from kagya.runtime import (
+from suzka.runtime import (
     AgentStateConfigurationDrift,
     AgentStateLoadError,
     AgentStateSaveError,
@@ -54,7 +54,7 @@ from kagya.runtime import (
     working_memory_item_id,
     ValueSystemStateSnapshot,
 )
-import kagya.runtime.agent_state as agent_state_module
+import suzka.runtime.agent_state as agent_state_module
 
 
 NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
@@ -969,12 +969,12 @@ def test_missing_snapshot_returns_safe_configured_default(tmp_path: Path) -> Non
 
 def test_agent_state_config_is_explicit_and_pre_r04_config_uses_default() -> None:
     settings = load_settings(CONFIG_PATH)
-    assert settings.agent_state.path == Path(".kagya/agent_state.json")
+    assert settings.agent_state.path == Path(".suzka/agent_state.json")
 
     pre_r04 = settings.model_dump(mode="python")
     pre_r04.pop("agent_state")
     compatible = Settings.model_validate(pre_r04)
-    assert compatible.agent_state.path == Path(".kagya/agent_state.json")
+    assert compatible.agent_state.path == Path(".suzka/agent_state.json")
 
 
 def test_v0_migrates_strictly_to_v4(tmp_path: Path) -> None:

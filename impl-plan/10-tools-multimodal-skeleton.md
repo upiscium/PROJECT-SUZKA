@@ -6,12 +6,12 @@ Prepare schema and extension points for later tool execution and multimodal supp
 
 ## Target Files
 
-- `kagya/tools/__init__.py`
-- `kagya/tools/tool_schema.py`
-- `kagya/tools/tool_registry.py`
-- `kagya/tools/tool_executor.py`
-- `kagya/tools/tool_sandbox.py`
-- `kagya/tools/tool_generator.py`
+- `suzka/tools/__init__.py`
+- `suzka/tools/tool_schema.py`
+- `suzka/tools/tool_registry.py`
+- `suzka/tools/tool_executor.py`
+- `suzka/tools/tool_sandbox.py`
+- `suzka/tools/tool_generator.py`
 - API chat schemas that include `attachments`.
 
 ## Tool Skeleton Requirements
