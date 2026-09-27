@@ -532,6 +532,20 @@ class SemanticStore:
         )
 
     def load_current(self, semantic_id: str) -> SemanticStoredEntry | None:
+        """Load a current record, rejecting an untyped empty record directory."""
+
+        return self._load_current(semantic_id)
+
+    def load_pending_create_current(
+        self, semantic_id: str
+    ) -> SemanticStoredEntry | None:
+        """Load a create candidate when pending evidence permits an empty dir."""
+
+        return self._load_current(semantic_id, allow_empty=True)
+
+    def _load_current(
+        self, semantic_id: str, *, allow_empty: bool = False
+    ) -> SemanticStoredEntry | None:
         self._validate_identifier(semantic_id)
         directory = self.records_root / semantic_id
         if not self._path_exists(directory):
@@ -541,6 +555,8 @@ class SemanticStore:
         self._recover_compaction(directory, semantic_id)
         entries = self._load_entries(directory, semantic_id)
         if not entries:
+            if allow_empty:
+                return None
             raise SemanticStoreCorrupt("Semantic record directory is empty")
         try:
             self._validate_revision_window(entries)
@@ -821,6 +837,24 @@ class SemanticStore:
             expected_revision_digest,
         )
 
+    def _validate_revision_chain(
+        self, entries: dict[int, SemanticStoredEntry]
+    ) -> None:
+        for revision in sorted(entries):
+            entry = entries[revision]
+            if revision == 0:
+                if entry.revision.previous_revision_digest is not None:
+                    raise SemanticStoreCorrupt(
+                        "Genesis Semantic revision has a predecessor"
+                    )
+                continue
+            previous = entries.get(revision - 1)
+            if previous is not None:
+                if entry.revision.previous_revision_digest != previous.revision.revision_digest:
+                    raise SemanticStoreCorrupt("Semantic revision chain is broken")
+            elif entry.revision.previous_revision_digest is None:
+                raise SemanticStoreCorrupt("Compacted Semantic predecessor is absent")
+
     def _validate_revision_window(self, entries: dict[int, SemanticStoredEntry]) -> None:
         if not entries:
             raise SemanticStoreCorrupt("Semantic revision window is empty")
@@ -829,18 +863,7 @@ class SemanticStore:
         expected = set(range(floor, current_revision + 1))
         if set(entries) != expected:
             raise SemanticStoreCorrupt("Semantic revision window is incomplete")
-        for revision in range(floor, current_revision + 1):
-            entry = entries[revision]
-            if revision == 0:
-                if entry.revision.previous_revision_digest is not None:
-                    raise SemanticStoreCorrupt("Genesis Semantic revision has a predecessor")
-                continue
-            previous = entries.get(revision - 1)
-            if previous is not None:
-                if entry.revision.previous_revision_digest != previous.revision.revision_digest:
-                    raise SemanticStoreCorrupt("Semantic revision chain is broken")
-            elif entry.revision.previous_revision_digest is None:
-                raise SemanticStoreCorrupt("Compacted Semantic predecessor is absent")
+        self._validate_revision_chain(entries)
         current = entries[current_revision]
         if current_revision > SEMANTIC_REVISION_RETENTION:
             if (
@@ -947,6 +970,37 @@ class SemanticStore:
                     ) from error
             os.close(parent_fd)
 
+    def _validate_compaction_recovery(
+        self,
+        entries: dict[int, SemanticStoredEntry],
+        *,
+        current_revision: int,
+        floor: int,
+        anchor_revision: int,
+        anchor_digest: str,
+        current_digest: str,
+    ) -> None:
+        if not entries or max(entries) != current_revision:
+            raise SemanticStoreCorrupt("Semantic compaction current reference is invalid")
+        actual = set(entries)
+        suffix = set(range(floor, current_revision + 1))
+        prefix = sorted(revision for revision in actual if revision < floor)
+        prefix_is_contiguous_suffix = not prefix or prefix == list(range(prefix[0], floor))
+        if not suffix.issubset(actual) or not prefix_is_contiguous_suffix:
+            raise SemanticStoreCorrupt("Semantic compaction prefix is inconsistent")
+        self._validate_revision_chain(entries)
+        current = entries[current_revision]
+        first = entries.get(floor)
+        if first is None:
+            raise SemanticStoreCorrupt("Semantic compaction anchor is absent")
+        if (
+            current.revision.revision_digest != current_digest
+            or current.anchor_revision != anchor_revision
+            or current.anchor_revision_digest != anchor_digest
+            or first.revision.previous_revision_digest != anchor_digest
+        ):
+            raise SemanticStoreCorrupt("Semantic compaction marker conflicts")
+
     def _recover_compaction(self, directory: Path, semantic_id: str) -> None:
         marker = directory / _COMPACTION_NAME
         if not self._path_exists(marker):
@@ -984,19 +1038,14 @@ class SemanticStore:
         anchor_digest = _digest_value(value["anchor_revision_digest"], "anchor_revision_digest")
         current_digest = _digest_value(value["current_revision_digest"], "current_revision_digest")
         entries = self._load_entries(directory, semantic_id)
-        suffix = set(range(floor, current_revision + 1))
-        if not suffix.issubset(entries):
-            raise SemanticStoreCorrupt("Semantic compaction suffix is incomplete")
-        current = entries[current_revision]
-        if (
-            current.revision.revision_digest != current_digest
-            or current.anchor_revision != anchor_revision
-            or current.anchor_revision_digest != anchor_digest
-        ):
-            raise SemanticStoreCorrupt("Semantic compaction marker conflicts")
-        first = entries[floor]
-        if first.revision.previous_revision_digest != anchor_digest:
-            raise SemanticStoreCorrupt("Semantic compaction predecessor conflicts")
+        self._validate_compaction_recovery(
+            entries,
+            current_revision=current_revision,
+            floor=floor,
+            anchor_revision=anchor_revision,
+            anchor_digest=anchor_digest,
+            current_digest=current_digest,
+        )
         for revision in delete_revisions:
             path = directory / f"{revision}.json"
             if not self._path_exists(path):

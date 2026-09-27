@@ -1,13 +1,18 @@
 """R07 Semantic batch participant and projection-boundary tests."""
 
+import os
+import stat
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from kagya.config import Settings, load_settings
 from kagya.memory import (
     DualMemorySystem,
+    EpisodicMemoryReadError,
     MemorySemanticParticipant,
     SemanticBatchEntry,
     SemanticBatchOperation,
@@ -21,6 +26,9 @@ from kagya.memory.semantic_lifecycle import (
     SemanticRevision,
     SemanticRevisionOperation,
     SemanticRevisionReason,
+    SemanticSourceEdge,
+    SemanticSourceKind,
+    SemanticSourceStatus,
     semantic_content_digest,
 )
 from kagya.runtime import (
@@ -30,6 +38,7 @@ from kagya.runtime import (
     AgentEventType,
     ParticipantDivergedError,
     ParticipantOutcome,
+    ParticipantUnavailableError,
     TransactionBinding,
     TransactionCoordinator,
     TransactionKind,
@@ -65,7 +74,10 @@ def _event(sequence: int = 1) -> AgentEvent:
 
 
 def _create_participant(
-    memory: DualMemorySystem, *, event: AgentEvent | None = None
+    memory: DualMemorySystem,
+    *,
+    event: AgentEvent | None = None,
+    source_edges: tuple[SemanticSourceEdge, ...] = (),
 ) -> tuple[MemorySemanticParticipant, TransactionBinding, SemanticRevision]:
     current_event = event or _event()
     transaction_id = TransactionCoordinator.derive_transaction_id(
@@ -81,6 +93,7 @@ def _create_participant(
         event_id=current_event.event_id,
         event_sequence=current_event.processing_sequence,
     )
+    revision = replace(revision, source_edges=source_edges, provenance_class=None)
     operation = SemanticBatchOperation(
         transaction_id,
         (SemanticBatchEntry(0, SemanticCreateIntent(revision)),),
@@ -190,6 +203,150 @@ def test_partial_lifecycle_publication_rolls_forward_without_duplicate_revision(
     assert participant.finalize(binding) is ParticipantOutcome.FINALIZED
     assert participant.store.load_current(revision.semantic_id) is not None
     assert participant.store.load_receipt(binding.transaction_id) is not None
+
+
+@pytest.mark.parametrize("fault_stage", ["temp_fsync", "link", "post_link"])
+def test_first_create_publication_crash_leaves_pending_and_restart_finalizes_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault_stage: str
+) -> None:
+    memory = DualMemorySystem(_settings(tmp_path))
+    participant, binding, revision = _create_participant(memory)
+    participant.prepare(binding)
+
+    import kagya.memory.semantic_store as semantic_store_module
+
+    real_fsync = semantic_store_module.os.fsync
+    real_link = semantic_store_module.os.link
+    real_unlink = semantic_store_module.os.unlink
+    crashed = False
+
+    def fail_temp_fsync(descriptor: int) -> None:
+        nonlocal crashed
+        if (
+            fault_stage == "temp_fsync"
+            and stat.S_ISREG(os.fstat(descriptor).st_mode)
+            and not crashed
+        ):
+            crashed = True
+            raise OSError("simulated first-create publication crash")
+        real_fsync(descriptor)
+
+    def fail_link(
+        source: str, destination: str, *args: object, **kwargs: object
+    ) -> None:
+        nonlocal crashed
+        if fault_stage == "link" and not crashed:
+            crashed = True
+            raise OSError("simulated first-create link crash")
+        real_link(source, destination, *args, **kwargs)
+
+    def fail_unlink(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal crashed
+        if (
+            fault_stage == "post_link"
+            and isinstance(path, str)
+            and ".publish-" in path
+            and not crashed
+        ):
+            crashed = True
+            raise OSError("simulated first-create post-link crash")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(semantic_store_module.os, "fsync", fail_temp_fsync)
+    monkeypatch.setattr(semantic_store_module.os, "link", fail_link)
+    monkeypatch.setattr(semantic_store_module.os, "unlink", fail_unlink)
+    with pytest.raises(ParticipantUnavailableError, match="atomic publication"):
+        participant.finalize(binding)
+    assert crashed
+    record_directory = participant.store.records_root / revision.semantic_id
+    assert record_directory.is_dir()
+    if fault_stage == "post_link":
+        assert (record_directory / "0.json").exists()
+        assert any(".publish-" in item.name for item in record_directory.iterdir())
+    else:
+        assert tuple(record_directory.iterdir()) == ()
+    assert participant.store.load_pending(binding.transaction_id) is not None
+
+    monkeypatch.undo()
+    monkeypatch.setattr(semantic_store_module.os, "fsync", real_fsync)
+    restarted_memory = DualMemorySystem(_settings(tmp_path))
+    restarted_store = SemanticStore.from_memory_root(
+        restarted_memory.settings.memory.persist_directory
+    )
+    recovered = MemorySemanticParticipant.from_pending(
+        restarted_memory,
+        restarted_store,
+        binding.transaction_id,
+        binding.participant_id,
+        binding.operation_digest,
+        event_id=binding.event_id,
+        processing_sequence=binding.processing_sequence,
+    )
+
+    assert recovered.finalize(binding) is ParticipantOutcome.FINALIZED
+    assert recovered.finalize(binding) is ParticipantOutcome.ALREADY_CONSISTENT
+    assert sorted(record_directory.glob("*.json")) == [record_directory / "0.json"]
+    assert restarted_store.load_pending(binding.transaction_id) is None
+
+
+def test_committed_semantic_recovery_does_not_read_live_db1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory = DualMemorySystem(_settings(tmp_path))
+    source = SemanticSourceEdge(
+        SemanticSourceKind.EPISODIC,
+        "episode-source",
+        captured_context_id="context-source",
+        source_status=SemanticSourceStatus.AVAILABLE,
+    )
+    participant, binding, revision = _create_participant(
+        memory, source_edges=(source,)
+    )
+    committed = SimpleNamespace(record=SimpleNamespace(context_id="context-source"))
+    monkeypatch.setattr(
+        memory, "get_committed_episodic", lambda _source_id: committed
+    )
+    participant.prepare(binding)
+    participant.store.publish_create(revision, participant.operation_digest)
+
+    def unavailable(_source_id: str) -> None:
+        raise EpisodicMemoryReadError("DB1 is unavailable")
+
+    monkeypatch.setattr(memory, "get_committed_episodic", unavailable)
+    recovered = MemorySemanticParticipant.from_pending(
+        memory,
+        participant.store,
+        binding.transaction_id,
+        binding.participant_id,
+        binding.operation_digest,
+        event_id=binding.event_id,
+        processing_sequence=binding.processing_sequence,
+    )
+    assert recovered.finalize(binding) is ParticipantOutcome.FINALIZED
+    assert recovered.finalize(binding) is ParticipantOutcome.ALREADY_CONSISTENT
+
+
+def test_unpublished_semantic_still_requires_live_source_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory = DualMemorySystem(_settings(tmp_path))
+    source = SemanticSourceEdge(
+        SemanticSourceKind.EPISODIC,
+        "episode-source",
+        captured_context_id="context-source",
+        source_status=SemanticSourceStatus.AVAILABLE,
+    )
+    participant, binding, _revision = _create_participant(
+        memory, source_edges=(source,)
+    )
+
+    def unavailable(_source_id: str) -> None:
+        raise EpisodicMemoryReadError("DB1 is unavailable")
+
+    monkeypatch.setattr(memory, "get_committed_episodic", unavailable)
+    with pytest.raises(ParticipantUnavailableError, match="source is unavailable"):
+        participant.prepare(binding)
+    assert participant.store.load_pending(binding.transaction_id) is None
 
 
 def test_divergent_legacy_projection_is_not_overwritten(tmp_path: Path) -> None:

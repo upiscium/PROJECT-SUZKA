@@ -635,6 +635,8 @@ class MemorySemanticParticipant:
 
     def _validate_sources(self) -> None:
         for entry in self.operation.entries:
+            if self._target_committed(entry):
+                continue
             revision = entry.mutation.revision
             for edge in revision.source_edges:
                 if isinstance(entry.mutation, SemanticCreateIntent):
@@ -654,8 +656,11 @@ class MemorySemanticParticipant:
 
     def _validate_revision_preconditions(self) -> None:
         for entry in self.operation.entries:
-            current = self._current(entry.semantic_id)
             mutation = entry.mutation
+            current = self._current(
+                entry.semantic_id,
+                allow_empty=isinstance(mutation, SemanticCreateIntent),
+            )
             if isinstance(mutation, SemanticCreateIntent):
                 if current is None:
                     continue
@@ -678,8 +683,12 @@ class MemorySemanticParticipant:
                 continue
             raise ParticipantDivergedError("Semantic revision target is stale")
 
-    def _current(self, semantic_id: str) -> SemanticStoredEntry | None:
+    def _current(
+        self, semantic_id: str, *, allow_empty: bool = False
+    ) -> SemanticStoredEntry | None:
         try:
+            if allow_empty:
+                return self.store.load_pending_create_current(semantic_id)
             return self.store.load_current(semantic_id)
         except SemanticStoreCorrupt as error:
             raise ParticipantDivergedError(str(error)) from None
@@ -707,9 +716,12 @@ class MemorySemanticParticipant:
         )
 
     def _target_committed(self, entry: SemanticBatchEntry) -> bool:
-        current = self._current(entry.semantic_id)
+        is_create = isinstance(entry.mutation, SemanticCreateIntent)
+        current = self._current(entry.semantic_id, allow_empty=is_create)
         if current is not None and self._entry_matches_target(current, entry.mutation.revision):
             return True
+        if is_create and current is None:
+            return False
         return self._historical_entry_matches(entry)
 
     def _any_target_committed(self) -> bool:

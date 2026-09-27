@@ -1,6 +1,7 @@
 """Durability tests for the Memory-owned R12 Semantic store."""
 
 from datetime import UTC, datetime, timedelta
+import json
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
@@ -14,6 +15,7 @@ from kagya.memory.semantic_lifecycle import (
 )
 from kagya.memory.semantic_store import (
     SEMANTIC_MAX_RECEIPTS,
+    SEMANTIC_REVISION_RETENTION,
     SemanticStore,
     SemanticStoreCorrupt,
     SemanticStoreUnavailable,
@@ -105,6 +107,19 @@ def test_store_rejects_unknown_revision_artifact(tmp_path: Path) -> None:
         store.load_current(revision.semantic_id)
 
 
+def test_typed_empty_record_directory_requires_pending_create_evidence(
+    tmp_path: Path,
+) -> None:
+    store = SemanticStore(tmp_path / "semantic")
+    semantic_id = "semantic:empty"
+    store.records_root.mkdir(parents=True)
+    (store.records_root / semantic_id).mkdir()
+
+    with pytest.raises(SemanticStoreCorrupt):
+        store.load_current(semantic_id)
+    assert store.load_pending_create_current(semantic_id) is None
+
+
 def test_iter_current_enumerates_only_verified_authority(tmp_path: Path) -> None:
     store = SemanticStore(tmp_path / "semantic")
     first = _revision("semantic:first", 0)
@@ -157,3 +172,69 @@ def test_receipt_retirement_is_proof_bound_and_clears_capacity(tmp_path: Path) -
     store.prune_receipts(transaction_ids)
 
     assert tuple(store.receipts_root.iterdir()) == ()
+
+
+def test_compaction_recovery_validates_present_prefix_before_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SemanticStore(tmp_path / "semantic")
+    semantic_id = "semantic:damaged-prefix"
+    revisions = [_revision(semantic_id, 0)]
+    for revision in range(1, 34):
+        revisions.append(
+            _revision(semantic_id, revision, revisions[-1].revision_digest)
+        )
+    store.publish_create(revisions[0], "a" * 64)
+
+    for revision in range(1, len(revisions)):
+        if revision == SEMANTIC_REVISION_RETENTION + 1:
+            original_unlink = Path.unlink
+            failed = False
+
+            def fail_first_prune_unlink(
+                path: Path, *args: object, **kwargs: object
+            ) -> None:
+                nonlocal failed
+                if path.name == "0.json" and not failed:
+                    failed = True
+                    raise OSError("injected compaction failure")
+                original_unlink(path, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "unlink", fail_first_prune_unlink)
+            with pytest.raises(SemanticStoreUnavailable):
+                store.publish_revision(
+                    revisions[revision],
+                    "a" * 64,
+                    expected_revision=revision - 1,
+                    expected_digest=revisions[revision - 1].revision_digest,
+                )
+            monkeypatch.undo()
+            break
+        store.publish_revision(
+            revisions[revision],
+            "a" * 64,
+            expected_revision=revision - 1,
+            expected_digest=revisions[revision - 1].revision_digest,
+        )
+
+    directory = store.records_root / semantic_id
+    marker = directory / ".compaction.json"
+    marker_bytes = marker.read_bytes()
+    prefix = store.record_path(semantic_id, 0)
+    prefix_bytes = prefix.read_bytes()
+
+    damaged_path = store.record_path(semantic_id, 1)
+    damaged_payload = json.loads(damaged_path.read_text())
+    damaged_revision = _revision(semantic_id, 1, "c" * 64)
+    damaged_payload["revision"] = semantic_revision_to_dict(damaged_revision)
+    damaged_payload["revision_digest"] = damaged_revision.revision_digest
+    damaged_payload["expected_revision_digest"] = (
+        damaged_revision.previous_revision_digest
+    )
+    damaged_path.write_text(json.dumps(damaged_payload, sort_keys=True) + "\n")
+
+    with pytest.raises(SemanticStoreCorrupt):
+        store.load_current(semantic_id)
+    assert marker.read_bytes() == marker_bytes
+    assert prefix.read_bytes() == prefix_bytes
+    assert damaged_path.exists()
