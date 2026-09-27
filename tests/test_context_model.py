@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from kagya.identifiers import validate_identifier
-import kagya.runtime.context as context_module
-from kagya.runtime import (
+from suzka.identifiers import validate_identifier
+import suzka.runtime.context as context_module
+from suzka.runtime import (
     MAX_CONTEXTS,
     MAX_EVIDENCE_REFERENCES,
     MAX_INTERLOCUTOR_BINDINGS,
@@ -929,7 +929,7 @@ def test_context_domain_has_no_later_authority_or_raw_local_text_fields() -> Non
         "dataclasses",
         "datetime",
         "enum",
-        "kagya",
+        "suzka",
         "math",
         "re",
         "threading",

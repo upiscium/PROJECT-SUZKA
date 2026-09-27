@@ -5,20 +5,20 @@ from datetime import UTC, datetime
 
 import pytest
 
-from kagya.body import (
+from suzka.body import (
     ArousalContributions,
     EmotionState,
     EmotionUpdate,
     EmotionUpdateReasonCode,
     ValenceContributions,
 )
-from kagya.cognition import (
+from suzka.cognition import (
     AppraisalReasonCode,
     AppraisalResult,
     LossInvalidReason,
     LossMeasurement,
 )
-from kagya.experience import (
+from suzka.experience import (
     ExperienceAppraisalEvidence,
     ExperienceAppraisalReasonCode,
     ExperienceArousalContributions,

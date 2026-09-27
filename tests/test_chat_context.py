@@ -6,12 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from kagya.body import EmotionState
-from kagya.config import Settings, load_settings
-from kagya.memory import DualMemorySystem, MemoryRecordType
-from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
-from kagya.persona import ContextPromptView, PromptBuilder
-from kagya.runtime import (
+from suzka.body import EmotionState
+from suzka.config import Settings, load_settings
+from suzka.memory import DualMemorySystem, MemoryRecordType
+from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
+from suzka.persona import ContextPromptView, PromptBuilder
+from suzka.runtime import (
     ChatContextSelectors,
     ContextConflict,
     ContextNotFound,
@@ -74,7 +74,7 @@ def test_session_context_id_is_deterministic_and_never_falls_back() -> None:
     expected = (
         "conversation.session."
         + hashlib.sha256(
-            b"PROJECT-KAGYA:R09:CHAT-SESSION:V1\0" + session_id.encode("ascii")
+            b"PROJECT-SUZKA:R09:CHAT-SESSION:V1\0" + session_id.encode("ascii")
         ).hexdigest()
     )
 

@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from kagya.body import (
+from suzka.body import (
     ArousalContributions,
     EmotionEngineAllostasis,
     EmotionState,
@@ -12,7 +12,7 @@ from kagya.body import (
     EmotionUpdateReasonCode,
     ValenceContributions,
 )
-from kagya.cognition import AppraisalResult
+from suzka.cognition import AppraisalResult
 
 
 UTC = timezone.utc

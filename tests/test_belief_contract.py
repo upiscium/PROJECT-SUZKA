@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import pytest
 
-from kagya.belief import (
+from suzka.belief import (
     AdmissionReason,
     BeliefEvidence,
     BeliefEvidenceType,
