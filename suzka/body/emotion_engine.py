@@ -6,7 +6,7 @@ from enum import Enum
 import math
 from typing import Callable
 
-from kagya.cognition.appraisal import AppraisalResult
+from suzka.cognition.appraisal import AppraisalResult
 
 
 def _number(value: float, name: str) -> float:

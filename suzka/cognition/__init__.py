@@ -1,13 +1,13 @@
-"""Cognition primitives for PROJECT-KAGYA."""
+"""Cognition primitives for PROJECT-SUZKA."""
 
-from kagya.cognition.appraisal import (
+from suzka.cognition.appraisal import (
     AppraisalReason,
     AppraisalReasonCode,
     AppraisalResult,
     AppraisalSignals,
     CognitiveAppraiser,
 )
-from kagya.cognition.surprisal_calculator import (
+from suzka.cognition.surprisal_calculator import (
     CalibrationEntry,
     LossCalibration,
     LossInvalidReason,

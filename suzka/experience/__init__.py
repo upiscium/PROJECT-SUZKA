@@ -1,6 +1,6 @@
 """Pure, bounded Experience evidence contracts for R12."""
 
-from kagya.experience.records import (
+from suzka.experience.records import (
     EXPERIENCE_MAX_REVISIONS,
     EXPERIENCE_MAX_REVISION,
     EXPERIENCE_MAX_EVENT_SEQUENCE,

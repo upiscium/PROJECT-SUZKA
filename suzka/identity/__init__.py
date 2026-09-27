@@ -1,6 +1,6 @@
 """Dependency-light identity provenance and Value domain primitives."""
 
-from kagya.identity.origin import (
+from suzka.identity.origin import (
     IdentityOrigin,
     OriginActor,
     OriginInputKind,
@@ -8,7 +8,7 @@ from kagya.identity.origin import (
     recompute_origin_id,
     validate_origin_id,
 )
-from kagya.identity.value_system import (
+from suzka.identity.value_system import (
     ValueConflictDefinition,
     ValueDomainError,
     ValueEvidence,
