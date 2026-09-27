@@ -3,6 +3,7 @@
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -10,7 +11,11 @@ from kagya.config import Settings, load_settings
 from kagya.learning import AdapterRegistry, SleepCycleManager
 from kagya.memory import DualMemorySystem, MemorySemanticParticipant
 from kagya.memory.dual_memory_system import SemanticMemoryFormatError
-from kagya.memory.semantic_store import SemanticStore
+from kagya.memory.semantic_store import (
+    SEMANTIC_MAX_RECEIPTS,
+    SemanticStore,
+    SemanticStoreUnavailable,
+)
 from kagya.memory.semantic_lifecycle import (
     SemanticLifecycle,
     SemanticRevision,
@@ -30,8 +35,11 @@ from kagya.runtime import (
 )
 from kagya.runtime.event_journal import (
     EventLifecycle,
+    EventJournal,
     EventJournalTransaction,
+    ParticipantBaseline,
     ParticipantCapability,
+    ParticipantDomain,
     ParticipantOutcome,
     ParticipantRequirement,
 )
@@ -301,7 +309,7 @@ def test_receipt_cleanup_requires_terminal_participant_evidence(tmp_path: Path) 
     assert store.load_receipt(transaction_id) is None
 
 
-def test_reconstructible_semantic_receipt_can_retire_after_baseline(
+def test_semantic_receipt_retains_until_verified_baseline(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -335,37 +343,72 @@ def test_reconstructible_semantic_receipt_can_retire_after_baseline(
     participant.finalize(binding)
     store = SemanticStore.from_memory_root(settings.memory.persist_directory)
     assert store.load_receipt(transaction_id) is not None
-    transaction = EventJournalTransaction(
-        transaction_id=transaction_id,
-        event_id=event.event_id,
-        event_type=event.event_type,
-        source=event.source,
-        processing_sequence=event.processing_sequence or 0,
-        kind=TransactionKind.EVENT_MUTATION,
-        required_participants=(
-            ParticipantRequirement(
+    journal = EventJournal(
+        tmp_path / "events.jsonl",
+        100_000,
+        4,
+        clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    generation = str(uuid5(NAMESPACE_URL, "r12-retention-generation"))
+    wal_id = str(uuid5(NAMESPACE_URL, "r12-retention-wal"))
+    journal.append_v2_bootstrap_checkpoint(0, "a" * 64, generation, wal_id, "b" * 64)
+    journal.append_v3_migration_checkpoint()
+    requirement = ParticipantRequirement(
+        participant_id="memory.semantic",
+        operation_digest=participant.operation_digest,
+        capabilities=(
+            ParticipantCapability.IDEMPOTENT_FINALIZE,
+            ParticipantCapability.PREPARE,
+        ),
+    )
+    journal.append_accepted(event)
+    journal.append_started(event)
+    journal.append_transaction_prepared(
+        event,
+        transaction_id,
+        TransactionKind.EVENT_MUTATION,
+        (requirement,),
+    )
+    journal.append_prepared(event, "a" * 64, "b" * 64, generation)
+    journal.append_participant_finalized(
+        event,
+        transaction_id,
+        requirement.participant_id,
+        requirement.operation_digest,
+        ParticipantOutcome.FINALIZED,
+    )
+    journal.append_transaction_completed(event, transaction_id)
+    journal.append_completed(event, 1, "b" * 64, generation, wal_id, "c" * 64)
+
+    retention = SemanticReceiptRetentionCoordinator(journal, store)
+    retention.before_prepare()
+
+    assert store.load_receipt(transaction_id) is not None
+    inspection = journal.inspect()
+    anchor = next(
+        record
+        for record in reversed(inspection.records)
+        if record.wal_generation_id is not None
+        and record.wal_record_id is not None
+        and record.wal_record_hash is not None
+    )
+    journal.append_participant_baseline(
+        str(uuid5(NAMESPACE_URL, "r12-retention-baseline")),
+        inspection.snapshot_sequence,
+        inspection.snapshot_hash,
+        inspection.processing_high_water,
+        anchor.wal_generation_id or "",
+        anchor.wal_record_id or "",
+        anchor.wal_record_hash or "",
+        inspection.journal_lineage_id or "",
+        (
+            ParticipantBaseline(
                 participant_id="memory.semantic",
-                operation_digest=participant.operation_digest,
-                capabilities=(
-                    ParticipantCapability.IDEMPOTENT_FINALIZE,
-                    ParticipantCapability.PREPARE,
-                ),
+                domain=ParticipantDomain.DURABLE_DOMAIN,
             ),
         ),
-        participant_outcomes=(
-            ("memory.semantic", ParticipantOutcome.FINALIZED),
-        ),
-        terminal_lifecycle=EventLifecycle.TRANSACTION_COMPLETED,
     )
-    journal = SimpleNamespace(
-        inspect=lambda: SimpleNamespace(
-            completed_transactions=(transaction,),
-            reconciled_transactions=(),
-            baselines=(SimpleNamespace(processing_high_water=0),),
-        )
-    )
-
-    SemanticReceiptRetentionCoordinator(journal, store).before_prepare()  # type: ignore[arg-type]
+    retention.before_prepare()
 
     assert store.load_receipt(transaction_id) is None
     reconstructed = MemorySemanticParticipant.from_pending(
@@ -378,6 +421,54 @@ def test_reconstructible_semantic_receipt_can_retire_after_baseline(
         processing_sequence=event.processing_sequence,
     )
     assert reconstructed.operation == participant.operation
+
+
+def test_receipt_capacity_blocks_only_semantic_retention_admission(
+    tmp_path: Path,
+) -> None:
+    store = SemanticStore(tmp_path / "semantic")
+    transaction_ids = tuple(
+        str(uuid5(NAMESPACE_URL, f"r12-receipt-capacity-{index}"))
+        for index in range(SEMANTIC_MAX_RECEIPTS + 1)
+    )
+    for transaction_id in transaction_ids:
+        store.write_receipt(
+            transaction_id,
+            {"transaction_id": transaction_id, "operation_digest": "a" * 64},
+        )
+    journal = EventJournal(
+        tmp_path / "events.jsonl",
+        100_000,
+        4,
+        clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    retention = SemanticReceiptRetentionCoordinator(journal, store)
+
+    retention.before_prepare(
+        (
+            ParticipantRequirement(
+                participant_id="session.turn",
+                operation_digest="b" * 64,
+                capabilities=(
+                    ParticipantCapability.IDEMPOTENT_FINALIZE,
+                    ParticipantCapability.PREPARE,
+                ),
+            ),
+        )
+    )
+    with pytest.raises(SemanticStoreUnavailable):
+        retention.before_prepare(
+            (
+                ParticipantRequirement(
+                    participant_id="memory.semantic",
+                    operation_digest="b" * 64,
+                    capabilities=(
+                        ParticipantCapability.IDEMPOTENT_FINALIZE,
+                        ParticipantCapability.PREPARE,
+                    ),
+                ),
+            )
+        )
 
 
 def test_semantic_checkpoint_binds_horizon_to_journal_record(tmp_path: Path) -> None:

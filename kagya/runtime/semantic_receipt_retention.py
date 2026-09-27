@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from kagya.memory.semantic_participant import (
     MEMORY_SEMANTIC_PARTICIPANT_ID,
-    MemorySemanticParticipant,
-    SemanticCreateIntent,
 )
 from kagya.memory.semantic_store import (
     SemanticStore,
@@ -14,9 +14,7 @@ from kagya.memory.semantic_store import (
 )
 from kagya.runtime.event_journal import EventJournal
 from kagya.runtime.transaction_coordinator import (
-    ParticipantDivergedError,
-    ParticipantUnavailableError,
-    UnsupportedParticipantReconciliationError,
+    ParticipantRequirement,
 )
 
 
@@ -111,7 +109,9 @@ class SemanticReceiptRetentionCoordinator:
             for horizon in (baseline_horizon, checkpoint_horizon)
             if horizon is not None
         )
-        safe_horizon = max(horizons) if horizons else None
+        if not horizons:
+            return {}
+        safe_horizon = max(horizons)
         proofs: dict[str, str] = {}
         for transaction in transactions:
             if not any(
@@ -129,40 +129,21 @@ class SemanticReceiptRetentionCoordinator:
             )
             if requirement is None:
                 continue
-            if safe_horizon is not None and transaction.processing_sequence <= safe_horizon:
-                reconstructible = True
-            else:
-                try:
-                    operation = MemorySemanticParticipant.operation_from_authority(
-                        self.store,
-                        transaction.transaction_id,
-                        transaction.event_id,
-                        transaction.processing_sequence,
-                        requirement.operation_digest,
-                    )
-                except (
-                    ParticipantDivergedError,
-                    ParticipantUnavailableError,
-                    UnsupportedParticipantReconciliationError,
-                ):
-                    reconstructible = False
-                else:
-                    # Revision authority can later be compacted out of the
-                    # retained Semantic window.  U3 create batches have
-                    # deterministic revision-zero artifacts; retain revision
-                    # receipts until a baseline proves them unreachable.
-                    reconstructible = all(
-                        isinstance(entry.mutation, SemanticCreateIntent)
-                        for entry in operation.entries
-                    )
-                if not reconstructible:
-                    continue
+            if transaction.processing_sequence > safe_horizon:
+                continue
             proofs[transaction.transaction_id] = requirement.operation_digest
         return proofs
 
-    def before_prepare(self) -> None:
+    def before_prepare(
+        self, requirements: Iterable[ParticipantRequirement] | None = None
+    ) -> None:
         """Retry safe retirement before admitting another coordinated mutation."""
 
+        if requirements is not None and not any(
+            requirement.participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID
+            for requirement in requirements
+        ):
+            return
         proofs = self._retired_transaction_proofs()
         for transaction_id, operation_digest in proofs.items():
             receipt = self.store.load_receipt(transaction_id)

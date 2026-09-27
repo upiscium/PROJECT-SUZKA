@@ -152,7 +152,8 @@ class TransactionCoordinator:
         journal: EventJournal,
         internal_commit_verifier: Callable[[AgentEvent, InternalCommitEvidence], None],
         *,
-        before_prepare: Callable[[], None] | None = None,
+        before_prepare: Callable[[tuple[ParticipantRequirement, ...]], None]
+        | None = None,
         after_participant_finalized: Callable[[], None] | None = None,
     ) -> None:
         self.journal = journal
@@ -215,15 +216,17 @@ class TransactionCoordinator:
         ):
             raise TransactionPreparationError("Transaction preparation is invalid")
 
+        participants, requirements = self._validate_plan(result.participants)
         if self._before_prepare is not None:
+            retention_failed = False
             try:
-                self._before_prepare()
-            except Exception as error:
+                self._before_prepare(requirements)
+            except Exception:
+                retention_failed = True
+            if retention_failed:
                 raise TransactionPreparationError(
                     "Transaction receipt retention is unavailable"
-                ) from error
-
-        participants, requirements = self._validate_plan(result.participants)
+                )
         transaction_id = self.derive_transaction_id(event, result.transaction_kind)
         bindings = tuple(
             TransactionBinding(
