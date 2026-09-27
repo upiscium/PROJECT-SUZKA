@@ -1,4 +1,4 @@
-"""Typed configuration schema for PROJECT-KAGYA."""
+"""Typed configuration schema for PROJECT-SUZKA."""
 
 from pathlib import Path
 import math
@@ -16,8 +16,8 @@ from pydantic import (
     model_validator,
 )
 
-from kagya.identifiers import validate_identifier
-from kagya.identity.value_system import ValueSeedDeclaration, ValueScope
+from suzka.identifiers import validate_identifier
+from suzka.identity.value_system import ValueSeedDeclaration, ValueScope
 
 
 class StrictBaseModel(BaseModel):
@@ -151,17 +151,17 @@ class RuntimeSettings(StrictBaseModel):
 
 
 class AgentStateSettings(StrictBaseModel):
-    path: Path = Path(".kagya/agent_state.json")
+    path: Path = Path(".suzka/agent_state.json")
 
 
 class EventJournalSettings(StrictBaseModel):
-    path: Path = Path(".kagya/event_journal.jsonl")
+    path: Path = Path(".suzka/event_journal.jsonl")
     max_bytes: int = Field(default=1_048_576, gt=0)
     retained_files: int = Field(default=4, ge=2)
 
 
 class StateWALSettings(StrictBaseModel):
-    directory: Path = Path(".kagya/private/state_wal")
+    directory: Path = Path(".suzka/private/state_wal")
 
 
 class ValueSeedSettings(StrictBaseModel):

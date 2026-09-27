@@ -7,10 +7,10 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped]  # PyYAML has no bundled stubs in the frozen baseline.
 
-from kagya.config.schema import Settings
+from suzka.config.schema import Settings
 
 
-CONFIG_PATH_ENV = "KAGYA_CONFIG_PATH"
+CONFIG_PATH_ENV = "SUZKA_CONFIG_PATH"
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config.yaml"
 
 

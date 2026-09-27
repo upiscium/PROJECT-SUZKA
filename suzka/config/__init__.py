@@ -1,6 +1,6 @@
-"""Configuration helpers for PROJECT-KAGYA."""
+"""Configuration helpers for PROJECT-SUZKA."""
 
-from kagya.config.schema import Settings
-from kagya.config.settings import get_settings, load_settings
+from suzka.config.schema import Settings
+from suzka.config.settings import get_settings, load_settings
 
 __all__ = ["Settings", "get_settings", "load_settings"]

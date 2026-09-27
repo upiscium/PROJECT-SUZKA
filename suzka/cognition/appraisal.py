@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 import math
 
-from kagya.cognition.surprisal_calculator import LossMeasurement
+from suzka.cognition.surprisal_calculator import LossMeasurement
 
 
 class AppraisalReasonCode(str, Enum):

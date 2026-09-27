@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Final, TypeVar, cast
 
-from kagya.identifiers import validate_identifier
+from suzka.identifiers import validate_identifier
 
 
 class _ClosedStrEnum(str, Enum):
@@ -46,7 +46,7 @@ class ValueAdmissionStatus(_ClosedStrEnum):
     UNCERTAIN = "uncertain"
 
 
-_ORIGIN_DOMAIN: Final = "kagya.identity.origin/v1"
+_ORIGIN_DOMAIN: Final = "suzka.identity.origin/v1"
 _ACTIVE: Final = frozenset(
     {ValueAdmissionStatus.SELF_ENDORSED, ValueAdmissionStatus.SYSTEM_AUTHORIZED}
 )
