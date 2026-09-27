@@ -1,10 +1,13 @@
 """Focused U4 multi-Context Semantic projection contract tests."""
 
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from suzka.config import Settings, load_settings
+from suzka.memory.dual_memory_system import DualMemorySystem
 from suzka.memory.memory_schema import MemoryRecordType, SemanticMemoryRecord
 from suzka.memory.semantic_lifecycle import (
     SEMANTIC_MAX_SOURCE_EDGES,
@@ -35,6 +38,23 @@ from suzka.runtime.working_memory import (
 
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
+PRIVATE_SENTINEL = "R12-PRIVATE-HIDDEN-THOUGHT"
+
+
+def _settings(tmp_path: Path) -> Settings:
+    settings = load_settings(CONFIG_PATH)
+    return settings.model_copy(
+        update={
+            "memory": settings.memory.model_copy(
+                update={
+                    "persist_directory": tmp_path / "chroma",
+                    "db1_collection": "u4_projection_db1",
+                    "db2_collection": "u4_projection_db2",
+                }
+            )
+        }
+    )
 
 
 def _registry() -> ContextRegistry:
@@ -220,6 +240,28 @@ def test_projection_is_canonical_for_duplicate_order_and_preserves_status() -> N
     assert left_projection.incomplete is True
 
 
+@pytest.mark.parametrize(
+    "status",
+    [SemanticSourceStatus.MISSING, SemanticSourceStatus.SUPERSEDED],
+)
+def test_projection_preserves_incomplete_source_statuses(
+    status: SemanticSourceStatus,
+) -> None:
+    projection = project_semantic_revision_context(
+        _revision(
+            f"semantic-{status.value}",
+            (_edge("episode-incomplete", "context-current", status=status),),
+        ),
+        _registry(),
+        "context-current",
+    )
+
+    assert projection.provenance_classification is SemanticProvenanceClass.INCOMPLETE
+    assert projection.unknown is True
+    assert projection.incomplete is True
+    assert projection.source_evidence[0].source_status is status
+
+
 def test_missing_retained_context_becomes_unknown_context_without_revision_change() -> None:
     registry = _registry()
     revision = _revision(
@@ -301,6 +343,23 @@ def test_legacy_context_without_sources_is_malformed() -> None:
             registry,
             "context-current",
         )
+
+
+def test_legacy_duplicate_sources_are_deduplicated_before_bound() -> None:
+    projection = project_legacy_semantic_context(
+        _legacy(
+            "semantic-duplicate-overflow",
+            ["episode-duplicate"] * (SEMANTIC_MAX_SOURCE_EDGES + 1),
+            None,
+        ),
+        _registry(),
+        "context-current",
+    )
+
+    assert projection.source_count == 1
+    assert [evidence.source_id for evidence in projection.source_evidence] == [
+        "episode-duplicate"
+    ]
 
 
 def test_legacy_contextual_resolver_never_reads_db1() -> None:
@@ -389,6 +448,65 @@ def test_new_format_contextual_resolver_uses_authoritative_revision() -> None:
         SemanticProvenanceClass.MULTI_CONTEXT
     )
     assert resolution.context_projection.aggregate_compatibility == pytest.approx(0.6)
+
+
+def test_projection_does_not_expose_semantic_content_or_private_sentinel() -> None:
+    projection = project_semantic_revision_context(
+        _revision(
+            "semantic-private-content",
+            (_edge("episode-visible", "context-current"),),
+            text=f"visible fact {PRIVATE_SENTINEL}",
+        ),
+        _registry(),
+        "context-current",
+    )
+
+    assert PRIVATE_SENTINEL not in repr(projection)
+    assert PRIVATE_SENTINEL not in repr(projection.source_evidence)
+
+
+def test_persisted_new_format_repeated_reads_are_pure_and_never_read_db1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory = DualMemorySystem(_settings(tmp_path))
+    revision = _revision(
+        "semantic-persisted",
+        (_edge("episode-a", "context-current"),),
+    )
+    memory.semantic_store.publish_create(revision, "a" * 64)
+    memory.project_semantic_revision(revision)
+
+    registry = _registry()
+    working = WorkingMemory(item_capacity=1, projection_max_bytes=100)
+    item = working.admit(
+        WorkingMemorySourceKind.SEMANTIC,
+        revision.semantic_id,
+        activation=1.0,
+        salience=1.0,
+    ).item
+    db2_before = memory.db2.get(
+        ids=[revision.semantic_id], include=["documents", "metadatas"]
+    )
+    store_before = memory.semantic_store.load_current(revision.semantic_id)
+    state_before = (working.revision, working.items, registry.state)
+
+    def fail_db1(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Semantic contextual resolution must not read DB1")
+
+    monkeypatch.setattr(memory.db1, "get", fail_db1)
+    resolver = MemoryWorkingMemoryResolver(memory)
+    first = resolver.resolve_contextual(item, registry, "context-current")
+    second = resolver.resolve_contextual(item, registry, "context-current")
+
+    assert first == second
+    assert first.status is WorkingMemoryResolutionStatus.RESOLVED
+    assert isinstance(first.context_projection, SemanticContextProjection)
+    assert first.context_projection.source_count == 1
+    assert memory.db2.get(
+        ids=[revision.semantic_id], include=["documents", "metadatas"]
+    ) == db2_before
+    assert memory.semantic_store.load_current(revision.semantic_id) == store_before
+    assert (working.revision, working.items, registry.state) == state_before
 
 
 def test_contextual_working_memory_uses_semantic_mean_not_best_source() -> None:

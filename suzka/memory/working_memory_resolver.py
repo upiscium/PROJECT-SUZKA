@@ -142,9 +142,6 @@ def project_legacy_semantic_context(
         raise TypeError("context_registry must be ContextRegistry")
     validate_identifier(record.id)
     validate_identifier(current_context_id)
-    if len(record.source_episode_ids) > SEMANTIC_MAX_SOURCE_EDGES:
-        raise ValueError("legacy Semantic source evidence exceeds its bound")
-
     unique_source_ids: list[str] = []
     seen: set[str] = set()
     for source_id in record.source_episode_ids:
@@ -153,6 +150,8 @@ def project_legacy_semantic_context(
             seen.add(checked)
             unique_source_ids.append(checked)
     unique_source_ids.sort()
+    if len(unique_source_ids) > SEMANTIC_MAX_SOURCE_EDGES:
+        raise ValueError("legacy Semantic source evidence exceeds its bound")
 
     retained_context_id = (
         None
