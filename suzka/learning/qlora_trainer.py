@@ -6,9 +6,9 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
-from kagya.config import Settings
-from kagya.learning.dream_dataset_generator import DreamDatasetRecord, format_training_text
-from kagya.privacy import reject_private_fields
+from suzka.config import Settings
+from suzka.learning.dream_dataset_generator import DreamDatasetRecord, format_training_text
+from suzka.privacy import reject_private_fields
 
 
 @dataclass(frozen=True)

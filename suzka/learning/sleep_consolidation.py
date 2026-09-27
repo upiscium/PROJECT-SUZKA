@@ -3,11 +3,11 @@
 from dataclasses import dataclass, replace
 from threading import RLock
 
-from kagya.config import Settings
-from kagya.learning.adapter_registry import AdapterEntry, AdapterRegistry
-from kagya.learning.dream_dataset_generator import DreamDatasetGenerator
-from kagya.learning.qlora_trainer import QloraTrainer, QloraTrainingResult
-from kagya.memory import (
+from suzka.config import Settings
+from suzka.learning.adapter_registry import AdapterEntry, AdapterRegistry
+from suzka.learning.dream_dataset_generator import DreamDatasetGenerator
+from suzka.learning.qlora_trainer import QloraTrainer, QloraTrainingResult
+from suzka.memory import (
     DualMemorySystem,
     EpisodicMemoryRecord,
     MemorySemanticParticipant,
@@ -17,9 +17,9 @@ from kagya.memory import (
     SemanticStore,
     semantic_id_for_batch_entry,
 )
-from kagya.models import ModelProvider
-from kagya.persona import ResponsePostprocessor
-from kagya.runtime import (
+from suzka.models import ModelProvider
+from suzka.persona import ResponsePostprocessor
+from suzka.runtime import (
     AgentEvent,
     AgentEventType,
     AgentEventSource,
@@ -29,7 +29,7 @@ from kagya.runtime import (
     TransactionCoordinator,
     TransactionKind,
 )
-from kagya.memory.semantic_lifecycle import (
+from suzka.memory.semantic_lifecycle import (
     SemanticLifecycle,
     SemanticRevision,
     SemanticRevisionOperation,

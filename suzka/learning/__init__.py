@@ -1,11 +1,11 @@
-"""Learning and adapter lifecycle helpers for PROJECT-KAGYA."""
+"""Learning and adapter lifecycle helpers for PROJECT-SUZKA."""
 
-from kagya.learning.adapter_evaluator import AdapterEvaluationDecision, AdapterEvaluationResult, AdapterEvaluator
-from kagya.learning.adapter_registry import AdapterEntry, AdapterRegistry, AdapterStatus
-from kagya.learning.dream_dataset_generator import DreamDatasetGenerator, DreamDatasetRecord, format_training_text
-from kagya.learning.eval_sets import EvalCase, EvalSet, load_eval_sets
-from kagya.learning.qlora_trainer import QloraTrainer, QloraTrainingResult
-from kagya.learning.sleep_consolidation import SleepCycleManager, SleepCycleResult
+from suzka.learning.adapter_evaluator import AdapterEvaluationDecision, AdapterEvaluationResult, AdapterEvaluator
+from suzka.learning.adapter_registry import AdapterEntry, AdapterRegistry, AdapterStatus
+from suzka.learning.dream_dataset_generator import DreamDatasetGenerator, DreamDatasetRecord, format_training_text
+from suzka.learning.eval_sets import EvalCase, EvalSet, load_eval_sets
+from suzka.learning.qlora_trainer import QloraTrainer, QloraTrainingResult
+from suzka.learning.sleep_consolidation import SleepCycleManager, SleepCycleResult
 
 __all__ = [
     "AdapterEntry",

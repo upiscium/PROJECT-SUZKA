@@ -17,7 +17,7 @@ from threading import RLock
 from typing import Any
 from uuid import UUID, uuid4, uuid5
 
-from kagya.memory.dual_memory_system import (
+from suzka.memory.dual_memory_system import (
     CommittedEpisodicMemory,
     DualMemorySystem,
     EpisodicMemoryFormatError,
@@ -25,15 +25,15 @@ from kagya.memory.dual_memory_system import (
     canonical_episodic_document,
     canonical_episodic_metadata,
 )
-from kagya.memory.memory_schema import EpisodicMemoryRecord, MemoryRecordType
-from kagya.identifiers import validate_identifier
-from kagya.runtime.event_journal import (
+from suzka.memory.memory_schema import EpisodicMemoryRecord, MemoryRecordType
+from suzka.identifiers import validate_identifier
+from suzka.runtime.event_journal import (
     AbortOutcome,
     ParticipantCapability,
     ParticipantOutcome,
     StartupParticipantOutcome,
 )
-from kagya.runtime.transaction_coordinator import (
+from suzka.runtime.transaction_coordinator import (
     ParticipantDivergedError,
     ParticipantUnavailableError,
     TransactionBinding,
@@ -46,9 +46,9 @@ MEMORY_EPISODIC_PARTICIPANT_ID = "memory.episodic"
 _OPERATION_SCHEMA_VERSION = 2
 _PENDING_SCHEMA_VERSION = 1
 _OPERATION_HASH_DOMAINS = {
-    1: b"PROJECT-KAGYA:R07:MEMORY-EPISODIC:V1\x00",
-    2: b"PROJECT-KAGYA:R07:MEMORY-EPISODIC:V2\x00",
-    3: b"PROJECT-KAGYA:R07:MEMORY-EPISODIC:V3\x00",
+    1: b"PROJECT-SUZKA:R07:MEMORY-EPISODIC:V1\x00",
+    2: b"PROJECT-SUZKA:R07:MEMORY-EPISODIC:V2\x00",
+    3: b"PROJECT-SUZKA:R07:MEMORY-EPISODIC:V3\x00",
 }
 _EPISODE_ID_NAMESPACE = UUID("f0ced3ab-ad3f-5acb-b190-edea7fff6aff")
 _STAGING_DIRECTORY = ".r07-episodic-pending"

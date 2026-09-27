@@ -1,6 +1,6 @@
-"""Dual memory system for PROJECT-KAGYA."""
+"""Dual memory system for PROJECT-SUZKA."""
 
-from kagya.memory.dual_memory_system import (
+from suzka.memory.dual_memory_system import (
     CommittedEpisodicMemory,
     CommittedSemanticMemory,
     DualMemorySystem,
@@ -13,13 +13,13 @@ from kagya.memory.dual_memory_system import (
     SemanticProjectionStatus,
     semantic_projection_metadata,
 )
-from kagya.memory.memory_schema import (
+from suzka.memory.memory_schema import (
     EpisodicMemoryRecord,
     MemoryContext,
     MemoryRecordType,
     SemanticMemoryRecord,
 )
-from kagya.memory.experience_participant import (
+from suzka.memory.experience_participant import (
     MEMORY_EXPERIENCE_PARTICIPANT_ID,
     MemoryExperienceParticipant,
     ExperienceCreateIntent,
@@ -27,9 +27,9 @@ from kagya.memory.experience_participant import (
     experience_id_for_event,
     experience_operation_digest,
 )
-from kagya.memory.experience_store import ExperienceStore
-from kagya.memory.episodic_participant import episodic_episode_id
-from kagya.memory.semantic_participant import (
+from suzka.memory.experience_store import ExperienceStore
+from suzka.memory.episodic_participant import episodic_episode_id
+from suzka.memory.semantic_participant import (
     MEMORY_SEMANTIC_PARTICIPANT_ID,
     SEMANTIC_MAX_BATCH_ENTRIES,
     MemorySemanticParticipant,
@@ -40,7 +40,7 @@ from kagya.memory.semantic_participant import (
     semantic_batch_operation_digest,
     semantic_id_for_batch_entry,
 )
-from kagya.memory.semantic_store import (
+from suzka.memory.semantic_store import (
     SemanticStoredEntry,
     SemanticStore,
     SemanticStoreConflict,

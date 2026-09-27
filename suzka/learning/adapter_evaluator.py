@@ -6,10 +6,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from kagya.config import Settings
-from kagya.learning.adapter_registry import AdapterRegistry, AdapterStatus
-from kagya.learning.eval_sets import EvalSet, load_eval_sets
-from kagya.models import ModelProvider
+from suzka.config import Settings
+from suzka.learning.adapter_registry import AdapterRegistry, AdapterStatus
+from suzka.learning.eval_sets import EvalSet, load_eval_sets
+from suzka.models import ModelProvider
 
 
 class AdapterEvaluationDecision(StrEnum):
