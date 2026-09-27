@@ -2,16 +2,16 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from kagya.api.dependencies import get_agent_runtime, get_main_loop
-from kagya.api.runtime_execution import execute
-from kagya.api.schemas.chat import ChatRequest, ChatResponse, EmotionSchema, ModelSchema
-from kagya.runtime import (
+from suzka.api.dependencies import get_agent_runtime, get_main_loop
+from suzka.api.runtime_execution import execute
+from suzka.api.schemas.chat import ChatRequest, ChatResponse, EmotionSchema, ModelSchema
+from suzka.runtime import (
     AgentEventSource,
     AgentEventType,
     AgentRuntime,
     ChatResult,
     ChatContextSelectors,
-    KagyaMainLoop,
+    SuzkaMainLoop,
 )
 
 
@@ -21,7 +21,7 @@ router = APIRouter(prefix="/api", tags=["chat"])
 @router.post("/chat", response_model=ChatResponse)
 def chat(
     request: ChatRequest,
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> ChatResponse:
     reject_unsupported_attachments(request)

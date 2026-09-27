@@ -2,23 +2,23 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from kagya.api.dependencies import get_agent_runtime, get_main_loop, require_admin
-from kagya.api.runtime_execution import execute
-from kagya.api.schemas.context import (
+from suzka.api.dependencies import get_agent_runtime, get_main_loop, require_admin
+from suzka.api.runtime_execution import execute
+from suzka.api.schemas.context import (
     ContextFrameResponse,
     ContextListResponse,
     ContextRelationRequest,
     ContextRelationResponse,
 )
-from kagya.identifiers import validate_identifier
-from kagya.runtime import (
+from suzka.identifiers import validate_identifier
+from suzka.runtime import (
     AgentEventSource,
     AgentEventType,
     AgentRuntime,
     ContextFrame,
     ContextNotFound,
     ContextRegistry,
-    KagyaMainLoop,
+    SuzkaMainLoop,
 )
 
 
@@ -27,7 +27,7 @@ router = APIRouter(
 )
 
 
-def _registry(main_loop: KagyaMainLoop) -> ContextRegistry:
+def _registry(main_loop: SuzkaMainLoop) -> ContextRegistry:
     return main_loop.context_registry
 
 
@@ -61,7 +61,7 @@ def _frame(frame: ContextFrame, current_context_id: str | None) -> ContextFrameR
 
 @router.get("", response_model=ContextListResponse)
 def list_contexts(
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
 ) -> ContextListResponse:
     state = _registry(main_loop).state
     return ContextListResponse(
@@ -74,7 +74,7 @@ def list_contexts(
 
 @router.get("/{context_id}", response_model=ContextFrameResponse)
 def get_context(
-    context_id: str, main_loop: KagyaMainLoop = Depends(get_main_loop)
+    context_id: str, main_loop: SuzkaMainLoop = Depends(get_main_loop)
 ) -> ContextFrameResponse:
     checked = _context_id(context_id)
     registry = _registry(main_loop)
@@ -87,7 +87,7 @@ def get_context(
 
 def _transition(
     context_id: str,
-    main_loop: KagyaMainLoop,
+    main_loop: SuzkaMainLoop,
     runtime: AgentRuntime,
     source: AgentEventSource,
     operation: str,
@@ -104,7 +104,7 @@ def _transition(
 @router.post("/{context_id}/suspend", response_model=ContextFrameResponse)
 def suspend_context(
     context_id: str,
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> ContextFrameResponse:
     return _transition(
@@ -115,7 +115,7 @@ def suspend_context(
 @router.post("/{context_id}/resume", response_model=ContextFrameResponse)
 def resume_context(
     context_id: str,
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> ContextFrameResponse:
     return _transition(
@@ -126,7 +126,7 @@ def resume_context(
 @router.post("/{context_id}/close", response_model=ContextFrameResponse)
 def close_context(
     context_id: str,
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> ContextFrameResponse:
     return _transition(
@@ -138,7 +138,7 @@ def close_context(
 def relate_context(
     context_id: str,
     request: ContextRelationRequest,
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> ContextRelationResponse:
     checked = _context_id(context_id)

@@ -2,19 +2,19 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from kagya.api.dependencies import (
+from suzka.api.dependencies import (
     get_agent_runtime,
     get_api_settings,
     get_main_loop,
     require_admin,
 )
-from kagya.api.runtime_execution import execute
-from kagya.api.routes.chat import (
+from suzka.api.runtime_execution import execute
+from suzka.api.routes.chat import (
     chat_response_from_result,
     reject_unsupported_attachments,
 )
-from kagya.api.schemas.chat import ChatRequest
-from kagya.api.schemas.debug import (
+from suzka.api.schemas.chat import ChatRequest
+from suzka.api.schemas.debug import (
     AppraisalSchema,
     ArousalContributionsSchema,
     ChatDiagnosticsSchema,
@@ -28,17 +28,17 @@ from kagya.api.schemas.debug import (
     RetrievedSemanticSchema,
     ValenceContributionsSchema,
 )
-from kagya.body import EmotionUpdate
-from kagya.cognition import AppraisalResult, LossMeasurement
-from kagya.config import Settings
-from kagya.runtime import (
+from suzka.body import EmotionUpdate
+from suzka.cognition import AppraisalResult, LossMeasurement
+from suzka.config import Settings
+from suzka.runtime import (
     AgentEventSource,
     AgentEventType,
     AgentRuntime,
     ChatContextSelectors,
-    KagyaMainLoop,
+    SuzkaMainLoop,
 )
-from kagya.runtime.main_loop import ChatDiagnostics
+from suzka.runtime.main_loop import ChatDiagnostics
 
 
 router = APIRouter(prefix="/api", tags=["debug"], dependencies=[Depends(require_admin)])
@@ -47,7 +47,7 @@ router = APIRouter(prefix="/api", tags=["debug"], dependencies=[Depends(require_
 @router.post("/chat/debug", response_model=DebugChatResponse)
 def debug_chat(
     request: ChatRequest,
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
     settings: Settings = Depends(get_api_settings),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> DebugChatResponse:
@@ -162,7 +162,7 @@ def _emotion_update_response(update: EmotionUpdate) -> EmotionUpdateSchema:
 
 @router.get("/state/emotion", response_model=EmotionStateResponse)
 def emotion_state(
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
 ) -> EmotionStateResponse:
     state = main_loop.emotion_engine.state
     return EmotionStateResponse(

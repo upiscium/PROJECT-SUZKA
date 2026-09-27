@@ -4,13 +4,13 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from kagya.api.dependencies import get_memory_system, require_admin
-from kagya.api.schemas.memory import (
+from suzka.api.dependencies import get_memory_system, require_admin
+from suzka.api.schemas.memory import (
     EpisodeMemoryResponse,
     MemorySearchResponse,
     SemanticMemoryResponse,
 )
-from kagya.memory import (
+from suzka.memory import (
     DualMemorySystem,
     EpisodicMemoryFormatError,
     EpisodicMemoryReadError,
