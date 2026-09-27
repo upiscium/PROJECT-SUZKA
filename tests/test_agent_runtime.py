@@ -228,16 +228,26 @@ def test_checkpoint_failure_fail_stops_runtime() -> None:
             )
 
     handler_ran = Event()
+    release_handler = Event()
     runtime = AgentRuntime(2, internal_commit_checkpoint=checkpoint)
     runtime.start()
+
+    def fail_handler() -> None:
+        handler_ran.set()
+        assert release_handler.wait(timeout=2)
+
     failed = runtime.submit(
         AgentEventType.CHAT,
         AgentEventSource.API_CHAT,
-        handler_ran.set,
+        fail_handler,
     )
-    succeeding = runtime.submit(
-        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "ok"
-    )
+    try:
+        assert handler_ran.wait(timeout=2)
+        succeeding = runtime.submit(
+            AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "ok"
+        )
+    finally:
+        release_handler.set()
 
     with pytest.raises(AgentRuntimeDurabilityError) as error:
         failed.result(timeout=2)
