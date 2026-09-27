@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel, Field, StrictStr, field_validator
 
-from kagya.identifiers import validate_identifier
+from suzka.identifiers import validate_identifier
 
 
 class AttachmentSchema(BaseModel):

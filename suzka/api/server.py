@@ -1,4 +1,4 @@
-"""FastAPI startup foundation for PROJECT-KAGYA."""
+"""FastAPI startup foundation for PROJECT-SUZKA."""
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -12,13 +12,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from kagya.api.routes import adapters, chat, contexts, debug, memory, sleep, values
-from kagya.config import Settings, get_settings
-from kagya.identity import ValueConflictDefinition
-from kagya.learning import AdapterRegistry, SleepCycleManager
-from kagya.memory import DualMemorySystem, ExperienceStore
-from kagya.models import load_model_provider
-from kagya.runtime import (
+from suzka.api.routes import adapters, chat, contexts, debug, memory, sleep, values
+from suzka.config import Settings, get_settings
+from suzka.identity import ValueConflictDefinition
+from suzka.learning import AdapterRegistry, SleepCycleManager
+from suzka.memory import DualMemorySystem, ExperienceStore
+from suzka.models import load_model_provider
+from suzka.runtime import (
     AgentEvent,
     AgentRuntime,
     AgentRuntimeStatus,
@@ -29,7 +29,7 @@ from kagya.runtime import (
     EventJournalLease,
     EmotionTimer,
     InternalCommitEvidence,
-    KagyaMainLoop,
+    SuzkaMainLoop,
     StateRecoveryCoordinator,
     StateRecoveryError,
     StateRecoveryResult,
@@ -37,8 +37,8 @@ from kagya.runtime import (
     TransactionCoordinator,
     WorkingMemory,
 )
-from kagya.runtime.startup_reconciliation import StartupReconciliationCoordinator
-from kagya.runtime.semantic_receipt_retention import (
+from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
+from suzka.runtime.semantic_receipt_retention import (
     SemanticReceiptRetentionCoordinator,
 )
 
@@ -107,7 +107,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             injected_main_loop = getattr(app.state, "main_loop", None)
             if injected_main_loop is not None and not isinstance(
-                injected_main_loop, KagyaMainLoop
+                injected_main_loop, SuzkaMainLoop
             ):
                 raise RuntimeError("Injected main loop has an invalid type")
             injected_experience_store = getattr(app.state, "experience_store", None)
@@ -208,7 +208,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             app.state.main_loop = getattr(
                 app.state, "main_loop", None
-            ) or KagyaMainLoop(
+            ) or SuzkaMainLoop(
                 app_settings,
                 app.state.model_provider,
                 app.state.memory_system,
@@ -456,7 +456,7 @@ def main() -> None:
 
     settings = get_settings()
     uvicorn.run(
-        "kagya.api.server:app",
+        "suzka.api.server:app",
         host=settings.api.host,
         port=settings.api.port,
         reload=False,

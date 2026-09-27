@@ -4,7 +4,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, StrictStr, field_validator
 
-from kagya.identifiers import validate_identifier
+from suzka.identifiers import validate_identifier
 
 
 class ContextRelationRequest(BaseModel):

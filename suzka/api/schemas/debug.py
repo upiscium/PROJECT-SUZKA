@@ -2,9 +2,9 @@
 
 from pydantic import BaseModel
 
-from kagya.api.schemas.chat import ChatResponse, EmotionSchema
-from kagya.body import EmotionUpdateReasonCode
-from kagya.cognition import AppraisalReasonCode, LossInvalidReason
+from suzka.api.schemas.chat import ChatResponse, EmotionSchema
+from suzka.body import EmotionUpdateReasonCode
+from suzka.cognition import AppraisalReasonCode, LossInvalidReason
 
 
 class RetrievedEpisodeSchema(BaseModel):
