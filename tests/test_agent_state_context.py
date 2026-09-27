@@ -9,9 +9,9 @@ from uuid import uuid4
 
 import pytest
 
-from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
-from kagya.cognition import LossCalibration
-from kagya.runtime import (
+from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
+from suzka.cognition import LossCalibration
+from suzka.runtime import (
     AgentStateLoadError,
     AgentStateSaveError,
     AgentStateSaveStage,
@@ -34,7 +34,7 @@ from kagya.runtime import (
     WorkingMemoryItemSnapshot,
     WorkingMemorySnapshot,
 )
-from kagya.identity import ValueSystem
+from suzka.identity import ValueSystem
 
 
 NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)

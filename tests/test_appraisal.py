@@ -3,7 +3,7 @@ import math
 
 import pytest
 
-from kagya.cognition import (
+from suzka.cognition import (
     AppraisalReasonCode,
     AppraisalResult,
     AppraisalSignals,

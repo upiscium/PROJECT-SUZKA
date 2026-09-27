@@ -1,9 +1,9 @@
 import json
 from pathlib import Path
 
-from kagya.config import Settings, load_settings
-from kagya.learning import AdapterEvaluationDecision, AdapterEvaluator, AdapterRegistry, AdapterStatus
-from kagya.models import DummyProvider
+from suzka.config import Settings, load_settings
+from suzka.learning import AdapterEvaluationDecision, AdapterEvaluator, AdapterRegistry, AdapterStatus
+from suzka.models import DummyProvider
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
