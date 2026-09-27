@@ -6,12 +6,12 @@ Connect prediction error, emotion, memory retrieval, prompt construction, respon
 
 ## Target Files
 
-- `kagya/persona/prompt_builder.py`
-- `kagya/persona/conscious_agent.py`
-- `kagya/runtime/__init__.py`
-- `kagya/runtime/agent_runtime.py`
-- `kagya/runtime/session_state.py`
-- `kagya/runtime/main_loop.py`
+- `suzka/persona/prompt_builder.py`
+- `suzka/persona/conscious_agent.py`
+- `suzka/runtime/__init__.py`
+- `suzka/runtime/agent_runtime.py`
+- `suzka/runtime/session_state.py`
+- `suzka/runtime/main_loop.py`
 - `tests/test_agent_runtime.py`
 - `tests/test_main_loop.py`
 
@@ -32,10 +32,10 @@ Connect prediction error, emotion, memory retrieval, prompt construction, respon
 
 ## Main Loop Requirements
 
-- Treat `KagyaMainLoop` as the chat/cognition orchestration compatibility facade, not as the authority that orders concurrent subject mutations.
-- As of R07, `KagyaMainLoop.chat(...)` intentionally returns `CoordinatedResult[ChatResult]`; direct callers must submit that plan through `AgentRuntime` with the `TransactionCoordinator` durability callbacks rather than treating it as a committed result. There is no compatibility window for direct uncoordinated mutation.
+- Treat `SuzkaMainLoop` as the chat/cognition orchestration compatibility facade, not as the authority that orders concurrent subject mutations.
+- As of R07, `SuzkaMainLoop.chat(...)` intentionally returns `CoordinatedResult[ChatResult]`; direct callers must submit that plan through `AgentRuntime` with the `TransactionCoordinator` durability callbacks rather than treating it as a committed result. There is no compatibility window for direct uncoordinated mutation.
 - The separate diagnostic boundary similarly returns `CoordinatedResult[tuple[ChatResult, DebugChatTrace]]`; the trace remains request-scoped and ephemeral while the ordinary public value is materialized only after transaction preparation.
-- `KagyaMainLoop` computes input/context/surprisal/emotion/retrieval/prompt/generation/postprocessing and typed participant plans. It does not save DB1 or mutate SessionState directly. `AgentRuntime` and `TransactionCoordinator` own prepare, internal-commit handoff, finalize, durable classification, and public-result unwrapping.
+- `SuzkaMainLoop` computes input/context/surprisal/emotion/retrieval/prompt/generation/postprocessing and typed participant plans. It does not save DB1 or mutate SessionState directly. `AgentRuntime` and `TransactionCoordinator` own prepare, internal-commit handoff, finalize, durable classification, and public-result unwrapping.
 - Store no hidden/private model reasoning in DB1 documents or metadata.
 - Keep ordinary `ChatResult` limited to visible response and explicitly public structured data such as episode ID, loss/emotion values, model ID, and adapter ID; it does not own a hidden-thought field.
 - When explicitly requested and authorized, expose private diagnostics through a separate request-scoped debug boundary that cannot be persisted or returned through the ordinary result contract.

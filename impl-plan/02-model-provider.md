@@ -6,11 +6,11 @@ Define the model provider interface, implement a deterministic `DummyProvider`, 
 
 ## Target Files
 
-- `kagya/models/__init__.py`
-- `kagya/models/base.py`
-- `kagya/models/model_loader.py`
-- `kagya/models/dummy_provider.py`
-- `kagya/models/transformers_provider.py`
+- `suzka/models/__init__.py`
+- `suzka/models/base.py`
+- `suzka/models/model_loader.py`
+- `suzka/models/dummy_provider.py`
+- `suzka/models/transformers_provider.py`
 
 ## Implementation Requirements
 

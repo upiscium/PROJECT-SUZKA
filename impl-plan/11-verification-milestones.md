@@ -2,7 +2,7 @@
 
 ## Goal
 
-Define the verification gates that must pass before PROJECT-KAGYA v1.0 is considered complete.
+Define the verification gates that must pass before PROJECT-SUZKA v1.0 is considered complete.
 
 ## Unit Test Gates
 
@@ -29,7 +29,7 @@ Define the verification gates that must pass before PROJECT-KAGYA v1.0 is consid
 ## Command Gates
 
 - `uv run pytest`
-- `uv run python -m kagya.api.server`
+- `uv run python -m suzka.api.server`
 - Frontend typecheck command once frontend is introduced.
 - Frontend lint command once frontend is introduced.
 
