@@ -260,8 +260,11 @@ class MemoryWorkingMemoryResolver:
 
         if not isinstance(item, WorkingMemoryItem):
             raise TypeError("item must be WorkingMemoryItem")
+        base_resolution = self.resolve(item)
         if item.source_kind is not WorkingMemorySourceKind.SEMANTIC:
-            return self.resolve(item)
+            return base_resolution
+        if base_resolution.status is not WorkingMemoryResolutionStatus.RESOLVED:
+            return base_resolution
 
         from suzka.memory.dual_memory_system import (
             SEMANTIC_PROJECTION_SCHEMA,
@@ -310,9 +313,16 @@ class MemoryWorkingMemoryResolver:
             except (TypeError, ValueError):
                 return WorkingMemoryResolution(WorkingMemoryResolutionStatus.MALFORMED)
 
+        source_context_id = (
+            base_resolution.source_context_id
+            if projection.provenance_classification
+            is SemanticProvenanceClass.SINGLE_CONTEXT
+            else None
+        )
         return WorkingMemoryResolution(
             WorkingMemoryResolutionStatus.RESOLVED,
             semantic.document,
+            source_context_id=source_context_id,
             context_projection=projection,
         )
 
