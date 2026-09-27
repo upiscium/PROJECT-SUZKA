@@ -6,7 +6,7 @@ import "./globals.css";
 import "@/components/ui/styles.css";
 
 export const metadata: Metadata = {
-  title: "PROJECT-KAGYA",
+  title: "PROJECT-SUZKA",
   description: "Subjective AI runtime interface",
 };
 
@@ -26,7 +26,7 @@ export default function RootLayout({ children }: Readonly<{ children: ReactNode 
         <QueryProvider>
           <div className="app-shell">
             <aside className="sidebar">
-              <div className="brand">PROJECT-KAGYA</div>
+              <div className="brand">PROJECT-SUZKA</div>
               <nav className="nav" aria-label="Primary navigation">
                 {navItems.map(([label, href]) => (
                   <Link key={href} href={href}>{label}</Link>
