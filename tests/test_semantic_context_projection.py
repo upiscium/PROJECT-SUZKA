@@ -327,7 +327,7 @@ def test_legacy_contextual_resolver_never_reads_db1() -> None:
     )
 
     assert resolution.status is WorkingMemoryResolutionStatus.RESOLVED
-    assert resolution.source_context_id is None
+    assert resolution.source_context_id == "context-current"
     assert isinstance(resolution.context_projection, SemanticContextProjection)
     assert resolution.context_projection.aggregate_compatibility == pytest.approx(1.0)
 
