@@ -74,7 +74,7 @@ def test_session_context_id_is_deterministic_and_never_falls_back() -> None:
     expected = (
         "conversation.session."
         + hashlib.sha256(
-            b"PROJECT-SUZKA:R09:CHAT-SESSION:V1\0" + session_id.encode("ascii")
+            b"PROJECT-KAGYA:R09:CHAT-SESSION:V1\0" + session_id.encode("ascii")
         ).hexdigest()
     )
 

@@ -22,7 +22,7 @@ from suzka.runtime.transaction_coordinator import (
 
 
 SESSION_TURN_PARTICIPANT_ID = "session.turn"
-_SESSION_HASH_DOMAIN = b"PROJECT-SUZKA:R07:SESSION-TURN:V1\x00"
+_SESSION_HASH_DOMAIN = b"PROJECT-KAGYA:R07:SESSION-TURN:V1\x00"
 
 
 @dataclass(frozen=True, slots=True)

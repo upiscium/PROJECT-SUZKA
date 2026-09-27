@@ -1206,6 +1206,8 @@ def test_handler_failure_checkpoint_consumes_sequence_and_runtime_continues() ->
 
 
 def test_handler_failure_checkpoint_failure_stops_later_handlers() -> None:
+    handler_started = Event()
+    release_failure = Event()
     later_ran = Event()
 
     def fail_handler_checkpoint(_event) -> None:
@@ -1215,12 +1217,16 @@ def test_handler_failure_checkpoint_failure_stops_later_handlers() -> None:
     runtime.start()
 
     def fail() -> None:
+        handler_started.set()
+        assert release_failure.wait(timeout=2)
         raise ValueError("domain failure")
 
     failed = runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, fail)
+    assert handler_started.wait(timeout=2)
     later = runtime.submit(
         AgentEventType.CHAT, AgentEventSource.API_CHAT, later_ran.set
     )
+    release_failure.set()
     with pytest.raises(AgentRuntimeDurabilityError) as error:
         failed.result(timeout=2)
     with pytest.raises(AgentRuntimeDurabilityError):

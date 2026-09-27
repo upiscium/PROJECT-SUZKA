@@ -14,7 +14,7 @@ from typing import Final, Iterable
 from suzka.models import ModelProvider
 
 
-MODEL_KEY_DOMAIN: Final[bytes] = b"PROJECT-SUZKA:R10:CALIBRATION-MODEL:V1\0"
+MODEL_KEY_DOMAIN: Final[bytes] = b"PROJECT-KAGYA:R10:CALIBRATION-MODEL:V1\0"
 _MODEL_KEY_PATTERN: Final[re.Pattern[str]] = re.compile(r"model\.[0-9a-f]{64}")
 
 
