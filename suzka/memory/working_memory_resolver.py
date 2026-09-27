@@ -269,7 +269,7 @@ class MemoryWorkingMemoryResolver:
             SemanticMemoryReadError,
         )
         from suzka.memory.semantic_store import (
-            SemanticStoreCorrupt,
+            SemanticStoreError,
             SemanticStoreUnavailable,
         )
 
@@ -289,7 +289,7 @@ class MemoryWorkingMemoryResolver:
                 return WorkingMemoryResolution(
                     WorkingMemoryResolutionStatus.UNAVAILABLE
                 )
-            except SemanticStoreCorrupt:
+            except SemanticStoreError:
                 return WorkingMemoryResolution(WorkingMemoryResolutionStatus.MALFORMED)
             if stored is None:
                 return WorkingMemoryResolution(
