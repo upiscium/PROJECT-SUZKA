@@ -9,11 +9,11 @@ Create the minimal Python project foundation and configuration layer required by
 - `pyproject.toml`
 - `config.yaml`
 - `.env.example`
-- `kagya/__init__.py`
-- `kagya/config/__init__.py`
-- `kagya/config/schema.py`
-- `kagya/config/settings.py`
-- `kagya/api/server.py`
+- `suzka/__init__.py`
+- `suzka/config/__init__.py`
+- `suzka/config/schema.py`
+- `suzka/config/settings.py`
+- `suzka/api/server.py`
 
 ## Implementation Requirements
 
@@ -23,7 +23,7 @@ Create the minimal Python project foundation and configuration layer required by
 - Create `config.yaml` with all sections required by the specification: `project`, `model`, `generation`, `emotion`, `memory`, `sleep`, `qlora`, `adapter_registry`, `api`, and `frontend`.
 - Implement typed configuration loading from `config.yaml`.
 - Preserve model IDs in configuration only.
-- Provide an importable FastAPI app and a `python -m kagya.api.server` startup path.
+- Provide an importable FastAPI app and a `python -m suzka.api.server` startup path.
 
 ## Test Requirements
 
@@ -35,5 +35,5 @@ Create the minimal Python project foundation and configuration layer required by
 ## Completion Criteria
 
 - `uv run pytest` runs.
-- `uv run python -m kagya.api.server` has a valid startup foundation.
+- `uv run python -m suzka.api.server` has a valid startup foundation.
 - No Ollama or external LLM dependency is present.

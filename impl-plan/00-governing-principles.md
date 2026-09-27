@@ -2,7 +2,7 @@
 
 ## Scope
 
-PROJECT-KAGYA is a subjective AI architecture with prediction error, emotion, memory, and sleep-time learning. It is not a generic chatbot.
+PROJECT-SUZKA is a subjective AI architecture with prediction error, emotion, memory, and sleep-time learning. It is not a generic chatbot.
 
 This file defines non-negotiable constraints that apply to every implementation phase. Issue #245 and the R02 privacy/public-output boundary supersede earlier plan text that treated hidden/private model reasoning as persistent or trainable data.
 
