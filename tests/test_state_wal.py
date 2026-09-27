@@ -10,20 +10,27 @@ import pytest
 from pydantic import ValidationError
 
 from suzka.belief import (
+    AdmissionReason,
+    BeliefEvidence,
+    BeliefEvidenceType,
     BeliefMutationEvidence,
     BeliefProposition,
+    BeliefSubjectAdmission,
     BeliefSystem,
     belief_record_digest,
 )
 from suzka.config import Settings, load_settings
+from suzka.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 from suzka.runtime.agent_state import (
     AgentStateSnapshotV6,
     AppraisalStateSnapshot,
     AgentStateSnapshotV2,
     AgentStateSnapshotV1,
+    BeliefEvidenceStateSnapshot,
     BeliefPropositionStateSnapshot,
     BeliefRecordStateSnapshot,
     BeliefRevisionStateSnapshot,
+    BeliefSubjectAdmissionStateSnapshot,
     BeliefSystemStateSnapshot,
     ContextStateSnapshot,
     EmotionStateSnapshot,
@@ -70,23 +77,54 @@ def make_v6_snapshot(
     sequence: int, *, include_belief: bool = True, compacted: bool = False
 ) -> AgentStateSnapshotV6:
     timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    system = BeliefSystem()
+    active_event: AgentEvent | None = None
+
+    def set_event(event_sequence: int) -> BeliefMutationEvidence:
+        nonlocal active_event
+        active_event = AgentEvent(
+            event_id=f"belief-event:{event_sequence}",
+            event_type=AgentEventType.CHAT,
+            source=AgentEventSource.API_CHAT,
+            requested_at=timestamp,
+            processing_sequence=event_sequence,
+        )
+        return BeliefMutationEvidence(
+            active_event.event_id, event_sequence, timestamp
+        )
+
+    system = BeliefSystem(event_provider=lambda: active_event)
     records = ()
     if include_belief:
+        evidence = (BeliefEvidence("claim:1", BeliefEvidenceType.EXTERNAL_CLAIM),)
         record = system.create_proposal(
             BeliefProposition("claim"),
-            BeliefMutationEvidence("belief-event:1", 1, timestamp),
+            set_event(1),
+            evidence=evidence,
         )
         if compacted:
+            admission = BeliefSubjectAdmission(
+                record.proposition.proposition_digest,
+                ("claim:1",),
+                "belief-event:2",
+                2,
+                AdmissionReason.SUBJECT_REVIEW,
+            )
+            record = system.adopt(record.belief_id, admission, set_event(2))
             for revision_sequence in range(2, 42):
+                if revision_sequence == 2:
+                    continue
+                admission = BeliefSubjectAdmission(
+                    record.proposition.proposition_digest,
+                    ("claim:1",),
+                    f"belief-event:{revision_sequence}",
+                    revision_sequence,
+                    AdmissionReason.SUBJECT_CORRECTION,
+                )
                 record = system.correct(
                     record.belief_id,
                     record,
-                    BeliefMutationEvidence(
-                        f"belief-event:{revision_sequence}",
-                        revision_sequence,
-                        timestamp,
-                    ),
+                    set_event(revision_sequence),
+                    admission=admission,
                 )
         records = (
             BeliefRecordStateSnapshot(
@@ -99,8 +137,26 @@ def make_v6_snapshot(
                 epistemic_status=record.epistemic_status.value,
                 confidence=record.confidence,
                 context_scope=(),
-                evidence=(),
+                evidence=tuple(
+                    BeliefEvidenceStateSnapshot(
+                        evidence_ref=item.evidence_ref,
+                        evidence_type=item.evidence_type.value,
+                    )
+                    for item in record.evidence
+                ),
                 revision=record.revision,
+                subject_admission=(
+                    None
+                    if record.subject_admission is None
+                    else BeliefSubjectAdmissionStateSnapshot(
+                        proposition_digest=record.subject_admission.proposition_digest,
+                        evidence_refs=record.subject_admission.evidence_refs,
+                        event_id=record.subject_admission.event_id,
+                        event_sequence=record.subject_admission.event_sequence,
+                        reason=record.subject_admission.reason.value,
+                        admission_digest=record.subject_admission.admission_digest,
+                    )
+                ),
                 revision_history=tuple(
                     BeliefRevisionStateSnapshot(
                         belief_id=revision.belief_id,
@@ -111,7 +167,7 @@ def make_v6_snapshot(
                         previous_revision_digest=revision.previous_revision_digest,
                         event_id=revision.event_id,
                         event_sequence=revision.event_sequence,
-                        evidence_refs=(),
+                        evidence_refs=revision.evidence_refs,
                         record_digest=revision.record_digest,
                     )
                     for revision in record.revision_history

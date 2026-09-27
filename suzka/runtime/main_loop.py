@@ -241,11 +241,13 @@ class SuzkaMainLoop:
         self._value_system = authority
         self._committed_value_snapshot: ValueSystemSnapshot = authority.snapshot()
         if belief_system is None:
-            belief_authority = BeliefSystem()
+            belief_authority = BeliefSystem(event_provider=self._current_belief_event)
         else:
             if not isinstance(belief_system, BeliefSystem):
                 raise TypeError("belief_system must be BeliefSystem")
-            belief_authority = BeliefSystem.restore_snapshot(belief_system.snapshot())
+            belief_authority = BeliefSystem.restore_snapshot(
+                belief_system.snapshot(), event_provider=self._current_belief_event
+            )
         self._belief_system = belief_authority
         self._committed_belief_snapshot: BeliefSystemSnapshot = (
             belief_authority.snapshot()
@@ -279,16 +281,27 @@ class SuzkaMainLoop:
 
         return BeliefSystem.restore_snapshot(self._committed_belief_snapshot)
 
-    def _belief_system_for_state(self) -> BeliefSystem:
-        """Return the internal Belief authority to AgentState only."""
+    def export_belief_state(self) -> BeliefSystemSnapshot:
+        """Export an immutable Belief snapshot for AgentState capture."""
 
-        return self._belief_system
+        return self._belief_system.snapshot()
 
-    def _replace_belief_system_for_state(self, belief_system: BeliefSystem) -> None:
-        if not isinstance(belief_system, BeliefSystem):
-            raise TypeError("belief_system must be BeliefSystem")
-        self._belief_system = belief_system
-        self._committed_belief_snapshot = belief_system.snapshot()
+    def restore_belief_state(self, snapshot: BeliefSystemSnapshot) -> None:
+        """Replace Belief authority through the explicit AgentState port."""
+
+        if not isinstance(snapshot, BeliefSystemSnapshot):
+            raise TypeError("snapshot must be BeliefSystemSnapshot")
+        restored = BeliefSystem.restore_snapshot(
+            snapshot, event_provider=self._current_belief_event
+        )
+        self._belief_system = restored
+        self._committed_belief_snapshot = restored.snapshot()
+
+    def _current_belief_event(self) -> object | None:
+        runtime = self._runtime
+        if not isinstance(runtime, AgentRuntime):
+            return None
+        return runtime.current_event()
 
     def _publish_committed_belief_view(self) -> None:
         """Publish Belief state after the runtime commit protocol succeeds."""

@@ -12,10 +12,13 @@ from pydantic import ValidationError
 
 from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
 from suzka.belief import (
+    AdmissionReason,
     BeliefEvidence,
     BeliefEvidenceType,
+    BeliefEpistemicStatus,
     BeliefMutationEvidence,
     BeliefProposition,
+    BeliefSubjectAdmission,
     BeliefSystem,
 )
 from suzka.cognition.surprisal_calculator import LossCalibration
@@ -64,6 +67,7 @@ from suzka.runtime import (
     BeliefSystemStateSnapshot,
 )
 import suzka.runtime.agent_state as agent_state_module
+from suzka.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 
 
 NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
@@ -124,17 +128,62 @@ class BeliefLoopStub(LoopStub):
         super().__init__(EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0))
         self.belief_system = belief_system
 
+    def export_belief_state(self):
+        return self.belief_system.snapshot()
+
+    def restore_belief_state(self, snapshot) -> None:
+        self.belief_system = BeliefSystem.restore_snapshot(snapshot)
+
+
+class FailOnceBeliefLoopStub(BeliefLoopStub):
+    def __init__(self, belief_system: BeliefSystem) -> None:
+        super().__init__(belief_system)
+        self._fail_restore = True
+
+    def restore_belief_state(self, snapshot) -> None:
+        self.belief_system = BeliefSystem.restore_snapshot(snapshot)
+        if self._fail_restore:
+            self._fail_restore = False
+            raise AgentStateLoadError("bounded Belief restore failure")
+
 
 def belief_system_with_proposal() -> BeliefSystem:
-    system = BeliefSystem()
+    active_event: AgentEvent | None = None
+
+    def set_event(event_sequence: int) -> BeliefMutationEvidence:
+        nonlocal active_event
+        active_event = AgentEvent(
+            event_id=f"belief-event:{event_sequence}",
+            event_type=AgentEventType.CHAT,
+            source=AgentEventSource.API_CHAT,
+            requested_at=NOW,
+            processing_sequence=event_sequence,
+        )
+        return BeliefMutationEvidence(
+            event_id=active_event.event_id,
+            event_sequence=event_sequence,
+            recorded_at=NOW,
+        )
+
+    system = BeliefSystem(event_provider=lambda: active_event)
     system.create_proposal(
         BeliefProposition("Alice likes tea", "Alice", "likes", "tea"),
-        BeliefMutationEvidence(
-            event_id="belief-event:1",
-            event_sequence=1,
-            recorded_at=NOW,
-        ),
+        set_event(1),
         evidence=(BeliefEvidence("claim:1", BeliefEvidenceType.EXTERNAL_CLAIM),),
+    )
+    proposal = system.records[0]
+    admission = BeliefSubjectAdmission(
+        proposal.proposition.proposition_digest,
+        ("claim:1",),
+        "belief-event:2",
+        2,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
+    system.adopt(
+        proposal.belief_id,
+        admission,
+        set_event(2),
+        epistemic_status=BeliefEpistemicStatus.PROBABLE,
     )
     return system
 
@@ -142,14 +191,34 @@ def belief_system_with_proposal() -> BeliefSystem:
 def belief_system_with_compacted_history() -> BeliefSystem:
     system = belief_system_with_proposal()
     current = system.records[0]
-    for sequence in range(2, 42):
+    # The proposal helper already performed event 1 creation and event 2 adoption.
+    active_event: AgentEvent | None = None
+
+    def set_event(event_sequence: int) -> BeliefMutationEvidence:
+        nonlocal active_event
+        active_event = AgentEvent(
+            event_id=f"belief-event:{event_sequence}",
+            event_type=AgentEventType.CHAT,
+            source=AgentEventSource.API_CHAT,
+            requested_at=NOW,
+            processing_sequence=event_sequence,
+        )
+        return BeliefMutationEvidence(
+            active_event.event_id, event_sequence, NOW
+        )
+
+    system._event_provider = lambda: active_event
+    for sequence in range(3, 42):
         current = system.correct(
             current.belief_id,
             replace(current, confidence=(sequence % 10) / 10),
-            BeliefMutationEvidence(
-                event_id=f"belief-event:{sequence}",
-                event_sequence=sequence,
-                recorded_at=NOW,
+            set_event(sequence),
+            admission=BeliefSubjectAdmission(
+                current.proposition.proposition_digest,
+                ("claim:1",),
+                f"belief-event:{sequence}",
+                sequence,
+                AdmissionReason.SUBJECT_CORRECTION,
             ),
         )
     return system
@@ -429,6 +498,36 @@ def test_v6_round_trip_preserves_compacted_belief_history_without_replay(
     )
 
 
+def test_belief_and_agent_state_byte_bounds_are_deterministic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = make_store(tmp_path / "agent_state.json")
+    snapshot = store.capture(BeliefLoopStub(belief_system_with_proposal()), sequence=4)
+    belief_bytes = agent_state_module._canonical_json_bytes(
+        snapshot.belief_state.model_dump(mode="json")
+    )
+    monkeypatch.setattr(
+        agent_state_module, "BELIEF_MAX_SERIALIZED_BYTES", len(belief_bytes)
+    )
+    assert store.canonical_bytes(snapshot)
+
+    monkeypatch.setattr(
+        agent_state_module, "BELIEF_MAX_SERIALIZED_BYTES", len(belief_bytes) - 1
+    )
+    with pytest.raises(AgentStateSaveError):
+        store.canonical_bytes(snapshot)
+
+    monkeypatch.setattr(
+        agent_state_module, "BELIEF_MAX_SERIALIZED_BYTES", len(belief_bytes)
+    )
+    state_bytes = store.canonical_bytes(snapshot)
+    monkeypatch.setattr(
+        agent_state_module, "AGENT_STATE_MAX_SERIALIZED_BYTES", len(state_bytes) - 1
+    )
+    with pytest.raises(AgentStateSaveError):
+        store.canonical_bytes(snapshot)
+
+
 def test_v6_nonempty_belief_restore_requires_intrinsic_authority(
     tmp_path: Path,
 ) -> None:
@@ -437,6 +536,40 @@ def test_v6_nonempty_belief_restore_requires_intrinsic_authority(
 
     with pytest.raises(AgentStateLoadError, match="BeliefSystem authority"):
         store.restore_into(LoopStub(EmotionState(0.0, 0.0, 1.0)), snapshot)
+
+
+def test_belief_port_failure_rolls_back_the_entire_restore_transaction(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path / "agent_state.json")
+    source = BeliefLoopStub(belief_system_with_compacted_history())
+    target = FailOnceBeliefLoopStub(belief_system_with_proposal())
+    target.working_memory.admit(
+        WorkingMemorySourceKind.EPISODIC, "target-episode", 0.5, 0.5
+    )
+    target.context_registry.create("target-context", ContextType.CONVERSATION, "chat")
+    target.loss_calibration.sample(MODEL_KEY, 0.2)
+    target.emotion_engine.temporal_state = EmotionTemporalState(NOW)
+
+    before_emotion = target.emotion_engine.state
+    before_temporal = target.emotion_engine.temporal_state
+    before_working_memory = (target.working_memory.revision, target.working_memory.items)
+    before_context = target.context_registry.state
+    before_calibration = target.loss_calibration.export()
+    before_value = target.value_system.snapshot()
+    before_belief = target.belief_system.snapshot()
+    snapshot = store.capture(source, sequence=42)
+
+    with pytest.raises(AgentStateLoadError, match="restore failed"):
+        store.restore_into(target, snapshot)
+
+    assert target.emotion_engine.state == before_emotion
+    assert target.emotion_engine.temporal_state == before_temporal
+    assert (target.working_memory.revision, target.working_memory.items) == before_working_memory
+    assert target.context_registry.state == before_context
+    assert target.loss_calibration.export() == before_calibration
+    assert target.value_system.snapshot() == before_value
+    assert target.belief_system.snapshot() == before_belief
 
 
 def test_legacy_v5_restore_clears_belief_authority_not_in_snapshot(

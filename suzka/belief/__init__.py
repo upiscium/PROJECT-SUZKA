@@ -56,6 +56,7 @@ from suzka.belief.records import (
 from suzka.belief.system import (
     BELIEF_ID_DOMAIN,
     BELIEF_MAX_RECORDS,
+    BELIEF_MAX_SERIALIZED_BYTES,
     BELIEF_SYSTEM_DOMAIN,
     BELIEF_SYSTEM_SCHEMA_VERSION,
     BeliefCapacityExceeded,
@@ -65,6 +66,7 @@ from suzka.belief.system import (
     BeliefSystem,
     BeliefSystemSnapshot,
     belief_id_for_proposition,
+    canonical_belief_system_bytes,
 )
 
 __all__ = [
@@ -82,6 +84,7 @@ __all__ = [
     "BELIEF_REVISION_DOMAIN",
     "BELIEF_SCHEMA_VERSION",
     "BELIEF_MAX_RECORDS",
+    "BELIEF_MAX_SERIALIZED_BYTES",
     "BELIEF_SYSTEM_DOMAIN",
     "BELIEF_SYSTEM_SCHEMA_VERSION",
     "BeliefAdmissionProof",
@@ -119,6 +122,7 @@ __all__ = [
     "SubjectAdmissionProof",
     "belief_record_digest",
     "belief_id_for_proposition",
+    "canonical_belief_system_bytes",
     "belief_revision_digest",
     "build_conflict_candidate",
     "canonical_belief_record_payload",

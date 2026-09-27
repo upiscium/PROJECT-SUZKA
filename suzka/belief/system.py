@@ -36,6 +36,7 @@ from suzka.identifiers import validate_identifier
 
 
 BELIEF_MAX_RECORDS: Final = 256
+BELIEF_MAX_SERIALIZED_BYTES: Final = 64 * 1024 * 1024
 BELIEF_SYSTEM_SCHEMA_VERSION: Final = 1
 BELIEF_ID_DOMAIN: Final = b"PROJECT-SUZKA:R12:BELIEF-ID:V1\0"
 BELIEF_SYSTEM_DOMAIN: Final = b"PROJECT-SUZKA:R12:BELIEF-SYSTEM:V1\0"
@@ -137,6 +138,80 @@ def _canonical_system_digest(records: tuple[BeliefRecord, ...]) -> str:
     ).hexdigest()
 
 
+def _canonical_record_payload(record: BeliefRecord) -> dict[str, object]:
+    admission = record.subject_admission
+    return {
+        "belief_id": record.belief_id,
+        "confidence": record.confidence.hex(),
+        "context_scope": list(record.context_scope),
+        "epistemic_status": record.epistemic_status.value,
+        "evidence": [
+            {
+                "evidence_ref": item.evidence_ref,
+                "evidence_type": item.evidence_type.value,
+            }
+            for item in record.evidence
+        ],
+        "history_anchor_digest": record.history_anchor_digest,
+        "lifecycle": record.lifecycle.value,
+        "proposition": {
+            "canonical_text": record.proposition.canonical_text,
+            "object": record.proposition.object,
+            "predicate": record.proposition.predicate,
+            "proposition_digest": record.proposition.proposition_digest,
+            "subject": record.proposition.subject,
+        },
+        "revision": record.revision,
+        "revision_history": [
+            {
+                "belief_id": revision.belief_id,
+                "created_at": revision.created_at.isoformat(),
+                "event_id": revision.event_id,
+                "event_sequence": revision.event_sequence,
+                "evidence_refs": list(revision.evidence_refs),
+                "operation": revision.operation.value,
+                "previous_revision_digest": revision.previous_revision_digest,
+                "reason": revision.reason.value,
+                "record_digest": revision.record_digest,
+                "revision": revision.revision,
+            }
+            for revision in record.revision_history
+        ],
+        "schema_version": record.schema_version,
+        "subject_admission": (
+            None
+            if admission is None
+            else {
+                "admission_digest": admission.admission_digest,
+                "event_id": admission.event_id,
+                "event_sequence": admission.event_sequence,
+                "evidence_refs": list(admission.evidence_refs),
+                "proposition_digest": admission.proposition_digest,
+                "reason": admission.reason.value,
+            }
+        ),
+        "superseded_by_id": record.superseded_by_id,
+        "supersedes_id": record.supersedes_id,
+        "valid_from": None if record.valid_from is None else record.valid_from.isoformat(),
+        "valid_until": None if record.valid_until is None else record.valid_until.isoformat(),
+    }
+
+
+def canonical_belief_system_bytes(records: tuple[BeliefRecord, ...]) -> bytes:
+    """Return the deterministic representation used for size admission."""
+
+    return json.dumps(
+        {
+            "records": [_canonical_record_payload(record) for record in records],
+            "schema_version": BELIEF_SYSTEM_SCHEMA_VERSION,
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+
+
 @dataclass(frozen=True, slots=True)
 class BeliefSystemSnapshot:
     """Canonical immutable projection of the complete Belief authority."""
@@ -157,6 +232,8 @@ class BeliefSystemSnapshot:
         ids = tuple(record.belief_id for record in self.records)
         if ids != tuple(sorted(set(ids))):
             raise ValueError("Belief records must be sorted and unique")
+        if len(canonical_belief_system_bytes(self.records)) > BELIEF_MAX_SERIALIZED_BYTES:
+            raise BeliefCapacityExceeded("Belief snapshot exceeds its serialized byte bound")
         object.__setattr__(self, "authority_digest", _canonical_system_digest(self.records))
 
 
@@ -177,16 +254,29 @@ class BeliefSystem:
 
     MAX_RECORDS: Final = BELIEF_MAX_RECORDS
 
-    def __init__(self, records: Iterable[BeliefRecord] = ()) -> None:
+    def __init__(
+        self,
+        records: Iterable[BeliefRecord] = (),
+        *,
+        event_provider: Callable[[], object | None] | None = None,
+    ) -> None:
         self._lock = RLock()
+        if event_provider is not None and not callable(event_provider):
+            raise TypeError("event_provider must be callable")
+        self._event_provider = event_provider
         canonical = tuple(sorted(tuple(records), key=lambda record: record.belief_id))
         self._replace_records(canonical)
 
     @classmethod
-    def restore_snapshot(cls, snapshot: BeliefSystemSnapshot) -> BeliefSystem:
+    def restore_snapshot(
+        cls,
+        snapshot: BeliefSystemSnapshot,
+        *,
+        event_provider: Callable[[], object | None] | None = None,
+    ) -> BeliefSystem:
         if not isinstance(snapshot, BeliefSystemSnapshot):
             raise TypeError("snapshot must be BeliefSystemSnapshot")
-        system = cls(snapshot.records)
+        system = cls(snapshot.records, event_provider=event_provider)
         if system.snapshot().authority_digest != snapshot.authority_digest:
             raise BeliefDomainError("Belief authority digest does not match records")
         return system
@@ -225,7 +315,7 @@ class BeliefSystem:
     def create_proposal(
         self,
         proposition: BeliefProposition,
-        event: BeliefMutationEvidence,
+        event: BeliefMutationEvidence | None = None,
         *,
         epistemic_status: BeliefEpistemicStatus = BeliefEpistemicStatus.UNKNOWN,
         confidence: float = 0.0,
@@ -252,7 +342,7 @@ class BeliefSystem:
         )
 
     def propose(
-        self, record: BeliefRecord, event: BeliefMutationEvidence
+        self, record: BeliefRecord, event: BeliefMutationEvidence | None = None
     ) -> BeliefRecord:
         evidence = self._require_event(event)
         if not isinstance(record, BeliefRecord):
@@ -284,7 +374,7 @@ class BeliefSystem:
         self,
         belief_id: str,
         admission: BeliefSubjectAdmission,
-        event: BeliefMutationEvidence,
+        event: BeliefMutationEvidence | None = None,
         *,
         epistemic_status: BeliefEpistemicStatus | None = None,
         confidence: float | None = None,
@@ -295,15 +385,7 @@ class BeliefSystem:
         current = self._require_record(belief_id)
         if current.lifecycle is not BeliefLifecycle.PROPOSED:
             raise BeliefDomainError("only proposed Beliefs may be adopted")
-        if admission.proposition_digest != current.proposition.proposition_digest:
-            raise BeliefDomainError("subject admission proposition mismatch")
-        if tuple(item.evidence_ref for item in current.evidence) != admission.evidence_refs:
-            raise BeliefDomainError("subject admission evidence does not match")
-        if (
-            admission.event_id != evidence.event_id
-            or admission.event_sequence != evidence.event_sequence
-        ):
-            raise BeliefDomainError("subject admission is not bound to the active event")
+        admission = self._require_subject_admission(admission, current, evidence)
         revision = self._next_revision(
             current,
             BeliefRevisionOperation.ADOPT,
@@ -334,12 +416,16 @@ class BeliefSystem:
         self,
         belief_id: str,
         corrected: BeliefRecord,
-        event: BeliefMutationEvidence,
+        event: BeliefMutationEvidence | None = None,
+        *,
+        admission: BeliefSubjectAdmission | None = None,
     ) -> BeliefRecord:
         evidence = self._require_event(event)
         current = self._require_record(belief_id)
         if not isinstance(corrected, BeliefRecord):
             raise TypeError("corrected must be BeliefRecord")
+        if current.lifecycle is not BeliefLifecycle.ADOPTED:
+            raise BeliefDomainError("only adopted Beliefs may be corrected")
         if corrected.belief_id != current.belief_id:
             raise BeliefDomainError("correction cannot change Belief identity")
         if corrected.proposition.proposition_digest != current.proposition.proposition_digest:
@@ -350,15 +436,20 @@ class BeliefSystem:
             raise BeliefDomainError("correction cannot change subject admission")
         if corrected.supersedes_id != current.supersedes_id or corrected.superseded_by_id != current.superseded_by_id:
             raise BeliefDomainError("correction cannot change supersession links")
+        subject_admission = self._require_subject_admission(
+            admission, corrected, evidence
+        )
         revision = self._next_revision(
             current,
             BeliefRevisionOperation.CORRECT,
             BeliefRevisionReason.CORRECTION,
             evidence,
+            subject_admission,
         )
         revision_history, history_anchor_digest = self._append_revision(current, revision)
         updated = replace(
             corrected,
+            subject_admission=subject_admission,
             revision=current.revision + 1,
             revision_history=revision_history,
             history_anchor_digest=history_anchor_digest,
@@ -371,7 +462,9 @@ class BeliefSystem:
         self,
         belief_id: str,
         successor: BeliefRecord,
-        event: BeliefMutationEvidence,
+        event: BeliefMutationEvidence | None = None,
+        *,
+        admission: BeliefSubjectAdmission | None = None,
     ) -> tuple[BeliefRecord, BeliefRecord]:
         evidence = self._require_event(event)
         current = self._require_record(belief_id)
@@ -386,22 +479,22 @@ class BeliefSystem:
             BeliefLifecycle.EXPIRED,
         }:
             raise BeliefConflict("terminal Beliefs cannot be superseded")
-        if successor.revision != 0 or successor.revision_history:
+        if (
+            successor.lifecycle is not BeliefLifecycle.PROPOSED
+            or successor.subject_admission is not None
+            or successor.revision != 0
+            or successor.revision_history
+        ):
             raise BeliefDomainError("a successor must begin at revision zero")
-        if successor.lifecycle is BeliefLifecycle.ADOPTED:
-            admission = successor.subject_admission
-            if admission is None or (
-                admission.event_id != evidence.event_id
-                or admission.event_sequence != evidence.event_sequence
-            ):
-                raise BeliefDomainError(
-                    "an adopted successor must bind admission to the active event"
-                )
+        subject_admission = self._require_subject_admission(
+            admission, successor, evidence
+        )
         old_revision = self._next_revision(
             current,
             BeliefRevisionOperation.SUPERSEDE,
             BeliefRevisionReason.SUPERSESSION,
             evidence,
+            subject_admission,
         )
         old_history, old_history_anchor_digest = self._append_revision(
             current, old_revision
@@ -414,7 +507,18 @@ class BeliefSystem:
             created_at=evidence.recorded_at,
             event_id=evidence.event_id,
             event_sequence=evidence.event_sequence,
-            evidence_refs=_revision_evidence_refs(successor, successor.subject_admission),
+            evidence_refs=_revision_evidence_refs(successor),
+        )
+        successor_adoption_revision = BeliefRevisionRecord(
+            belief_id=successor.belief_id,
+            revision=1,
+            operation=BeliefRevisionOperation.ADOPT,
+            reason=BeliefRevisionReason.SUBJECT_ADMISSION,
+            created_at=evidence.recorded_at,
+            previous_revision_digest=successor_revision.record_digest,
+            event_id=evidence.event_id,
+            event_sequence=evidence.event_sequence,
+            evidence_refs=_revision_evidence_refs(successor, subject_admission),
         )
         superseded = replace(
             current,
@@ -424,7 +528,13 @@ class BeliefSystem:
             revision_history=old_history,
             history_anchor_digest=old_history_anchor_digest,
         )
-        created_successor = replace(successor, revision_history=(successor_revision,))
+        created_successor = replace(
+            successor,
+            lifecycle=BeliefLifecycle.ADOPTED,
+            subject_admission=subject_admission,
+            revision=1,
+            revision_history=(successor_revision, successor_adoption_revision),
+        )
         self._replace_records(
             tuple(
                 superseded if item.belief_id == superseded.belief_id else item
@@ -436,7 +546,11 @@ class BeliefSystem:
 
     @_locked_mutation
     def retract(
-        self, belief_id: str, event: BeliefMutationEvidence
+        self,
+        belief_id: str,
+        event: BeliefMutationEvidence | None = None,
+        *,
+        admission: BeliefSubjectAdmission | None = None,
     ) -> BeliefRecord:
         return self._terminalize(
             belief_id,
@@ -444,16 +558,24 @@ class BeliefSystem:
             BeliefRevisionOperation.RETRACT,
             BeliefRevisionReason.RETRACTION,
             event,
+            admission,
         )
 
     @_locked_mutation
-    def expire(self, belief_id: str, event: BeliefMutationEvidence) -> BeliefRecord:
+    def expire(
+        self,
+        belief_id: str,
+        event: BeliefMutationEvidence | None = None,
+        *,
+        admission: BeliefSubjectAdmission | None = None,
+    ) -> BeliefRecord:
         return self._terminalize(
             belief_id,
             BeliefLifecycle.EXPIRED,
             BeliefRevisionOperation.EXPIRE,
             BeliefRevisionReason.EXPIRATION,
             event,
+            admission,
         )
 
     def _terminalize(
@@ -462,7 +584,8 @@ class BeliefSystem:
         lifecycle: BeliefLifecycle,
         operation: BeliefRevisionOperation,
         reason: BeliefRevisionReason,
-        event: BeliefMutationEvidence,
+        event: BeliefMutationEvidence | None,
+        admission: BeliefSubjectAdmission | None,
     ) -> BeliefRecord:
         evidence = self._require_event(event)
         current = self._require_record(belief_id)
@@ -472,11 +595,17 @@ class BeliefSystem:
             BeliefLifecycle.EXPIRED,
         }:
             raise BeliefDomainError("Belief is already terminal")
-        revision = self._next_revision(current, operation, reason, evidence)
+        subject_admission = self._require_subject_admission(
+            admission, current, evidence
+        )
+        revision = self._next_revision(
+            current, operation, reason, evidence, subject_admission
+        )
         revision_history, history_anchor_digest = self._append_revision(current, revision)
         updated = replace(
             current,
             lifecycle=lifecycle,
+            subject_admission=subject_admission,
             revision=current.revision + 1,
             revision_history=revision_history,
             history_anchor_digest=history_anchor_digest,
@@ -521,11 +650,56 @@ class BeliefSystem:
             history = history[1:]
         return history, anchor
 
+    def _require_event(
+        self, supplied: BeliefMutationEvidence | None
+    ) -> BeliefMutationEvidence:
+        if self._event_provider is None:
+            raise BeliefDomainError("Belief mutation requires an active runtime event")
+        try:
+            active_event = self._event_provider()
+        except Exception:
+            raise BeliefDomainError("Belief mutation event is unavailable") from None
+        if active_event is None:
+            raise BeliefDomainError("Belief mutation requires an active runtime event")
+        try:
+            from suzka.runtime.agent_runtime import AgentEvent
+
+            if not isinstance(active_event, AgentEvent):
+                raise BeliefDomainError("Belief event context is not an AgentRuntime event")
+            if isinstance(active_event, BeliefMutationEvidence):
+                raise BeliefDomainError("Belief event context is not an AgentRuntime event")
+            if not hasattr(active_event, "event_type") or not hasattr(active_event, "source"):
+                raise BeliefDomainError("Belief event context is not an AgentRuntime event")
+            evidence = BeliefMutationEvidence.from_event(active_event)
+        except (TypeError, ValueError, BeliefDomainError):
+            raise BeliefDomainError("Belief mutation event is invalid") from None
+        if supplied is not None:
+            if not isinstance(supplied, BeliefMutationEvidence):
+                raise TypeError("event must be BeliefMutationEvidence")
+            if supplied != evidence:
+                raise BeliefDomainError(
+                    "caller-supplied Belief event does not match the active runtime event"
+                )
+        return evidence
+
     @staticmethod
-    def _require_event(event: BeliefMutationEvidence) -> BeliefMutationEvidence:
-        if not isinstance(event, BeliefMutationEvidence):
-            raise TypeError("event must be BeliefMutationEvidence")
-        return event
+    def _require_subject_admission(
+        admission: BeliefSubjectAdmission | None,
+        target: BeliefRecord,
+        event: BeliefMutationEvidence,
+    ) -> BeliefSubjectAdmission:
+        if not isinstance(admission, BeliefSubjectAdmission):
+            raise BeliefDomainError("Belief mutation requires subject admission")
+        if (
+            admission.event_id != event.event_id
+            or admission.event_sequence != event.event_sequence
+        ):
+            raise BeliefDomainError("subject admission is not bound to the active event")
+        if admission.proposition_digest != target.proposition.proposition_digest:
+            raise BeliefDomainError("subject admission proposition mismatch")
+        if tuple(item.evidence_ref for item in target.evidence) != admission.evidence_refs:
+            raise BeliefDomainError("subject admission evidence does not match")
+        return admission
 
     def _require_record(self, belief_id: str) -> BeliefRecord:
         record = self.get(belief_id)
@@ -547,6 +721,8 @@ class BeliefSystem:
     def _replace_records(self, records: tuple[BeliefRecord, ...]) -> None:
         canonical = tuple(sorted(records, key=lambda record: record.belief_id))
         self._validate_records(canonical)
+        if len(canonical_belief_system_bytes(canonical)) > BELIEF_MAX_SERIALIZED_BYTES:
+            raise BeliefCapacityExceeded("Belief snapshot exceeds its serialized byte bound")
         self._records = canonical
         self._record_map = {record.belief_id: record for record in canonical}
 
@@ -569,10 +745,38 @@ class BeliefSystem:
                 successor = record_map.get(record.superseded_by_id)
                 if successor is None or successor.supersedes_id != record.belief_id:
                     raise BeliefConflict("supersession links are not reciprocal")
+        cls._validate_supersession_graph(records, record_map)
 
     @staticmethod
+    def _validate_supersession_graph(
+        records: tuple[BeliefRecord, ...], record_map: dict[str, BeliefRecord]
+    ) -> None:
+        """Reject reciprocal supersession cycles during every authority load."""
+
+        state: dict[str, int] = {record.belief_id: 0 for record in records}
+        for root in sorted(state):
+            if state[root] == 2:
+                continue
+            current: str | None = root
+            path: list[str] = []
+            while current is not None:
+                color = state[current]
+                if color == 1:
+                    raise BeliefConflict("supersession graph contains a cycle")
+                if color == 2:
+                    break
+                state[current] = 1
+                path.append(current)
+                successor_id = record_map[current].superseded_by_id
+                if successor_id is not None and successor_id not in record_map:
+                    raise BeliefConflict("supersession successor is missing")
+                current = successor_id
+            for belief_id in path:
+                state[belief_id] = 2
+
+    @classmethod
     def _require_record_shape(
-        record: BeliefRecord, record_map: dict[str, BeliefRecord]
+        cls, record: BeliefRecord, record_map: dict[str, BeliefRecord]
     ) -> None:
         if not isinstance(record, BeliefRecord):
             raise TypeError("records must contain BeliefRecord values")
@@ -586,11 +790,133 @@ class BeliefSystem:
         for revision in record.revision_history:
             if revision.event_id is None or revision.event_sequence is None:
                 raise BeliefDomainError("authoritative revisions require event evidence")
+        cls._validate_revision_history(record)
+        latest_operation = record.revision_history[-1].operation
+        expected_operation = {
+            BeliefLifecycle.PROPOSED: BeliefRevisionOperation.CREATE,
+            BeliefLifecycle.ADOPTED: {
+                BeliefRevisionOperation.ADOPT,
+                BeliefRevisionOperation.CORRECT,
+            },
+            BeliefLifecycle.SUPERSEDED: BeliefRevisionOperation.SUPERSEDE,
+            BeliefLifecycle.RETRACTED: BeliefRevisionOperation.RETRACT,
+            BeliefLifecycle.EXPIRED: BeliefRevisionOperation.EXPIRE,
+        }[record.lifecycle]
+        if isinstance(expected_operation, set):
+            valid_operation = latest_operation in expected_operation
+        else:
+            valid_operation = latest_operation is expected_operation
+        if not valid_operation:
+            raise BeliefDomainError("Belief lifecycle does not match its latest revision")
+        if record.lifecycle is BeliefLifecycle.PROPOSED and record.subject_admission is not None:
+            raise BeliefDomainError("proposals cannot carry subject admission")
+        if record.lifecycle in {
+            BeliefLifecycle.ADOPTED,
+            BeliefLifecycle.RETRACTED,
+            BeliefLifecycle.EXPIRED,
+        }:
+            admission = record.subject_admission
+            latest = record.revision_history[-1]
+            if admission is None:
+                raise BeliefDomainError("terminal or adopted Beliefs require subject admission")
+            if (
+                admission.event_id != latest.event_id
+                or admission.event_sequence != latest.event_sequence
+                or admission.admission_digest not in latest.evidence_refs
+            ):
+                raise BeliefDomainError(
+                    "subject admission does not match the latest Belief revision"
+                )
         if record.supersedes_id == record.belief_id or record.superseded_by_id == record.belief_id:
             raise BeliefConflict("a Belief cannot supersede itself")
         if record.lifecycle is BeliefLifecycle.SUPERSEDED and record.superseded_by_id is None:
             raise BeliefConflict("superseded Beliefs require a successor")
         del record_map
+
+    @staticmethod
+    def _validate_revision_history(record: BeliefRecord) -> None:
+        """Validate reachable lifecycle transitions in the retained history."""
+
+        reasons = {
+            BeliefRevisionOperation.CREATE: BeliefRevisionReason.CREATION,
+            BeliefRevisionOperation.ADOPT: BeliefRevisionReason.SUBJECT_ADMISSION,
+            BeliefRevisionOperation.CORRECT: BeliefRevisionReason.CORRECTION,
+            BeliefRevisionOperation.SUPERSEDE: BeliefRevisionReason.SUPERSESSION,
+            BeliefRevisionOperation.RETRACT: BeliefRevisionReason.RETRACTION,
+            BeliefRevisionOperation.EXPIRE: BeliefRevisionReason.EXPIRATION,
+        }
+        history = record.revision_history
+        first = history[0]
+        if first.revision == 0 and first.operation is not BeliefRevisionOperation.CREATE:
+            raise BeliefDomainError("Belief history must begin with creation")
+        if first.revision > 0 and first.operation is BeliefRevisionOperation.CREATE:
+            raise BeliefDomainError("compacted Belief history cannot recreate a record")
+
+        state: BeliefLifecycle | None = None
+        previous: BeliefRevisionRecord | None = None
+        for revision in history:
+            expected_reason = reasons[revision.operation]
+            if revision.reason is not expected_reason:
+                raise BeliefDomainError("Belief revision operation and reason disagree")
+            if previous is not None:
+                if (
+                    revision.event_sequence is None
+                    or previous.event_sequence is None
+                    or revision.event_sequence < previous.event_sequence
+                ):
+                    raise BeliefDomainError(
+                        "Belief revision events must increase monotonically"
+                    )
+                if revision.event_sequence == previous.event_sequence and not (
+                    previous.operation is BeliefRevisionOperation.CREATE
+                    and revision.operation is BeliefRevisionOperation.ADOPT
+                    and revision.event_id == previous.event_id
+                ):
+                    raise BeliefDomainError(
+                        "only successor creation and adoption may share an event"
+                    )
+            if state is None:
+                if revision.operation is BeliefRevisionOperation.CREATE:
+                    state = BeliefLifecycle.PROPOSED
+                elif revision.operation in {
+                    BeliefRevisionOperation.ADOPT,
+                    BeliefRevisionOperation.CORRECT,
+                }:
+                    state = BeliefLifecycle.ADOPTED
+                elif revision.operation is BeliefRevisionOperation.SUPERSEDE:
+                    state = BeliefLifecycle.SUPERSEDED
+                elif revision.operation is BeliefRevisionOperation.RETRACT:
+                    state = BeliefLifecycle.RETRACTED
+                else:
+                    state = BeliefLifecycle.EXPIRED
+            else:
+                transitions = {
+                    BeliefLifecycle.PROPOSED: {
+                        BeliefRevisionOperation.ADOPT: BeliefLifecycle.ADOPTED,
+                        BeliefRevisionOperation.SUPERSEDE: BeliefLifecycle.SUPERSEDED,
+                        BeliefRevisionOperation.RETRACT: BeliefLifecycle.RETRACTED,
+                        BeliefRevisionOperation.EXPIRE: BeliefLifecycle.EXPIRED,
+                    },
+                    BeliefLifecycle.ADOPTED: {
+                        BeliefRevisionOperation.CORRECT: BeliefLifecycle.ADOPTED,
+                        BeliefRevisionOperation.SUPERSEDE: BeliefLifecycle.SUPERSEDED,
+                        BeliefRevisionOperation.RETRACT: BeliefLifecycle.RETRACTED,
+                        BeliefRevisionOperation.EXPIRE: BeliefLifecycle.EXPIRED,
+                    },
+                    BeliefLifecycle.SUPERSEDED: {},
+                    BeliefLifecycle.RETRACTED: {},
+                    BeliefLifecycle.EXPIRED: {},
+                }
+                next_state = transitions[state].get(revision.operation)
+                if next_state is None:
+                    raise BeliefDomainError(
+                        "Belief revision history contains an invalid lifecycle transition"
+                    )
+                state = next_state
+            previous = revision
+
+        if state is not record.lifecycle:
+            raise BeliefDomainError("Belief history does not reach its lifecycle")
 
 
 __all__ = [

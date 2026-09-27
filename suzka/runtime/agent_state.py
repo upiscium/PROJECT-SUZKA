@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
-from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, cast, runtime_checkable
 
 from pydantic import (
     BaseModel,
@@ -32,6 +32,7 @@ from suzka.belief import (
     BELIEF_MAX_PROPOSITION_CODEPOINTS,
     BELIEF_MAX_REVISIONS,
     BELIEF_MAX_RECORDS,
+    BELIEF_MAX_SERIALIZED_BYTES,
     BeliefEpistemicStatus,
     BeliefEvidenceType,
     BeliefLifecycle,
@@ -44,6 +45,7 @@ from suzka.belief import (
     BeliefRecord,
     BeliefRevisionRecord,
     BeliefSubjectAdmission,
+    BeliefSystemSnapshot,
     belief_record_digest,
 )
 from suzka.cognition.surprisal_calculator import (
@@ -88,6 +90,18 @@ from suzka.runtime.working_memory import (
 
 if TYPE_CHECKING:
     from suzka.runtime.main_loop import SuzkaMainLoop
+
+
+AGENT_STATE_MAX_SERIALIZED_BYTES = 128 * 1024 * 1024
+
+
+@runtime_checkable
+class BeliefStatePort(Protocol):
+    """Explicit immutable export/restore boundary owned by the runtime."""
+
+    def export_belief_state(self) -> BeliefSystemSnapshot: ...
+
+    def restore_belief_state(self, snapshot: BeliefSystemSnapshot) -> None: ...
 
 
 CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[6] = 6
@@ -832,6 +846,16 @@ class BeliefRecordStateSnapshot(_StateModel):
         return self
 
 
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 class BeliefSystemStateSnapshot(_StateModel):
     """Complete bounded intrinsic Belief authority embedded in AgentState v6."""
 
@@ -851,6 +875,8 @@ class BeliefSystemStateSnapshot(_StateModel):
         ids = tuple(record.belief_id for record in self.records)
         if ids != tuple(sorted(set(ids))):
             raise ValueError("Belief records must be ordered and unique")
+        if len(_canonical_json_bytes(self.model_dump(mode="json"))) > BELIEF_MAX_SERIALIZED_BYTES:
+            raise ValueError("Belief section exceeds its serialized byte bound")
         return self
 
 class AgentStateSnapshotV4(_AgentStateSnapshotBase):
@@ -1205,9 +1231,12 @@ def _belief_record_snapshot(record: BeliefRecord) -> BeliefRecordStateSnapshot:
     return snapshot
 
 
-def _belief_state_snapshot(system: BeliefSystem) -> BeliefSystemStateSnapshot:
-    system.validate()
-    authority = system.snapshot()
+def _belief_state_snapshot(
+    snapshot: BeliefSystemSnapshot,
+) -> BeliefSystemStateSnapshot:
+    if not isinstance(snapshot, BeliefSystemSnapshot):
+        raise TypeError("snapshot must be BeliefSystemSnapshot")
+    authority = snapshot
     return BeliefSystemStateSnapshot(
         schema_version=1,
         records=tuple(_belief_record_snapshot(record) for record in authority.records),
@@ -1448,7 +1477,7 @@ def default_agent_state_snapshot(
             calibration_entries=(), last_emotion_update_at=None
         ),
         value_state=_value_state_snapshot(system),
-        belief_state=_belief_state_snapshot(BeliefSystem()),
+        belief_state=_belief_state_snapshot(BeliefSystem().snapshot()),
     )
 
 
@@ -1475,27 +1504,10 @@ def _replace_value_system_authority(
         setattr(main_loop, "value_system", value_system)
 
 
-def _belief_system_authority(main_loop: SuzkaMainLoop) -> BeliefSystem | None:
-    """Read the internal Belief authority without exposing a mutable public port."""
+def _belief_state_port(main_loop: SuzkaMainLoop) -> BeliefStatePort | None:
+    """Return the explicit runtime-owned Belief state port, if implemented."""
 
-    getter = getattr(main_loop, "_belief_system_for_state", None)
-    if callable(getter):
-        belief_system = getter()
-    else:
-        belief_system = getattr(main_loop, "belief_system", None)
-    return belief_system if isinstance(belief_system, BeliefSystem) else None
-
-
-def _replace_belief_system_authority(
-    main_loop: SuzkaMainLoop, belief_system: BeliefSystem
-) -> None:
-    """Replace Belief authority through the MainLoop state boundary when present."""
-
-    setter = getattr(main_loop, "_replace_belief_system_for_state", None)
-    if callable(setter):
-        setter(belief_system)
-    else:
-        setattr(main_loop, "belief_system", belief_system)
+    return main_loop if isinstance(main_loop, BeliefStatePort) else None
 
 
 class AgentStateStore:
@@ -1598,11 +1610,20 @@ class AgentStateStore:
                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
             )
             try:
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                file_stat = os.fstat(descriptor)
+                if not stat.S_ISREG(file_stat.st_mode):
                     raise OSError("snapshot is not a regular file")
+                if file_stat.st_size > AGENT_STATE_MAX_SERIALIZED_BYTES:
+                    raise AgentStateLoadError(
+                        "AgentState snapshot exceeds its serialized byte bound"
+                    )
                 with os.fdopen(descriptor, "rb") as snapshot_file:
                     descriptor = -1
-                    raw_bytes = snapshot_file.read()
+                    raw_bytes = snapshot_file.read(AGENT_STATE_MAX_SERIALIZED_BYTES + 1)
+                    if len(raw_bytes) > AGENT_STATE_MAX_SERIALIZED_BYTES:
+                        raise AgentStateLoadError(
+                            "AgentState snapshot exceeds its serialized byte bound"
+                        )
             finally:
                 if descriptor >= 0:
                     os.close(descriptor)
@@ -1798,7 +1819,10 @@ class AgentStateStore:
                 _domain_value_system(validated.value_state)
             if isinstance(validated, AgentStateSnapshotV6):
                 _domain_belief_system(validated.belief_state)
-            return self._canonical_bytes(validated)
+            payload = self._canonical_bytes(validated)
+            if len(payload) > AGENT_STATE_MAX_SERIALIZED_BYTES:
+                raise ValueError("AgentState snapshot exceeds its serialized byte bound")
+            return payload
         except (AgentStateConfigurationDrift, AgentStateLoadError):
             raise
         except Exception:
@@ -1858,11 +1882,16 @@ class AgentStateStore:
                     self.path,
                     os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
                 )
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                file_stat = os.fstat(descriptor)
+                if not stat.S_ISREG(file_stat.st_mode):
                     raise OSError("snapshot is not a regular file")
+                if file_stat.st_size > AGENT_STATE_MAX_SERIALIZED_BYTES:
+                    raise OSError("snapshot exceeds its serialized byte bound")
                 with os.fdopen(descriptor, "rb") as snapshot_file:
                     descriptor = None
-                    published = snapshot_file.read()
+                    published = snapshot_file.read(AGENT_STATE_MAX_SERIALIZED_BYTES + 1)
+                    if len(published) > AGENT_STATE_MAX_SERIALIZED_BYTES:
+                        raise OSError("snapshot exceeds its serialized byte bound")
             except OSError:
                 if descriptor is not None:
                     try:
@@ -1919,9 +1948,14 @@ class AgentStateStore:
                 raise ValueError("Value authority is unavailable")
             value_system.validate()
             self._validate_value_system_configuration(value_system)
-            belief_system = _belief_system_authority(main_loop)
-            if isinstance(belief_system, BeliefSystem):
-                belief_system.validate()
+            belief_port = _belief_state_port(main_loop)
+            belief_snapshot = (
+                belief_port.export_belief_state() if belief_port is not None else None
+            )
+            if belief_snapshot is not None and not isinstance(
+                belief_snapshot, BeliefSystemSnapshot
+            ):
+                raise ValueError("Belief state port returned an invalid snapshot")
             common: dict[str, Any] = dict(
                 saved_at=self._now(),
                 last_processed_event_sequence=sequence,
@@ -1989,14 +2023,14 @@ class AgentStateStore:
                 ),
             )
             value_state = _value_state_snapshot(value_system)
-            if not isinstance(belief_system, BeliefSystem):
+            if belief_snapshot is None:
                 # Older injected runtimes do not own Belief yet; retain their
                 # exact v5 contract instead of inventing an empty authority.
                 return AgentStateSnapshotV5(**common, value_state=value_state)
             return AgentStateSnapshotV6(
                 **common,
                 value_state=value_state,
-                belief_state=_belief_state_snapshot(belief_system),
+                belief_state=_belief_state_snapshot(belief_snapshot),
             )
         except Exception:
             capture_failure = AgentStateSaveError(
@@ -2017,13 +2051,14 @@ class AgentStateStore:
         previous_calibration: tuple[CalibrationEntry, ...] | None = None
         previous_temporal: EmotionTemporalState | None = None
         previous_value_system: ValueSystem | None = None
-        previous_belief_system: BeliefSystem | None = None
+        previous_belief_snapshot: BeliefSystemSnapshot | None = None
         value_system_authority: ValueSystem | None = None
-        belief_system_authority: BeliefSystem | None = None
+        belief_port: BeliefStatePort | None = None
         value_system_was_present = False
-        belief_system_was_present = False
+        belief_port_was_present = False
         emotion_engine: EmotionEngineAllostasis | None = None
         working_memory_authority: WorkingMemory | None = None
+        state_mutation_started = False
         try:
             validated = validate_compatible_agent_state_snapshot(
                 snapshot.model_dump(mode="python")
@@ -2143,21 +2178,17 @@ class AgentStateStore:
                 previous_value_system = current_value_system
                 value_system_was_present = True
 
-            current_belief_system = _belief_system_authority(main_loop)
+            belief_port = _belief_state_port(main_loop)
             if isinstance(validated, AgentStateSnapshotV6):
-                if not isinstance(current_belief_system, BeliefSystem):
-                    if restored_belief_system is not None and restored_belief_system.records:
-                        raise AgentStateLoadError(
-                            "AgentState restore requires BeliefSystem authority"
-                        )
-                else:
-                    belief_system_authority = current_belief_system
-                    previous_belief_system = current_belief_system
-                    belief_system_was_present = True
-            elif isinstance(current_belief_system, BeliefSystem):
-                belief_system_authority = current_belief_system
-                previous_belief_system = current_belief_system
-                belief_system_was_present = True
+                if belief_port is None:
+                    raise AgentStateLoadError(
+                        "AgentState restore requires BeliefSystem authority via the explicit state port"
+                    )
+            if belief_port is not None:
+                previous_belief_snapshot = belief_port.export_belief_state()
+                if not isinstance(previous_belief_snapshot, BeliefSystemSnapshot):
+                    raise AgentStateLoadError("Belief state port returned an invalid snapshot")
+                belief_port_was_present = True
 
             previous_emotion = emotion_engine.state
             previous_working_memory_revision = working_memory_authority.revision
@@ -2167,6 +2198,7 @@ class AgentStateStore:
             )
             previous_calibration = calibration.export()
             previous_temporal = current_temporal
+            state_mutation_started = True
             working_memory_authority.restore_exact(
                 working_memory.revision,
                 restored_items,
@@ -2176,17 +2208,19 @@ class AgentStateStore:
             calibration.restore_exact(restored_calibration)
             if value_system_authority is not None:
                 _replace_value_system_authority(main_loop, restored_value_system)
-            if belief_system_authority is not None and restored_belief_system is not None:
-                _replace_belief_system_authority(main_loop, restored_belief_system)
+            if belief_port is not None:
+                belief_port.restore_belief_state(restored_belief_system.snapshot())
             emotion_engine.state = EmotionState(
                 valence=emotion.valence,
                 arousal=emotion.arousal,
                 optimal_loss=emotion.optimal_loss,
             )
             emotion_engine.temporal_state = restored_temporal
-        except (AgentStateConfigurationDrift, AgentStateLoadError):
+        except AgentStateConfigurationDrift:
             raise
-        except Exception:
+        except Exception as error:
+            if isinstance(error, AgentStateLoadError) and not state_mutation_started:
+                raise
             if (
                 previous_working_memory_revision is not None
                 and previous_working_memory_items is not None
@@ -2224,9 +2258,10 @@ class AgentStateStore:
                     _replace_value_system_authority(main_loop, previous_value_system)
                 except Exception:
                     pass
-            if belief_system_was_present and previous_belief_system is not None:
+            if belief_port_was_present and previous_belief_snapshot is not None:
                 try:
-                    _replace_belief_system_authority(main_loop, previous_belief_system)
+                    assert belief_port is not None
+                    belief_port.restore_belief_state(previous_belief_snapshot)
                 except Exception:
                     pass
             restore_failure = AgentStateLoadError("AgentState restore failed")
@@ -2271,13 +2306,16 @@ class AgentStateStore:
             _domain_value_system(snapshot.value_state)
         if isinstance(snapshot, AgentStateSnapshotV6):
             _domain_belief_system(snapshot.belief_state)
-        return json.dumps(
+        payload = json.dumps(
             snapshot.model_dump(mode="json"),
             ensure_ascii=False,
             allow_nan=False,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
+        if len(payload) > AGENT_STATE_MAX_SERIALIZED_BYTES:
+            raise ValueError("AgentState snapshot exceeds its serialized byte bound")
+        return payload
 
     @staticmethod
     def _reject_json_constant(_value: str) -> None:

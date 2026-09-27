@@ -615,6 +615,8 @@ class BeliefRecord:
                 raise ValueError("subject_admission proposition mismatch")
             if evidence_refs != self.subject_admission.evidence_refs:
                 raise ValueError("subject admission evidence does not match record evidence")
+        if self.lifecycle is BeliefLifecycle.PROPOSED and self.subject_admission is not None:
+            raise ValueError("proposed Beliefs cannot carry subject admission")
         if self.lifecycle is BeliefLifecycle.ADOPTED and self.subject_admission is None:
             raise ValueError("adopted Beliefs require subject admission")
         object.__setattr__(

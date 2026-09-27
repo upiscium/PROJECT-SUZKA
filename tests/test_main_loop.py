@@ -42,7 +42,12 @@ from suzka.runtime import (
     WorkingMemoryView,
 )
 from suzka.runtime.main_loop import DebugChatTrace
-from suzka.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
+from suzka.runtime.agent_runtime import (
+    AgentEvent,
+    AgentEventSource,
+    AgentEventType,
+    AgentRuntime,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -95,7 +100,7 @@ def test_dummy_provider_drives_user_input_to_public_response_end_to_end(
     assert not hasattr(result, "memory_context")
 
 
-def test_unapproved_belief_mutation_cannot_be_published_by_a_later_event(
+def test_belief_mutation_requires_the_active_runtime_event(
     tmp_path: Path,
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
@@ -107,16 +112,40 @@ def test_unapproved_belief_mutation_cannot_be_published_by_a_later_event(
         requested_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         processing_sequence=1,
     )
-    loop._belief_system_for_state().create_proposal(
-        BeliefProposition("claim"),
-        BeliefMutationEvidence("forged-event", 99, event.requested_at),
-        evidence=(BeliefEvidence("claim:1", BeliefEvidenceType.EXTERNAL_CLAIM),),
-    )
-
-    with pytest.raises(BeliefDomainError, match="committing event"):
-        loop._validate_belief_event_commit(event)
+    with pytest.raises(BeliefDomainError, match="active runtime event"):
+        loop.belief_system.create_proposal(
+            BeliefProposition("claim"),
+            BeliefMutationEvidence("forged-event", 99, event.requested_at),
+            evidence=(BeliefEvidence("claim:1", BeliefEvidenceType.EXTERNAL_CLAIM),),
+        )
 
     assert loop.belief_system.records == ()
+
+
+def test_belief_mutation_uses_the_bound_runtime_event_not_caller_evidence(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = SuzkaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
+    runtime = AgentRuntime(2, allow_volatile=True)
+    loop.bind_runtime(runtime)
+    runtime.start()
+
+    def mutate() -> object:
+        return loop._belief_system.create_proposal(
+            BeliefProposition("runtime-bound claim"),
+            evidence=(BeliefEvidence("claim:runtime", BeliefEvidenceType.EXTERNAL_CLAIM),),
+        )
+
+    result = runtime.submit(
+        AgentEventType.CHAT,
+        AgentEventSource.API_CHAT,
+        mutate,
+    ).result(timeout=5)
+    runtime.shutdown()
+
+    assert result.value.belief_id.startswith("belief-")
+    assert loop.export_belief_state().records
 
 
 def test_main_loop_passively_owns_configured_or_injected_working_memory(
