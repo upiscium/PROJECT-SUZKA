@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from suzka.identifiers import validate_identifier
 from suzka.memory.memory_schema import SemanticMemoryRecord
 from suzka.memory.semantic_lifecycle import (
+    SEMANTIC_MAX_SOURCE_EDGES,
     SemanticProvenanceClass,
     SemanticRevision,
     SemanticSourceKind,
@@ -141,6 +142,8 @@ def project_legacy_semantic_context(
         raise TypeError("context_registry must be ContextRegistry")
     validate_identifier(record.id)
     validate_identifier(current_context_id)
+    if len(record.source_episode_ids) > SEMANTIC_MAX_SOURCE_EDGES:
+        raise ValueError("legacy Semantic source evidence exceeds its bound")
 
     unique_source_ids: list[str] = []
     seen: set[str] = set()
