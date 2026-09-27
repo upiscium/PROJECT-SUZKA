@@ -50,7 +50,7 @@ export function ChatClient() {
         {history.length === 0 ? <p className="muted">No messages yet.</p> : null}
         {history.map((turn, index) => (
           <div key={`${turn.role}-${index}`} className={`chat-bubble ${turn.role}`}>
-            <strong>{turn.role === "user" ? "You" : "KAGYA"}</strong>
+            <strong>{turn.role === "user" ? "You" : "SUZKA"}</strong>
             <p>{turn.content}</p>
           </div>
         ))}
@@ -63,7 +63,7 @@ export function ChatClient() {
           if (message.trim()) mutation.mutate({ message, attachments: [], debug: false });
         }}
       >
-        <Textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="Send a message to PROJECT-KAGYA" />
+        <Textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="Send a message to PROJECT-SUZKA" />
         <Button disabled={mutation.isPending || !message.trim()} type="submit">{mutation.isPending ? "Sending" : "Send"}</Button>
       </form>
 
