@@ -7,6 +7,7 @@ import pytest
 
 from suzka.memory.memory_schema import MemoryRecordType, SemanticMemoryRecord
 from suzka.memory.semantic_lifecycle import (
+    SEMANTIC_MAX_SOURCE_EDGES,
     SemanticProvenanceClass,
     SemanticRevision,
     SemanticSourceEdge,
@@ -459,6 +460,26 @@ def test_contextual_working_memory_uses_semantic_mean_not_best_source() -> None:
     assert view.selected[1].context_projection is projection_mean
     assert (working.revision, working.items, registry.state) == before
 
+
+
+
+def test_legacy_projection_overflow_fails_closed() -> None:
+    registry = _registry()
+    oversized = _legacy(
+        "semantic-overflow",
+        [
+            f"episode-{index}"
+            for index in range(SEMANTIC_MAX_SOURCE_EDGES + 1)
+        ],
+        None,
+    )
+
+    with pytest.raises(ValueError, match="exceeds"):
+        project_legacy_semantic_context(
+            oversized,
+            registry,
+            "context-current",
+        )
 
 def test_nonresolved_working_memory_cannot_carry_context_projection() -> None:
     registry = _registry()
