@@ -28,9 +28,9 @@ jobs:
       - name: Backend tests
         run: uv run pytest tests/ -v
       - name: Ruff
-        run: uv run ruff check kagya tests
+        run: uv run ruff check suzka tests
       - name: Mypy
-        run: uv run mypy kagya
+        run: uv run mypy suzka
 
   frontend:
     name: Frontend

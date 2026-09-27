@@ -19,7 +19,7 @@ wheels/
 .env
 
 # Runtime artifacts
-.kagya/
+.suzka/
 /.worktrees/
 
 # local config
