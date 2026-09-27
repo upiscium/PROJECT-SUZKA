@@ -9,7 +9,7 @@ import math
 from threading import RLock
 from typing import cast
 
-from kagya.identifiers import validate_identifier
+from suzka.identifiers import validate_identifier
 
 
 MAX_CONTEXTS = 1024

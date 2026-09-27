@@ -7,7 +7,7 @@ import math
 from threading import Event, Lock, Thread, current_thread
 from typing import Callable
 
-from kagya.runtime.agent_runtime import (
+from suzka.runtime.agent_runtime import (
     AgentEventOutcome,
     AgentEventSource,
     AgentEventType,
@@ -65,7 +65,7 @@ class EmotionTimer:
                 return
             self._thread = Thread(
                 target=self._run,
-                name="kagya-emotion-timer",
+                name="suzka-emotion-timer",
                 daemon=True,
             )
             try:

@@ -1,6 +1,6 @@
-"""Runtime loop for PROJECT-KAGYA."""
+"""Runtime loop for PROJECT-SUZKA."""
 
-from kagya.runtime.agent_runtime import (
+from suzka.runtime.agent_runtime import (
     AgentEvent,
     AgentEventOutcome,
     AgentEventSource,
@@ -14,7 +14,7 @@ from kagya.runtime.agent_runtime import (
     AgentRuntimeStatus,
     AgentRuntimeStopped,
 )
-from kagya.runtime.agent_state import (
+from suzka.runtime.agent_state import (
     CURRENT_AGENT_STATE_SCHEMA_VERSION,
     AgentStateConfigurationDrift,
     AgentStateError,
@@ -47,7 +47,7 @@ from kagya.runtime.agent_state import (
     WorkingMemorySnapshot,
     default_agent_state_snapshot,
 )
-from kagya.runtime.context import (
+from suzka.runtime.context import (
     MAX_CONTEXTS,
     MAX_EVIDENCE_REFERENCES,
     MAX_INTERLOCUTOR_BINDINGS,
@@ -68,13 +68,13 @@ from kagya.runtime.context import (
     InterlocutorBinding,
     validate_context_registry_state,
 )
-from kagya.runtime.chat_context import (
+from suzka.runtime.chat_context import (
     CHAT_SOURCE_CHANNEL,
     DEFAULT_CHAT_CONTEXT_ID,
     ChatContextSelectors,
     resolve_chat_context,
 )
-from kagya.runtime.working_memory import (
+from suzka.runtime.working_memory import (
     WorkingMemory,
     WorkingMemoryAdmission,
     WorkingMemoryAdmissionReason,
@@ -89,7 +89,7 @@ from kagya.runtime.working_memory import (
     WorkingMemoryView,
     working_memory_item_id,
 )
-from kagya.runtime.event_journal import (
+from suzka.runtime.event_journal import (
     AbortOutcome,
     CURRENT_EVENT_JOURNAL_SCHEMA_VERSION,
     EventFailureCategory,
@@ -122,7 +122,7 @@ from kagya.runtime.event_journal import (
     TransactionKind,
     UnsupportedEventJournalVersion,
 )
-from kagya.runtime.transaction_coordinator import (
+from suzka.runtime.transaction_coordinator import (
     AbortableTransactionParticipant,
     CoordinatedResult,
     ParticipantDivergedError,
@@ -137,7 +137,7 @@ from kagya.runtime.transaction_coordinator import (
     TransactionPreparationError,
     UnsupportedParticipantReconciliationError,
 )
-from kagya.runtime.state_wal import (
+from suzka.runtime.state_wal import (
     BaselineRecord,
     BootAnchor,
     DryRunDiff,
@@ -153,7 +153,7 @@ from kagya.runtime.state_wal import (
     StateWALPermissionError,
     TransitionRecord,
 )
-from kagya.runtime.state_recovery import (
+from suzka.runtime.state_recovery import (
     InternalCommitClassification,
     InternalCommitEvidence,
     InternalCommitProof,
@@ -161,16 +161,16 @@ from kagya.runtime.state_recovery import (
     StateRecoveryError,
     StateRecoveryResult,
 )
-from kagya.runtime.session_state import SessionState, SessionTurn
-from kagya.runtime.session_participant import (
+from suzka.runtime.session_state import SessionState, SessionTurn
+from suzka.runtime.session_participant import (
     SESSION_TURN_PARTICIPANT_ID,
     SessionTurnOperation,
     SessionTurnParticipant,
     inspect_reset_session_operation,
     session_turn_operation_digest,
 )
-from kagya.runtime.main_loop import ChatResult, KagyaMainLoop
-from kagya.runtime.emotion_timer import EmotionTimer
+from suzka.runtime.main_loop import ChatResult, SuzkaMainLoop
+from suzka.runtime.emotion_timer import EmotionTimer
 
 __all__ = [
     "AbortOutcome",
@@ -237,7 +237,7 @@ __all__ = [
     "CHAT_SOURCE_CHANNEL",
     "CoordinatedResult",
     "DEFAULT_CHAT_CONTEXT_ID",
-    "KagyaMainLoop",
+    "SuzkaMainLoop",
     "SessionState",
     "SessionTurn",
     "SESSION_TURN_PARTICIPANT_ID",

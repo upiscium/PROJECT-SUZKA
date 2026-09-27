@@ -1,8 +1,8 @@
-"""Persona response helpers for PROJECT-KAGYA."""
+"""Persona response helpers for PROJECT-SUZKA."""
 
-from kagya.persona.conscious_agent import ConsciousAgent
-from kagya.persona.prompt_builder import ContextPromptView, PromptBuilder
-from kagya.persona.response_postprocessor import ProcessedResponse, ResponsePostprocessor
+from suzka.persona.conscious_agent import ConsciousAgent
+from suzka.persona.prompt_builder import ContextPromptView, PromptBuilder
+from suzka.persona.response_postprocessor import ProcessedResponse, ResponsePostprocessor
 
 __all__ = [
     "ConsciousAgent",

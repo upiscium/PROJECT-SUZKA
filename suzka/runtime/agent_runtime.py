@@ -229,7 +229,7 @@ class AgentRuntime:
             self._status = AgentRuntimeStatus.ACCEPTING
             self._worker = Thread(
                 target=self._consume,
-                name="kagya-agent-runtime",
+                name="suzka-agent-runtime",
                 daemon=True,
             )
             worker = self._worker
