@@ -1,6 +1,6 @@
 """Provider-agnostic conscious agent wrapper."""
 
-from kagya.models import ModelProvider
+from suzka.models import ModelProvider
 
 
 class ConsciousAgent:

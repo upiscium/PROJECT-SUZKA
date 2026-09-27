@@ -62,7 +62,7 @@ class ResponsePostprocessor:
         visible_response = ASSISTANT_SELF_ECHO_PATTERN.sub("", visible_response).strip()
         visible_response = LEADING_ANSWER_LABEL_PATTERN.sub("", visible_response).strip()
         visible_response = PROJECT_NAME_VARIANT_PATTERN.sub(
-            "PROJECT-KAGYA", visible_response
+            "PROJECT-SUZKA", visible_response
         ).strip()
         visible_response = REPEATED_COMMA_WORD_PATTERN.sub(
             r"\1", visible_response

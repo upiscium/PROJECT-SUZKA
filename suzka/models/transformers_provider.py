@@ -8,7 +8,7 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
 
-from kagya.config import Settings
+from suzka.config import Settings
 
 
 LOADABLE_ADAPTER_STATES = {"trial_active", "approved", "active"}

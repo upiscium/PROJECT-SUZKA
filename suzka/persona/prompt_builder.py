@@ -5,16 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from kagya.body import EmotionState
-from kagya.identity import ValuePromptEntry, ValuePromptView
-from kagya.identifiers import validate_identifier
+from suzka.body import EmotionState
+from suzka.identity import ValuePromptEntry, ValuePromptView
+from suzka.identifiers import validate_identifier
 
 
 _MAX_PROJECTED_PARTICIPANTS = 32
 
 if TYPE_CHECKING:
-    from kagya.runtime.context import ContextFrame
-    from kagya.runtime.working_memory import WorkingMemorySelection, WorkingMemoryView
+    from suzka.runtime.context import ContextFrame
+    from suzka.runtime.working_memory import WorkingMemorySelection, WorkingMemoryView
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,7 +91,7 @@ class PromptBuilder:
         value_lines = _value_lines(value_view)
         return "\n".join(
             [
-                "Context: PROJECT-KAGYA is a private local AI assistant for subjective conversation.",
+                "Context: PROJECT-SUZKA is a private local AI assistant for subjective conversation.",
                 "Private runtime data below is for tone and context only; do not quote it.",
                 *context_lines,
                 *value_lines,

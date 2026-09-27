@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 
-from kagya.identifiers import validate_identifier
-from kagya.runtime.context import (
+from suzka.identifiers import validate_identifier
+from suzka.runtime.context import (
     ContextConflict,
     ContextFrame,
     ContextNotFound,
@@ -19,7 +19,7 @@ from kagya.runtime.context import (
 
 DEFAULT_CHAT_CONTEXT_ID = "conversation.default"
 CHAT_SOURCE_CHANNEL = "chat"
-_CHAT_SESSION_DOMAIN = b"PROJECT-KAGYA:R09:CHAT-SESSION:V1\0"
+_CHAT_SESSION_DOMAIN = b"PROJECT-SUZKA:R09:CHAT-SESSION:V1\0"
 
 
 @dataclass(frozen=True, slots=True)

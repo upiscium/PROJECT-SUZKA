@@ -24,18 +24,18 @@ from pydantic import (
     model_validator,
 )
 
-from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
-from kagya.cognition.surprisal_calculator import (
+from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
+from suzka.cognition.surprisal_calculator import (
     CalibrationEntry,
     LossCalibration,
 )
-from kagya.identity.origin import (
+from suzka.identity.origin import (
     IdentityOrigin,
     OriginActor,
     OriginInputKind,
     ValueAdmissionStatus,
 )
-from kagya.identity.value_system import (
+from suzka.identity.value_system import (
     ValueConflictDefinition,
     ValueDomainError,
     ValueRevisionHistory,
@@ -47,8 +47,8 @@ from kagya.identity.value_system import (
     ValueSystem,
     recompute_seed_contract_digest,
 )
-from kagya.privacy import normalize_private_key
-from kagya.runtime.context import (
+from suzka.privacy import normalize_private_key
+from suzka.runtime.context import (
     ContextFrame,
     ContextRegistry,
     ContextRegistryState,
@@ -57,7 +57,7 @@ from kagya.runtime.context import (
     InterlocutorBinding,
     validate_context_registry_state,
 )
-from kagya.runtime.working_memory import (
+from suzka.runtime.working_memory import (
     WorkingMemory,
     WorkingMemoryItem,
     WorkingMemoryRetentionReason,
@@ -66,7 +66,7 @@ from kagya.runtime.working_memory import (
 )
 
 if TYPE_CHECKING:
-    from kagya.runtime.main_loop import KagyaMainLoop
+    from suzka.runtime.main_loop import SuzkaMainLoop
 
 
 CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[5] = 5
@@ -1064,7 +1064,7 @@ def default_agent_state_snapshot(
     )
 
 
-def _value_system_authority(main_loop: KagyaMainLoop) -> ValueSystem | None:
+def _value_system_authority(main_loop: SuzkaMainLoop) -> ValueSystem | None:
     """Read the internal Value authority without exposing it as a public port."""
 
     getter = getattr(main_loop, "_value_system_for_state", None)
@@ -1076,7 +1076,7 @@ def _value_system_authority(main_loop: KagyaMainLoop) -> ValueSystem | None:
 
 
 def _replace_value_system_authority(
-    main_loop: KagyaMainLoop, value_system: ValueSystem
+    main_loop: SuzkaMainLoop, value_system: ValueSystem
 ) -> None:
     """Replace Value authority through the MainLoop state boundary when present."""
 
@@ -1446,7 +1446,7 @@ class AgentStateStore:
         self.save(snapshot)
 
     def capture(
-        self, main_loop: KagyaMainLoop, sequence: int
+        self, main_loop: SuzkaMainLoop, sequence: int
     ) -> AgentStateSnapshotV5:
         capture_failure: AgentStateSaveError | None = None
         try:
@@ -1562,7 +1562,7 @@ class AgentStateStore:
         raise capture_failure
 
     def restore_into(
-        self, main_loop: KagyaMainLoop, snapshot: CompatibleAgentStateSnapshot
+        self, main_loop: SuzkaMainLoop, snapshot: CompatibleAgentStateSnapshot
     ) -> None:
         restore_failure: AgentStateLoadError | None = None
         context_registry: ContextRegistry | None = None
