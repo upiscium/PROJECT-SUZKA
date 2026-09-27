@@ -66,6 +66,7 @@ class WorkingMemoryContextProjection(Protocol):
     @property
     def aggregate_compatibility(self) -> float:
         """Return the already-computed aggregate Context compatibility."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,7 +174,11 @@ class WorkingMemoryResolution:
                 )
             if self.context_projection is not None:
                 score = self.context_projection.aggregate_compatibility
-                if type(score) is not float or not math.isfinite(score) or not 0 <= score <= 1:
+                if (
+                    type(score) is not float
+                    or not math.isfinite(score)
+                    or not 0 <= score <= 1
+                ):
                     raise ValueError("context projection compatibility is invalid")
         elif self.rendered_content is not None:
             raise ValueError("non-resolved Working Memory content must be None")
