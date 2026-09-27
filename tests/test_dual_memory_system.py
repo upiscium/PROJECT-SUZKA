@@ -5,22 +5,22 @@ from pathlib import Path
 
 import pytest
 
-from kagya.config import Settings, load_settings
-from kagya.memory import DualMemorySystem, MemoryRecordType
-from kagya.memory.dual_memory_system import (
+from suzka.config import Settings, load_settings
+from suzka.memory import DualMemorySystem, MemoryRecordType
+from suzka.memory.dual_memory_system import (
     EpisodicMemoryFormatError,
     EpisodicMemoryReadError,
     SemanticMemoryFormatError,
     SemanticMemoryReadError,
     SemanticMemoryWriteError,
 )
-from kagya.memory.episodic_participant import (
+from suzka.memory.episodic_participant import (
     MEMORY_EPISODIC_PARTICIPANT_ID,
     EpisodicWrite,
     MemoryEpisodicParticipant,
 )
-from kagya.models import DummyProvider
-from kagya.runtime import (
+from suzka.models import DummyProvider
+from suzka.runtime import (
     AbortOutcome,
     ParticipantDivergedError,
     ParticipantOutcome,

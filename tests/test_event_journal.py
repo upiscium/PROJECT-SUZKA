@@ -10,9 +10,9 @@ from uuid import NAMESPACE_URL, uuid5
 import pytest
 from pydantic import ValidationError
 
-from kagya.config import Settings, load_settings
-from kagya.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
-from kagya.runtime.event_journal import (
+from suzka.config import Settings, load_settings
+from suzka.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
+from suzka.runtime.event_journal import (
     AbortOutcome,
     EventFailureCategory,
     EventRecoveryCategory,
@@ -33,7 +33,7 @@ from kagya.runtime.event_journal import (
     StartupParticipantOutcome,
     TransactionKind,
 )
-import kagya.runtime.event_journal as journal_module
+import suzka.runtime.event_journal as journal_module
 
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -420,14 +420,14 @@ def test_adoption_epoch_is_baseline_only(
 
 def test_journal_config_is_strict_positive_and_backward_compatible() -> None:
     settings = load_settings(CONFIG_PATH)
-    assert settings.event_journal.path == Path(".kagya/event_journal.jsonl")
+    assert settings.event_journal.path == Path(".suzka/event_journal.jsonl")
     assert settings.event_journal.max_bytes == 1_048_576
     assert settings.event_journal.retained_files == 4
 
     pre_r05 = settings.model_dump(mode="python")
     pre_r05.pop("event_journal")
     compatible = Settings.model_validate(pre_r05)
-    assert compatible.event_journal.path == Path(".kagya/event_journal.jsonl")
+    assert compatible.event_journal.path == Path(".suzka/event_journal.jsonl")
     with pytest.raises(ValidationError):
         type(settings.event_journal).model_validate(
             {"path": "journal", "max_bytes": 0, "retained_files": 1}

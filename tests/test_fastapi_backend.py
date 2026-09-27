@@ -12,10 +12,10 @@ import pytest
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
-from kagya.api.server import create_app
-from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
-from kagya.config import Settings, load_settings
-from kagya.identity import (
+from suzka.api.server import create_app
+from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
+from suzka.config import Settings, load_settings
+from suzka.identity import (
     IdentityOrigin,
     OriginActor,
     OriginInputKind,
@@ -24,19 +24,19 @@ from kagya.identity import (
     ValueDomainError,
     ValueMutationEvidence,
 )
-from kagya.learning import AdapterRegistry
-from kagya.memory import (
+from suzka.learning import AdapterRegistry
+from suzka.memory import (
     DualMemorySystem,
     EpisodicMemoryFormatError,
     ExperienceStore,
     MemoryContext,
 )
-from kagya.memory.episodic_participant import MemoryEpisodicParticipant
-from kagya.memory.experience_participant import experience_id_for_event
-from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
-from kagya.models import DummyProvider
-from kagya.persona import PromptBuilder
-from kagya.runtime import (
+from suzka.memory.episodic_participant import MemoryEpisodicParticipant
+from suzka.memory.experience_participant import experience_id_for_event
+from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
+from suzka.models import DummyProvider
+from suzka.persona import PromptBuilder
+from suzka.runtime import (
     AbortOutcome,
     AgentEvent,
     AgentEventOutcome,
@@ -61,7 +61,7 @@ from kagya.runtime import (
     ContextFrameSnapshot,
     ContextStateSnapshot,
     EmotionStateSnapshot,
-    KagyaMainLoop,
+    SuzkaMainLoop,
     WorkingMemoryItemSnapshot,
     WorkingMemorySnapshot,
     WorkingMemoryResolution,
@@ -407,7 +407,7 @@ def test_injected_main_loop_store_is_used_as_startup_authority(tmp_path: Path) -
     settings = _settings(tmp_path)
     memory = DualMemorySystem(settings)
     store = ExperienceStore(tmp_path / "injected-experience")
-    loop = KagyaMainLoop(settings, ThinkingProvider(), memory, experience_store=store)
+    loop = SuzkaMainLoop(settings, ThinkingProvider(), memory, experience_store=store)
 
     with _client(tmp_path, settings=settings, main_loop=loop) as client:
         assert client.app.state.experience_store is store
@@ -424,7 +424,7 @@ def test_injected_main_loop_and_store_must_match(tmp_path: Path) -> None:
     memory = DualMemorySystem(settings)
     loop_store = ExperienceStore(tmp_path / "loop-experience")
     app_store = ExperienceStore(tmp_path / "app-experience")
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings, ThinkingProvider(), memory, experience_store=loop_store
     )
     client = _client(
@@ -493,7 +493,7 @@ def test_chat_and_emotion_tick_share_fifo_durable_order(tmp_path: Path) -> None:
         assert tick.event.processing_sequence == 2
         assert tick.value is None
         assert max_active == 1
-        assert threads == ["kagya-agent-runtime", "kagya-agent-runtime"]
+        assert threads == ["suzka-agent-runtime", "suzka-agent-runtime"]
         assert len(chat_state) == 1
         assert main_loop.emotion_engine.temporal_state.last_update_at == t1
 
@@ -1614,7 +1614,7 @@ def test_sensitive_api_reports_missing_admin_token_config(tmp_path: Path) -> Non
             json={"message": "hello", "attachments": [], "debug": True},
         )
         assert response.status_code == 503
-        assert "KAGYA_TEST_ADMIN_TOKEN" in response.json()["detail"]
+        assert "SUZKA_TEST_ADMIN_TOKEN" in response.json()["detail"]
 
 
 def test_lifespan_owns_and_drains_one_runtime(tmp_path: Path) -> None:
@@ -3553,13 +3553,13 @@ def _client(
     runtime: AgentRuntime | AdmissionRuntime | None = None,
     provider: DummyProvider | None = None,
     timer: RecordingTimer | None = None,
-    main_loop: KagyaMainLoop | None = None,
+    main_loop: SuzkaMainLoop | None = None,
     experience_store: ExperienceStore | None = None,
 ) -> TestClient:
     if configure_admin_token:
-        os.environ["KAGYA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
+        os.environ["SUZKA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
     else:
-        os.environ.pop("KAGYA_TEST_ADMIN_TOKEN", None)
+        os.environ.pop("SUZKA_TEST_ADMIN_TOKEN", None)
     app_settings = settings or _settings(tmp_path)
     app = create_app(app_settings)
     app.state.model_provider = provider or ThinkingProvider()
@@ -3605,7 +3605,7 @@ def _settings(tmp_path: Path) -> Settings:
                 }
             ),
             "api": settings.api.model_copy(
-                update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}
+                update={"admin_token_env": "SUZKA_TEST_ADMIN_TOKEN"}
             ),
             "agent_state": settings.agent_state.model_copy(
                 update={"path": tmp_path / "agent_state.json"}
@@ -3621,4 +3621,4 @@ def _settings(tmp_path: Path) -> Settings:
 
 
 def admin_headers() -> dict[str, str]:
-    return {"X-KAGYA-Admin-Token": ADMIN_TOKEN}
+    return {"X-SUZKA-Admin-Token": ADMIN_TOKEN}

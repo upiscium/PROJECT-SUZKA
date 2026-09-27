@@ -8,15 +8,15 @@ from pathlib import Path
 
 import pytest
 
-from kagya.config import Settings, load_settings
-from kagya.memory import DualMemorySystem, EpisodicMemoryFormatError, MemoryRecordType
-from kagya.memory.episodic_participant import (
+from suzka.config import Settings, load_settings
+from suzka.memory import DualMemorySystem, EpisodicMemoryFormatError, MemoryRecordType
+from suzka.memory.episodic_participant import (
     MEMORY_EPISODIC_PARTICIPANT_ID,
     EpisodicWrite,
     MemoryEpisodicParticipant,
     episodic_operation_digest,
 )
-from kagya.runtime import (
+from suzka.runtime import (
     ParticipantDivergedError,
     ParticipantOutcome,
     StartupParticipantOutcome,
@@ -663,7 +663,7 @@ def test_legacy_exact_read_has_no_fabricated_provenance(tmp_path: Path) -> None:
 
 
 def test_semantic_and_working_memory_durable_shapes_keep_only_allowed_context_field() -> None:
-    from kagya.memory import SemanticMemoryRecord
+    from suzka.memory import SemanticMemoryRecord
 
     semantic_fields = tuple(field.name for field in fields(SemanticMemoryRecord))
     assert semantic_fields[-1] == "context_id"
