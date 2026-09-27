@@ -488,6 +488,9 @@ class BeliefRevisionRecord:
     reason: BeliefRevisionReason
     created_at: datetime
     previous_revision_digest: str | None = None
+    event_id: str | None = None
+    event_sequence: int | None = None
+    evidence_refs: tuple[str, ...] = ()
     record_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -506,6 +509,27 @@ class BeliefRevisionRecord:
             raise ValueError("non-genesis revision requires a previous digest")
         if self.previous_revision_digest is not None:
             _digest(self.previous_revision_digest, "previous_revision_digest")
+        if (self.event_id is None) != (self.event_sequence is None):
+            raise ValueError("event_id and event_sequence must be supplied together")
+        if self.event_id is not None:
+            object.__setattr__(self, "event_id", validate_identifier(self.event_id))
+            object.__setattr__(
+                self,
+                "event_sequence",
+                _positive_int(
+                    self.event_sequence,
+                    "event_sequence",
+                    maximum=BELIEF_MAX_EVENT_SEQUENCE,
+                ),
+            )
+        if type(self.evidence_refs) is not tuple:
+            raise TypeError("evidence_refs must be a tuple")
+        refs = tuple(validate_identifier(reference) for reference in self.evidence_refs)
+        if len(refs) > BELIEF_MAX_EVIDENCE:
+            raise ValueError("evidence_refs exceeds its bound")
+        if refs != tuple(sorted(set(refs))):
+            raise ValueError("evidence_refs must be sorted and unique")
+        object.__setattr__(self, "evidence_refs", refs)
         object.__setattr__(self, "record_digest", recompute_revision_digest(self))
 
 
@@ -513,6 +537,9 @@ def _revision_fields(record: BeliefRevisionRecord) -> dict[str, object]:
     return {
         "belief_id": record.belief_id,
         "created_at": _datetime_value(record.created_at),
+        "event_id": record.event_id,
+        "event_sequence": record.event_sequence,
+        "evidence_refs": list(record.evidence_refs),
         "operation": record.operation.value,
         "previous_revision_digest": record.previous_revision_digest,
         "reason": record.reason.value,
@@ -617,11 +644,20 @@ class BeliefRecord:
         if len(self.revision_history) > BELIEF_MAX_REVISIONS:
             raise ValueError("revision_history exceeds its bound")
         if self.revision == 0 and self.revision_history:
-            raise ValueError("revision zero cannot retain prior revisions")
+            if len(self.revision_history) != 1 or self.revision_history[0].revision != 0:
+                raise ValueError("revision zero can retain only its genesis revision")
         if self.revision == 0 and self.history_anchor_digest is not None:
             raise ValueError("revision zero cannot retain a history anchor")
-        if self.revision > 0 and not self.revision_history and self.history_anchor_digest is None:
-            raise ValueError("nonzero revision requires history or an anchor")
+        if self.revision > 0 and not self.revision_history:
+            raise ValueError("nonzero revision requires its current history record")
+        if self.history_anchor_digest is not None:
+            if len(self.revision_history) != BELIEF_MAX_REVISIONS:
+                raise ValueError("compacted history must retain its full bounded suffix")
+            expected_first_revision = self.revision - BELIEF_MAX_REVISIONS + 1
+            if expected_first_revision < 1:
+                raise ValueError("compacted history anchor precedes the retained suffix")
+            if self.revision_history[0].revision != expected_first_revision:
+                raise ValueError("compacted history does not retain the expected suffix")
         previous: BeliefRevisionRecord | None = None
         for item in self.revision_history:
             if not isinstance(item, BeliefRevisionRecord):
@@ -643,7 +679,7 @@ class BeliefRecord:
             if item.revision > self.revision:
                 raise ValueError("revision_history contains a future revision")
             previous = item
-        if previous is not None and previous.revision != self.revision - 1:
+        if previous is not None and previous.revision != self.revision:
             raise ValueError("revision_history does not reach the current revision")
         if self.history_anchor_digest is not None:
             _digest(self.history_anchor_digest, "history_anchor_digest")

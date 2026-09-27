@@ -524,6 +524,7 @@ def test_committed_before_crash_v5_reconstructs_value_without_replay(
 ) -> None:
     seed = value_seed()
     store, journal, wal = configured_graph(tmp_path, seed)
+    store.save(capture_v5(store, 0, ValueSystem.from_seed_declarations((seed,))))
     recovery = StateRecoveryCoordinator(store, journal, wal)
     initial = recovery.prepare_startup().snapshot
     assert isinstance(initial, AgentStateSnapshotV5)

@@ -265,6 +265,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             nonlocal committed_snapshot, committed_snapshot_hash
             sequence = event.processing_sequence
             assert sequence is not None
+            validate_belief_commit = getattr(
+                app.state.main_loop, "_validate_belief_event_commit", None
+            )
+            if callable(validate_belief_commit):
+                validate_belief_commit(event)
             app.state.main_loop._validate_value_event_commit(event)
             candidate = app.state.agent_state_store.capture(
                 app.state.main_loop, sequence
@@ -274,6 +279,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 event, committed_snapshot, candidate
             )
             app.state.main_loop._publish_committed_value_view()
+            publish_belief_view = getattr(
+                app.state.main_loop, "_publish_committed_belief_view", None
+            )
+            if callable(publish_belief_view):
+                publish_belief_view()
             committed_snapshot = candidate
             committed_snapshot_hash = candidate_hash
             return evidence

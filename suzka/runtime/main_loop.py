@@ -8,6 +8,7 @@ import inspect
 from typing import TYPE_CHECKING, Callable, cast
 
 from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionUpdate
+from suzka.belief import BeliefDomainError, BeliefSystem, BeliefSystemSnapshot
 from suzka.cognition import (
     AppraisalResult,
     AppraisalSignals,
@@ -155,6 +156,7 @@ class SuzkaMainLoop:
         adapter_id: str | None = None,
         context_registry: ContextRegistry | None = None,
         value_system: ValueSystem | None = None,
+        belief_system: BeliefSystem | None = None,
         experience_store: ExperienceStore | None = None,
     ) -> None:
         from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
@@ -238,6 +240,16 @@ class SuzkaMainLoop:
             authority = ValueSystem.restore_snapshot(value_system.snapshot())
         self._value_system = authority
         self._committed_value_snapshot: ValueSystemSnapshot = authority.snapshot()
+        if belief_system is None:
+            belief_authority = BeliefSystem()
+        else:
+            if not isinstance(belief_system, BeliefSystem):
+                raise TypeError("belief_system must be BeliefSystem")
+            belief_authority = BeliefSystem.restore_snapshot(belief_system.snapshot())
+        self._belief_system = belief_authority
+        self._committed_belief_snapshot: BeliefSystemSnapshot = (
+            belief_authority.snapshot()
+        )
 
     @property
     def value_system(self) -> ValueSystem:
@@ -260,6 +272,70 @@ class SuzkaMainLoop:
         """Publish the Value state after the runtime commit protocol succeeds."""
 
         self._committed_value_snapshot = self._value_system.snapshot()
+
+    @property
+    def belief_system(self) -> BeliefSystem:
+        """Return a detached read-only-by-convention Belief projection."""
+
+        return BeliefSystem.restore_snapshot(self._committed_belief_snapshot)
+
+    def _belief_system_for_state(self) -> BeliefSystem:
+        """Return the internal Belief authority to AgentState only."""
+
+        return self._belief_system
+
+    def _replace_belief_system_for_state(self, belief_system: BeliefSystem) -> None:
+        if not isinstance(belief_system, BeliefSystem):
+            raise TypeError("belief_system must be BeliefSystem")
+        self._belief_system = belief_system
+        self._committed_belief_snapshot = belief_system.snapshot()
+
+    def _publish_committed_belief_view(self) -> None:
+        """Publish Belief state after the runtime commit protocol succeeds."""
+
+        self._committed_belief_snapshot = self._belief_system.snapshot()
+
+    def _validate_belief_event_commit(self, event: AgentEvent) -> None:
+        """Require every newly published Belief revision to bind this event."""
+
+        if event.processing_sequence is None or event.processing_sequence <= 0:
+            raise BeliefDomainError("Belief commit event has no processing sequence")
+        self._belief_system.validate()
+        current = self._belief_system.snapshot()
+        previous = self._committed_belief_snapshot
+        if current == previous:
+            return
+        previous_records = {record.belief_id: record for record in previous.records}
+        current_records = {record.belief_id: record for record in current.records}
+        if set(previous_records) - set(current_records):
+            raise BeliefDomainError("Belief authority removed a committed record")
+
+        for belief_id, record in current_records.items():
+            prior = previous_records.get(belief_id)
+            if prior == record:
+                continue
+            prior_digests = (
+                {revision.record_digest for revision in prior.revision_history}
+                if prior is not None
+                else set()
+            )
+            new_revisions = tuple(
+                revision
+                for revision in record.revision_history
+                if revision.record_digest not in prior_digests
+            )
+            if not new_revisions:
+                raise BeliefDomainError(
+                    "Belief change has no committing revision"
+                )
+            for revision in new_revisions:
+                if (
+                    revision.event_id != event.event_id
+                    or revision.event_sequence != event.processing_sequence
+                ):
+                    raise BeliefDomainError(
+                        "Belief revision is not bound to the committing event"
+                    )
 
     def _validate_value_event_commit(self, event: AgentEvent) -> None:
         """Require newly introduced Value history to name the committing event."""

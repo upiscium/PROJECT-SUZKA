@@ -9,11 +9,25 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
+from suzka.belief import (
+    BeliefMutationEvidence,
+    BeliefProposition,
+    BeliefSystem,
+    belief_record_digest,
+)
 from suzka.config import Settings, load_settings
 from suzka.runtime.agent_state import (
+    AgentStateSnapshotV6,
+    AppraisalStateSnapshot,
     AgentStateSnapshotV2,
     AgentStateSnapshotV1,
+    BeliefPropositionStateSnapshot,
+    BeliefRecordStateSnapshot,
+    BeliefRevisionStateSnapshot,
+    BeliefSystemStateSnapshot,
+    ContextStateSnapshot,
     EmotionStateSnapshot,
+    ValueSystemStateSnapshot,
     WorkingMemorySnapshot,
 )
 from suzka.runtime.state_wal import (
@@ -48,6 +62,86 @@ def make_v1_snapshot(sequence: int, *, value: float = 0.1) -> AgentStateSnapshot
         last_processed_event_sequence=sequence,
         emotion_state=EmotionStateSnapshot(
             valence=value, arousal=0.2, optimal_loss=1.0
+        ),
+    )
+
+
+def make_v6_snapshot(
+    sequence: int, *, include_belief: bool = True, compacted: bool = False
+) -> AgentStateSnapshotV6:
+    timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    system = BeliefSystem()
+    records = ()
+    if include_belief:
+        record = system.create_proposal(
+            BeliefProposition("claim"),
+            BeliefMutationEvidence("belief-event:1", 1, timestamp),
+        )
+        if compacted:
+            for revision_sequence in range(2, 42):
+                record = system.correct(
+                    record.belief_id,
+                    record,
+                    BeliefMutationEvidence(
+                        f"belief-event:{revision_sequence}",
+                        revision_sequence,
+                        timestamp,
+                    ),
+                )
+        records = (
+            BeliefRecordStateSnapshot(
+                belief_id=record.belief_id,
+                proposition=BeliefPropositionStateSnapshot(
+                    canonical_text=record.proposition.canonical_text,
+                    proposition_digest=record.proposition.proposition_digest,
+                ),
+                lifecycle=record.lifecycle.value,
+                epistemic_status=record.epistemic_status.value,
+                confidence=record.confidence,
+                context_scope=(),
+                evidence=(),
+                revision=record.revision,
+                revision_history=tuple(
+                    BeliefRevisionStateSnapshot(
+                        belief_id=revision.belief_id,
+                        revision=revision.revision,
+                        operation=revision.operation.value,
+                        reason=revision.reason.value,
+                        created_at=revision.created_at,
+                        previous_revision_digest=revision.previous_revision_digest,
+                        event_id=revision.event_id,
+                        event_sequence=revision.event_sequence,
+                        evidence_refs=(),
+                        record_digest=revision.record_digest,
+                    )
+                    for revision in record.revision_history
+                ),
+                history_anchor_digest=record.history_anchor_digest,
+                record_digest=belief_record_digest(record),
+            ),
+        )
+    return AgentStateSnapshotV6(
+        saved_at=timestamp,
+        last_processed_event_sequence=sequence,
+        emotion_state=EmotionStateSnapshot(
+            valence=0.1, arousal=0.2, optimal_loss=1.0
+        ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
+        context_state=ContextStateSnapshot(
+            revision=0,
+            current_context_id=None,
+            frames=(),
+            interlocutor_bindings=(),
+        ),
+        appraisal_state=AppraisalStateSnapshot(
+            calibration_entries=(), last_emotion_update_at=None
+        ),
+        value_state=ValueSystemStateSnapshot(
+            values=(), conflicts=(), histories=(), evidence_ledgers=()
+        ),
+        belief_state=BeliefSystemStateSnapshot(
+            records=records,
+            authority_digest=system.snapshot().authority_digest,
         ),
     )
 
@@ -273,6 +367,53 @@ def test_reconstruct_by_sequence_hash_and_record(tmp_path: Path) -> None:
         wal.reconstruct(record_id=transition.record_id).last_processed_event_sequence
         == 12
     )
+
+
+def test_v6_wal_reconstructs_nonempty_belief_without_replay(tmp_path: Path) -> None:
+    wal = make_wal(tmp_path)
+    initial = make_v6_snapshot(0, include_belief=False)
+    candidate = make_v6_snapshot(1)
+    wal.bootstrap(initial, 0)
+    transition = wal.append_transition(
+        event_id=uuid4(),
+        event_type="state.transition",
+        event_source="test",
+        processing_sequence=1,
+        prior_snapshot=initial,
+        candidate_snapshot=candidate,
+    )
+
+    assert wal.reconstruct(sequence=0) == initial
+    assert initial.belief_state.records == ()
+    reconstructed = wal.reconstruct(record_id=transition.record_id)
+    assert reconstructed == candidate
+    assert len(reconstructed.belief_state.records) == 1
+    assert reconstructed.belief_state.authority_digest == (
+        candidate.belief_state.authority_digest
+    )
+
+
+def test_v6_wal_reconstructs_compacted_belief_history_without_replay(
+    tmp_path: Path,
+) -> None:
+    wal = make_wal(tmp_path)
+    initial = make_v6_snapshot(0, include_belief=False)
+    candidate = make_v6_snapshot(41, compacted=True)
+    wal.bootstrap(initial, 0)
+    transition = wal.append_transition(
+        event_id=uuid4(),
+        event_type="state.transition",
+        event_source="test",
+        processing_sequence=41,
+        prior_snapshot=initial,
+        candidate_snapshot=candidate,
+    )
+
+    reconstructed = wal.reconstruct(record_id=transition.record_id)
+    record = reconstructed.belief_state.records[0]
+    assert len(record.revision_history) == 32
+    assert record.history_anchor_digest is not None
+    assert reconstructed == candidate
 
 
 def test_retained_v1_records_preserve_exact_snapshot_and_record_hashes(

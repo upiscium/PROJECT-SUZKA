@@ -25,6 +25,27 @@ from pydantic import (
 )
 
 from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
+from suzka.belief import (
+    BELIEF_MAX_COMPONENT_CODEPOINTS,
+    BELIEF_MAX_CONTEXTS,
+    BELIEF_MAX_EVIDENCE,
+    BELIEF_MAX_PROPOSITION_CODEPOINTS,
+    BELIEF_MAX_REVISIONS,
+    BELIEF_MAX_RECORDS,
+    BeliefEpistemicStatus,
+    BeliefEvidenceType,
+    BeliefLifecycle,
+    BeliefSystem,
+    BeliefRevisionOperation,
+    BeliefRevisionReason,
+    BeliefSubjectAdmissionReason,
+    BeliefProposition,
+    BeliefEvidence,
+    BeliefRecord,
+    BeliefRevisionRecord,
+    BeliefSubjectAdmission,
+    belief_record_digest,
+)
 from suzka.cognition.surprisal_calculator import (
     CalibrationEntry,
     LossCalibration,
@@ -69,7 +90,7 @@ if TYPE_CHECKING:
     from suzka.runtime.main_loop import SuzkaMainLoop
 
 
-CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[5] = 5
+CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[6] = 6
 
 
 class _StateModel(BaseModel):
@@ -666,6 +687,172 @@ class ValueSystemStateSnapshot(_StateModel):
             raise ValueError("Value conflict pairs must be ordered and unique")
         return self
 
+
+class BeliefPropositionStateSnapshot(_StateModel):
+    canonical_text: str = Field(max_length=BELIEF_MAX_PROPOSITION_CODEPOINTS)
+    subject: str | None = Field(default=None, max_length=BELIEF_MAX_COMPONENT_CODEPOINTS)
+    predicate: str | None = Field(default=None, max_length=BELIEF_MAX_COMPONENT_CODEPOINTS)
+    object: str | None = Field(default=None, max_length=BELIEF_MAX_COMPONENT_CODEPOINTS)
+    proposition_digest: str = Field(min_length=64, max_length=64)
+
+
+class BeliefEvidenceStateSnapshot(_StateModel):
+    evidence_ref: str = Field(min_length=1, max_length=128)
+    evidence_type: Literal[
+        "experience",
+        "semantic_memory",
+        "episodic_memory",
+        "external_claim",
+        "model_inference",
+        "operator_correction",
+    ]
+
+
+class BeliefSubjectAdmissionStateSnapshot(_StateModel):
+    proposition_digest: str = Field(min_length=64, max_length=64)
+    evidence_refs: tuple[str, ...]
+    event_id: str = Field(min_length=1, max_length=128)
+    event_sequence: int = Field(ge=1)
+    reason: Literal["subject_endorsement", "subject_correction", "subject_review"]
+    admission_digest: str = Field(min_length=64, max_length=64)
+
+    @field_validator("evidence_refs", mode="before")
+    @classmethod
+    def parse_admission_refs(cls, value: object) -> object:
+        return _tuple_value(value)
+
+    @model_validator(mode="after")
+    def require_canonical_refs(self) -> BeliefSubjectAdmissionStateSnapshot:
+        if len(self.evidence_refs) == 0 or len(self.evidence_refs) > BELIEF_MAX_EVIDENCE:
+            raise ValueError("Belief admission evidence is outside its bound")
+        if self.evidence_refs != tuple(sorted(set(self.evidence_refs))):
+            raise ValueError("Belief admission evidence must be ordered and unique")
+        return self
+
+
+class BeliefRevisionStateSnapshot(_StateModel):
+    belief_id: str = Field(min_length=1, max_length=128)
+    revision: int = Field(ge=0)
+    operation: Literal["create", "adopt", "correct", "supersede", "retract", "expire"]
+    reason: Literal[
+        "creation",
+        "subject_admission",
+        "correction",
+        "supersession",
+        "retraction",
+        "expiration",
+    ]
+    created_at: datetime
+    previous_revision_digest: str | None = Field(default=None, min_length=64, max_length=64)
+    event_id: str = Field(min_length=1, max_length=128)
+    event_sequence: int = Field(ge=1)
+    evidence_refs: tuple[str, ...]
+    record_digest: str = Field(min_length=64, max_length=64)
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def parse_revision_timestamp(cls, value: object) -> object:
+        return _parse_context_timestamp(value)
+
+    @field_validator("created_at")
+    @classmethod
+    def require_revision_utc(cls, value: datetime) -> datetime:
+        return _require_context_utc(value)
+
+    @field_validator("evidence_refs", mode="before")
+    @classmethod
+    def parse_revision_refs(cls, value: object) -> object:
+        return _tuple_value(value)
+
+    @model_validator(mode="after")
+    def require_canonical_refs(self) -> BeliefRevisionStateSnapshot:
+        if len(self.evidence_refs) > BELIEF_MAX_EVIDENCE:
+            raise ValueError("Belief revision evidence exceeds its bound")
+        if self.evidence_refs != tuple(sorted(set(self.evidence_refs))):
+            raise ValueError("Belief revision evidence must be ordered and unique")
+        return self
+
+
+class BeliefRecordStateSnapshot(_StateModel):
+    belief_id: str = Field(min_length=1, max_length=128)
+    proposition: BeliefPropositionStateSnapshot
+    lifecycle: Literal["proposed", "adopted", "superseded", "retracted", "expired"]
+    epistemic_status: Literal["unknown", "uncertain", "probable", "established"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    context_scope: tuple[str, ...]
+    valid_from: datetime | None = None
+    valid_until: datetime | None = None
+    evidence: tuple[BeliefEvidenceStateSnapshot, ...]
+    subject_admission: BeliefSubjectAdmissionStateSnapshot | None = None
+    supersedes_id: str | None = Field(default=None, max_length=128)
+    superseded_by_id: str | None = Field(default=None, max_length=128)
+    revision: int = Field(ge=0)
+    revision_history: tuple[BeliefRevisionStateSnapshot, ...]
+    history_anchor_digest: str | None = Field(default=None, min_length=64, max_length=64)
+    schema_version: Literal[1] = 1
+    record_digest: str = Field(min_length=64, max_length=64)
+
+    @field_validator("confidence")
+    @classmethod
+    def require_finite_confidence(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("Belief confidence must be finite")
+        return value
+
+    @field_validator(
+        "context_scope", "evidence", "revision_history", mode="before"
+    )
+    @classmethod
+    def parse_belief_lists(cls, value: object) -> object:
+        return _tuple_value(value)
+
+    @field_validator("valid_from", "valid_until", mode="before")
+    @classmethod
+    def parse_belief_timestamps(cls, value: object) -> object:
+        return _parse_context_timestamp(value)
+
+    @field_validator("valid_from", "valid_until")
+    @classmethod
+    def require_belief_utc(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _require_context_utc(value)
+
+    @model_validator(mode="after")
+    def require_canonical_collections(self) -> BeliefRecordStateSnapshot:
+        if len(self.context_scope) > BELIEF_MAX_CONTEXTS:
+            raise ValueError("Belief Context scope exceeds its bound")
+        if self.context_scope != tuple(sorted(set(self.context_scope))):
+            raise ValueError("Belief Context scope must be ordered and unique")
+        if len(self.evidence) > BELIEF_MAX_EVIDENCE:
+            raise ValueError("Belief evidence exceeds its bound")
+        evidence_refs = tuple(item.evidence_ref for item in self.evidence)
+        if evidence_refs != tuple(sorted(set(evidence_refs))):
+            raise ValueError("Belief evidence must be ordered and unique")
+        if len(self.revision_history) > BELIEF_MAX_REVISIONS:
+            raise ValueError("Belief revision history exceeds its bound")
+        return self
+
+
+class BeliefSystemStateSnapshot(_StateModel):
+    """Complete bounded intrinsic Belief authority embedded in AgentState v6."""
+
+    schema_version: Literal[1] = 1
+    records: tuple[BeliefRecordStateSnapshot, ...]
+    authority_digest: str = Field(min_length=64, max_length=64)
+
+    @field_validator("records", mode="before")
+    @classmethod
+    def parse_belief_records(cls, value: object) -> object:
+        return _tuple_value(value)
+
+    @model_validator(mode="after")
+    def require_canonical_records(self) -> BeliefSystemStateSnapshot:
+        if len(self.records) > BELIEF_MAX_RECORDS:
+            raise ValueError("Belief authority exceeds its record bound")
+        ids = tuple(record.belief_id for record in self.records)
+        if ids != tuple(sorted(set(ids))):
+            raise ValueError("Belief records must be ordered and unique")
+        return self
+
 class AgentStateSnapshotV4(_AgentStateSnapshotBase):
     """Exact retained R10 canonical AgentState v4 schema."""
 
@@ -685,7 +872,7 @@ class AgentStateSnapshotV4(_AgentStateSnapshotBase):
 class AgentStateSnapshotV5(_AgentStateSnapshotBase):
     """Current AgentState v5 with complete Value authority continuity."""
 
-    schema_version: Literal[5] = CURRENT_AGENT_STATE_SCHEMA_VERSION
+    schema_version: Literal[5] = 5
     working_memory: WorkingMemorySnapshot
     context_state: ContextStateSnapshot
     appraisal_state: AppraisalStateSnapshot
@@ -699,9 +886,27 @@ class AgentStateSnapshotV5(_AgentStateSnapshotBase):
         return value.astimezone(timezone.utc)
 
 
+class AgentStateSnapshotV6(_AgentStateSnapshotBase):
+    """Current AgentState v6 with complete Belief and Value authority continuity."""
+
+    schema_version: Literal[6] = CURRENT_AGENT_STATE_SCHEMA_VERSION
+    working_memory: WorkingMemorySnapshot
+    context_state: ContextStateSnapshot
+    appraisal_state: AppraisalStateSnapshot
+    value_state: ValueSystemStateSnapshot
+    belief_state: BeliefSystemStateSnapshot
+
+    @field_validator("saved_at")
+    @classmethod
+    def require_canonical_saved_at(cls, value: datetime) -> datetime:
+        if value.utcoffset() != timedelta(0):
+            raise ValueError("saved_at must be canonical UTC")
+        return value.astimezone(timezone.utc)
+
+
 # The unqualified name denotes the current schema; retained callers should use
 # AgentStateSnapshotV4 when they intentionally construct the exact v4 shape.
-AgentStateSnapshot = AgentStateSnapshotV5
+AgentStateSnapshot = AgentStateSnapshotV6
 
 
 CompatibleAgentStateSnapshot = Annotated[
@@ -709,7 +914,8 @@ CompatibleAgentStateSnapshot = Annotated[
     | AgentStateSnapshotV2
     | AgentStateSnapshotV3
     | AgentStateSnapshotV4
-    | AgentStateSnapshotV5,
+    | AgentStateSnapshotV5
+    | AgentStateSnapshotV6,
     Field(discriminator="schema_version"),
 ]
 _COMPATIBLE_SNAPSHOT_ADAPTER: TypeAdapter[CompatibleAgentStateSnapshot] = (
@@ -922,6 +1128,187 @@ def _value_state_snapshot(system: ValueSystem) -> ValueSystemStateSnapshot:
     )
 
 
+def _belief_proposition_snapshot(
+    proposition: BeliefProposition,
+) -> BeliefPropositionStateSnapshot:
+    return BeliefPropositionStateSnapshot(
+        canonical_text=proposition.canonical_text,
+        subject=proposition.subject,
+        predicate=proposition.predicate,
+        object=proposition.object,
+        proposition_digest=proposition.proposition_digest,
+    )
+
+
+def _belief_revision_snapshot(
+    revision: BeliefRevisionRecord,
+) -> BeliefRevisionStateSnapshot:
+    if revision.event_id is None or revision.event_sequence is None:
+        raise ValueError("authoritative Belief revisions require event evidence")
+    return BeliefRevisionStateSnapshot(
+        belief_id=revision.belief_id,
+        revision=revision.revision,
+        operation=revision.operation.value,
+        reason=revision.reason.value,
+        created_at=revision.created_at,
+        previous_revision_digest=revision.previous_revision_digest,
+        event_id=revision.event_id,
+        event_sequence=revision.event_sequence,
+        evidence_refs=revision.evidence_refs,
+        record_digest=revision.record_digest,
+    )
+
+
+def _belief_record_snapshot(record: BeliefRecord) -> BeliefRecordStateSnapshot:
+    if not record.revision_history or record.revision_history[-1].revision != record.revision:
+        raise ValueError("Belief history must include the current revision")
+    admission = record.subject_admission
+    admission_snapshot = (
+        None
+        if admission is None
+        else BeliefSubjectAdmissionStateSnapshot(
+            proposition_digest=admission.proposition_digest,
+            evidence_refs=admission.evidence_refs,
+            event_id=admission.event_id,
+            event_sequence=admission.event_sequence,
+            reason=admission.reason.value,
+            admission_digest=admission.admission_digest,
+        )
+    )
+    snapshot = BeliefRecordStateSnapshot(
+        belief_id=record.belief_id,
+        proposition=_belief_proposition_snapshot(record.proposition),
+        lifecycle=record.lifecycle.value,
+        epistemic_status=record.epistemic_status.value,
+        confidence=record.confidence,
+        context_scope=record.context_scope,
+        valid_from=record.valid_from,
+        valid_until=record.valid_until,
+        evidence=tuple(
+            BeliefEvidenceStateSnapshot(
+                evidence_ref=item.evidence_ref,
+                evidence_type=item.evidence_type.value,
+            )
+            for item in record.evidence
+        ),
+        subject_admission=admission_snapshot,
+        supersedes_id=record.supersedes_id,
+        superseded_by_id=record.superseded_by_id,
+        revision=record.revision,
+        revision_history=tuple(
+            _belief_revision_snapshot(item) for item in record.revision_history
+        ),
+        history_anchor_digest=record.history_anchor_digest,
+        schema_version=1,
+        record_digest=belief_record_digest(record),
+    )
+    return snapshot
+
+
+def _belief_state_snapshot(system: BeliefSystem) -> BeliefSystemStateSnapshot:
+    system.validate()
+    authority = system.snapshot()
+    return BeliefSystemStateSnapshot(
+        schema_version=1,
+        records=tuple(_belief_record_snapshot(record) for record in authority.records),
+        authority_digest=authority.authority_digest,
+    )
+
+
+def _domain_belief_proposition(
+    snapshot: BeliefPropositionStateSnapshot,
+) -> BeliefProposition:
+    proposition = BeliefProposition(
+        canonical_text=snapshot.canonical_text,
+        subject=snapshot.subject,
+        predicate=snapshot.predicate,
+        object=snapshot.object,
+    )
+    if proposition.proposition_digest != snapshot.proposition_digest:
+        raise ValueError("Belief proposition digest does not match persisted text")
+    return proposition
+
+
+def _domain_belief_revision(
+    snapshot: BeliefRevisionStateSnapshot,
+) -> BeliefRevisionRecord:
+    revision = BeliefRevisionRecord(
+        belief_id=snapshot.belief_id,
+        revision=snapshot.revision,
+        operation=BeliefRevisionOperation(snapshot.operation),
+        reason=BeliefRevisionReason(snapshot.reason),
+        created_at=snapshot.created_at,
+        previous_revision_digest=snapshot.previous_revision_digest,
+        event_id=snapshot.event_id,
+        event_sequence=snapshot.event_sequence,
+        evidence_refs=snapshot.evidence_refs,
+    )
+    if revision.record_digest != snapshot.record_digest:
+        raise ValueError("Belief revision digest does not match persisted record")
+    return revision
+
+
+def _domain_belief_record(snapshot: BeliefRecordStateSnapshot) -> BeliefRecord:
+    admission_snapshot = snapshot.subject_admission
+    admission = (
+        None
+        if admission_snapshot is None
+        else BeliefSubjectAdmission(
+            proposition_digest=admission_snapshot.proposition_digest,
+            evidence_refs=admission_snapshot.evidence_refs,
+            event_id=admission_snapshot.event_id,
+            event_sequence=admission_snapshot.event_sequence,
+            reason=BeliefSubjectAdmissionReason(admission_snapshot.reason),
+        )
+    )
+    if admission is not None:
+        assert admission_snapshot is not None
+        if admission.admission_digest != admission_snapshot.admission_digest:
+            raise ValueError("Belief admission digest does not match persisted proof")
+    record = BeliefRecord(
+        belief_id=snapshot.belief_id,
+        proposition=_domain_belief_proposition(snapshot.proposition),
+        lifecycle=BeliefLifecycle(snapshot.lifecycle),
+        epistemic_status=BeliefEpistemicStatus(snapshot.epistemic_status),
+        confidence=snapshot.confidence,
+        context_scope=snapshot.context_scope,
+        valid_from=snapshot.valid_from,
+        valid_until=snapshot.valid_until,
+        evidence=tuple(
+            BeliefEvidence(
+                evidence_ref=item.evidence_ref,
+                evidence_type=BeliefEvidenceType(item.evidence_type),
+            )
+            for item in snapshot.evidence
+        ),
+        subject_admission=admission,
+        supersedes_id=snapshot.supersedes_id,
+        superseded_by_id=snapshot.superseded_by_id,
+        revision=snapshot.revision,
+        revision_history=tuple(
+            _domain_belief_revision(item) for item in snapshot.revision_history
+        ),
+        history_anchor_digest=snapshot.history_anchor_digest,
+        schema_version=snapshot.schema_version,
+    )
+    if belief_record_digest(record) != snapshot.record_digest:
+        raise ValueError("Belief record digest does not match persisted state")
+    return record
+
+
+def _domain_belief_system(snapshot: BeliefSystemStateSnapshot) -> BeliefSystem:
+    system = BeliefSystem(
+        _domain_belief_record(record) for record in snapshot.records
+    )
+    authority = system.snapshot()
+    if (
+        snapshot.schema_version != authority.schema_version
+        or snapshot.authority_digest != authority.authority_digest
+    ):
+        raise ValueError("Belief authority digest does not match persisted state")
+    return system
+
+
 def _identity_origin(snapshot: IdentityOriginSnapshot) -> IdentityOrigin:
     origin = IdentityOrigin(
         OriginActor(snapshot.actor),
@@ -1038,11 +1425,11 @@ def default_agent_state_snapshot(
     *,
     saved_at: datetime | None = None,
     value_system: ValueSystem | None = None,
-) -> AgentStateSnapshotV5:
+) -> AgentStateSnapshotV6:
     """Return the bootstrap state used only when the canonical file is absent."""
 
     system = value_system if value_system is not None else ValueSystem()
-    return AgentStateSnapshotV5(
+    return AgentStateSnapshotV6(
         saved_at=saved_at or datetime.now(timezone.utc),
         last_processed_event_sequence=0,
         emotion_state=EmotionStateSnapshot(
@@ -1061,6 +1448,7 @@ def default_agent_state_snapshot(
             calibration_entries=(), last_emotion_update_at=None
         ),
         value_state=_value_state_snapshot(system),
+        belief_state=_belief_state_snapshot(BeliefSystem()),
     )
 
 
@@ -1085,6 +1473,29 @@ def _replace_value_system_authority(
         setter(value_system)
     else:
         setattr(main_loop, "value_system", value_system)
+
+
+def _belief_system_authority(main_loop: SuzkaMainLoop) -> BeliefSystem | None:
+    """Read the internal Belief authority without exposing a mutable public port."""
+
+    getter = getattr(main_loop, "_belief_system_for_state", None)
+    if callable(getter):
+        belief_system = getter()
+    else:
+        belief_system = getattr(main_loop, "belief_system", None)
+    return belief_system if isinstance(belief_system, BeliefSystem) else None
+
+
+def _replace_belief_system_authority(
+    main_loop: SuzkaMainLoop, belief_system: BeliefSystem
+) -> None:
+    """Replace Belief authority through the MainLoop state boundary when present."""
+
+    setter = getattr(main_loop, "_replace_belief_system_for_state", None)
+    if callable(setter):
+        setter(belief_system)
+    else:
+        setattr(main_loop, "belief_system", belief_system)
 
 
 class AgentStateStore:
@@ -1249,13 +1660,32 @@ class AgentStateStore:
                 raise AgentStateLoadError(
                     "AgentState snapshot schema is invalid"
                 ) from None
+        if version == 5:
+            schema_failure = None
+            try:
+                loaded_v5 = AgentStateSnapshotV5.model_validate(raw)
+                self._validate_value_configuration(loaded_v5)
+                _domain_value_system(loaded_v5.value_state)
+                return loaded_v5
+            except ValidationError:
+                schema_failure = AgentStateLoadError(
+                    "AgentState snapshot schema is invalid"
+                )
+            except AgentStateLoadError:
+                raise
+            except Exception:
+                schema_failure = AgentStateLoadError(
+                    "AgentState snapshot schema is invalid"
+                )
+            raise schema_failure
         if version == CURRENT_AGENT_STATE_SCHEMA_VERSION:
             schema_failure = None
             try:
-                loaded = AgentStateSnapshotV5.model_validate(raw)
-                self._validate_value_configuration(loaded)
-                _domain_value_system(loaded.value_state)
-                return loaded
+                loaded_v6 = AgentStateSnapshotV6.model_validate(raw)
+                self._validate_value_configuration(loaded_v6)
+                _domain_value_system(loaded_v6.value_state)
+                _domain_belief_system(loaded_v6.belief_state)
+                return loaded_v6
             except ValidationError:
                 schema_failure = AgentStateLoadError(
                     "AgentState snapshot schema is invalid"
@@ -1275,7 +1705,9 @@ class AgentStateStore:
             )
         raise AgentStateLoadError("AgentState schema version is invalid")
 
-    def _validate_value_configuration(self, snapshot: AgentStateSnapshotV5) -> None:
+    def _validate_value_configuration(
+        self, snapshot: AgentStateSnapshotV5 | AgentStateSnapshotV6
+    ) -> None:
         """Check configuration as compatibility evidence, never as overwrite authority."""
 
         value_system = _domain_value_system(snapshot.value_state)
@@ -1361,9 +1793,11 @@ class AgentStateStore:
             raw: object = snapshot.model_dump(mode="python")
             _reject_private_keys(raw)
             validated = validate_compatible_agent_state_snapshot(raw)
-            if isinstance(validated, AgentStateSnapshotV5):
+            if isinstance(validated, (AgentStateSnapshotV5, AgentStateSnapshotV6)):
                 self._validate_value_configuration(validated)
                 _domain_value_system(validated.value_state)
+            if isinstance(validated, AgentStateSnapshotV6):
+                _domain_belief_system(validated.belief_state)
             return self._canonical_bytes(validated)
         except (AgentStateConfigurationDrift, AgentStateLoadError):
             raise
@@ -1447,7 +1881,7 @@ class AgentStateStore:
 
     def capture(
         self, main_loop: SuzkaMainLoop, sequence: int
-    ) -> AgentStateSnapshotV5:
+    ) -> AgentStateSnapshotV5 | AgentStateSnapshotV6:
         capture_failure: AgentStateSaveError | None = None
         try:
             emotion_engine = getattr(main_loop, "emotion_engine", None)
@@ -1485,6 +1919,9 @@ class AgentStateStore:
                 raise ValueError("Value authority is unavailable")
             value_system.validate()
             self._validate_value_system_configuration(value_system)
+            belief_system = _belief_system_authority(main_loop)
+            if isinstance(belief_system, BeliefSystem):
+                belief_system.validate()
             common: dict[str, Any] = dict(
                 saved_at=self._now(),
                 last_processed_event_sequence=sequence,
@@ -1551,9 +1988,15 @@ class AgentStateStore:
                     last_emotion_update_at=temporal.last_update_at,
                 ),
             )
-            return AgentStateSnapshotV5(
+            value_state = _value_state_snapshot(value_system)
+            if not isinstance(belief_system, BeliefSystem):
+                # Older injected runtimes do not own Belief yet; retain their
+                # exact v5 contract instead of inventing an empty authority.
+                return AgentStateSnapshotV5(**common, value_state=value_state)
+            return AgentStateSnapshotV6(
                 **common,
-                value_state=_value_state_snapshot(value_system),
+                value_state=value_state,
+                belief_state=_belief_state_snapshot(belief_system),
             )
         except Exception:
             capture_failure = AgentStateSaveError(
@@ -1574,19 +2017,27 @@ class AgentStateStore:
         previous_calibration: tuple[CalibrationEntry, ...] | None = None
         previous_temporal: EmotionTemporalState | None = None
         previous_value_system: ValueSystem | None = None
+        previous_belief_system: BeliefSystem | None = None
         value_system_authority: ValueSystem | None = None
+        belief_system_authority: BeliefSystem | None = None
         value_system_was_present = False
+        belief_system_was_present = False
         emotion_engine: EmotionEngineAllostasis | None = None
         working_memory_authority: WorkingMemory | None = None
         try:
             validated = validate_compatible_agent_state_snapshot(
                 snapshot.model_dump(mode="python")
             )
-            if isinstance(validated, AgentStateSnapshotV5):
+            if isinstance(validated, (AgentStateSnapshotV5, AgentStateSnapshotV6)):
                 self._validate_value_configuration(validated)
                 restored_value_system = _domain_value_system(validated.value_state)
             else:
                 restored_value_system = self.configured_value_system
+            restored_belief_system = (
+                _domain_belief_system(validated.belief_state)
+                if isinstance(validated, AgentStateSnapshotV6)
+                else BeliefSystem()
+            )
             emotion_engine = getattr(main_loop, "emotion_engine", None)
             if not isinstance(emotion_engine, EmotionEngineAllostasis):
                 raise AgentStateLoadError("AgentState restore requires EmotionEngine")
@@ -1603,6 +2054,7 @@ class AgentStateStore:
                         AgentStateSnapshotV3,
                         AgentStateSnapshotV4,
                         AgentStateSnapshotV5,
+                        AgentStateSnapshotV6,
                     ),
                 )
                 else WorkingMemorySnapshot(revision=0, items=())
@@ -1616,7 +2068,12 @@ class AgentStateStore:
                 validated.context_state.to_registry_state()
                 if isinstance(
                     validated,
-                    (AgentStateSnapshotV3, AgentStateSnapshotV4, AgentStateSnapshotV5),
+                    (
+                        AgentStateSnapshotV3,
+                        AgentStateSnapshotV4,
+                        AgentStateSnapshotV5,
+                        AgentStateSnapshotV6,
+                    ),
                 )
                 else ContextRegistryState(0, None, (), ())
             )
@@ -1626,7 +2083,10 @@ class AgentStateStore:
                 raise AgentStateLoadError("AgentState restore requires LossCalibration")
             appraisal = (
                 validated.appraisal_state
-                if isinstance(validated, (AgentStateSnapshotV4, AgentStateSnapshotV5))
+                if isinstance(
+                    validated,
+                    (AgentStateSnapshotV4, AgentStateSnapshotV5, AgentStateSnapshotV6),
+                )
                 else AppraisalStateSnapshot(
                     calibration_entries=(), last_emotion_update_at=None
                 )
@@ -1658,14 +2118,19 @@ class AgentStateStore:
             if (
                 isinstance(
                     validated,
-                    (AgentStateSnapshotV3, AgentStateSnapshotV4, AgentStateSnapshotV5),
+                    (
+                        AgentStateSnapshotV3,
+                        AgentStateSnapshotV4,
+                        AgentStateSnapshotV5,
+                        AgentStateSnapshotV6,
+                    ),
                 )
                 and context_registry is None
             ):
                 raise AgentStateLoadError("AgentState restore requires ContextRegistry")
 
             current_value_system = _value_system_authority(main_loop)
-            if isinstance(validated, AgentStateSnapshotV5):
+            if isinstance(validated, (AgentStateSnapshotV5, AgentStateSnapshotV6)):
                 if not isinstance(current_value_system, ValueSystem):
                     raise AgentStateLoadError(
                         "AgentState restore requires ValueSystem authority"
@@ -1677,6 +2142,22 @@ class AgentStateStore:
                 value_system_authority = current_value_system
                 previous_value_system = current_value_system
                 value_system_was_present = True
+
+            current_belief_system = _belief_system_authority(main_loop)
+            if isinstance(validated, AgentStateSnapshotV6):
+                if not isinstance(current_belief_system, BeliefSystem):
+                    if restored_belief_system is not None and restored_belief_system.records:
+                        raise AgentStateLoadError(
+                            "AgentState restore requires BeliefSystem authority"
+                        )
+                else:
+                    belief_system_authority = current_belief_system
+                    previous_belief_system = current_belief_system
+                    belief_system_was_present = True
+            elif isinstance(current_belief_system, BeliefSystem):
+                belief_system_authority = current_belief_system
+                previous_belief_system = current_belief_system
+                belief_system_was_present = True
 
             previous_emotion = emotion_engine.state
             previous_working_memory_revision = working_memory_authority.revision
@@ -1695,6 +2176,8 @@ class AgentStateStore:
             calibration.restore_exact(restored_calibration)
             if value_system_authority is not None:
                 _replace_value_system_authority(main_loop, restored_value_system)
+            if belief_system_authority is not None and restored_belief_system is not None:
+                _replace_belief_system_authority(main_loop, restored_belief_system)
             emotion_engine.state = EmotionState(
                 valence=emotion.valence,
                 arousal=emotion.arousal,
@@ -1741,11 +2224,16 @@ class AgentStateStore:
                     _replace_value_system_authority(main_loop, previous_value_system)
                 except Exception:
                     pass
+            if belief_system_was_present and previous_belief_system is not None:
+                try:
+                    _replace_belief_system_authority(main_loop, previous_belief_system)
+                except Exception:
+                    pass
             restore_failure = AgentStateLoadError("AgentState restore failed")
         if restore_failure is not None:
             raise restore_failure
 
-    def _migrate_v0(self, raw: dict[str, Any]) -> AgentStateSnapshotV5:
+    def _migrate_v0(self, raw: dict[str, Any]) -> AgentStateSnapshotV6:
         migration_failure: AgentStateLoadError | None = None
         try:
             legacy = _LegacyAgentStateV0.model_validate(raw)
@@ -1779,8 +2267,10 @@ class AgentStateStore:
 
     @staticmethod
     def _canonical_bytes(snapshot: CompatibleAgentStateSnapshot) -> bytes:
-        if isinstance(snapshot, AgentStateSnapshotV5):
+        if isinstance(snapshot, (AgentStateSnapshotV5, AgentStateSnapshotV6)):
             _domain_value_system(snapshot.value_state)
+        if isinstance(snapshot, AgentStateSnapshotV6):
+            _domain_belief_system(snapshot.belief_state)
         return json.dumps(
             snapshot.model_dump(mode="json"),
             ensure_ascii=False,

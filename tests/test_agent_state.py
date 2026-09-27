@@ -11,6 +11,13 @@ import pytest
 from pydantic import ValidationError
 
 from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
+from suzka.belief import (
+    BeliefEvidence,
+    BeliefEvidenceType,
+    BeliefMutationEvidence,
+    BeliefProposition,
+    BeliefSystem,
+)
 from suzka.cognition.surprisal_calculator import LossCalibration
 from suzka.config import Settings, load_settings
 from suzka.identity import (
@@ -37,6 +44,7 @@ from suzka.runtime import (
     AgentStateSnapshotV3,
     AgentStateSnapshotV4,
     AgentStateSnapshotV5,
+    AgentStateSnapshotV6,
     AppraisalStateSnapshot,
     AgentStateStore,
     CalibrationEntrySnapshot,
@@ -53,6 +61,7 @@ from suzka.runtime import (
     WorkingMemorySourceKind,
     working_memory_item_id,
     ValueSystemStateSnapshot,
+    BeliefSystemStateSnapshot,
 )
 import suzka.runtime.agent_state as agent_state_module
 
@@ -108,6 +117,42 @@ class ValueLoopStub(LoopStub):
     def __init__(self, value_system: ValueSystem) -> None:
         super().__init__(EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0))
         self.value_system = value_system
+
+
+class BeliefLoopStub(LoopStub):
+    def __init__(self, belief_system: BeliefSystem) -> None:
+        super().__init__(EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0))
+        self.belief_system = belief_system
+
+
+def belief_system_with_proposal() -> BeliefSystem:
+    system = BeliefSystem()
+    system.create_proposal(
+        BeliefProposition("Alice likes tea", "Alice", "likes", "tea"),
+        BeliefMutationEvidence(
+            event_id="belief-event:1",
+            event_sequence=1,
+            recorded_at=NOW,
+        ),
+        evidence=(BeliefEvidence("claim:1", BeliefEvidenceType.EXTERNAL_CLAIM),),
+    )
+    return system
+
+
+def belief_system_with_compacted_history() -> BeliefSystem:
+    system = belief_system_with_proposal()
+    current = system.records[0]
+    for sequence in range(2, 42):
+        current = system.correct(
+            current.belief_id,
+            replace(current, confidence=(sequence % 10) / 10),
+            BeliefMutationEvidence(
+                event_id=f"belief-event:{sequence}",
+                event_sequence=sequence,
+                recorded_at=NOW,
+            ),
+        )
+    return system
 
 
 def value_system_with_history(seed: ValueSeedDeclaration) -> ValueSystem:
@@ -336,6 +381,78 @@ def test_v5_round_trip_preserves_complete_value_authority_without_replay(
     assert target.value_system is not source_system
     assert target.value_system.snapshot() == source_system.snapshot()
     assert target.value_system.history(seed.value_id).history_anchor_revision == 1
+
+
+def test_v6_round_trip_preserves_intrinsic_belief_authority_without_replay(
+    tmp_path: Path,
+) -> None:
+    source_system = belief_system_with_proposal()
+    store = make_store(tmp_path / "agent_state.json")
+    source = BeliefLoopStub(source_system)
+
+    snapshot = store.capture(source, sequence=4)
+    assert isinstance(snapshot, AgentStateSnapshotV6)
+    assert len(snapshot.belief_state.records) == 1
+    store.save(snapshot)
+
+    target = BeliefLoopStub(BeliefSystem())
+    loaded = store.load()
+    assert isinstance(loaded, AgentStateSnapshotV6)
+    store.restore_into(target, loaded)
+
+    assert target.belief_system.snapshot() == source_system.snapshot()
+    assert target.belief_system.snapshot().authority_digest == (
+        loaded.belief_state.authority_digest
+    )
+
+
+def test_v6_round_trip_preserves_compacted_belief_history_without_replay(
+    tmp_path: Path,
+) -> None:
+    source_system = belief_system_with_compacted_history()
+    store = make_store(tmp_path / "agent_state.json")
+    source = BeliefLoopStub(source_system)
+
+    snapshot = store.capture(source, sequence=41)
+    assert isinstance(snapshot, AgentStateSnapshotV6)
+    assert len(snapshot.belief_state.records[0].revision_history) == 32
+    assert snapshot.belief_state.records[0].history_anchor_digest is not None
+    store.save(snapshot)
+
+    target = BeliefLoopStub(BeliefSystem())
+    loaded = store.load()
+    store.restore_into(target, loaded)
+
+    assert target.belief_system.snapshot() == source_system.snapshot()
+    assert target.belief_system.records[0].history_anchor_digest == (
+        source_system.records[0].history_anchor_digest
+    )
+
+
+def test_v6_nonempty_belief_restore_requires_intrinsic_authority(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path / "agent_state.json")
+    snapshot = store.capture(BeliefLoopStub(belief_system_with_proposal()), sequence=4)
+
+    with pytest.raises(AgentStateLoadError, match="BeliefSystem authority"):
+        store.restore_into(LoopStub(EmotionState(0.0, 0.0, 1.0)), snapshot)
+
+
+def test_legacy_v5_restore_clears_belief_authority_not_in_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path / "agent_state.json")
+    legacy = store.capture(
+        LoopStub(EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0)),
+        sequence=4,
+    )
+    assert isinstance(legacy, AgentStateSnapshotV5)
+    target = BeliefLoopStub(belief_system_with_proposal())
+
+    store.restore_into(target, legacy)
+
+    assert target.belief_system.records == ()
 
 
 def test_v5_origin_witness_rejects_provenance_tampering_without_rewrite(
@@ -953,11 +1070,12 @@ def test_missing_snapshot_returns_safe_configured_default(tmp_path: Path) -> Non
         arousal=0.0,
         optimal_loss=2.5,
     )
-    assert isinstance(snapshot, AgentStateSnapshotV5)
-    assert snapshot.schema_version == 5
+    assert isinstance(snapshot, AgentStateSnapshotV6)
+    assert snapshot.schema_version == 6
     assert snapshot.value_state == ValueSystemStateSnapshot(
         values=(), conflicts=(), histories=(), evidence_ledgers=()
     )
+    assert snapshot.belief_state.records == ()
     assert snapshot.working_memory == WorkingMemorySnapshot(revision=0, items=())
     assert snapshot.context_state == ContextStateSnapshot(
         revision=0,
@@ -996,7 +1114,7 @@ def test_v0_migrates_strictly_to_v4(tmp_path: Path) -> None:
 
     migrated = make_store(path).load()
 
-    assert migrated == AgentStateSnapshotV5(
+    assert migrated == AgentStateSnapshotV6(
         saved_at=NOW,
         last_processed_event_sequence=7,
         emotion_state=EmotionStateSnapshot(
@@ -1014,10 +1132,16 @@ def test_v0_migrates_strictly_to_v4(tmp_path: Path) -> None:
         appraisal_state=AppraisalStateSnapshot(
             calibration_entries=(), last_emotion_update_at=None
         ),
-        value_state=ValueSystemStateSnapshot(
-            values=(), conflicts=(), histories=(), evidence_ledgers=()
-        ),
-    )
+            value_state=ValueSystemStateSnapshot(
+                values=(), conflicts=(), histories=(), evidence_ledgers=()
+            ),
+            belief_state=BeliefSystemStateSnapshot(
+                records=(),
+                authority_digest=(
+                    "a034e31171a907dcf0ebe53ae8c82871fed8b674248760414f8f83b1acd27091"
+                ),
+            ),
+        )
 
 
 def test_v0_migration_rejects_unexpected_fields(tmp_path: Path) -> None:
@@ -1483,7 +1607,7 @@ def test_ensure_published_stabilizes_bootstrap_and_v0_snapshot(tmp_path: Path) -
     migrated = legacy_store.load()
     legacy_store.ensure_published(migrated)
     assert legacy_path.read_bytes() == legacy_store.canonical_bytes(migrated)
-    assert json.loads(legacy_path.read_text(encoding="utf-8"))["schema_version"] == 5
+    assert json.loads(legacy_path.read_text(encoding="utf-8"))["schema_version"] == 6
 
 
 def test_ensure_published_does_not_rewrite_identical_canonical_snapshot(
