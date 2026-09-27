@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from kagya.memory.semantic_lifecycle import (
+from suzka.memory.semantic_lifecycle import (
     SEMANTIC_MAX_EVENT_SEQUENCE,
     SEMANTIC_MAX_SOURCE_EDGES,
     SemanticLifecycle,

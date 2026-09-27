@@ -1,6 +1,6 @@
 import pytest
 
-from kagya.identity.origin import (
+from suzka.identity.origin import (
     IdentityOrigin,
     OriginActor,
     OriginInputKind,

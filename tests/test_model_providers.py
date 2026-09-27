@@ -5,10 +5,10 @@ import json
 import pytest
 import torch
 
-from kagya.config import load_settings
-from kagya.models.dummy_provider import DummyProvider
-from kagya.models.model_loader import load_model_provider
-from kagya.models.transformers_provider import (
+from suzka.config import load_settings
+from suzka.models.dummy_provider import DummyProvider
+from suzka.models.model_loader import load_model_provider
+from suzka.models.transformers_provider import (
     TransformersProvider,
     is_registry_approved_adapter,
 )
@@ -97,11 +97,11 @@ def test_transformers_provider_loads_configured_model_id(monkeypatch: pytest.Mon
         return FakeModel()
 
     monkeypatch.setattr(
-        "kagya.models.transformers_provider.AutoProcessor.from_pretrained",
+        "suzka.models.transformers_provider.AutoProcessor.from_pretrained",
         fake_processor_from_pretrained,
     )
     monkeypatch.setattr(
-        "kagya.models.transformers_provider.AutoModelForImageTextToText.from_pretrained",
+        "suzka.models.transformers_provider.AutoModelForImageTextToText.from_pretrained",
         fake_model_from_pretrained,
     )
 

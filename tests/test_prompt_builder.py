@@ -1,14 +1,14 @@
 """U4 PromptBuilder contract tests."""
 
-from kagya.body import EmotionState
-from kagya.identity import (
+from suzka.body import EmotionState
+from suzka.identity import (
     ValueSeedDeclaration,
     ValuePromptView,
     ValueScope,
     ValueSystem,
 )
-from kagya.persona import PromptBuilder
-from kagya.runtime import (
+from suzka.persona import PromptBuilder
+from suzka.runtime import (
     WorkingMemoryDecision,
     WorkingMemoryDecisionReason,
     WorkingMemorySelection,

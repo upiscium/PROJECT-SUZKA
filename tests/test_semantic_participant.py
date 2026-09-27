@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from kagya.config import Settings, load_settings
-from kagya.memory import (
+from suzka.config import Settings, load_settings
+from suzka.memory import (
     DualMemorySystem,
     EpisodicMemoryReadError,
     MemorySemanticParticipant,
@@ -21,7 +21,7 @@ from kagya.memory import (
     SemanticStore,
     semantic_id_for_batch_entry,
 )
-from kagya.memory.semantic_lifecycle import (
+from suzka.memory.semantic_lifecycle import (
     SemanticLifecycle,
     SemanticRevision,
     SemanticRevisionOperation,
@@ -31,7 +31,7 @@ from kagya.memory.semantic_lifecycle import (
     SemanticSourceStatus,
     semantic_content_digest,
 )
-from kagya.runtime import (
+from suzka.runtime import (
     AbortOutcome,
     AgentEvent,
     AgentEventSource,
@@ -213,7 +213,7 @@ def test_first_create_publication_crash_leaves_pending_and_restart_finalizes_onc
     participant, binding, revision = _create_participant(memory)
     participant.prepare(binding)
 
-    import kagya.memory.semantic_store as semantic_store_module
+    import suzka.memory.semantic_store as semantic_store_module
 
     real_fsync = semantic_store_module.os.fsync
     real_link = semantic_store_module.os.link
