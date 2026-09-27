@@ -12,28 +12,28 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID, uuid5
 
-from kagya.memory.dual_memory_system import (
+from suzka.memory.dual_memory_system import (
     DualMemorySystem,
     SemanticMemoryFormatError,
     SemanticMemoryReadError,
     SemanticProjectionStatus,
 )
-from kagya.memory.episodic_participant import (
+from suzka.memory.episodic_participant import (
     MEMORY_EPISODIC_PARTICIPANT_ID,
     MemoryEpisodicParticipant,
 )
-from kagya.memory.experience_participant import (
+from suzka.memory.experience_participant import (
     MEMORY_EXPERIENCE_PARTICIPANT_ID,
     MemoryExperienceParticipant,
 )
-from kagya.memory.experience_store import ExperienceStore
-from kagya.memory.semantic_participant import (
+from suzka.memory.experience_store import ExperienceStore
+from suzka.memory.semantic_participant import (
     MEMORY_SEMANTIC_PARTICIPANT_ID,
     MemorySemanticParticipant,
 )
-from kagya.memory.semantic_store import SemanticStore, SemanticStoreError
-from kagya.runtime.agent_runtime import AgentEvent
-from kagya.runtime.event_journal import (
+from suzka.memory.semantic_store import SemanticStore, SemanticStoreError
+from suzka.runtime.agent_runtime import AgentEvent
+from suzka.runtime.event_journal import (
     EventJournal,
     EventJournalIntegrityError,
     EventJournalParticipantBaseline,
@@ -51,17 +51,17 @@ from kagya.runtime.event_journal import (
     StartupParticipantOutcome,
     startup_participant_aggregate_digest,
 )
-from kagya.runtime.session_participant import (
+from suzka.runtime.session_participant import (
     SESSION_TURN_PARTICIPANT_ID,
     inspect_reset_session_operation,
 )
-from kagya.runtime.state_recovery import (
+from suzka.runtime.state_recovery import (
     InternalCommitClassification,
     StateRecoveryCoordinator,
     StateRecoveryError,
     StateRecoveryResult,
 )
-from kagya.runtime.transaction_coordinator import (
+from suzka.runtime.transaction_coordinator import (
     ParticipantDivergedError,
     ParticipantUnavailableError,
     ReconcilableTransactionParticipant,

@@ -8,13 +8,13 @@ import re
 from dataclasses import dataclass
 from uuid import UUID
 
-from kagya.runtime.event_journal import (
+from suzka.runtime.event_journal import (
     ParticipantCapability,
     ParticipantOutcome,
     StartupParticipantOutcome,
 )
-from kagya.runtime.session_state import SessionState
-from kagya.runtime.transaction_coordinator import (
+from suzka.runtime.session_state import SessionState
+from suzka.runtime.transaction_coordinator import (
     ParticipantDivergedError,
     TransactionBinding,
     validate_transaction_binding,
@@ -22,7 +22,7 @@ from kagya.runtime.transaction_coordinator import (
 
 
 SESSION_TURN_PARTICIPANT_ID = "session.turn"
-_SESSION_HASH_DOMAIN = b"PROJECT-KAGYA:R07:SESSION-TURN:V1\x00"
+_SESSION_HASH_DOMAIN = b"PROJECT-SUZKA:R07:SESSION-TURN:V1\x00"
 
 
 @dataclass(frozen=True, slots=True)

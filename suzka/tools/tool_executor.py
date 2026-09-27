@@ -1,8 +1,8 @@
 """Tool executor skeleton that intentionally executes nothing."""
 
-from kagya.tools.tool_registry import ToolRegistry
-from kagya.tools.tool_sandbox import ToolSandbox
-from kagya.tools.tool_schema import ToolExecutionRequest, ToolExecutionResult
+from suzka.tools.tool_registry import ToolRegistry
+from suzka.tools.tool_sandbox import ToolSandbox
+from suzka.tools.tool_schema import ToolExecutionRequest, ToolExecutionResult
 
 
 class ToolExecutionBlocked(RuntimeError):

@@ -9,8 +9,8 @@ from threading import RLock
 from typing import Generic, Protocol, TypeVar, cast, runtime_checkable
 from uuid import UUID, uuid5
 
-from kagya.runtime.agent_runtime import AgentEvent
-from kagya.runtime.event_journal import (
+from suzka.runtime.agent_runtime import AgentEvent
+from suzka.runtime.event_journal import (
     AbortOutcome,
     EventJournal,
     EventJournalTransaction,
@@ -21,7 +21,7 @@ from kagya.runtime.event_journal import (
     StartupParticipantOutcome,
     TransactionKind,
 )
-from kagya.runtime.state_recovery import InternalCommitEvidence
+from suzka.runtime.state_recovery import InternalCommitEvidence
 
 
 T = TypeVar("T")
