@@ -165,13 +165,6 @@ class WorkingMemoryResolution:
                 raise ValueError("resolved Working Memory content must be a string")
             if self.source_context_id is not None:
                 validate_identifier(self.source_context_id)
-            if (
-                self.source_context_id is not None
-                and self.context_projection is not None
-            ):
-                raise ValueError(
-                    "resolved Working Memory provenance must not be ambiguous"
-                )
             if self.context_projection is not None:
                 score = self.context_projection.aggregate_compatibility
                 if (
