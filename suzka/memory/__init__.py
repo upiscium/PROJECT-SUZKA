@@ -13,6 +13,7 @@ from suzka.memory.dual_memory_system import (
     SemanticProjectionStatus,
     semantic_projection_metadata,
 )
+from suzka.memory.semantic_context_projection import SemanticContextEvidence
 from suzka.memory.memory_schema import (
     EpisodicMemoryRecord,
     MemoryContext,
@@ -65,6 +66,7 @@ __all__ = [
     "SemanticProjectionInspection",
     "SemanticProjectionStatus",
     "semantic_projection_metadata",
+    "SemanticContextEvidence",
     "ExperienceCreateIntent",
     "ExperienceRevisionIntent",
     "ExperienceStore",

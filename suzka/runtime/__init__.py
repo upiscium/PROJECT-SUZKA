@@ -75,6 +75,11 @@ from suzka.runtime.chat_context import (
     resolve_chat_context,
 )
 from suzka.runtime.working_memory import (
+    ContextualProjection,
+    ContextualEvidence,
+    ContextualSourceEvidence,
+    ContextualWorkingMemoryResolver,
+    WorkingMemoryContextProjection,
     WorkingMemory,
     WorkingMemoryAdmission,
     WorkingMemoryAdmissionReason,
@@ -188,6 +193,11 @@ __all__ = [
     "AgentRuntimeStatus",
     "AgentRuntimeStopped",
     "WorkingMemory",
+    "ContextualProjection",
+    "ContextualEvidence",
+    "ContextualSourceEvidence",
+    "ContextualWorkingMemoryResolver",
+    "WorkingMemoryContextProjection",
     "WorkingMemoryAdmission",
     "WorkingMemoryAdmissionReason",
     "WorkingMemoryDecision",

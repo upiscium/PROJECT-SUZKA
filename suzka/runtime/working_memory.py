@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 from threading import RLock
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from suzka.identifiers import validate_identifier
 from suzka.runtime.context import ContextRelation
@@ -24,6 +24,12 @@ MAX_SOURCE_ID_BYTES = 128
 REACTIVATION_BONUS = 0.2
 _ITEM_ID_DOMAIN = b"suzka-working-memory-item-v1\0"
 _SOURCE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
+_CONTEXTUAL_SOURCE_STATUSES = frozenset(
+    {"available", "unknown", "missing", "retracted", "superseded"}
+)
+_CONTEXTUAL_PROVENANCE_CLASSES = frozenset(
+    {"single_context", "multi_context", "unknown", "incomplete"}
+)
 
 
 class WorkingMemorySourceKind(str, Enum):
@@ -50,6 +56,177 @@ class WorkingMemoryDecisionReason(str, Enum):
     SOURCE_UNAVAILABLE = "source_unavailable"
     SOURCE_MALFORMED = "source_malformed"
     PROJECTION_BUDGET = "projection_budget"
+
+
+@dataclass(frozen=True, slots=True)
+class ContextualSourceEvidence:
+    """Runtime-owned, transport-neutral evidence for one source edge."""
+
+    source_kind: str
+    source_id: str
+    source_revision: int | None
+    source_status: str
+    captured_context_id: str | None
+    context_relation: ContextRelation
+    compatibility_score: float
+
+    def __post_init__(self) -> None:
+        source_kind = (
+            self.source_kind.value
+            if isinstance(self.source_kind, Enum)
+            else self.source_kind
+        )
+        if source_kind not in {
+            WorkingMemorySourceKind.EPISODIC.value,
+            WorkingMemorySourceKind.SEMANTIC.value,
+        }:
+            raise ValueError("source_kind is unsupported")
+        object.__setattr__(self, "source_kind", source_kind)
+        object.__setattr__(self, "source_id", validate_identifier(self.source_id))
+        if self.source_revision is not None and (
+            isinstance(self.source_revision, bool)
+            or not isinstance(self.source_revision, int)
+            or self.source_revision < 0
+        ):
+            raise ValueError("source_revision must be a non-negative integer")
+        if source_kind == WorkingMemorySourceKind.EPISODIC.value and (
+            self.source_revision is not None
+        ):
+            raise ValueError("episodic source evidence cannot carry a revision")
+        if source_kind == WorkingMemorySourceKind.SEMANTIC.value and (
+            self.source_revision is None
+        ):
+            raise ValueError("semantic source evidence requires a revision")
+        source_status = (
+            self.source_status.value
+            if isinstance(self.source_status, Enum)
+            else self.source_status
+        )
+        if source_status not in _CONTEXTUAL_SOURCE_STATUSES:
+            raise ValueError("source_status is unsupported")
+        object.__setattr__(self, "source_status", source_status)
+        if self.captured_context_id is not None:
+            object.__setattr__(
+                self,
+                "captured_context_id",
+                validate_identifier(self.captured_context_id),
+            )
+        if not isinstance(self.context_relation, ContextRelation):
+            raise TypeError("context_relation must be ContextRelation")
+        _unit_float(self.compatibility_score, "compatibility_score")
+
+
+@dataclass(frozen=True, slots=True)
+class ContextualProjection:
+    """Ephemeral aggregate contextual evidence; never Working Memory authority."""
+
+    provenance_classification: str
+    source_count: int
+    source_evidence: tuple[ContextualSourceEvidence, ...]
+    compatibility_score: float
+    cross_context: bool
+    unknown_or_incomplete: bool
+    source_less: bool
+    authoritative_revision: int | None = None
+    authoritative_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        provenance_classification = (
+            self.provenance_classification.value
+            if isinstance(self.provenance_classification, Enum)
+            else self.provenance_classification
+        )
+        if provenance_classification not in _CONTEXTUAL_PROVENANCE_CLASSES:
+            raise ValueError("provenance_classification is unsupported")
+        object.__setattr__(self, "provenance_classification", provenance_classification)
+        if isinstance(self.source_count, bool) or not isinstance(self.source_count, int):
+            raise ValueError("source_count must be an integer")
+        if type(self.source_evidence) is not tuple or any(
+            not isinstance(evidence, ContextualSourceEvidence)
+            for evidence in self.source_evidence
+        ):
+            raise TypeError("source_evidence must be a tuple of contextual evidence")
+        identities = tuple(
+            (
+                evidence.source_kind,
+                evidence.source_id,
+                -1 if evidence.source_revision is None else evidence.source_revision,
+            )
+            for evidence in self.source_evidence
+        )
+        if len(set(identities)) != len(identities):
+            raise ValueError("source_evidence contains duplicate source edges")
+        if identities != tuple(sorted(identities)):
+            raise ValueError("source_evidence must be canonicalized")
+        if self.source_count != len(self.source_evidence):
+            raise ValueError("source_count does not match source_evidence")
+        if self.source_count:
+            expected = sum(e.compatibility_score for e in self.source_evidence) / self.source_count
+        else:
+            expected = self.compatibility_score
+        _unit_float(self.compatibility_score, "compatibility_score")
+        if self.compatibility_score != expected:
+            raise ValueError("compatibility_score must be the arithmetic mean")
+        if not isinstance(self.cross_context, bool) or not isinstance(self.unknown_or_incomplete, bool):
+            raise TypeError("projection flags must be bool")
+        if not isinstance(self.source_less, bool) or self.source_less != (self.source_count == 0):
+            raise ValueError("source_less must match source_count")
+        if self.cross_context != (
+            provenance_classification == "multi_context"
+        ):
+            raise ValueError("cross_context does not match provenance_classification")
+        if self.unknown_or_incomplete != (
+            provenance_classification in {"unknown", "incomplete"}
+        ):
+            raise ValueError(
+                "unknown_or_incomplete does not match provenance_classification"
+            )
+        if (self.authoritative_revision is None) != (
+            self.authoritative_digest is None
+        ):
+            raise ValueError("authority revision and digest must be bound together")
+        if self.authoritative_revision is not None and (
+            isinstance(self.authoritative_revision, bool)
+            or not isinstance(self.authoritative_revision, int)
+            or self.authoritative_revision < 0
+        ):
+            raise ValueError("authoritative_revision must be non-negative")
+        if self.authoritative_digest is not None:
+            if (
+                not isinstance(self.authoritative_digest, str)
+                or len(self.authoritative_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in self.authoritative_digest
+                )
+            ):
+                raise ValueError("authoritative_digest must be a lowercase SHA-256 digest")
+
+    @property
+    def aggregate_compatibility(self) -> float:
+        return self.compatibility_score
+
+    @property
+    def evidence(self) -> tuple[ContextualSourceEvidence, ...]:
+        return self.source_evidence
+
+    @property
+    def per_source_evidence(self) -> tuple[ContextualSourceEvidence, ...]:
+        return self.source_evidence
+
+    @property
+    def source_edges(self) -> tuple[ContextualSourceEvidence, ...]:
+        return self.source_evidence
+
+    @property
+    def provenance_class(self) -> str:
+        return self.provenance_classification
+
+
+class ContextualWorkingMemoryResolver(Protocol):
+    def resolve_contextual(
+        self, item: "WorkingMemoryItem", context_registry: "ContextRegistry", current_context_id: str
+    ) -> "WorkingMemoryResolution": ...
 
 
 class WorkingMemoryAdmissionReason(str, Enum):
@@ -98,6 +275,7 @@ class WorkingMemorySelection:
     context_relation: ContextRelation | None = None
     context_compatibility: float | None = None
     effective_score: float | None = None
+    contextual_projection: ContextualProjection | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +291,7 @@ class WorkingMemoryDecision:
     context_relation: ContextRelation | None = None
     context_compatibility: float | None = None
     effective_score: float | None = None
+    contextual_projection: ContextualProjection | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +323,7 @@ class WorkingMemoryResolution:
     status: WorkingMemoryResolutionStatus
     rendered_content: str | None = None
     source_context_id: str | None = None
+    contextual_projection: ContextualProjection | None = None
 
     def __post_init__(self) -> None:
         if type(self.status) is not WorkingMemoryResolutionStatus:
@@ -153,6 +333,8 @@ class WorkingMemoryResolution:
                 raise ValueError("resolved Working Memory content must be a string")
             if self.source_context_id is not None:
                 validate_identifier(self.source_context_id)
+        elif self.contextual_projection is not None:
+            raise ValueError("non-resolved Working Memory cannot carry projection")
         elif self.rendered_content is not None:
             raise ValueError("non-resolved Working Memory content must be None")
         elif self.source_context_id is not None:
@@ -161,6 +343,11 @@ class WorkingMemoryResolution:
 
 WorkingMemoryResolverResult = str | WorkingMemoryResolution | None
 WorkingMemoryResolver = Callable[[WorkingMemoryItem], WorkingMemoryResolverResult]
+
+# Descriptive aliases keep the contract usable without coupling callers to WM
+# terminology while retaining one immutable implementation.
+ContextualEvidence = ContextualSourceEvidence
+WorkingMemoryContextProjection = ContextualProjection
 
 
 def working_memory_item_id(
@@ -503,6 +690,7 @@ class WorkingMemory:
                     ContextRelation | None,
                     float | None,
                     float | None,
+                    ContextualProjection | None,
                 ]
             ] = []
             for item in items:
@@ -512,8 +700,14 @@ class WorkingMemory:
                 relation: ContextRelation | None = None
                 compatibility_score: float | None = None
                 effective_score: float | None = None
+                contextual_projection: ContextualProjection | None = None
                 try:
-                    resolved = resolver(item)
+                    contextual_resolver = getattr(resolver, "resolve_contextual", None)
+                    resolved = (
+                        contextual_resolver(item, context_registry, current_context_id)
+                        if callable(contextual_resolver)
+                        else resolver(item)
+                    )
                     if resolved is None:
                         reason = WorkingMemoryDecisionReason.UNRESOLVED_REFERENCE
                     elif isinstance(resolved, str):
@@ -544,17 +738,30 @@ class WorkingMemory:
                         else:
                             rendered = resolved.rendered_content
                             source_context_id = resolved.source_context_id
+                            contextual_projection = resolved.contextual_projection
                             reason = WorkingMemoryDecisionReason.SELECTED
                 except Exception:
                     reason = WorkingMemoryDecisionReason.RESOLVER_FAILURE
 
                 if rendered is not None:
-                    compatibility = context_registry.compatibility(
-                        source_context_id, current_context_id
-                    )
-                    relation = compatibility.relation
-                    compatibility_score = compatibility.score
-                    effective_score = base_score * compatibility_score
+                    if contextual_projection is not None:
+                        compatibility_score = contextual_projection.compatibility_score
+                        effective_score = base_score * compatibility_score
+                        if (
+                            contextual_projection.source_count == 1
+                            and not contextual_projection.unknown_or_incomplete
+                            and not contextual_projection.cross_context
+                        ):
+                            evidence = contextual_projection.source_evidence[0]
+                            source_context_id = evidence.captured_context_id
+                            relation = evidence.context_relation
+                    else:
+                        compatibility = context_registry.compatibility(
+                            source_context_id, current_context_id
+                        )
+                        relation = compatibility.relation
+                        compatibility_score = compatibility.score
+                        effective_score = base_score * compatibility_score
                 candidates.append(
                     (
                         item,
@@ -565,6 +772,7 @@ class WorkingMemory:
                         relation,
                         compatibility_score,
                         effective_score,
+                        contextual_projection,
                     )
                 )
 
@@ -590,9 +798,10 @@ class WorkingMemory:
                 reason,
                 source_context_id,
                 relation,
-                compatibility_score,
-                effective_score,
-            ) in candidates:
+                    compatibility_score,
+                    effective_score,
+                    contextual_projection,
+                ) in candidates:
                 if rendered is not None:
                     rendered_bytes = len(rendered.encode("utf-8"))
                     if projected_bytes + rendered_bytes > projection_max_bytes:
@@ -612,6 +821,7 @@ class WorkingMemory:
                         context_relation=relation,
                         context_compatibility=compatibility_score,
                         effective_score=effective_score,
+                        contextual_projection=contextual_projection,
                     )
                 )
                 if is_selected:
@@ -628,6 +838,7 @@ class WorkingMemory:
                             context_relation=relation,
                             context_compatibility=compatibility_score,
                             effective_score=effective_score,
+                            contextual_projection=contextual_projection,
                         )
                     )
             return WorkingMemoryView(
