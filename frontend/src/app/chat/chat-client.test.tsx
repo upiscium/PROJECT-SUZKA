@@ -30,7 +30,7 @@ describe("ChatClient", () => {
     });
     renderWithQuery();
 
-    await userEvent.type(screen.getByPlaceholderText("Send a message to PROJECT-KAGYA"), "hello");
+    await userEvent.type(screen.getByPlaceholderText("Send a message to PROJECT-SUZKA"), "hello");
     await userEvent.click(screen.getByRole("button", { name: "Send" }));
 
     expect(await screen.findByText("Visible answer")).toBeInTheDocument();
