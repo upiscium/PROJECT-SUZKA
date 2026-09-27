@@ -1,7 +1,6 @@
 """The current repository uses SUZKA for all product and durable namespaces."""
 
 from pathlib import Path
-import re
 import subprocess
 
 from suzka.belief import records as belief_records
@@ -77,22 +76,27 @@ def test_authoritative_domain_constants_use_suzka_namespace() -> None:
 
 def test_tracked_tree_has_no_pre_rename_namespace() -> None:
     repository = Path(__file__).resolve().parents[1]
-    product_marker = "PROJECT-" + "K" + "AGYA"
-    forbidden = (
-        product_marker,
-        "K" + "AGYA_",
-        "X-" + "K" + "AGYA",
-        "." + "k" + "agya",
-        "k" + "agya" + ".",
-        "k" + "agya" + "-",
-    )
-    pattern = "|".join(re.escape(marker) for marker in forbidden)
-    result = subprocess.run(
-        ["git", "grep", "-n", "-E", pattern, "--", "."],
+    old_name = "k" + "agya"
+    content_result = subprocess.run(
+        ["git", "grep", "-n", "-i", "-F", old_name, "--", "."],
         cwd=repository,
         capture_output=True,
         check=False,
         text=True,
     )
-    assert result.returncode in (0, 1)
-    assert result.stdout == ""
+    assert content_result.returncode in (0, 1), content_result.stderr
+    assert content_result.stdout == ""
+
+    tracked_paths = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+    ).stdout.split(b"\0")
+    old_name_bytes = old_name.encode("ascii")
+    stale_paths = [
+        path.decode("utf-8", errors="surrogateescape")
+        for path in tracked_paths
+        if path and old_name_bytes in path.lower()
+    ]
+    assert stale_paths == []
