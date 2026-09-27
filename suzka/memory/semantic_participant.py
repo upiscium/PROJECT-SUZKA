@@ -9,7 +9,7 @@ import json
 import re
 from uuid import UUID, uuid5
 
-from kagya.memory.dual_memory_system import (
+from suzka.memory.dual_memory_system import (
     DualMemorySystem,
     EpisodicMemoryFormatError,
     EpisodicMemoryReadError,
@@ -17,7 +17,7 @@ from kagya.memory.dual_memory_system import (
     SemanticMemoryReadError,
     SemanticProjectionStatus,
 )
-from kagya.memory.semantic_lifecycle import (
+from suzka.memory.semantic_lifecycle import (
     SEMANTIC_MAX_REVISION,
     SemanticLifecycle,
     SemanticRevision,
@@ -25,7 +25,7 @@ from kagya.memory.semantic_lifecycle import (
     SemanticSourceKind,
     SemanticSourceStatus,
 )
-from kagya.memory.semantic_store import (
+from suzka.memory.semantic_store import (
     SEMANTIC_PENDING_SCHEMA_VERSION,
     SEMANTIC_RECEIPT_SCHEMA_VERSION,
     SemanticStore,
@@ -37,26 +37,26 @@ from kagya.memory.semantic_store import (
     semantic_revision_from_dict,
     semantic_revision_to_dict,
 )
-from kagya.runtime.event_journal import (
+from suzka.runtime.event_journal import (
     AbortOutcome,
     ParticipantCapability,
     ParticipantOutcome,
     StartupParticipantOutcome,
 )
-from kagya.runtime.transaction_coordinator import (
+from suzka.runtime.transaction_coordinator import (
     ParticipantDivergedError,
     ParticipantUnavailableError,
     TransactionBinding,
     UnsupportedParticipantReconciliationError,
     validate_transaction_binding,
 )
-from kagya.identifiers import validate_identifier
+from suzka.identifiers import validate_identifier
 
 
 MEMORY_SEMANTIC_PARTICIPANT_ID = "memory.semantic"
 SEMANTIC_MAX_BATCH_ENTRIES = 128
 _SEMANTIC_ID_NAMESPACE = UUID("4a64ff28-55e0-5e7d-9f6d-08f743ab4b47")
-_OPERATION_DOMAIN = b"PROJECT-KAGYA:R12:SEMANTIC-PARTICIPANT:V1\0"
+_OPERATION_DOMAIN = b"PROJECT-SUZKA:R12:SEMANTIC-PARTICIPANT:V1\0"
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 
 

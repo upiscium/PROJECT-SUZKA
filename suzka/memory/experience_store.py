@@ -11,7 +11,7 @@ import stat
 from typing import Any
 from uuid import UUID, uuid4
 
-from kagya.experience import (
+from suzka.experience import (
     EXPERIENCE_MAX_REVISION,
     ExperienceAppraisalEvidence,
     ExperienceAppraisalReasonCode,
@@ -29,7 +29,7 @@ from kagya.experience import (
     ExperienceValenceContributions,
     experience_record_digest,
 )
-from kagya.identifiers import validate_identifier
+from suzka.identifiers import validate_identifier
 
 
 EXPERIENCE_STORE_SCHEMA_VERSION = 2

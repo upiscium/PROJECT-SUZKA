@@ -18,8 +18,8 @@ import stat
 from typing import Any
 from uuid import UUID, uuid4
 
-from kagya.identifiers import validate_identifier
-from kagya.memory.semantic_lifecycle import (
+from suzka.identifiers import validate_identifier
+from suzka.memory.semantic_lifecycle import (
     SEMANTIC_MAX_REVISION,
     SemanticLifecycle,
     SemanticProvenanceClass,

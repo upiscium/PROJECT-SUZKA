@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from kagya.runtime.working_memory import (
+from suzka.runtime.working_memory import (
     WorkingMemoryItem,
     WorkingMemoryResolution,
     WorkingMemoryResolutionStatus,
@@ -12,7 +12,7 @@ from kagya.runtime.working_memory import (
 )
 
 if TYPE_CHECKING:
-    from kagya.memory.dual_memory_system import DualMemorySystem
+    from suzka.memory.dual_memory_system import DualMemorySystem
 
 
 class MemoryWorkingMemoryResolver:
@@ -30,7 +30,7 @@ class MemoryWorkingMemoryResolver:
 
         # Importing the domain exceptions here keeps the bridge out of the
         # memory package's public initializer and avoids an import cycle.
-        from kagya.memory.dual_memory_system import (
+        from suzka.memory.dual_memory_system import (
             EpisodicMemoryFormatError,
             EpisodicMemoryReadError,
             SemanticMemoryFormatError,

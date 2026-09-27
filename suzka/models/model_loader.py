@@ -1,9 +1,9 @@
 """Factory for configured model providers."""
 
-from kagya.config import Settings, get_settings
-from kagya.models.base import ModelProvider
-from kagya.models.dummy_provider import DummyProvider
-from kagya.models.transformers_provider import TransformersProvider
+from suzka.config import Settings, get_settings
+from suzka.models.base import ModelProvider
+from suzka.models.dummy_provider import DummyProvider
+from suzka.models.transformers_provider import TransformersProvider
 
 
 def load_model_provider(settings: Settings | None = None) -> ModelProvider:
