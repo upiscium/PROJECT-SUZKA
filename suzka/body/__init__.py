@@ -1,6 +1,6 @@
-"""Body-state primitives for PROJECT-KAGYA."""
+"""Body-state primitives for PROJECT-SUZKA."""
 
-from kagya.body.emotion_engine import (
+from suzka.body.emotion_engine import (
     ArousalContributions,
     EmotionEngineAllostasis,
     EmotionState,

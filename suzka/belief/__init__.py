@@ -1,6 +1,6 @@
 """Pure, bounded Belief contracts for R12 U1."""
 
-from kagya.belief.records import (
+from suzka.belief.records import (
     AdmissionReason,
     BELIEF_ADMISSION_DOMAIN,
     BELIEF_MAX_COMPONENT_CODEPOINTS,
