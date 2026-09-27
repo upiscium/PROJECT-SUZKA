@@ -1,12 +1,12 @@
-# PROJECT-KAGYA Agent Guide
+# PROJECT-SUZKA Agent Guide
 
 ## Repository shape
 
-- Backend is the Python package in `kagya/`; there is no `src/` package tree.
+- Backend is the Python package in `suzka/`; there is no `src/` package tree.
 - Backend tests live in `tests/`.
 - Frontend is the separate Next.js application in `frontend/` and uses npm with `package-lock.json`.
 - Runtime configuration is `config.yaml`.
-- Runtime/generated state belongs under `.kagya/` and is not source code.
+- Runtime/generated state belongs under `.suzka/` and is not source code.
 
 ## Stable validation entrypoints
 

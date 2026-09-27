@@ -1,4 +1,4 @@
-# PROJECT-KAGYA
+# PROJECT-SUZKA
 
 ## Local Runbook
 
@@ -10,9 +10,9 @@
 ## Admin Access
 
 - Normal chat remains public at `POST /api/chat`.
-- Debug, memory inspection, sleep, and adapter endpoints require `X-KAGYA-Admin-Token`.
-- The expected token is read from the env var named by `api.admin_token_env`; the default is `KAGYA_ADMIN_TOKEN`.
-- Frontend admin pages call the Next.js `/admin-proxy/*` route, which injects `KAGYA_ADMIN_TOKEN` server-side; the token is not included in browser bundles.
+- Debug, memory inspection, sleep, and adapter endpoints require `X-SUZKA-Admin-Token`.
+- The expected token is read from the env var named by `api.admin_token_env`; the default is `SUZKA_ADMIN_TOKEN`.
+- Frontend admin pages call the Next.js `/admin-proxy/*` route, which injects `SUZKA_ADMIN_TOKEN` server-side; the token is not included in browser bundles.
 
 ## Model Provider
 
@@ -31,16 +31,16 @@
 
 ## Private Deployment
 
-PROJECT-KAGYA is intended to run as a private/local application, not as a public website. The deployment target is a single Linux host with FastAPI bound to `127.0.0.1:8000`, Next.js bound to `127.0.0.1:3000`, and nginx or Caddy bound to loopback for local or SSH-tunnel access.
+PROJECT-SUZKA is intended to run as a private/local application, not as a public website. The deployment target is a single Linux host with FastAPI bound to `127.0.0.1:8000`, Next.js bound to `127.0.0.1:3000`, and nginx or Caddy bound to loopback for local or SSH-tunnel access.
 
 ### 1. Prepare Host
 
 Create a service user and install the required runtime tools:
 
 ```bash
-sudo useradd --system --create-home --shell /usr/sbin/nologin kagya
-sudo mkdir -p /opt/project-kagya /etc/project-kagya
-sudo chown -R kagya:kagya /opt/project-kagya /etc/project-kagya
+sudo useradd --system --create-home --shell /usr/sbin/nologin suzka
+sudo mkdir -p /opt/project-suzka /etc/project-suzka
+sudo chown -R suzka:suzka /opt/project-suzka /etc/project-suzka
 ```
 
 Install `git`, `uv`, `nodejs` 22, `npm`, and either `nginx` or `caddy` using your OS package manager or Nix profile. For the real Transformers provider, verify NVIDIA drivers/CUDA before switching away from the default `dummy` provider.
@@ -48,24 +48,24 @@ Install `git`, `uv`, `nodejs` 22, `npm`, and either `nginx` or `caddy` using you
 ### 2. Install Application
 
 ```bash
-sudo -u kagya git clone <repo-url> /opt/project-kagya
-cd /opt/project-kagya
-sudo -u kagya git switch develop
-sudo -u kagya uv sync
+sudo -u suzka git clone <repo-url> /opt/project-suzka
+cd /opt/project-suzka
+sudo -u suzka git switch develop
+sudo -u suzka uv sync
 cd frontend
-sudo -u kagya npm ci
+sudo -u suzka npm ci
 ```
 
 ### 3. Configure Environment
 
 ```bash
-sudo cp deploy/env/backend.env.example /etc/project-kagya/backend.env
-sudo cp deploy/env/frontend.env.example /etc/project-kagya/frontend.env
-sudo chmod 600 /etc/project-kagya/*.env
-sudo chown kagya:kagya /etc/project-kagya/*.env
+sudo cp deploy/env/backend.env.example /etc/project-suzka/backend.env
+sudo cp deploy/env/frontend.env.example /etc/project-suzka/frontend.env
+sudo chmod 600 /etc/project-suzka/*.env
+sudo chown suzka:suzka /etc/project-suzka/*.env
 ```
 
-Edit both env files and set the same long random `KAGYA_ADMIN_TOKEN`. Set `NEXT_PUBLIC_API_BASE_URL` to the browser-visible private origin and keep `KAGYA_BACKEND_URL` pointed at the private FastAPI listener.
+Edit both env files and set the same long random `SUZKA_ADMIN_TOKEN`. Set `NEXT_PUBLIC_API_BASE_URL` to the browser-visible private origin and keep `SUZKA_BACKEND_URL` pointed at the private FastAPI listener.
 
 For SSH-tunnel access, run `ssh -L 18080:127.0.0.1:8080 user@host`, set `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:18080`, rebuild the frontend, and open `http://127.0.0.1:18080` locally.
 
@@ -74,17 +74,17 @@ Admin warning: the frontend no longer exposes the admin token to browser bundles
 Build the frontend after the env file is configured because `NEXT_PUBLIC_API_BASE_URL` is embedded at build time:
 
 ```bash
-sudo -u kagya bash -lc 'set -a; source /etc/project-kagya/frontend.env; set +a; cd /opt/project-kagya/frontend && npm run build'
+sudo -u suzka bash -lc 'set -a; source /etc/project-suzka/frontend.env; set +a; cd /opt/project-suzka/frontend && npm run build'
 ```
 
 ### 4. Install Services
 
 ```bash
-sudo cp deploy/systemd/kagya-api.service /etc/systemd/system/kagya-api.service
-sudo cp deploy/systemd/kagya-frontend.service /etc/systemd/system/kagya-frontend.service
+sudo cp deploy/systemd/suzka-api.service /etc/systemd/system/suzka-api.service
+sudo cp deploy/systemd/suzka-frontend.service /etc/systemd/system/suzka-frontend.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now kagya-api kagya-frontend
-sudo systemctl status kagya-api kagya-frontend
+sudo systemctl enable --now suzka-api suzka-frontend
+sudo systemctl status suzka-api suzka-frontend
 ```
 
 ### 5. Configure Reverse Proxy
@@ -92,8 +92,8 @@ sudo systemctl status kagya-api kagya-frontend
 For nginx:
 
 ```bash
-sudo cp deploy/nginx/kagya.conf /etc/nginx/sites-available/kagya.conf
-sudo ln -s /etc/nginx/sites-available/kagya.conf /etc/nginx/sites-enabled/kagya.conf
+sudo cp deploy/nginx/suzka.conf /etc/nginx/sites-available/suzka.conf
+sudo ln -s /etc/nginx/sites-available/suzka.conf /etc/nginx/sites-enabled/suzka.conf
 sudo nginx -t
 sudo systemctl reload nginx
 ```
@@ -103,9 +103,9 @@ For Caddy, copy `deploy/caddy/Caddyfile` into your Caddy config path. The provid
 ### 6. Verify Deployment
 
 ```bash
-KAGYA_ADMIN_TOKEN=replace-with-long-random-token scripts/smoke-private-deploy.sh http://127.0.0.1:8080
+SUZKA_ADMIN_TOKEN=replace-with-long-random-token scripts/smoke-private-deploy.sh http://127.0.0.1:8080
 ```
 
-The smoke script verifies `/health`, public `/api/chat`, direct admin API rejection without a token, direct admin API success with `X-KAGYA-Admin-Token`, and `/admin-proxy/*` forwarding through the frontend. Set `CHECK_ADMIN_PROXY=0` if you are checking only the FastAPI reverse proxy without the frontend service.
+The smoke script verifies `/health`, public `/api/chat`, direct admin API rejection without a token, direct admin API success with `X-SUZKA-Admin-Token`, and `/admin-proxy/*` forwarding through the frontend. Set `CHECK_ADMIN_PROXY=0` if you are checking only the FastAPI reverse proxy without the frontend service.
 
 Normal chat is unauthenticated on the private listener at `POST /api/chat`; direct debug, memory, sleep, and adapter APIs require the admin token header. Frontend admin pages use `/admin-proxy/*` and should remain behind your private access boundary.
