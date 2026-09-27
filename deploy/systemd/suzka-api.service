@@ -1,0 +1,18 @@
+[Unit]
+Description=PROJECT-SUZKA FastAPI backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=suzka
+Group=suzka
+WorkingDirectory=/opt/project-suzka
+EnvironmentFile=/etc/project-suzka/backend.env
+Environment=PATH=/home/suzka/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env uv run python -m suzka.api.server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
