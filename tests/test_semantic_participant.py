@@ -21,6 +21,7 @@ from kagya.memory import (
     SemanticStore,
     semantic_id_for_batch_entry,
 )
+from kagya.memory.semantic_store import SemanticStoreUnavailable
 from kagya.memory.semantic_lifecycle import (
     SemanticLifecycle,
     SemanticRevision,
@@ -39,6 +40,7 @@ from kagya.runtime import (
     ParticipantDivergedError,
     ParticipantOutcome,
     ParticipantUnavailableError,
+    StartupParticipantOutcome,
     TransactionBinding,
     TransactionCoordinator,
     TransactionKind,
@@ -182,6 +184,31 @@ def test_prepare_is_non_authoritative_and_finalize_is_idempotent(tmp_path: Path)
     assert reconstructed.operation == participant.operation
 
 
+def test_mismatched_binding_transaction_fails_before_any_write(tmp_path: Path) -> None:
+    memory = DualMemorySystem(_settings(tmp_path))
+    participant, binding, revision = _create_participant(memory)
+    other_event = _event(2)
+    other_transaction_id = TransactionCoordinator.derive_transaction_id(
+        other_event, TransactionKind.EVENT_MUTATION
+    )
+    mismatched = replace(
+        binding,
+        transaction_id=other_transaction_id,
+        event_id=other_event.event_id,
+        processing_sequence=other_event.processing_sequence or 0,
+    )
+
+    with pytest.raises(ParticipantDivergedError, match="binding is invalid"):
+        participant.prepare(mismatched)
+
+    assert participant.store.load_pending(mismatched.transaction_id) is None
+    assert participant.store.load_receipt(mismatched.transaction_id) is None
+    assert participant.store.load_pending(binding.transaction_id) is None
+    assert participant.store.load_receipt(binding.transaction_id) is None
+    assert participant.store.load_current(revision.semantic_id) is None
+    assert memory.db2.get(ids=[revision.semantic_id], include=["documents", "metadatas"])["ids"] == []
+
+
 def test_pre_internal_abort_removes_pending_without_publication(tmp_path: Path) -> None:
     memory = DualMemorySystem(_settings(tmp_path))
     participant, binding, revision = _create_participant(memory)
@@ -203,6 +230,62 @@ def test_partial_lifecycle_publication_rolls_forward_without_duplicate_revision(
     assert participant.finalize(binding) is ParticipantOutcome.FINALIZED
     assert participant.store.load_current(revision.semantic_id) is not None
     assert participant.store.load_receipt(binding.transaction_id) is not None
+
+
+def test_partial_lifecycle_publication_restarts_from_pending_batch(
+    tmp_path: Path,
+) -> None:
+    memory = DualMemorySystem(_settings(tmp_path))
+    event = _event()
+    transaction_id = TransactionCoordinator.derive_transaction_id(
+        event, TransactionKind.EVENT_MUTATION
+    )
+    revisions = tuple(
+        _revision_for_slot(transaction_id, index, event.processing_sequence or 0)
+        for index in range(2)
+    )
+    operation = SemanticBatchOperation(
+        transaction_id,
+        tuple(
+            SemanticBatchEntry(index, SemanticCreateIntent(revision))
+            for index, revision in enumerate(revisions)
+        ),
+    )
+    store = SemanticStore.from_memory_root(memory.settings.memory.persist_directory)
+    participant = MemorySemanticParticipant(memory, store, operation)
+    binding = TransactionBinding(
+        transaction_id,
+        event.event_id,
+        event.processing_sequence or 0,
+        participant.participant_id,
+        participant.operation_digest,
+        TransactionKind.EVENT_MUTATION,
+    )
+    participant.prepare(binding)
+    store.publish_create(revisions[0], participant.operation_digest, batch_index=0)
+
+    restarted_memory = DualMemorySystem(_settings(tmp_path))
+    restarted_store = SemanticStore.from_memory_root(
+        restarted_memory.settings.memory.persist_directory
+    )
+    restarted = MemorySemanticParticipant.from_pending(
+        restarted_memory,
+        restarted_store,
+        binding.transaction_id,
+        binding.participant_id,
+        binding.operation_digest,
+        event_id=binding.event_id,
+        processing_sequence=binding.processing_sequence,
+    )
+
+    assert restarted.finalize(binding) is ParticipantOutcome.FINALIZED
+    assert restarted.finalize(binding) is ParticipantOutcome.ALREADY_CONSISTENT
+    assert all(
+        restarted_store.load_current(revision.semantic_id) is not None
+        for revision in revisions
+    )
+    assert restarted_store.load_pending(binding.transaction_id) is None
+    assert restarted_store.load_receipt(binding.transaction_id) is not None
 
 
 @pytest.mark.parametrize("fault_stage", ["temp_fsync", "link", "post_link"])
@@ -326,6 +409,71 @@ def test_committed_semantic_recovery_does_not_read_live_db1(
     assert recovered.finalize(binding) is ParticipantOutcome.ALREADY_CONSISTENT
 
 
+def test_exact_semantic_source_revision_is_validated_and_recovery_does_not_reread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory = DualMemorySystem(_settings(tmp_path))
+    source = _revision_for_slot("88888888-8888-4888-8888-888888888888", 0, 7)
+    participant, binding, revision = _create_participant(
+        memory,
+        source_edges=(
+            SemanticSourceEdge(
+                SemanticSourceKind.SEMANTIC,
+                source.semantic_id,
+                source_revision=0,
+                source_status=SemanticSourceStatus.AVAILABLE,
+            ),
+        ),
+    )
+    participant.store.publish_create(source, "c" * 64, batch_index=0)
+
+    participant.prepare(binding)
+    participant.store.publish_create(revision, participant.operation_digest)
+
+    original_load_revision = participant.store.load_revision
+
+    def unavailable(semantic_id: str, revision_number: int) -> object:
+        if semantic_id == source.semantic_id:
+            raise RuntimeError("source must not be reread after commit")
+        return original_load_revision(semantic_id, revision_number)
+
+    monkeypatch.setattr(participant.store, "load_revision", unavailable)
+    assert participant.finalize(binding) is ParticipantOutcome.FINALIZED
+
+
+@pytest.mark.parametrize("source_case", ["absent", "malformed", "unavailable"])
+def test_semantic_source_revision_failures_are_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_case: str
+) -> None:
+    memory = DualMemorySystem(_settings(tmp_path))
+    source = _revision_for_slot("77777777-7777-4777-8777-777777777777", 0, 7)
+    edge = SemanticSourceEdge(
+        SemanticSourceKind.SEMANTIC,
+        source.semantic_id,
+        source_revision=1,
+        source_status=SemanticSourceStatus.AVAILABLE,
+    )
+    participant, binding, revision = _create_participant(memory, source_edges=(edge,))
+    if source_case == "malformed":
+        participant.store.publish_create(source, "d" * 64, batch_index=0)
+        participant.store.record_path(source.semantic_id, 1).parent.mkdir(
+            parents=True, exist_ok=True
+        )
+        participant.store.record_path(source.semantic_id, 1).write_text("not json")
+    elif source_case == "unavailable":
+        monkeypatch.setattr(
+            participant.store,
+            "load_revision",
+            lambda *_args: (_ for _ in ()).throw(SemanticStoreUnavailable("unavailable")),
+        )
+
+    expected = ParticipantUnavailableError if source_case != "malformed" else ParticipantDivergedError
+    with pytest.raises(expected):
+        participant.prepare(binding)
+    assert participant.store.load_pending(binding.transaction_id) is None
+    assert participant.store.load_current(revision.semantic_id) is None
+
+
 def test_unpublished_semantic_still_requires_live_source_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -378,7 +526,37 @@ def test_divergent_legacy_projection_is_not_overwritten(tmp_path: Path) -> None:
     assert memory.db2.get(ids=[collision_id], include=["documents", "metadatas"]) == before
 
 
-def test_non_active_revision_removes_search_projection(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("lifecycle", "operation", "reason"),
+    [
+        (
+            SemanticLifecycle.RETRACTED,
+            SemanticRevisionOperation.RETRACT,
+            SemanticRevisionReason.RETRACTION,
+        ),
+        (
+            SemanticLifecycle.SUPERSEDED,
+            SemanticRevisionOperation.SUPERSEDE,
+            SemanticRevisionReason.SUPERSESSION,
+        ),
+        (
+            SemanticLifecycle.ARCHIVED,
+            SemanticRevisionOperation.ARCHIVE,
+            SemanticRevisionReason.ARCHIVAL,
+        ),
+        (
+            SemanticLifecycle.QUARANTINED,
+            SemanticRevisionOperation.QUARANTINE,
+            SemanticRevisionReason.QUARANTINE,
+        ),
+    ],
+)
+def test_non_active_revision_without_db2_row_is_exact_and_reconciliation_is_noop(
+    tmp_path: Path,
+    lifecycle: SemanticLifecycle,
+    operation: SemanticRevisionOperation,
+    reason: SemanticRevisionReason,
+) -> None:
     memory = DualMemorySystem(_settings(tmp_path))
     create, create_binding, created = _create_participant(memory)
     create.prepare(create_binding)
@@ -393,9 +571,9 @@ def test_non_active_revision_removes_search_projection(tmp_path: Path) -> None:
         semantic_content=created.semantic_content,
         content_digest=created.content_digest,
         created_at=event.requested_at,
-        lifecycle=SemanticLifecycle.RETRACTED,
-        operation=SemanticRevisionOperation.RETRACT,
-        reason=SemanticRevisionReason.RETRACTION,
+        lifecycle=lifecycle,
+        operation=operation,
+        reason=reason,
         previous_revision_digest=created.revision_digest,
         event_id=event.event_id,
         event_sequence=event.processing_sequence,
@@ -416,6 +594,14 @@ def test_non_active_revision_removes_search_projection(tmp_path: Path) -> None:
     participant.prepare(binding)
     participant.finalize(binding)
 
+    assert memory.db2.get(ids=[created.semantic_id], include=["documents", "metadatas"])["ids"] == []
+    assert (
+        participant.inspect_reconciliation(binding)
+        is StartupParticipantOutcome.VERIFIED_CONSISTENT
+    )
+    assert (
+        participant.reconcile(binding) is StartupParticipantOutcome.VERIFIED_CONSISTENT
+    )
     assert memory.db2.get(ids=[created.semantic_id], include=["documents", "metadatas"])["ids"] == []
 
 

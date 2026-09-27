@@ -251,7 +251,11 @@ class DualMemorySystem:
         current_store = store or self.semantic_store
         raw = self._get_semantic_projection_raw(semantic_id)
         if raw is None:
-            return SemanticProjectionInspection(SemanticProjectionStatus.MISSING)
+            return SemanticProjectionInspection(
+                SemanticProjectionStatus.MISSING
+                if revision.lifecycle is SemanticLifecycle.ACTIVE
+                else SemanticProjectionStatus.EXACT
+            )
         document, metadata = raw
         if not _is_r12_semantic_projection(metadata):
             return SemanticProjectionInspection(

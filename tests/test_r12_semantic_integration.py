@@ -29,6 +29,7 @@ from kagya.runtime import (
     AgentEventSource,
     AgentEventType,
     CoordinatedResult,
+    ParticipantDivergedError,
     TransactionBinding,
     TransactionCoordinator,
     TransactionKind,
@@ -258,6 +259,89 @@ def test_terminal_startup_reconciles_missing_projection_from_authority(
     assert memory.get_committed_semantic(semantic_id) is not None
 
 
+def test_terminal_startup_accepts_absent_non_active_projection_as_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    memory = DualMemorySystem(settings)
+    store = SemanticStore.from_memory_root(settings.memory.persist_directory)
+    event = _event()
+    semantic_id = "semantic-terminal-no-projection"
+    created = SemanticRevision(
+        semantic_id=semantic_id,
+        revision=0,
+        semantic_content="terminal semantic authority",
+        content_digest=semantic_content_digest("terminal semantic authority"),
+        created_at=event.requested_at,
+        lifecycle=SemanticLifecycle.ACTIVE,
+        operation=SemanticRevisionOperation.CREATE,
+        reason=SemanticRevisionReason.CREATION,
+        event_id=event.event_id,
+        event_sequence=event.processing_sequence,
+    )
+    terminal = SemanticRevision(
+        semantic_id=semantic_id,
+        revision=1,
+        semantic_content=created.semantic_content,
+        content_digest=created.content_digest,
+        created_at=event.requested_at,
+        lifecycle=SemanticLifecycle.RETRACTED,
+        operation=SemanticRevisionOperation.RETRACT,
+        reason=SemanticRevisionReason.RETRACTION,
+        previous_revision_digest=created.revision_digest,
+        event_id=event.event_id,
+        event_sequence=event.processing_sequence,
+    )
+    store.publish_create(created, "a" * 64)
+    store.publish_revision(
+        terminal,
+        "b" * 64,
+        expected_revision=0,
+        expected_digest=created.revision_digest,
+    )
+    transaction_id = TransactionCoordinator.derive_transaction_id(
+        event, TransactionKind.EVENT_MUTATION
+    )
+    transaction = EventJournalTransaction(
+        transaction_id=transaction_id,
+        event_id=event.event_id,
+        event_type=event.event_type,
+        source=event.source,
+        processing_sequence=event.processing_sequence or 0,
+        kind=TransactionKind.EVENT_MUTATION,
+        required_participants=(
+            ParticipantRequirement(
+                participant_id="memory.semantic",
+                operation_digest="b" * 64,
+                capabilities=(
+                    ParticipantCapability.IDEMPOTENT_FINALIZE,
+                    ParticipantCapability.INSPECT_RECONCILE,
+                    ParticipantCapability.PREPARE,
+                ),
+            ),
+        ),
+        participant_outcomes=(("memory.semantic", ParticipantOutcome.FINALIZED),),
+        terminal_lifecycle=EventLifecycle.TRANSACTION_COMPLETED,
+    )
+    journal = SimpleNamespace(
+        inspect=lambda: SimpleNamespace(
+            completed_transactions=(transaction,),
+            reconciled_transactions=(),
+        )
+    )
+    coordinator = StartupReconciliationCoordinator(
+        journal, object(), memory, semantic_store=store  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(
+        memory,
+        "project_semantic_revision",
+        lambda *_args, **_kwargs: pytest.fail("terminal projection must stay absent"),
+    )
+
+    assert coordinator.reconcile_terminal_semantic_projections() == (True, None)
+    assert memory.db2.get(ids=[semantic_id], include=["documents", "metadatas"])["ids"] == []
+
+
 def test_receipt_cleanup_requires_terminal_participant_evidence(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     store = SemanticStore.from_memory_root(settings.memory.persist_directory)
@@ -421,6 +505,66 @@ def test_semantic_receipt_retains_until_verified_baseline(
         processing_sequence=event.processing_sequence,
     )
     assert reconstructed.operation == participant.operation
+
+
+def test_retained_receipt_with_deleted_lifecycle_fails_closed_everywhere(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    memory = DualMemorySystem(settings)
+    memory.save_episodic("sleep input", "sleep output", emotion_arousal=0.9)
+    manager = SleepCycleManager(settings, memory, DummyProvider(), AdapterRegistry(settings))
+    event = _event()
+
+    class Runtime:
+        def current_event(self) -> AgentEvent:
+            return event
+
+    manager.bind_runtime(Runtime())  # type: ignore[arg-type]
+    coordinated = manager.run()
+    assert isinstance(coordinated, CoordinatedResult)
+    participant = coordinated.participants[0]
+    transaction_id = TransactionCoordinator.derive_transaction_id(
+        event, TransactionKind.EVENT_MUTATION
+    )
+    binding = TransactionBinding(
+        transaction_id,
+        event.event_id,
+        event.processing_sequence or 0,
+        participant.participant_id,
+        participant.operation_digest,
+        TransactionKind.EVENT_MUTATION,
+    )
+    participant.prepare(binding)
+    participant.finalize(binding)
+    store = SemanticStore.from_memory_root(settings.memory.persist_directory)
+    semantic_id = coordinated.value.materialize(transaction_id).semantic_memory_ids[0]
+    target = store.records_root / semantic_id / "0.json"
+    projection_before = memory.db2.get(
+        ids=[semantic_id], include=["documents", "metadatas"]
+    )
+    target.unlink()
+    assert store.load_receipt(transaction_id) is not None
+
+    with pytest.raises(ParticipantDivergedError, match="missing lifecycle authority"):
+        participant.finalize(binding)
+    with pytest.raises(ParticipantDivergedError, match="missing lifecycle authority"):
+        MemorySemanticParticipant.from_pending(
+            memory,
+            store,
+            transaction_id,
+            participant.participant_id,
+            participant.operation_digest,
+            event_id=event.event_id,
+            processing_sequence=event.processing_sequence,
+        )
+    with pytest.raises(ParticipantDivergedError, match="missing lifecycle authority"):
+        participant.inspect_reconciliation(binding)
+    with pytest.raises(ParticipantDivergedError, match="missing lifecycle authority"):
+        participant.reconcile(binding)
+    assert not target.exists()
+    assert store.load_receipt(transaction_id) is not None
+    assert memory.db2.get(ids=[semantic_id], include=["documents", "metadatas"]) == projection_before
 
 
 def test_receipt_capacity_blocks_only_semantic_retention_admission(

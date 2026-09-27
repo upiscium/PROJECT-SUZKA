@@ -328,6 +328,8 @@ class MemorySemanticParticipant:
             if event_id is None or processing_sequence is None:
                 raise ParticipantDivergedError("Semantic event binding is incomplete")
             participant._validate_event_identity(event_id, processing_sequence)
+        if receipt is not None:
+            participant._validate_receipt_targets()
         return participant
 
     @classmethod
@@ -475,7 +477,6 @@ class MemorySemanticParticipant:
     def prepare(self, binding: TransactionBinding) -> None:
         self._validate_binding(binding)
         self._validate_event_identity(binding.event_id, binding.processing_sequence)
-        self._validate_sources()
         expected = self._artifact(binding, SEMANTIC_PENDING_SCHEMA_VERSION)
         pending = self._load_pending(self.store, binding.transaction_id)
         receipt = self._load_receipt(self.store, binding.transaction_id)
@@ -488,6 +489,8 @@ class MemorySemanticParticipant:
                 binding.participant_id,
                 binding.operation_digest,
             )
+            self._validate_receipt_targets()
+        self._validate_sources()
         self._validate_revision_preconditions()
         if pending is None and receipt is None:
             try:
@@ -533,7 +536,6 @@ class MemorySemanticParticipant:
     def finalize(self, binding: TransactionBinding) -> ParticipantOutcome:
         self._validate_binding(binding)
         self._validate_event_identity(binding.event_id, binding.processing_sequence)
-        self._validate_sources()
         expected = self._artifact(binding, SEMANTIC_PENDING_SCHEMA_VERSION)
         pending = self._load_pending(self.store, binding.transaction_id)
         receipt = self._load_receipt(self.store, binding.transaction_id)
@@ -546,6 +548,8 @@ class MemorySemanticParticipant:
                 binding.participant_id,
                 binding.operation_digest,
             )
+            self._validate_receipt_targets()
+        self._validate_sources()
         if pending is None and receipt is None:
             raise ParticipantUnavailableError("Semantic pending artifact is absent")
         already_consistent = receipt is not None
@@ -596,6 +600,7 @@ class MemorySemanticParticipant:
                 binding.participant_id,
                 binding.operation_digest,
             )
+            self._validate_receipt_targets()
         elif pending is None:
             raise UnsupportedParticipantReconciliationError(
                 "Semantic operation evidence is absent"
@@ -622,6 +627,7 @@ class MemorySemanticParticipant:
             not validate_transaction_binding(binding)
             or binding.participant_id != self.participant_id
             or binding.operation_digest != self.operation_digest
+            or self.operation.transaction_id != binding.transaction_id
         ):
             raise ParticipantDivergedError("Semantic transaction binding is invalid")
 
@@ -653,6 +659,38 @@ class MemorySemanticParticipant:
                         raise ParticipantUnavailableError("Committed Semantic source is absent")
                     if committed.record.context_id != edge.captured_context_id:
                         raise ParticipantDivergedError("Semantic source Context binding conflicts")
+                if edge.source_kind is SemanticSourceKind.SEMANTIC:
+                    expected_lifecycle = {
+                        SemanticSourceStatus.AVAILABLE: SemanticLifecycle.ACTIVE,
+                        SemanticSourceStatus.SUPERSEDED: SemanticLifecycle.SUPERSEDED,
+                        SemanticSourceStatus.RETRACTED: SemanticLifecycle.RETRACTED,
+                    }.get(edge.source_status)
+                    if expected_lifecycle is None:
+                        continue
+                    if edge.source_revision is None:
+                        raise ParticipantDivergedError(
+                            "Semantic source revision is missing"
+                        )
+                    try:
+                        source = self.store.load_revision(
+                            edge.source_id, edge.source_revision
+                        )
+                    except (SemanticStoreConflict, SemanticStoreCorrupt):
+                        raise ParticipantDivergedError(
+                            "Semantic source is invalid"
+                        ) from None
+                    except SemanticStoreUnavailable:
+                        raise ParticipantUnavailableError(
+                            "Semantic source is unavailable"
+                        ) from None
+                    if source is None:
+                        raise ParticipantUnavailableError(
+                            "Semantic source is absent"
+                        )
+                    if source.revision.lifecycle is not expected_lifecycle:
+                        raise ParticipantDivergedError(
+                            "Semantic source lifecycle conflicts"
+                        )
 
     def _validate_revision_preconditions(self) -> None:
         for entry in self.operation.entries:
@@ -723,6 +761,13 @@ class MemorySemanticParticipant:
         if is_create and current is None:
             return False
         return self._historical_entry_matches(entry)
+
+    def _validate_receipt_targets(self) -> None:
+        for entry in self.operation.entries:
+            if not self._target_committed(entry):
+                raise ParticipantDivergedError(
+                    "Committed Semantic receipt has missing lifecycle authority"
+                )
 
     def _any_target_committed(self) -> bool:
         return any(self._target_committed(entry) for entry in self.operation.entries)
