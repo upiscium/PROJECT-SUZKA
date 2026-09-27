@@ -2,29 +2,29 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from kagya.api.dependencies import (
+from suzka.api.dependencies import (
     get_adapter_registry,
     get_agent_runtime,
     get_api_settings,
     get_model_provider,
     require_admin,
 )
-from kagya.api.runtime_execution import execute
-from kagya.api.schemas.adapter import (
+from suzka.api.runtime_execution import execute
+from suzka.api.schemas.adapter import (
     AdapterEvaluateRequest,
     AdapterEvaluateResponse,
     AdapterListResponse,
     AdapterResponse,
 )
-from kagya.config import Settings
-from kagya.learning import (
+from suzka.config import Settings
+from suzka.learning import (
     AdapterEntry,
     AdapterEvaluator,
     AdapterRegistry,
     AdapterStatus,
 )
-from kagya.models import ModelProvider
-from kagya.runtime import AgentEventSource, AgentEventType, AgentRuntime
+from suzka.models import ModelProvider
+from suzka.runtime import AgentEventSource, AgentEventType, AgentRuntime
 
 
 router = APIRouter(

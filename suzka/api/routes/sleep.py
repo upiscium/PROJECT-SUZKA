@@ -4,15 +4,15 @@ from typing import cast
 
 from fastapi import APIRouter, Depends
 
-from kagya.api.dependencies import (
+from suzka.api.dependencies import (
     get_agent_runtime,
     get_sleep_cycle_manager,
     require_admin,
 )
-from kagya.api.runtime_execution import execute
-from kagya.api.schemas.sleep import SleepRunResponse
-from kagya.learning import SleepCycleManager, SleepCycleResult
-from kagya.runtime import AgentEventSource, AgentEventType, AgentRuntime
+from suzka.api.runtime_execution import execute
+from suzka.api.schemas.sleep import SleepRunResponse
+from suzka.learning import SleepCycleManager, SleepCycleResult
+from suzka.runtime import AgentEventSource, AgentEventType, AgentRuntime
 
 
 router = APIRouter(

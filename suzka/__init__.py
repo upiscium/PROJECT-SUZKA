@@ -1,1 +1,1 @@
-"""PROJECT-KAGYA package."""
+"""PROJECT-SUZKA package."""

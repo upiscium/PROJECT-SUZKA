@@ -1,1 +1,1 @@
-"""API package for PROJECT-KAGYA."""
+"""API package for PROJECT-SUZKA."""

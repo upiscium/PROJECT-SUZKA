@@ -5,11 +5,11 @@ import os
 
 from fastapi import Header, HTTPException, Request, status
 
-from kagya.config import Settings
-from kagya.learning import AdapterRegistry, SleepCycleManager
-from kagya.memory import DualMemorySystem
-from kagya.models import ModelProvider
-from kagya.runtime import AgentRuntime, KagyaMainLoop
+from suzka.config import Settings
+from suzka.learning import AdapterRegistry, SleepCycleManager
+from suzka.memory import DualMemorySystem
+from suzka.models import ModelProvider
+from suzka.runtime import AgentRuntime, SuzkaMainLoop
 
 
 def get_api_settings(request: Request) -> Settings:
@@ -21,7 +21,7 @@ def get_api_settings(request: Request) -> Settings:
 
 def require_admin(
     request: Request,
-    x_kagya_admin_token: str | None = Header(default=None, alias="X-KAGYA-Admin-Token"),
+    x_suzka_admin_token: str | None = Header(default=None, alias="X-SUZKA-Admin-Token"),
 ) -> None:
     settings = get_api_settings(request)
     expected = os.getenv(settings.api.admin_token_env)
@@ -30,7 +30,7 @@ def require_admin(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Admin token env var {settings.api.admin_token_env} is not configured",
         )
-    if x_kagya_admin_token is None or not compare_digest(x_kagya_admin_token, expected):
+    if x_suzka_admin_token is None or not compare_digest(x_suzka_admin_token, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin token"
         )
@@ -57,7 +57,7 @@ def get_adapter_registry(request: Request) -> AdapterRegistry:
     return registry
 
 
-def get_main_loop(request: Request) -> KagyaMainLoop:
+def get_main_loop(request: Request) -> SuzkaMainLoop:
     main_loop = getattr(request.app.state, "main_loop", None)
     if main_loop is None:
         raise RuntimeError("main loop is not initialized")

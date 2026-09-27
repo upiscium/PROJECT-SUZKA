@@ -2,14 +2,14 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from kagya.api.dependencies import (
+from suzka.api.dependencies import (
     get_agent_runtime,
     get_api_settings,
     get_main_loop,
     require_admin,
 )
-from kagya.api.runtime_execution import execute
-from kagya.api.schemas.value import (
+from suzka.api.runtime_execution import execute
+from suzka.api.schemas.value import (
     ValueEmptyRequest,
     ValueListResponse,
     ValueMutationResponse,
@@ -21,8 +21,8 @@ from kagya.api.schemas.value import (
     ValueSeedListResponse,
     ValueSeedResponse,
 )
-from kagya.config import Settings
-from kagya.identity import (
+from suzka.config import Settings
+from suzka.identity import (
     ValueMutationResult,
     ValueNotFound,
     ValueOriginReviewDecision,
@@ -31,12 +31,12 @@ from kagya.identity import (
     ValueSystem,
     recompute_seed_contract_digest,
 )
-from kagya.identifiers import validate_identifier
-from kagya.runtime import (
+from suzka.identifiers import validate_identifier
+from suzka.runtime import (
     AgentEventSource,
     AgentEventType,
     AgentRuntime,
-    KagyaMainLoop,
+    SuzkaMainLoop,
 )
 
 
@@ -109,14 +109,14 @@ def _revision(record: ValueRevisionRecord) -> ValueRevisionResponse:
     )
 
 
-def _system(main_loop: KagyaMainLoop) -> ValueSystem:
+def _system(main_loop: SuzkaMainLoop) -> ValueSystem:
     return main_loop.value_system
 
 
 @router.get("/config-seeds", response_model=ValueSeedListResponse)
 def list_config_seeds(
     settings: Settings = Depends(get_api_settings),
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
 ) -> ValueSeedListResponse:
     values = _system(main_loop).value_map
     seeds = tuple(
@@ -137,7 +137,7 @@ def list_config_seeds(
 
 @router.get("", response_model=ValueListResponse)
 def list_values(
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
 ) -> ValueListResponse:
     return ValueListResponse(values=tuple(_value(value) for value in _system(main_loop).values))
 
@@ -145,7 +145,7 @@ def list_values(
 @router.get("/{value_id}", response_model=ValueResponse)
 def get_value(
     value_id: str,
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
 ) -> ValueResponse:
     checked = _value_id(value_id)
     try:
@@ -157,7 +157,7 @@ def get_value(
 @router.get("/{value_id}/revisions", response_model=ValueRevisionListResponse)
 def list_revisions(
     value_id: str,
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
 ) -> ValueRevisionListResponse:
     checked = _value_id(value_id)
     try:
@@ -173,7 +173,7 @@ def list_revisions(
 def freeze_value(
     value_id: str,
     _request: ValueEmptyRequest | None = None,
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> ValueMutationResponse:
     checked = _value_id(value_id)
@@ -190,7 +190,7 @@ def freeze_value(
 def unfreeze_value(
     value_id: str,
     _request: ValueEmptyRequest | None = None,
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> ValueMutationResponse:
     checked = _value_id(value_id)
@@ -207,7 +207,7 @@ def unfreeze_value(
 def rollback_value(
     value_id: str,
     request: ValueRollbackRequest,
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> ValueMutationResponse:
     checked = _value_id(value_id)
@@ -224,7 +224,7 @@ def rollback_value(
 def review_value_origin(
     value_id: str,
     request: ValueOriginReviewRequest,
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> ValueMutationResponse:
     checked = _value_id(value_id)
@@ -243,7 +243,7 @@ def adopt_configured_seed(
     value_id: str,
     _request: ValueEmptyRequest | None = None,
     settings: Settings = Depends(get_api_settings),
-    main_loop: KagyaMainLoop = Depends(get_main_loop),
+    main_loop: SuzkaMainLoop = Depends(get_main_loop),
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> ValueMutationResponse:
     checked = _value_id(value_id)

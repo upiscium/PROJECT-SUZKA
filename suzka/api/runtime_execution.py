@@ -5,8 +5,8 @@ from typing import TypeVar, overload
 
 from fastapi import HTTPException, status
 
-from kagya.identity import ValueDomainError, ValueNotFound
-from kagya.runtime import (
+from suzka.identity import ValueDomainError, ValueNotFound
+from suzka.runtime import (
     AgentEventSource,
     AgentEventType,
     AgentRuntime,
