@@ -585,6 +585,11 @@ class WorkingMemory:
                         compatibility_score = (
                             context_projection.aggregate_compatibility
                         )
+                        if source_context_id is not None:
+                            compatibility = context_registry.compatibility(
+                                source_context_id, current_context_id
+                            )
+                            relation = compatibility.relation
                     else:
                         compatibility = context_registry.compatibility(
                             source_context_id, current_context_id
