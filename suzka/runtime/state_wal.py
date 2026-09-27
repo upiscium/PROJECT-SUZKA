@@ -17,8 +17,8 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from kagya.privacy import normalize_private_key
-from kagya.runtime.agent_state import (
+from suzka.privacy import normalize_private_key
+from suzka.runtime.agent_state import (
     AgentStateStore,
     CompatibleAgentStateSnapshot,
     validate_compatible_agent_state_snapshot,
@@ -540,7 +540,7 @@ class StateWAL:
             previous_record_hash=None,
             record_hash="0" * 64,
         )
-        raw, baseline_hash = _record_json(baseline, "kagya.state-wal.baseline")
+        raw, baseline_hash = _record_json(baseline, "suzka.state-wal.baseline")
         parent_descriptor = -1
         descriptor = -1
         try:
@@ -632,7 +632,7 @@ class StateWAL:
         )
         manifest_raw = manifest_base.model_dump(mode="json")
         manifest_raw["manifest_hash"] = _domain_hash(
-            "kagya.state-wal.manifest",
+            "suzka.state-wal.manifest",
             {
                 key: value
                 for key, value in manifest_raw.items()
@@ -655,7 +655,7 @@ class StateWAL:
                 raise ValueError
             raw = json.loads(lines[0])
             baseline = BaselineRecord.model_validate_json(_canonical(raw))
-            record_hash = _record_json(baseline, "kagya.state-wal.baseline")[1]
+            record_hash = _record_json(baseline, "suzka.state-wal.baseline")[1]
             if (
                 baseline.generation_id != generation_id
                 or baseline.record_hash != record_hash
@@ -820,7 +820,7 @@ class StateWAL:
         try:
             manifest = Manifest.model_validate_json(_canonical(manifest_raw))
             expected = _domain_hash(
-                "kagya.state-wal.manifest",
+                "suzka.state-wal.manifest",
                 {
                     key: value
                     for key, value in manifest_raw.items()
@@ -868,7 +868,7 @@ class StateWAL:
         with self._lock:
             expected_raw = expected.model_dump(mode="json")
             expected_hash = _domain_hash(
-                "kagya.state-wal.manifest",
+                "suzka.state-wal.manifest",
                 {key: value for key, value in expected_raw.items()
                  if key != "manifest_hash"},
             )
@@ -900,7 +900,7 @@ class StateWAL:
                 return manifest
             raw = clear_base.model_dump(mode="json")
             raw["manifest_hash"] = _domain_hash(
-                "kagya.state-wal.manifest",
+                "suzka.state-wal.manifest",
                 {key: value for key, value in raw.items() if key != "manifest_hash"},
             )
             self._atomic_write(self.root / "manifest.json", raw)
@@ -937,7 +937,7 @@ class StateWAL:
                 if model is None:
                     raise ValueError
                 record = model.model_validate_json(_canonical(raw))
-                record_hash = _record_json(record, f"kagya.state-wal.{kind}")[1]
+                record_hash = _record_json(record, f"suzka.state-wal.{kind}")[1]
                 if (
                     not _HASH_RE.fullmatch(record.record_hash)
                     or record.record_hash != record_hash
@@ -1050,7 +1050,7 @@ class StateWAL:
             previous_record_hash=inspection.record_hashes[-1],
             record_hash="0" * 64,
         )
-        raw, record_hash = _record_json(record, "kagya.state-wal.transition")
+        raw, record_hash = _record_json(record, "suzka.state-wal.transition")
         record = record.model_copy(update={"record_hash": record_hash})
         path = self._generation_path(inspection.active_manifest.active_generation_id)
         parent_descriptor = -1
@@ -1136,7 +1136,7 @@ class StateWAL:
         )
         raw = anchor_base.model_dump(mode="json")
         raw["anchor_hash"] = _domain_hash(
-            "kagya.state-wal.boot-anchor",
+            "suzka.state-wal.boot-anchor",
             {key: value for key, value in raw.items() if key != "anchor_hash"},
         )
         self._atomic_write(self.root / "boot_anchor.json", raw)
@@ -1147,7 +1147,7 @@ class StateWAL:
             raw = json.loads(self._read_regular(self.root / "boot_anchor.json"))
             anchor = BootAnchor.model_validate_json(_canonical(raw))
             expected = _domain_hash(
-                "kagya.state-wal.boot-anchor",
+                "suzka.state-wal.boot-anchor",
                 {key: value for key, value in raw.items() if key != "anchor_hash"},
             )
             if anchor.anchor_hash != expected:
@@ -1221,7 +1221,7 @@ class StateWAL:
                 if model is None:
                     raise ValueError
                 record = model.model_validate_json(_canonical(raw))
-                computed_hash = _record_json(record, f"kagya.state-wal.{kind}")[1]
+                computed_hash = _record_json(record, f"suzka.state-wal.{kind}")[1]
                 if (
                     record.record_id in seen
                     or not _HASH_RE.fullmatch(record.record_hash)

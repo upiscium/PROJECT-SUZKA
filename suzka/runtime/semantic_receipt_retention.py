@@ -4,16 +4,16 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from kagya.memory.semantic_participant import (
+from suzka.memory.semantic_participant import (
     MEMORY_SEMANTIC_PARTICIPANT_ID,
 )
-from kagya.memory.semantic_store import (
+from suzka.memory.semantic_store import (
     SemanticStore,
     SemanticStoreConflict,
     SemanticStoreError,
 )
-from kagya.runtime.event_journal import EventJournal
-from kagya.runtime.transaction_coordinator import (
+from suzka.runtime.event_journal import EventJournal
+from suzka.runtime.transaction_coordinator import (
     ParticipantRequirement,
 )
 

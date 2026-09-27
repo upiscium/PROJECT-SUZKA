@@ -7,8 +7,8 @@ from datetime import UTC, datetime
 import inspect
 from typing import TYPE_CHECKING, Callable, cast
 
-from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionUpdate
-from kagya.cognition import (
+from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionUpdate
+from suzka.cognition import (
     AppraisalResult,
     AppraisalSignals,
     CognitiveAppraiser,
@@ -17,8 +17,8 @@ from kagya.cognition import (
     SurprisalCalculator,
     model_key,
 )
-from kagya.config import Settings
-from kagya.identity import (
+from suzka.config import Settings
+from suzka.identity import (
     IdentityOrigin,
     OriginActor,
     OriginInputKind,
@@ -34,8 +34,8 @@ from kagya.identity import (
     ValueSystem,
     ValueSystemSnapshot,
 )
-from kagya.memory import DualMemorySystem, MemoryContext, MemoryRecordType
-from kagya.experience import (
+from suzka.memory import DualMemorySystem, MemoryContext, MemoryRecordType
+from suzka.experience import (
     ExperienceAppraisalEvidence,
     ExperienceEmotionContributions,
     ExperienceEmotionProjection,
@@ -48,43 +48,43 @@ from kagya.experience import (
     ExperienceRevisionRecord,
     calculate_subjective_salience,
 )
-from kagya.memory.experience_store import ExperienceStore
-from kagya.models import ModelProvider
-from kagya.persona import (
+from suzka.memory.experience_store import ExperienceStore
+from suzka.models import ModelProvider
+from suzka.persona import (
     ConsciousAgent,
     ContextPromptView,
     PromptBuilder,
     ResponsePostprocessor,
 )
-from kagya.runtime.chat_context import ChatContextSelectors, resolve_chat_context
-from kagya.runtime.agent_runtime import (
+from suzka.runtime.chat_context import ChatContextSelectors, resolve_chat_context
+from suzka.runtime.agent_runtime import (
     AgentEvent,
     AgentEventSource,
     AgentEventType,
     AgentRuntime,
 )
-from kagya.runtime.session_participant import (
+from suzka.runtime.session_participant import (
     SessionTurnOperation,
     SessionTurnParticipant,
 )
-from kagya.runtime.session_state import SessionState
-from kagya.runtime.context import ContextRegistry
-from kagya.runtime.transaction_coordinator import (
+from suzka.runtime.session_state import SessionState
+from suzka.runtime.context import ContextRegistry
+from suzka.runtime.transaction_coordinator import (
     CoordinatedResult,
     TransactionBoundValue,
     TransactionParticipant,
     TransactionKind,
     TransactionCoordinator,
 )
-from kagya.runtime.working_memory import (
+from suzka.runtime.working_memory import (
     WorkingMemory,
     WorkingMemorySourceKind,
     WorkingMemoryView,
 )
 
 if TYPE_CHECKING:
-    from kagya.memory.episodic_participant import MemoryEpisodicParticipant
-    from kagya.memory.experience_participant import MemoryExperienceParticipant
+    from suzka.memory.episodic_participant import MemoryEpisodicParticipant
+    from suzka.memory.experience_participant import MemoryExperienceParticipant
 
 
 @dataclass(frozen=True)
@@ -136,7 +136,7 @@ class _ComputedChat:
     session_participant: SessionTurnParticipant
 
 
-class KagyaMainLoop:
+class SuzkaMainLoop:
     """Connect prediction error, emotion, memory, generation, and storage."""
 
     def __init__(
@@ -157,7 +157,7 @@ class KagyaMainLoop:
         value_system: ValueSystem | None = None,
         experience_store: ExperienceStore | None = None,
     ) -> None:
-        from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
+        from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 
         self.settings = settings
         self.provider = provider
@@ -360,7 +360,7 @@ class KagyaMainLoop:
         """Bind the one application runtime allowed to govern this authority."""
 
         if self._runtime is not None and self._runtime is not runtime:
-            raise RuntimeError("KagyaMainLoop is already bound to another runtime")
+            raise RuntimeError("SuzkaMainLoop is already bound to another runtime")
         self._runtime = runtime
 
     def _validated_chat_event(self, *, capture_debug: bool) -> AgentEvent | None:
@@ -568,12 +568,12 @@ class KagyaMainLoop:
         working_memory: WorkingMemory,
         emotion_engine: EmotionEngineAllostasis,
     ) -> _ComputedChat:
-        from kagya.memory.episodic_participant import (
+        from suzka.memory.episodic_participant import (
             EpisodicWrite,
             MemoryEpisodicParticipant,
             episodic_episode_id,
         )
-        from kagya.memory.experience_participant import (
+        from suzka.memory.experience_participant import (
             ExperienceCreateIntent,
             MemoryExperienceParticipant,
             experience_id_for_event,

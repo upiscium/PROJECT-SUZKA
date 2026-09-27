@@ -9,8 +9,8 @@ import stat
 from threading import RLock
 from uuid import UUID, uuid4, uuid5
 
-from kagya.runtime.agent_runtime import AgentEvent
-from kagya.runtime.agent_state import (
+from suzka.runtime.agent_runtime import AgentEvent
+from suzka.runtime.agent_state import (
     AgentStateConfigurationDrift,
     AgentStateLoadError,
     AgentStateSnapshotV1,
@@ -20,7 +20,7 @@ from kagya.runtime.agent_state import (
     AgentStateStore,
     CompatibleAgentStateSnapshot,
 )
-from kagya.runtime.event_journal import (
+from suzka.runtime.event_journal import (
     EventJournalGateClear,
     EventFailureCategory,
     EventJournal,
@@ -33,7 +33,7 @@ from kagya.runtime.event_journal import (
     ParticipantBaseline,
     startup_participant_aggregate_digest,
 )
-from kagya.runtime.state_wal import (
+from suzka.runtime.state_wal import (
     BaselineRecord,
     Manifest,
     RecoveryReason,
