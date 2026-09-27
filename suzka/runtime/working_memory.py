@@ -237,6 +237,15 @@ class WorkingMemoryAdmissionReason(str, Enum):
     CAPACITY_EVICTED = "capacity_evicted"
 
 
+class WorkingMemoryContextProjection(Protocol):
+    """Opaque request-scoped Context evidence consumed only for ranking."""
+
+    @property
+    def aggregate_compatibility(self) -> float:
+        """Return the already-computed aggregate Context compatibility."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class WorkingMemoryItem:
     """Authoritative reference membership and R08-owned ranking metadata."""
@@ -275,7 +284,7 @@ class WorkingMemorySelection:
     context_relation: ContextRelation | None = None
     context_compatibility: float | None = None
     effective_score: float | None = None
-    contextual_projection: ContextualProjection | None = None
+    context_projection: WorkingMemoryContextProjection | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,7 +300,7 @@ class WorkingMemoryDecision:
     context_relation: ContextRelation | None = None
     context_compatibility: float | None = None
     effective_score: float | None = None
-    contextual_projection: ContextualProjection | None = None
+    context_projection: WorkingMemoryContextProjection | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,7 +332,7 @@ class WorkingMemoryResolution:
     status: WorkingMemoryResolutionStatus
     rendered_content: str | None = None
     source_context_id: str | None = None
-    contextual_projection: ContextualProjection | None = None
+    context_projection: WorkingMemoryContextProjection | None = None
 
     def __post_init__(self) -> None:
         if type(self.status) is not WorkingMemoryResolutionStatus:
@@ -333,22 +342,22 @@ class WorkingMemoryResolution:
                 raise ValueError("resolved Working Memory content must be a string")
             if self.source_context_id is not None:
                 validate_identifier(self.source_context_id)
-        elif self.contextual_projection is not None:
-            raise ValueError("non-resolved Working Memory cannot carry projection")
+            if self.context_projection is not None:
+                score = self.context_projection.aggregate_compatibility
+                if (
+                    type(score) is not float
+                    or not math.isfinite(score)
+                    or not 0 <= score <= 1
+                ):
+                    raise ValueError("context projection compatibility is invalid")
         elif self.rendered_content is not None:
             raise ValueError("non-resolved Working Memory content must be None")
-        elif self.source_context_id is not None:
+        elif self.source_context_id is not None or self.context_projection is not None:
             raise ValueError("non-resolved Working Memory provenance must be None")
 
 
 WorkingMemoryResolverResult = str | WorkingMemoryResolution | None
 WorkingMemoryResolver = Callable[[WorkingMemoryItem], WorkingMemoryResolverResult]
-
-# Descriptive aliases keep the contract usable without coupling callers to WM
-# terminology while retaining one immutable implementation.
-ContextualEvidence = ContextualSourceEvidence
-WorkingMemoryContextProjection = ContextualProjection
-
 
 def working_memory_item_id(
     source_kind: WorkingMemorySourceKind, source_id: str
@@ -583,6 +592,7 @@ class WorkingMemory:
                 reason: WorkingMemoryDecisionReason
                 rendered: str | None = None
                 source_context_id: str | None = None
+                context_projection: WorkingMemoryContextProjection | None = None
                 try:
                     resolved = resolver(item)
                     if resolved is None:
@@ -614,6 +624,7 @@ class WorkingMemory:
                         else:
                             rendered = resolved.rendered_content
                             source_context_id = resolved.source_context_id
+                            context_projection = resolved.context_projection
                     if rendered is not None:
                         resolved_bytes = rendered.encode("utf-8")
                         if projected_bytes + len(resolved_bytes) > projection_max_bytes:
@@ -633,6 +644,7 @@ class WorkingMemory:
                         is_selected,
                         score,
                         reason,
+                        context_projection=context_projection,
                     )
                 )
                 if is_selected:
@@ -646,6 +658,7 @@ class WorkingMemory:
                             score,
                             reason,
                             source_context_id,
+                            context_projection=context_projection,
                         )
                     )
             return WorkingMemoryView(
@@ -679,6 +692,7 @@ class WorkingMemory:
             projection_max_bytes = self._projection_max_bytes
             revision = self._revision
 
+        contextual_resolve = getattr(resolver, "resolve_contextual", None)
         try:
             candidates: list[
                 tuple[
@@ -690,7 +704,7 @@ class WorkingMemory:
                     ContextRelation | None,
                     float | None,
                     float | None,
-                    ContextualProjection | None,
+                    WorkingMemoryContextProjection | None,
                 ]
             ] = []
             for item in items:
@@ -700,12 +714,11 @@ class WorkingMemory:
                 relation: ContextRelation | None = None
                 compatibility_score: float | None = None
                 effective_score: float | None = None
-                contextual_projection: ContextualProjection | None = None
+                context_projection: WorkingMemoryContextProjection | None = None
                 try:
-                    contextual_resolver = getattr(resolver, "resolve_contextual", None)
                     resolved = (
-                        contextual_resolver(item, context_registry, current_context_id)
-                        if callable(contextual_resolver)
+                        contextual_resolve(item, context_registry, current_context_id)
+                        if callable(contextual_resolve)
                         else resolver(item)
                     )
                     if resolved is None:
@@ -738,30 +751,28 @@ class WorkingMemory:
                         else:
                             rendered = resolved.rendered_content
                             source_context_id = resolved.source_context_id
-                            contextual_projection = resolved.contextual_projection
+                            context_projection = resolved.context_projection
                             reason = WorkingMemoryDecisionReason.SELECTED
                 except Exception:
                     reason = WorkingMemoryDecisionReason.RESOLVER_FAILURE
 
                 if rendered is not None:
-                    if contextual_projection is not None:
-                        compatibility_score = contextual_projection.compatibility_score
-                        effective_score = base_score * compatibility_score
-                        if (
-                            contextual_projection.source_count == 1
-                            and not contextual_projection.unknown_or_incomplete
-                            and not contextual_projection.cross_context
-                        ):
-                            evidence = contextual_projection.source_evidence[0]
-                            source_context_id = evidence.captured_context_id
-                            relation = evidence.context_relation
+                    if context_projection is not None:
+                        compatibility_score = (
+                            context_projection.aggregate_compatibility
+                        )
+                        if source_context_id is not None:
+                            compatibility = context_registry.compatibility(
+                                source_context_id, current_context_id
+                            )
+                            relation = compatibility.relation
                     else:
                         compatibility = context_registry.compatibility(
                             source_context_id, current_context_id
                         )
                         relation = compatibility.relation
                         compatibility_score = compatibility.score
-                        effective_score = base_score * compatibility_score
+                    effective_score = base_score * compatibility_score
                 candidates.append(
                     (
                         item,
@@ -772,7 +783,7 @@ class WorkingMemory:
                         relation,
                         compatibility_score,
                         effective_score,
-                        contextual_projection,
+                        context_projection,
                     )
                 )
 
@@ -798,10 +809,10 @@ class WorkingMemory:
                 reason,
                 source_context_id,
                 relation,
-                    compatibility_score,
-                    effective_score,
-                    contextual_projection,
-                ) in candidates:
+                compatibility_score,
+                effective_score,
+                context_projection,
+            ) in candidates:
                 if rendered is not None:
                     rendered_bytes = len(rendered.encode("utf-8"))
                     if projected_bytes + rendered_bytes > projection_max_bytes:
@@ -821,7 +832,7 @@ class WorkingMemory:
                         context_relation=relation,
                         context_compatibility=compatibility_score,
                         effective_score=effective_score,
-                        contextual_projection=contextual_projection,
+                        context_projection=context_projection,
                     )
                 )
                 if is_selected:
@@ -838,7 +849,7 @@ class WorkingMemory:
                             context_relation=relation,
                             context_compatibility=compatibility_score,
                             effective_score=effective_score,
-                            contextual_projection=contextual_projection,
+                            context_projection=context_projection,
                         )
                     )
             return WorkingMemoryView(

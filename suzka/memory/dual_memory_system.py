@@ -23,13 +23,6 @@ from suzka.memory.memory_schema import (
     SemanticMemoryRecord,
 )
 from suzka.memory.semantic_lifecycle import SemanticLifecycle, SemanticRevision
-from suzka.memory.semantic_context_projection import (
-    SemanticContextEvidence,
-    SemanticContextProjectionInvalid,
-    SemanticContextProjectionUnavailable,
-    has_r12_projection_fields,
-    semantic_context_evidence,
-)
 from suzka.memory.semantic_store import (
     SemanticStore,
     SemanticStoreCorrupt,
@@ -99,6 +92,16 @@ class SemanticProjectionStatus(StrEnum):
 
 
 SEMANTIC_PROJECTION_SCHEMA = "r12.semantic.v1"
+_R12_PROJECTION_FIELDS = frozenset(
+    {
+        "semantic_projection_schema",
+        "semantic_revision",
+        "semantic_revision_digest",
+        "semantic_content_digest",
+        "semantic_lifecycle",
+        "semantic_provenance_digest",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,7 +237,7 @@ class DualMemorySystem:
             if not isinstance(ids[0], str) or ids[0] != semantic_id:
                 raise ValueError
             metadata = _strict_metadata(metadatas[0])
-            if has_r12_projection_fields(metadata) and not _is_r12_semantic_projection(
+            if _has_r12_projection_fields(metadata) and not _is_r12_semantic_projection(
                 metadata
             ):
                 raise ValueError
@@ -248,35 +251,6 @@ class DualMemorySystem:
         return CommittedSemanticMemory(
             document=documents[0], metadata=metadata, record=record
         )
-
-    def get_semantic_context_evidence(
-        self, semantic_id: str, store: SemanticStore | None = None
-    ) -> SemanticContextEvidence | None:
-        """Return request-scoped provenance without consulting DB1.
-
-        The single DB2 read is retained through bridge verification so a later
-        reread cannot change which metadata was checked against authority.
-        """
-
-        try:
-            committed = self.get_committed_semantic(semantic_id)
-        except SemanticMemoryReadError:
-            raise
-        except SemanticMemoryFormatError:
-            raise
-        if committed is None:
-            return None
-        try:
-            return semantic_context_evidence(
-                semantic_id,
-                committed.document,
-                committed.metadata,
-                store or self.semantic_store,
-            )
-        except SemanticContextProjectionUnavailable as error:
-            raise SemanticMemoryReadError(str(error)) from None
-        except SemanticContextProjectionInvalid as error:
-            raise SemanticMemoryFormatError(str(error)) from None
 
     def inspect_semantic_projection(
         self,
@@ -1175,6 +1149,10 @@ def _semantic_query_list(value: Any) -> list[Any]:
 
 def _is_r12_semantic_projection(metadata: Mapping[str, Any]) -> bool:
     return metadata.get("semantic_projection_schema") == SEMANTIC_PROJECTION_SCHEMA
+
+
+def _has_r12_projection_fields(metadata: Mapping[str, Any]) -> bool:
+    return bool(_R12_PROJECTION_FIELDS.intersection(metadata))
 
 
 def semantic_projection_metadata(
