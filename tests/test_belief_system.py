@@ -48,6 +48,13 @@ def make_system() -> BeliefSystem:
     return BeliefSystem(event_provider=lambda: _ACTIVE_EVENT)
 
 
+def full_evidence(prefix: str) -> tuple[BeliefEvidence, ...]:
+    return tuple(
+        BeliefEvidence(f"{prefix}-{index:02d}", BeliefEvidenceType.EXPERIENCE)
+        for index in range(32)
+    )
+
+
 def test_proposal_adoption_and_active_projection_require_subject_admission() -> None:
     system = make_system()
     proposition = BeliefProposition("Alice likes tea", "Alice", "likes", "tea")
@@ -178,6 +185,105 @@ def test_correction_can_replace_evidence_with_a_fresh_admission() -> None:
     assert corrected.subject_admission == fresh_admission
     assert corrected.revision_history[-1].operation is BeliefRevisionOperation.CORRECT
     assert fresh_admission.admission_digest in corrected.revision_history[-1].evidence_refs
+
+
+@pytest.mark.parametrize("terminal_operation", ["retract", "expire"])
+def test_full_domain_evidence_survives_adopt_correct_and_terminal_mutations(
+    terminal_operation: str,
+) -> None:
+    system = make_system()
+    evidence = full_evidence("full")
+    proposed = system.create_proposal(
+        BeliefProposition(f"full-evidence-{terminal_operation}"),
+        event(1),
+        evidence=evidence,
+    )
+    adopted = system.adopt(
+        proposed.belief_id,
+        BeliefSubjectAdmission(
+            proposed.proposition.proposition_digest,
+            tuple(item.evidence_ref for item in evidence),
+            "event:2",
+            2,
+            AdmissionReason.SUBJECT_ENDORSEMENT,
+        ),
+        event(2),
+        epistemic_status=BeliefEpistemicStatus.PROBABLE,
+    )
+    assert len(adopted.revision_history[-1].evidence_refs) == 33
+
+    correction_admission = BeliefSubjectAdmission(
+        adopted.proposition.proposition_digest,
+        tuple(item.evidence_ref for item in evidence),
+        "event:3",
+        3,
+        AdmissionReason.SUBJECT_CORRECTION,
+    )
+    corrected = system.correct(
+        adopted.belief_id,
+        replace(adopted, confidence=0.9, subject_admission=correction_admission),
+        event(3),
+        admission=correction_admission,
+    )
+    assert len(corrected.revision_history[-1].evidence_refs) == 33
+
+    terminal_admission = BeliefSubjectAdmission(
+        corrected.proposition.proposition_digest,
+        tuple(item.evidence_ref for item in evidence),
+        "event:4",
+        4,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
+    terminal = getattr(system, terminal_operation)(
+        corrected.belief_id,
+        event(4),
+        admission=terminal_admission,
+    )
+    assert len(terminal.revision_history[-1].evidence_refs) == 33
+
+
+def test_supersession_retains_two_admission_proofs_beyond_domain_evidence_bound() -> None:
+    system = make_system()
+    predecessor_evidence = full_evidence("predecessor")
+    successor_evidence = full_evidence("successor")
+    predecessor = system.create_proposal(
+        BeliefProposition("full predecessor"), event(1), evidence=predecessor_evidence
+    )
+    successor_proposition = BeliefProposition("full successor")
+    successor = BeliefRecord(
+        belief_id=belief_id_for_proposition(successor_proposition.proposition_digest),
+        proposition=successor_proposition,
+        lifecycle=BeliefLifecycle.PROPOSED,
+        epistemic_status=BeliefEpistemicStatus.UNKNOWN,
+        confidence=0.5,
+        evidence=successor_evidence,
+        supersedes_id=predecessor.belief_id,
+    )
+    predecessor_admission = BeliefSubjectAdmission(
+        predecessor.proposition.proposition_digest,
+        tuple(item.evidence_ref for item in predecessor_evidence),
+        "event:2",
+        2,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
+    successor_admission = BeliefSubjectAdmission(
+        successor.proposition.proposition_digest,
+        tuple(item.evidence_ref for item in successor_evidence),
+        "event:2",
+        2,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
+
+    superseded, created = system.supersede(
+        predecessor.belief_id,
+        successor,
+        event(2),
+        predecessor_admission=predecessor_admission,
+        successor_admission=successor_admission,
+    )
+
+    assert len(superseded.revision_history[-1].evidence_refs) == 34
+    assert len(created.revision_history[-1].evidence_refs) == 33
 
 
 def test_duck_typed_event_cannot_be_used_as_runtime_authority() -> None:

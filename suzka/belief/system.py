@@ -18,9 +18,9 @@ from typing import Callable, Concatenate, Final, Iterable, ParamSpec, TypeVar
 
 from suzka.belief.records import (
     BELIEF_MAX_EVENT_SEQUENCE,
-    BELIEF_MAX_EVIDENCE,
     BELIEF_MAX_REVISIONS,
     BELIEF_MAX_REVISION,
+    BELIEF_MAX_REVISION_WITNESSES,
     BeliefEpistemicStatus,
     BeliefEvidence,
     BeliefLifecycle,
@@ -245,8 +245,8 @@ def _revision_evidence_refs(
     refs = {evidence.evidence_ref for evidence in record.evidence}
     admissions = (() if admission is None else (admission,)) + additional_admissions
     refs.update(item.admission_digest for item in admissions)
-    if len(refs) > BELIEF_MAX_EVIDENCE:
-        raise BeliefCapacityExceeded("Belief revision evidence exceeds its bound")
+    if len(refs) > BELIEF_MAX_REVISION_WITNESSES:
+        raise BeliefCapacityExceeded("Belief revision witnesses exceed their bound")
     return tuple(sorted(refs))
 
 

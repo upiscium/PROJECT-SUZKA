@@ -81,6 +81,9 @@ BELIEF_SCHEMA_VERSION: Final = 1
 BELIEF_MAX_CONTEXTS: Final = 16
 BELIEF_MAX_EVIDENCE: Final = 32
 BELIEF_MAX_REVISIONS: Final = 32
+# Revision witnesses retain the complete domain evidence set plus the two
+# admission proof digests needed by one SUPERSEDE transition.
+BELIEF_MAX_REVISION_WITNESSES: Final = BELIEF_MAX_EVIDENCE + 2
 BELIEF_MAX_PROPOSITION_CODEPOINTS: Final = 2_000
 BELIEF_MAX_COMPONENT_CODEPOINTS: Final = 256
 BELIEF_MAX_REVISION: Final = 2**31 - 1
@@ -527,8 +530,8 @@ class BeliefRevisionRecord:
         if type(self.evidence_refs) is not tuple:
             raise TypeError("evidence_refs must be a tuple")
         refs = tuple(validate_identifier(reference) for reference in self.evidence_refs)
-        if len(refs) > BELIEF_MAX_EVIDENCE:
-            raise ValueError("evidence_refs exceeds its bound")
+        if len(refs) > BELIEF_MAX_REVISION_WITNESSES:
+            raise ValueError("revision witness refs exceed their bound")
         if refs != tuple(sorted(set(refs))):
             raise ValueError("evidence_refs must be sorted and unique")
         object.__setattr__(self, "evidence_refs", refs)
@@ -795,6 +798,7 @@ __all__ = [
     "BELIEF_MAX_PROPOSITION_CODEPOINTS",
     "BELIEF_MAX_REVISIONS",
     "BELIEF_MAX_REVISION",
+    "BELIEF_MAX_REVISION_WITNESSES",
     "BELIEF_PROPOSITION_DOMAIN",
     "BELIEF_RECORD_DOMAIN",
     "BELIEF_REVISION_DOMAIN",

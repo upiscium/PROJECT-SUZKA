@@ -43,6 +43,7 @@ from suzka.belief import (
     BELIEF_MAX_REVISIONS,
     BELIEF_MAX_RECORDS,
     BELIEF_MAX_REVISION,
+    BELIEF_MAX_REVISION_WITNESSES,
     BELIEF_MAX_SERIALIZED_BYTES,
     BeliefEpistemicStatus,
     BeliefEvidenceType,
@@ -796,8 +797,8 @@ class BeliefRevisionStateSnapshot(_StateModel):
 
     @model_validator(mode="after")
     def require_canonical_refs(self) -> BeliefRevisionStateSnapshot:
-        if len(self.evidence_refs) > BELIEF_MAX_EVIDENCE:
-            raise ValueError("Belief revision evidence exceeds its bound")
+        if len(self.evidence_refs) > BELIEF_MAX_REVISION_WITNESSES:
+            raise ValueError("Belief revision witnesses exceed their bound")
         if self.evidence_refs != tuple(sorted(set(self.evidence_refs))):
             raise ValueError("Belief revision evidence must be ordered and unique")
         return self
@@ -902,7 +903,7 @@ def _schema_max_belief_revision() -> dict[str, object]:
         "created_at": _BELIEF_MAX_DATETIME_JSON,
         "event_id": _BELIEF_MAX_IDENTIFIER,
         "event_sequence": _BELIEF_SCHEMA_MAX_EVENT_SEQUENCE,
-        "evidence_refs": [_BELIEF_MAX_IDENTIFIER] * BELIEF_MAX_EVIDENCE,
+        "evidence_refs": [_BELIEF_MAX_IDENTIFIER] * BELIEF_MAX_REVISION_WITNESSES,
         "operation": _schema_max_enum_value(BeliefRevisionOperation),
         "previous_revision_digest": _BELIEF_MAX_DIGEST,
         "reason": _schema_max_enum_value(BeliefRevisionReason),

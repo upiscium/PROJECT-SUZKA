@@ -555,7 +555,7 @@ def test_belief_schema_budget_is_derived_from_all_bounded_fields() -> None:
     )
 
     assert agent_state_module.BELIEF_SCHEMA_MAX_SERIALIZED_BYTES == expected
-    assert agent_state_module.BELIEF_SCHEMA_MAX_SERIALIZED_BYTES == 45_395_318
+    assert agent_state_module.BELIEF_SCHEMA_MAX_SERIALIZED_BYTES == 47_541_622
     assert (
         agent_state_module.BELIEF_SCHEMA_MAX_SERIALIZED_BYTES
         < agent_state_module.BELIEF_MAX_SERIALIZED_BYTES
@@ -579,7 +579,7 @@ def test_maximally_populated_valid_belief_section_fits_the_schema_budget() -> No
             sized_identifier("evidence", record_index, item_index)
             for item_index in range(agent_state_module.BELIEF_MAX_EVIDENCE)
         )
-        revision_evidence_refs = evidence_refs[:-1]
+        revision_evidence_refs = evidence_refs
         evidence = tuple(
             BeliefEvidence(reference, BeliefEvidenceType.EXTERNAL_CLAIM)
             for reference in evidence_refs
@@ -673,6 +673,76 @@ def test_maximally_populated_valid_belief_section_fits_the_schema_budget() -> No
     assert len(records) == agent_state_module.BELIEF_MAX_RECORDS
     assert len(payload) > 40_000_000
     assert len(payload) <= agent_state_module.BELIEF_SCHEMA_MAX_SERIALIZED_BYTES
+
+
+def test_v6_persists_full_evidence_supersession_witnesses(tmp_path: Path) -> None:
+    active_event: AgentEvent | None = None
+
+    def mutation(sequence: int) -> BeliefMutationEvidence:
+        nonlocal active_event
+        active_event = AgentEvent(
+            event_id=f"state-belief-event-{sequence}",
+            event_type=AgentEventType.CHAT,
+            source=AgentEventSource.API_CHAT,
+            requested_at=NOW,
+            processing_sequence=sequence,
+        )
+        return BeliefMutationEvidence(active_event.event_id, sequence, NOW)
+
+    evidence_refs = tuple(f"state-evidence-{index:02d}" for index in range(32))
+    evidence = tuple(
+        BeliefEvidence(reference, BeliefEvidenceType.EXPERIENCE)
+        for reference in evidence_refs
+    )
+    system = BeliefSystem(event_provider=lambda: active_event)
+    predecessor = system.create_proposal(
+        BeliefProposition("state predecessor"), mutation(1), evidence=evidence
+    )
+    successor_proposition = BeliefProposition("state successor")
+    successor = BeliefRecord(
+        belief_id=belief_id_for_proposition(successor_proposition.proposition_digest),
+        proposition=successor_proposition,
+        lifecycle=BeliefLifecycle.PROPOSED,
+        epistemic_status=BeliefEpistemicStatus.UNKNOWN,
+        confidence=0.5,
+        evidence=evidence,
+        supersedes_id=predecessor.belief_id,
+    )
+    predecessor_admission = BeliefSubjectAdmission(
+        predecessor.proposition.proposition_digest,
+        evidence_refs,
+        "state-belief-event-2",
+        2,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
+    successor_admission = BeliefSubjectAdmission(
+        successor.proposition.proposition_digest,
+        evidence_refs,
+        "state-belief-event-2",
+        2,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
+    superseded, created = system.supersede(
+        predecessor.belief_id,
+        successor,
+        mutation(2),
+        predecessor_admission=predecessor_admission,
+        successor_admission=successor_admission,
+    )
+    source = BeliefLoopStub(system)
+    store = make_store(tmp_path / "agent-state.json")
+    snapshot = store.capture(source, sequence=2)
+    target = BeliefLoopStub(BeliefSystem())
+
+    store.restore_into(target, snapshot)
+
+    restored_predecessor = target.belief_system.get(superseded.belief_id)
+    restored_successor = target.belief_system.get(created.belief_id)
+    assert restored_predecessor is not None
+    assert restored_successor is not None
+    assert len(restored_predecessor.revision_history[-1].evidence_refs) == 34
+    assert len(restored_successor.revision_history[-1].evidence_refs) == 33
+    assert target.belief_system.snapshot() == system.snapshot()
 
 
 def test_agent_state_uses_the_explicit_belief_port_for_ownership(tmp_path: Path) -> None:
