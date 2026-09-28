@@ -565,6 +565,157 @@ def test_restore_rejects_supersession_admissions_from_different_events() -> None
         BeliefSystem.restore_snapshot(snapshot)
 
 
+def _system_with_latest_witness_operation(operation: str) -> BeliefSystem:
+    system = make_system()
+    evidence = (
+        BeliefEvidence("claim:one", BeliefEvidenceType.EXPERIENCE),
+        BeliefEvidence("claim:two", BeliefEvidenceType.EXPERIENCE),
+    )
+    proposed = system.create_proposal(
+        BeliefProposition("witness-complete restore"),
+        event(1),
+        evidence=evidence,
+    )
+    if operation == "create":
+        return system
+    admission = BeliefSubjectAdmission(
+        proposed.proposition.proposition_digest,
+        ("claim:one", "claim:two"),
+        "event:2",
+        2,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
+    adopted = system.adopt(
+        proposed.belief_id,
+        admission,
+        event(2),
+        epistemic_status=BeliefEpistemicStatus.PROBABLE,
+    )
+    if operation == "adopt":
+        return system
+    if operation == "correct":
+        correction_admission = BeliefSubjectAdmission(
+            adopted.proposition.proposition_digest,
+            ("claim:one", "claim:two"),
+            "event:3",
+            3,
+            AdmissionReason.SUBJECT_CORRECTION,
+        )
+        system.correct(
+            adopted.belief_id,
+            replace(adopted, confidence=0.9),
+            event(3),
+            admission=correction_admission,
+        )
+        return system
+    if operation in {"retract", "expire"}:
+        terminal_admission = BeliefSubjectAdmission(
+            adopted.proposition.proposition_digest,
+            ("claim:one", "claim:two"),
+            "event:3",
+            3,
+            AdmissionReason.SUBJECT_REVIEW,
+        )
+        getattr(system, operation)(
+            adopted.belief_id,
+            event(3),
+            admission=terminal_admission,
+        )
+        return system
+    if operation == "supersede":
+        successor_proposition = BeliefProposition("witness-complete successor")
+        successor = BeliefRecord(
+            belief_id=belief_id_for_proposition(successor_proposition.proposition_digest),
+            proposition=successor_proposition,
+            lifecycle=BeliefLifecycle.PROPOSED,
+            epistemic_status=BeliefEpistemicStatus.UNKNOWN,
+            confidence=0.5,
+            evidence=evidence,
+            supersedes_id=adopted.belief_id,
+        )
+        predecessor_admission = BeliefSubjectAdmission(
+            adopted.proposition.proposition_digest,
+            ("claim:one", "claim:two"),
+            "event:3",
+            3,
+            AdmissionReason.SUBJECT_REVIEW,
+        )
+        successor_admission = BeliefSubjectAdmission(
+            successor.proposition.proposition_digest,
+            ("claim:one", "claim:two"),
+            "event:3",
+            3,
+            AdmissionReason.SUBJECT_REVIEW,
+        )
+        system.supersede(
+            adopted.belief_id,
+            successor,
+            event(3),
+            predecessor_admission=predecessor_admission,
+            successor_admission=successor_admission,
+        )
+        return system
+    if operation == "compacted":
+        current = adopted
+        for sequence in range(3, 42):
+            current = system.correct(
+                current.belief_id,
+                replace(current, confidence=(sequence % 10) / 10),
+                event(sequence),
+                admission=BeliefSubjectAdmission(
+                    current.proposition.proposition_digest,
+                    ("claim:one", "claim:two"),
+                    f"event:{sequence}",
+                    sequence,
+                    AdmissionReason.SUBJECT_CORRECTION,
+                ),
+            )
+        return system
+    raise AssertionError(f"unsupported operation: {operation}")
+
+
+@pytest.mark.parametrize(
+    "latest_operation",
+    ["create", "adopt", "correct", "retract", "expire", "supersede", "compacted"],
+)
+@pytest.mark.parametrize("tamper_kind", ["missing", "extra"])
+def test_restore_rejects_missing_or_extra_latest_revision_witnesses(
+    latest_operation: str, tamper_kind: str
+) -> None:
+    system = _system_with_latest_witness_operation(latest_operation)
+    target = next(
+        record
+        for record in system.records
+        if (
+            latest_operation != "supersede"
+            or record.lifecycle is BeliefLifecycle.SUPERSEDED
+        )
+    )
+    latest = target.revision_history[-1]
+    if tamper_kind == "missing":
+        witness_refs = tuple(
+            reference
+            for reference in latest.evidence_refs
+            if reference != target.evidence[0].evidence_ref
+        )
+    else:
+        witness_refs = tuple(sorted((*latest.evidence_refs, "claim:extra")))
+    tampered = replace(
+        target,
+        revision_history=(
+            *target.revision_history[:-1],
+            replace(latest, evidence_refs=witness_refs),
+        ),
+    )
+    records = tuple(
+        tampered if record.belief_id == target.belief_id else record
+        for record in system.records
+    )
+
+    with pytest.raises(BeliefDomainError, match="witness set"):
+        BeliefSystem.restore_snapshot(BeliefSystemSnapshot(records))
+
+
 def test_revision_history_compacts_with_an_anchor_and_keeps_current_revision() -> None:
     # A subject admission requires matching evidence; use one reference so the
     # long correction sequence remains representative.
@@ -658,7 +809,13 @@ def test_restore_rejects_two_node_supersession_cycles() -> None:
             event_id=admission.event_id,
             event_sequence=admission.event_sequence,
             evidence_refs=tuple(
-                sorted((admission.admission_digest, successor_admission.admission_digest))
+                sorted(
+                    (
+                        *(item.evidence_ref for item in record.evidence),
+                        admission.admission_digest,
+                        successor_admission.admission_digest,
+                    )
+                )
             ),
         )
         return replace(

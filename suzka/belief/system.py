@@ -876,7 +876,48 @@ class BeliefSystem:
             raise BeliefConflict("a Belief cannot supersede itself")
         if record.lifecycle is BeliefLifecycle.SUPERSEDED and record.superseded_by_id is None:
             raise BeliefConflict("superseded Beliefs require a successor")
+        expected_witnesses = cls._expected_latest_revision_witnesses(record, record_map)
+        if record.revision_history[-1].evidence_refs != expected_witnesses:
+            raise BeliefDomainError(
+                "latest Belief revision witness set does not match current evidence "
+                "and admission proofs"
+            )
         del record_map
+
+    @staticmethod
+    def _expected_latest_revision_witnesses(
+        record: BeliefRecord, record_map: dict[str, BeliefRecord]
+    ) -> tuple[str, ...]:
+        latest = record.revision_history[-1]
+        if latest.operation is BeliefRevisionOperation.SUPERSEDE:
+            predecessor_admission = record.subject_admission
+            successor_id = record.superseded_by_id
+            successor = None if successor_id is None else record_map.get(successor_id)
+            if (
+                predecessor_admission is None
+                or successor is None
+                or successor.subject_admission is None
+            ):
+                raise BeliefConflict(
+                    "supersession revision cannot establish both admission proofs"
+                )
+            return _revision_evidence_refs(
+                record,
+                predecessor_admission,
+                (successor.subject_admission,),
+            )
+        if latest.operation in {
+            BeliefRevisionOperation.ADOPT,
+            BeliefRevisionOperation.CORRECT,
+            BeliefRevisionOperation.RETRACT,
+            BeliefRevisionOperation.EXPIRE,
+        }:
+            if record.subject_admission is None:
+                raise BeliefDomainError(
+                    "latest Belief revision cannot establish its admission proof"
+                )
+            return _revision_evidence_refs(record, record.subject_admission)
+        return _revision_evidence_refs(record)
 
     @staticmethod
     def _validate_revision_history(record: BeliefRecord) -> None:
