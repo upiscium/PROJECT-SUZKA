@@ -185,6 +185,8 @@ def test_correction_can_replace_evidence_with_a_fresh_admission() -> None:
     assert corrected.subject_admission == fresh_admission
     assert corrected.revision_history[-1].operation is BeliefRevisionOperation.CORRECT
     assert fresh_admission.admission_digest in corrected.revision_history[-1].evidence_refs
+    assert "claim:new" in corrected.revision_history[-1].evidence_refs
+    assert "claim:old" not in corrected.revision_history[-1].evidence_refs
 
 
 @pytest.mark.parametrize("terminal_operation", ["retract", "expire"])
@@ -225,7 +227,10 @@ def test_full_domain_evidence_survives_adopt_correct_and_terminal_mutations(
         event(3),
         admission=correction_admission,
     )
-    assert len(corrected.revision_history[-1].evidence_refs) == 33
+    assert set(corrected.revision_history[-1].evidence_refs) == {
+        *(item.evidence_ref for item in evidence),
+        correction_admission.admission_digest,
+    }
 
     terminal_admission = BeliefSubjectAdmission(
         corrected.proposition.proposition_digest,

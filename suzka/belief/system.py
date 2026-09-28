@@ -444,6 +444,7 @@ class BeliefSystem:
             BeliefRevisionReason.CORRECTION,
             evidence,
             subject_admission,
+            witness_record=corrected,
         )
         revision_history, history_anchor_digest = self._append_revision(current, revision)
         updated = replace(
@@ -626,6 +627,8 @@ class BeliefSystem:
         event: BeliefMutationEvidence,
         admission: BeliefSubjectAdmission | None = None,
         additional_admissions: tuple[BeliefSubjectAdmission, ...] = (),
+        *,
+        witness_record: BeliefRecord | None = None,
     ) -> BeliefRevisionRecord:
         if not current.revision_history or current.revision_history[-1].revision != current.revision:
             raise BeliefDomainError("Belief history does not include current authority")
@@ -641,7 +644,9 @@ class BeliefSystem:
             event_id=event.event_id,
             event_sequence=event.event_sequence,
             evidence_refs=_revision_evidence_refs(
-                current, admission, additional_admissions
+                current if witness_record is None else witness_record,
+                admission,
+                additional_admissions,
             ),
         )
 
