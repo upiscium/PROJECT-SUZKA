@@ -48,13 +48,13 @@ R12_F_MATRIX: tuple[tuple[str, tuple[str, ...]], ...] = (
         "F1",
         (
             "tests/test_belief_contract.py::test_external_evidence_does_not_adopt_a_belief",
-            "tests/test_r12_whole_integration.py::test_repeated_semantic_retrieval_does_not_mutate_belief",
+            "tests/test_fastapi_backend.py::test_repeated_real_memory_and_experience_reads_do_not_mutate_authority",
         ),
     ),
     (
         "F2",
         (
-            "tests/test_r12_whole_integration.py::test_repeated_semantic_retrieval_does_not_mutate_belief",
+            "tests/test_fastapi_backend.py::test_repeated_real_memory_and_experience_reads_do_not_mutate_authority",
         ),
     ),
     (
@@ -154,6 +154,7 @@ R12_F_MATRIX: tuple[tuple[str, tuple[str, ...]], ...] = (
         "F17",
         (
             "tests/test_r12_whole_integration.py::test_experience_reference_cannot_self_endorse_value",
+            "tests/test_fastapi_backend.py::test_opaque_experience_evidence_and_proposal_do_not_mutate_value_authority",
             "tests/test_identity_origin.py::test_external_actors_cannot_construct_active_admissions",
         ),
     ),
@@ -168,6 +169,15 @@ R12_F_MATRIX: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "F19",
         (
+            "tests/test_experience_contract.py::test_experience_record_is_immutable_bounded_and_rejects_raw_content_fields",
+            "tests/test_experience_store.py::test_store_rejects_malformed_and_symlink_artifacts",
+            "tests/test_experience_store.py::test_store_rejects_future_schema_artifact",
+            "tests/test_experience_store.py::test_retention_is_exact_anchored_and_idempotent",
+            "tests/test_semantic_store.py::test_revision_serialization_rejects_digest_tampering",
+            "tests/test_semantic_store.py::test_store_rejects_unknown_revision_artifact",
+            "tests/test_semantic_store.py::test_store_rejects_future_schema_artifact",
+            "tests/test_semantic_store.py::test_typed_empty_record_directory_requires_pending_create_evidence",
+            "tests/test_semantic_store.py::test_revision_round_trip_and_exact_current_plus_32_retention",
             "tests/test_belief_system.py::test_total_record_capacity_fails_closed_without_eviction",
             "tests/test_agent_state.py::test_belief_schema_budget_is_derived_from_all_bounded_fields",
             "tests/test_belief_system.py::test_restore_rejects_missing_or_extra_latest_revision_witnesses",
@@ -206,6 +216,10 @@ RECOVERY_CRASH_MATRIX: tuple[tuple[str, str], ...] = (
         "tests/test_r12_semantic_integration.py::test_sleep_persists_visible_semantic_only_and_never_reruns_model",
     ),
     (
+        "SLEEP model/handler failure before internal commit",
+        "tests/test_fastapi_backend.py::test_sleep_handler_failure_before_internal_commit_leaves_no_semantic_authority",
+    ),
+    (
         "Semantic lifecycle pending",
         "tests/test_semantic_participant.py::test_partial_lifecycle_publication_restarts_from_pending_batch",
     ),
@@ -219,7 +233,7 @@ RECOVERY_CRASH_MATRIX: tuple[tuple[str, str], ...] = (
     ),
     (
         "Receipt without lifecycle authority",
-        "tests/test_experience_participant.py::test_receipt_without_committed_record_fails_closed",
+        "tests/test_r12_semantic_integration.py::test_retained_receipt_with_deleted_lifecycle_fails_closed_everywhere",
     ),
     (
         "AgentState v6 Belief restart",
@@ -359,7 +373,7 @@ def _belief_with_proposal() -> BeliefSystem:
     return system
 
 
-def test_repeated_semantic_retrieval_does_not_mutate_belief() -> None:
+def test_prompt_projection_with_fabricated_semantic_evidence_does_not_mutate_belief() -> None:
     system = _belief_with_proposal()
     before = system.snapshot()
     memory_view = _memory_view(
@@ -379,7 +393,7 @@ def test_repeated_semantic_retrieval_does_not_mutate_belief() -> None:
     assert system.snapshot() == before
 
 
-def test_repeated_experience_reads_do_not_mutate_belief() -> None:
+def test_prompt_projection_with_fabricated_experience_evidence_does_not_mutate_belief() -> None:
     system = _belief_with_proposal()
     before = system.snapshot()
     memory_view = _memory_view(

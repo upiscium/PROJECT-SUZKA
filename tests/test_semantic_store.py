@@ -95,6 +95,19 @@ def test_revision_serialization_rejects_digest_tampering() -> None:
         semantic_revision_from_dict(payload)
 
 
+def test_store_rejects_future_schema_artifact(tmp_path: Path) -> None:
+    store = SemanticStore(tmp_path / "semantic")
+    revision = _revision("semantic:future", 0)
+    store.publish_create(revision, "a" * 64)
+    path = store.record_path(revision.semantic_id, 0)
+    payload = json.loads(path.read_text(encoding="ascii"))
+    payload["schema_version"] = 999
+    path.write_text(json.dumps(payload), encoding="ascii")
+
+    with pytest.raises(SemanticStoreCorrupt):
+        store.load_current(revision.semantic_id)
+
+
 def test_store_rejects_unknown_revision_artifact(tmp_path: Path) -> None:
     store = SemanticStore(tmp_path / "semantic")
     revision = _revision("semantic:unknown", 0)

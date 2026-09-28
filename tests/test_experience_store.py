@@ -1,6 +1,7 @@
 """Durability and privacy tests for the Memory-owned Experience store."""
 
 from datetime import UTC, datetime
+import json
 import os
 from pathlib import Path
 
@@ -189,6 +190,19 @@ def test_store_rejects_malformed_and_symlink_artifacts(tmp_path: Path) -> None:
     path = store.record_path(record.experience_id, 0)
     path.unlink()
     path.symlink_to(tmp_path / "secret")
+
+    with pytest.raises(ExperienceStoreCorrupt):
+        store.load_current(record.experience_id)
+
+
+def test_store_rejects_future_schema_artifact(tmp_path: Path) -> None:
+    store = ExperienceStore(tmp_path / "experience")
+    record = _record()
+    store.publish_create(record, OPERATION_DIGEST, SOURCE_DIGEST)
+    path = store.record_path(record.experience_id, 0)
+    payload = json.loads(path.read_text(encoding="ascii"))
+    payload["schema_version"] = 999
+    path.write_text(json.dumps(payload), encoding="ascii")
 
     with pytest.raises(ExperienceStoreCorrupt):
         store.load_current(record.experience_id)

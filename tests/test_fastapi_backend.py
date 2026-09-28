@@ -22,7 +22,10 @@ from suzka.identity import (
     ValueAdmissionStatus,
     ValueConflictDefinition,
     ValueDomainError,
+    ValueEvidence,
     ValueMutationEvidence,
+    ValueProposal,
+    ValueReason,
 )
 from suzka.learning import AdapterRegistry
 from suzka.memory import (
@@ -118,6 +121,11 @@ class FailOnSecondGenerationProvider(ThinkingProvider):
         if self.generation_count == 2:
             raise ValueError(PRIVATE_SENTINEL)
         return super().generate(prompt)
+
+
+class FailingSleepProvider(ThinkingProvider):
+    def generate(self, prompt: str) -> str:
+        raise ValueError(PRIVATE_SENTINEL)
 
 
 class RecordingRuntime(AgentRuntime):
@@ -336,6 +344,132 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
         ) == 1
         pending = settings.memory.persist_directory / ".r07-episodic-pending"
         assert list(pending.glob("*.json")) == []
+
+
+def test_repeated_real_memory_and_experience_reads_do_not_mutate_authority(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        memory = client.app.state.memory_system
+        memory.save_episodic(
+            "real stored semantic input",
+            "real stored semantic response",
+            emotion_arousal=0.9,
+        )
+        sleep_response = client.post("/api/sleep/run", headers=admin_headers())
+        assert sleep_response.status_code == 200
+        semantic_id = sleep_response.json()["semantic_memory_ids"][0]
+        assert memory.semantic_store.load_current(semantic_id) is not None
+        response = client.post(
+            "/api/chat",
+            json={"message": "real stored semantic", "attachments": [], "debug": False},
+        )
+        assert response.status_code == 200
+        episode_id = response.json()["episode_id"]
+        completed = client.app.state.event_journal.records[-1]
+        assert completed.event_id is not None
+        assert completed.processing_sequence is not None
+        experience_id = experience_id_for_event(
+            completed.event_id, completed.processing_sequence
+        )
+        assert memory.get_committed_episodic(episode_id) is not None
+        assert memory.get_committed_semantic(semantic_id) is not None
+        assert (
+            client.app.state.experience_store.load_current(experience_id) is not None
+        )
+
+        semantic_store = memory.semantic_store
+        experience_store = client.app.state.experience_store
+        semantic_bytes_before = {
+            path.relative_to(semantic_store.root): path.read_bytes()
+            for path in semantic_store.root.rglob("*.json")
+        }
+        experience_bytes_before = {
+            path.relative_to(experience_store.root): path.read_bytes()
+            for path in experience_store.root.rglob("*.json")
+        }
+        semantic_record_before = memory.get_committed_semantic(semantic_id)
+        experience_record_before = experience_store.load_current(experience_id)
+        db2_before = memory.db2.get(include=["documents", "metadatas"])
+        assert semantic_record_before is not None
+        assert experience_record_before is not None
+        before_belief = client.app.state.main_loop.belief_system.snapshot()
+        before_value = client.app.state.main_loop.value_system.snapshot()
+        for _ in range(3):
+            context = memory.retrieve_context("real stored semantic")
+            assert semantic_id in {record.id for record in context.db2_results}
+            assert memory.get_committed_semantic(semantic_id) is not None
+            assert memory.get_committed_episodic(episode_id) is not None
+            current = client.app.state.experience_store.load_current(experience_id)
+            assert current is not None
+            assert current.record.experience_id == experience_id
+
+        assert memory.get_committed_semantic(semantic_id) == semantic_record_before
+        experience_record_after = experience_store.load_current(experience_id)
+        assert experience_record_after is not None
+        assert experience_record_after.record == experience_record_before.record
+        assert (
+            experience_record_after.operation_digest
+            == experience_record_before.operation_digest
+        )
+        assert (
+            experience_record_after.source_episode_operation_digest
+            == experience_record_before.source_episode_operation_digest
+        )
+        assert {
+            path.relative_to(semantic_store.root): path.read_bytes()
+            for path in semantic_store.root.rglob("*.json")
+        } == semantic_bytes_before
+        assert {
+            path.relative_to(experience_store.root): path.read_bytes()
+            for path in experience_store.root.rglob("*.json")
+        } == experience_bytes_before
+        assert memory.db2.get(include=["documents", "metadatas"]) == db2_before
+        assert client.app.state.main_loop.belief_system.snapshot() == before_belief
+        assert client.app.state.main_loop.value_system.snapshot() == before_value
+
+
+def test_opaque_experience_evidence_and_proposal_do_not_mutate_value_authority(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        response = client.post(
+            "/api/chat",
+            json={"message": "opaque Experience", "attachments": [], "debug": False},
+        )
+        assert response.status_code == 200
+        completed = client.app.state.event_journal.records[-1]
+        assert completed.event_id is not None
+        assert completed.processing_sequence is not None
+        experience_id = experience_id_for_event(
+            completed.event_id, completed.processing_sequence
+        )
+        current = client.app.state.experience_store.load_current(experience_id)
+        assert current is not None
+
+        before = client.app.state.main_loop.value_system.snapshot()
+        origin = IdentityOrigin(
+            OriginActor.EXTERNAL_SOURCE,
+            OriginInputKind.EVIDENCE,
+            ValueAdmissionStatus.UNCERTAIN,
+            source_ref=experience_id,
+        )
+        evidence = ValueEvidence(
+            evidence_ref=experience_id,
+            origin=origin,
+            reason=ValueReason.OBSERVATION,
+            evidence_refs=(experience_id,),
+        )
+        proposal = ValueProposal(
+            evidence_ref=experience_id,
+            origin=origin,
+            reason=ValueReason.PROPOSAL,
+            evidence_refs=(experience_id,),
+        )
+        assert evidence.evidence_ref == current.record.experience_id
+        assert proposal.evidence_ref == current.record.experience_id
+        client.app.state.main_loop.value_system.prompt_view(None)
+        assert client.app.state.main_loop.value_system.snapshot() == before
 
 
 def test_direct_runtime_submit_uses_public_chat_live_authority(
@@ -1282,6 +1416,37 @@ def test_sleep_endpoint_returns_dry_run_result(tmp_path: Path) -> None:
             not in client.app.state.settings.sleep.dream_dataset_path.read_text(
                 encoding="utf-8"
             ).casefold()
+        )
+
+
+def test_sleep_handler_failure_before_internal_commit_leaves_no_semantic_authority(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings, provider=FailingSleepProvider()) as client:
+        client.app.state.memory_system.save_episodic(
+            "sleep failure input",
+            "sleep failure output",
+            emotion_arousal=0.9,
+        )
+
+        with pytest.raises(ValueError, match=PRIVATE_SENTINEL):
+            client.post("/api/sleep/run", headers=admin_headers())
+
+        store = client.app.state.memory_system.semantic_store
+        assert not tuple(store.records_root.rglob("*.json"))
+        assert not tuple(store.receipts_root.glob("*.json"))
+        assert client.app.state.memory_system.db2.get()["ids"] == []
+        sleep_records = tuple(
+            record
+            for record in client.app.state.event_journal.records
+            if record.event_type is AgentEventType.SLEEP
+        )
+        assert sleep_records
+        assert sleep_records[-1].lifecycle is EventLifecycle.FAILED
+        assert all(
+            record.lifecycle is not EventLifecycle.TRANSACTION_PREPARED
+            for record in sleep_records
         )
 
 

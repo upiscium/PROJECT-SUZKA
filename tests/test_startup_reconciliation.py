@@ -1,6 +1,7 @@
 """Startup reconciliation coverage using the durable local authorities."""
 
 from datetime import UTC, datetime
+from dataclasses import replace
 import json
 from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -8,11 +9,34 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import pytest
 
 from suzka.config import Settings, load_settings
+from suzka.experience import (
+    ExperienceAppraisalEvidence,
+    ExperienceAppraisalReasonCode,
+    ExperienceEmotionContributions,
+    ExperienceEmotionProjection,
+    ExperienceEmotionUpdateReasonCode,
+    ExperienceLifecycle,
+    ExperienceMeasurementEvidence,
+    ExperienceRecord,
+    ExperienceRevisionOperation,
+    ExperienceRevisionReason,
+    ExperienceRevisionRecord,
+    experience_record_digest,
+)
 from suzka.memory import DualMemorySystem, MemoryRecordType
 from suzka.memory.episodic_participant import (
     EpisodicWrite,
     MemoryEpisodicParticipant,
 )
+from suzka.memory.experience_store import ExperienceStore
+from suzka.memory.semantic_lifecycle import (
+    SemanticLifecycle,
+    SemanticRevision,
+    SemanticRevisionOperation,
+    SemanticRevisionReason,
+    semantic_content_digest,
+)
+from suzka.memory.semantic_store import SemanticStore
 from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from suzka.models import ModelProvider
 from suzka.persona.prompt_builder import PromptBuilder
@@ -186,6 +210,134 @@ def _participant(
             context_id=context_id,
             source_channel="chat" if context_id is not None else None,
         ),
+    )
+
+
+def _append_only_history_fixtures(
+    memory: DualMemorySystem,
+) -> tuple[ExperienceStore, SemanticStore, dict[Path, bytes], dict[Path, bytes], str, str]:
+    experience_store = ExperienceStore.from_memory_root(
+        memory.settings.memory.persist_directory
+    )
+    semantic_store = SemanticStore.from_memory_root(
+        memory.settings.memory.persist_directory
+    )
+
+    experience_id = "experience-rollback-history"
+    experience_event = str(uuid5(NAMESPACE_URL, "rollback-experience-create"))
+    experience_revision_event = str(uuid5(NAMESPACE_URL, "rollback-experience-correct"))
+    genesis = ExperienceRevisionRecord(
+        experience_id=experience_id,
+        revision=0,
+        operation=ExperienceRevisionOperation.CREATE,
+        reason=ExperienceRevisionReason.CREATION,
+        created_at=NOW,
+        event_id=experience_event,
+        event_sequence=10,
+        evidence_refs=(experience_event,),
+    )
+    initial_experience = ExperienceRecord(
+        experience_id=experience_id,
+        revision=0,
+        lifecycle=ExperienceLifecycle.ACTIVE,
+        source_event_id=experience_event,
+        source_event_sequence=10,
+        source_episode_id="episode-rollback-history",
+        context_id="context-rollback-history",
+        measurement=ExperienceMeasurementEvidence(
+            "model." + "a" * 64, True, calibrated_novelty=0.25
+        ),
+        appraisal=ExperienceAppraisalEvidence(
+            novelty=0.25,
+            novelty_valid=True,
+            reason_codes=(ExperienceAppraisalReasonCode.NOVELTY_MEASURED,),
+        ),
+        pre_appraisal_emotion=ExperienceEmotionProjection(0.0, 0.0),
+        temporal_update_reasons=(ExperienceEmotionUpdateReasonCode.TIMELINE_INITIALIZED,),
+        post_appraisal_emotion=ExperienceEmotionProjection(0.5, 0.25),
+        emotion_contributions=ExperienceEmotionContributions(),
+        emotion_update_reasons=(ExperienceEmotionUpdateReasonCode.APPRAISAL_APPLIED,),
+        subjective_salience=0.25,
+        created_at=NOW,
+        revision_history=(genesis,),
+    )
+    correction = ExperienceRevisionRecord(
+        experience_id=experience_id,
+        revision=1,
+        operation=ExperienceRevisionOperation.CORRECT,
+        reason=ExperienceRevisionReason.CORRECTION,
+        created_at=NOW,
+        event_id=experience_revision_event,
+        event_sequence=11,
+        evidence_refs=(experience_revision_event,),
+        previous_revision_digest=genesis.record_digest,
+    )
+    revised_experience = replace(
+        initial_experience,
+        revision=1,
+        source_event_id=experience_revision_event,
+        source_event_sequence=11,
+        revision_history=(genesis, correction),
+    )
+    experience_store.publish_create(initial_experience, "a" * 64, "b" * 64)
+    experience_store.publish_revision(
+        revised_experience,
+        "c" * 64,
+        "d" * 64,
+        expected_revision=0,
+        expected_digest=experience_record_digest(initial_experience),
+    )
+
+    semantic_id = "semantic-rollback-history"
+    semantic_event = str(uuid5(NAMESPACE_URL, "rollback-semantic-create"))
+    semantic_revision_event = str(uuid5(NAMESPACE_URL, "rollback-semantic-correct"))
+    initial_semantic = SemanticRevision(
+        semantic_id=semantic_id,
+        revision=0,
+        semantic_content="new-format rollback semantic v0",
+        content_digest=semantic_content_digest("new-format rollback semantic v0"),
+        created_at=NOW,
+        lifecycle=SemanticLifecycle.ACTIVE,
+        operation=SemanticRevisionOperation.CREATE,
+        reason=SemanticRevisionReason.CREATION,
+        event_id=semantic_event,
+        event_sequence=10,
+    )
+    revised_semantic = replace(
+        initial_semantic,
+        revision=1,
+        semantic_content="new-format rollback semantic v1",
+        content_digest=semantic_content_digest("new-format rollback semantic v1"),
+        created_at=NOW,
+        operation=SemanticRevisionOperation.CORRECT,
+        reason=SemanticRevisionReason.CORRECTION,
+        previous_revision_digest=initial_semantic.revision_digest,
+        event_id=semantic_revision_event,
+        event_sequence=11,
+    )
+    semantic_store.publish_create(initial_semantic, "e" * 64)
+    semantic_store.publish_revision(
+        revised_semantic,
+        "f" * 64,
+        expected_revision=0,
+        expected_digest=initial_semantic.revision_digest,
+    )
+
+    experience_bytes = {
+        path.relative_to(experience_store.root): path.read_bytes()
+        for path in experience_store.root.rglob("*.json")
+    }
+    semantic_bytes = {
+        path.relative_to(semantic_store.root): path.read_bytes()
+        for path in semantic_store.root.rglob("*.json")
+    }
+    return (
+        experience_store,
+        semantic_store,
+        experience_bytes,
+        semantic_bytes,
+        experience_id,
+        semantic_id,
     )
 
 
@@ -677,6 +829,14 @@ def test_true_rollback_restores_working_memory_only_and_preserves_newer_episodic
     derived_semantic_id = memory.save_legacy_semantic(
         "semantic derived from context B", source_episode_ids=[committed_ids[1]]
     )
+    (
+        experience_store,
+        semantic_store,
+        experience_history_before,
+        semantic_history_before,
+        rollback_experience_id,
+        rollback_semantic_id,
+    ) = _append_only_history_fixtures(memory)
     episodic_before = memory.db1.get(
         ids=list(committed_ids), include=["documents", "metadatas"]
     )
@@ -760,7 +920,11 @@ def test_true_rollback_restores_working_memory_only_and_preserves_newer_episodic
     assert compatibility.score == 0.35
 
     result = StartupReconciliationCoordinator(
-        journal, recovery, memory
+        journal,
+        recovery,
+        memory,
+        experience_store=experience_store,
+        semantic_store=semantic_store,
     ).reconcile_recovery_gate(rolled_back)
     assert result.participants_consistent
     assert not result.recovery.external_reconciliation_required
@@ -779,6 +943,20 @@ def test_true_rollback_restores_working_memory_only_and_preserves_newer_episodic
         memory.get_committed_semantic(semantic_id)
         for semantic_id in (*semantic_ids, derived_semantic_id)
     ) == semantic_before
+    assert {
+        path.relative_to(experience_store.root): path.read_bytes()
+        for path in experience_store.root.rglob("*.json")
+    } == experience_history_before
+    assert {
+        path.relative_to(semantic_store.root): path.read_bytes()
+        for path in semantic_store.root.rglob("*.json")
+    } == semantic_history_before
+    current_experience = experience_store.load_current(rollback_experience_id)
+    assert current_experience is not None
+    assert current_experience.record.revision == 1
+    current_semantic = semantic_store.load_current(rollback_semantic_id)
+    assert current_semantic is not None
+    assert current_semantic.revision.revision == 1
     inspection = journal.inspect()
     assert not inspection.open_startup_reconciliations
     assert inspection.terminal_gate_clear is not None
