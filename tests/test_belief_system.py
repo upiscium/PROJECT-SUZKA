@@ -7,6 +7,8 @@ import pytest
 
 from suzka.belief import (
     AdmissionReason,
+    BELIEF_MAX_RECORDS,
+    BeliefCapacityExceeded,
     BeliefDomainError,
     BeliefEvidence,
     BeliefEvidenceType,
@@ -134,6 +136,50 @@ def test_correction_cannot_bypass_subject_admission() -> None:
     assert system.get(proposed.belief_id) == proposed
 
 
+def test_correction_can_replace_evidence_with_a_fresh_admission() -> None:
+    system = make_system()
+    proposed = system.create_proposal(
+        BeliefProposition("correctable claim"),
+        event(1),
+        evidence=(BeliefEvidence("claim:old", BeliefEvidenceType.EXTERNAL_CLAIM),),
+    )
+    adopted = system.adopt(
+        proposed.belief_id,
+        BeliefSubjectAdmission(
+            proposed.proposition.proposition_digest,
+            ("claim:old",),
+            "event:2",
+            2,
+            AdmissionReason.SUBJECT_ENDORSEMENT,
+        ),
+        event(2),
+        epistemic_status=BeliefEpistemicStatus.PROBABLE,
+    )
+    fresh_admission = BeliefSubjectAdmission(
+        adopted.proposition.proposition_digest,
+        ("claim:new",),
+        "event:3",
+        3,
+        AdmissionReason.SUBJECT_CORRECTION,
+    )
+    corrected = system.correct(
+        adopted.belief_id,
+        replace(
+            adopted,
+            confidence=0.9,
+            evidence=(BeliefEvidence("claim:new", BeliefEvidenceType.EXPERIENCE),),
+            subject_admission=fresh_admission,
+        ),
+        event(3),
+        admission=fresh_admission,
+    )
+
+    assert tuple(item.evidence_ref for item in corrected.evidence) == ("claim:new",)
+    assert corrected.subject_admission == fresh_admission
+    assert corrected.revision_history[-1].operation is BeliefRevisionOperation.CORRECT
+    assert fresh_admission.admission_digest in corrected.revision_history[-1].evidence_refs
+
+
 def test_duck_typed_event_cannot_be_used_as_runtime_authority() -> None:
     class FakeRuntimeEvent:
         event_id = "event:1"
@@ -188,8 +234,34 @@ def test_every_adopted_belief_mutation_requires_fresh_subject_admission() -> Non
         evidence=(BeliefEvidence("claim:replacement", BeliefEvidenceType.EXPERIENCE),),
         supersedes_id=adopted.belief_id,
     )
+    predecessor_admission = BeliefSubjectAdmission(
+        adopted.proposition.proposition_digest,
+        ("claim:1",),
+        "event:6",
+        6,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
+    successor_admission = BeliefSubjectAdmission(
+        successor.proposition.proposition_digest,
+        ("claim:replacement",),
+        "event:6",
+        6,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
     with pytest.raises(BeliefDomainError, match="subject admission"):
-        system.supersede(adopted.belief_id, successor, event(6))
+        system.supersede(
+            adopted.belief_id,
+            successor,
+            event(6),
+            successor_admission=successor_admission,
+        )
+    with pytest.raises(BeliefDomainError, match="subject admission"):
+        system.supersede(
+            adopted.belief_id,
+            successor,
+            event(6),
+            predecessor_admission=predecessor_admission,
+        )
 
     assert system.snapshot() == before
 
@@ -240,7 +312,14 @@ def test_correction_and_supersession_preserve_immutable_history() -> None:
         evidence=(BeliefEvidence("event:4", BeliefEvidenceType.EXPERIENCE),),
         supersedes_id=corrected.belief_id,
     )
-    admission = BeliefSubjectAdmission(
+    predecessor_admission = BeliefSubjectAdmission(
+        corrected.proposition.proposition_digest,
+        ("event:1",),
+        "event:4",
+        4,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
+    successor_admission = BeliefSubjectAdmission(
         successor.proposition.proposition_digest,
         ("event:4",),
         "event:4",
@@ -248,7 +327,11 @@ def test_correction_and_supersession_preserve_immutable_history() -> None:
         AdmissionReason.SUBJECT_REVIEW,
     )
     superseded, created = system.supersede(
-        corrected.belief_id, successor, event(4), admission=admission
+        corrected.belief_id,
+        successor,
+        event(4),
+        predecessor_admission=predecessor_admission,
+        successor_admission=successor_admission,
     )
 
     assert superseded.lifecycle is BeliefLifecycle.SUPERSEDED
@@ -257,10 +340,118 @@ def test_correction_and_supersession_preserve_immutable_history() -> None:
     assert created.lifecycle is BeliefLifecycle.ADOPTED
     assert created.revision == 1
     assert created.revision_history[-1].operation.value == "adopt"
+    supersede_revision = superseded.revision_history[-1]
+    assert supersede_revision.operation is BeliefRevisionOperation.SUPERSEDE
+    assert predecessor_admission.admission_digest in supersede_revision.evidence_refs
+    assert successor_admission.admission_digest in supersede_revision.evidence_refs
+    assert predecessor_admission.admission_digest != successor_admission.admission_digest
     assert system.get(created.belief_id) == created
     assert tuple(record.belief_id for record in system.records) == tuple(
         sorted(record.belief_id for record in system.records)
     )
+
+
+def test_restore_rejects_supersession_admissions_from_different_events() -> None:
+    system = make_system()
+    predecessor = system.create_proposal(
+        BeliefProposition("predecessor"),
+        event(1),
+        evidence=(BeliefEvidence("claim:predecessor", BeliefEvidenceType.EXPERIENCE),),
+    )
+    predecessor = system.adopt(
+        predecessor.belief_id,
+        BeliefSubjectAdmission(
+            predecessor.proposition.proposition_digest,
+            ("claim:predecessor",),
+            "event:2",
+            2,
+            AdmissionReason.SUBJECT_REVIEW,
+        ),
+        event(2),
+        epistemic_status=BeliefEpistemicStatus.PROBABLE,
+    )
+    successor_proposition = BeliefProposition("successor")
+    successor = BeliefRecord(
+        belief_id=belief_id_for_proposition(successor_proposition.proposition_digest),
+        proposition=successor_proposition,
+        lifecycle=BeliefLifecycle.PROPOSED,
+        epistemic_status=BeliefEpistemicStatus.UNKNOWN,
+        confidence=0.5,
+        evidence=(BeliefEvidence("claim:successor", BeliefEvidenceType.EXPERIENCE),),
+        supersedes_id=predecessor.belief_id,
+    )
+    predecessor_admission = BeliefSubjectAdmission(
+        predecessor.proposition.proposition_digest,
+        ("claim:predecessor",),
+        "event:3",
+        3,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
+    successor_admission = BeliefSubjectAdmission(
+        successor.proposition.proposition_digest,
+        ("claim:successor",),
+        "event:3",
+        3,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
+    superseded, created = system.supersede(
+        predecessor.belief_id,
+        successor,
+        event(3),
+        predecessor_admission=predecessor_admission,
+        successor_admission=successor_admission,
+    )
+
+    tampered_admission = BeliefSubjectAdmission(
+        created.proposition.proposition_digest,
+        ("claim:successor",),
+        "event:4",
+        4,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
+    tampered_successor_revision = replace(
+        created.revision_history[-1],
+        event_id=tampered_admission.event_id,
+        event_sequence=tampered_admission.event_sequence,
+        evidence_refs=tuple(
+            sorted(
+                ref
+                for ref in (
+                    *created.revision_history[-1].evidence_refs,
+                    tampered_admission.admission_digest,
+                )
+                if ref != successor_admission.admission_digest
+            )
+        ),
+    )
+    tampered_successor = replace(
+        created,
+        subject_admission=tampered_admission,
+        revision_history=(created.revision_history[0], tampered_successor_revision),
+    )
+    tampered_predecessor_revision = replace(
+        superseded.revision_history[-1],
+        evidence_refs=tuple(
+            sorted(
+                ref
+                for ref in (
+                    *superseded.revision_history[-1].evidence_refs,
+                    tampered_admission.admission_digest,
+                )
+                if ref != successor_admission.admission_digest
+            )
+        ),
+    )
+    tampered_predecessor = replace(
+        superseded,
+        revision_history=(*superseded.revision_history[:-1], tampered_predecessor_revision),
+    )
+    snapshot = BeliefSystemSnapshot(
+        tuple(sorted((tampered_predecessor, tampered_successor), key=lambda item: item.belief_id))
+    )
+
+    with pytest.raises(BeliefDomainError, match="share the SUPERSEDE event"):
+        BeliefSystem.restore_snapshot(snapshot)
 
 
 def test_revision_history_compacts_with_an_anchor_and_keeps_current_revision() -> None:
@@ -314,10 +505,38 @@ def test_revision_history_compacts_with_an_anchor_and_keeps_current_revision() -
 
 def test_restore_rejects_two_node_supersession_cycles() -> None:
     system = make_system()
-    first = system.create_proposal(BeliefProposition("first"), event(1))
-    second = system.create_proposal(BeliefProposition("second"), event(2))
+    first = system.create_proposal(
+        BeliefProposition("first"),
+        event(1),
+        evidence=(BeliefEvidence("first:1", BeliefEvidenceType.EXPERIENCE),),
+    )
+    second = system.create_proposal(
+        BeliefProposition("second"),
+        event(2),
+        evidence=(BeliefEvidence("second:1", BeliefEvidenceType.EXPERIENCE),),
+    )
 
-    def superseded(record: BeliefRecord, successor_id: str, sequence: int) -> BeliefRecord:
+    first_admission = BeliefSubjectAdmission(
+        first.proposition.proposition_digest,
+        ("first:1",),
+        "event:3",
+        3,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
+    second_admission = BeliefSubjectAdmission(
+        second.proposition.proposition_digest,
+        ("second:1",),
+        "event:3",
+        3,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
+
+    def superseded(
+        record: BeliefRecord,
+        successor_id: str,
+        admission: BeliefSubjectAdmission,
+        successor_admission: BeliefSubjectAdmission,
+    ) -> BeliefRecord:
         revision = BeliefRevisionRecord(
             belief_id=record.belief_id,
             revision=1,
@@ -325,20 +544,24 @@ def test_restore_rejects_two_node_supersession_cycles() -> None:
             reason=BeliefRevisionReason.SUPERSESSION,
             created_at=NOW,
             previous_revision_digest=record.revision_history[0].record_digest,
-            event_id=f"event:{sequence}",
-            event_sequence=sequence,
+            event_id=admission.event_id,
+            event_sequence=admission.event_sequence,
+            evidence_refs=tuple(
+                sorted((admission.admission_digest, successor_admission.admission_digest))
+            ),
         )
         return replace(
             record,
             lifecycle=BeliefLifecycle.SUPERSEDED,
+            subject_admission=admission,
             supersedes_id=successor_id,
             superseded_by_id=successor_id,
             revision=1,
             revision_history=(record.revision_history[0], revision),
         )
 
-    first = superseded(first, second.belief_id, 3)
-    second = superseded(second, first.belief_id, 4)
+    first = superseded(first, second.belief_id, first_admission, second_admission)
+    second = superseded(second, first.belief_id, second_admission, first_admission)
     snapshot = BeliefSystemSnapshot(tuple(sorted((first, second), key=lambda item: item.belief_id)))
 
     with pytest.raises(BeliefDomainError, match="cycle"):
@@ -390,3 +613,61 @@ def test_authoritative_records_are_bounded_and_snapshot_is_detached() -> None:
     assert detached.records == (proposal,)
     with pytest.raises(AttributeError):
         detached.records.append(proposal)  # type: ignore[attr-defined]
+
+
+def test_total_record_capacity_fails_closed_without_eviction() -> None:
+    system = make_system()
+    for sequence in range(1, BELIEF_MAX_RECORDS + 1):
+        system.create_proposal(BeliefProposition(f"claim-{sequence}"), event(sequence))
+
+    before = system.snapshot()
+    with pytest.raises(BeliefCapacityExceeded, match="record bound"):
+        system.create_proposal(
+            BeliefProposition(f"claim-{BELIEF_MAX_RECORDS + 1}"),
+            event(BELIEF_MAX_RECORDS + 1),
+        )
+
+    assert system.snapshot() == before
+
+
+@pytest.mark.parametrize(
+    ("operation", "lifecycle"),
+    [
+        ("retract", BeliefLifecycle.RETRACTED),
+        ("expire", BeliefLifecycle.EXPIRED),
+    ],
+)
+def test_successful_terminal_mutations_leave_the_ordinary_active_view(
+    operation: str, lifecycle: BeliefLifecycle
+) -> None:
+    system = make_system()
+    proposed = system.create_proposal(
+        BeliefProposition(f"terminal-{operation}"),
+        event(1),
+        evidence=(BeliefEvidence("claim:terminal", BeliefEvidenceType.EXPERIENCE),),
+    )
+    adopted = system.adopt(
+        proposed.belief_id,
+        BeliefSubjectAdmission(
+            proposed.proposition.proposition_digest,
+            ("claim:terminal",),
+            "event:2",
+            2,
+            AdmissionReason.SUBJECT_REVIEW,
+        ),
+        event(2),
+        epistemic_status=BeliefEpistemicStatus.PROBABLE,
+    )
+    admission = BeliefSubjectAdmission(
+        adopted.proposition.proposition_digest,
+        ("claim:terminal",),
+        "event:3",
+        3,
+        AdmissionReason.SUBJECT_REVIEW,
+    )
+
+    terminal = getattr(system, operation)(adopted.belief_id, event(3), admission=admission)
+
+    assert terminal.lifecycle is lifecycle
+    assert system.ordinary_active(at=NOW) == ()
+    assert system.get(adopted.belief_id) == terminal

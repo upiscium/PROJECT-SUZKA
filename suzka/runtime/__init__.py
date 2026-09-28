@@ -16,6 +16,8 @@ from suzka.runtime.agent_runtime import (
 )
 from suzka.runtime.agent_state import (
     AGENT_STATE_MAX_SERIALIZED_BYTES,
+    BELIEF_SCHEMA_MAX_SERIALIZED_BYTES,
+    BELIEF_SCHEMA_MAX_RECORD_SERIALIZED_BYTES,
     CURRENT_AGENT_STATE_SCHEMA_VERSION,
     AgentStateConfigurationDrift,
     AgentStateError,
@@ -226,6 +228,8 @@ __all__ = [
     "AppraisalStateSnapshot",
     "AgentStateStore",
     "AGENT_STATE_MAX_SERIALIZED_BYTES",
+    "BELIEF_SCHEMA_MAX_SERIALIZED_BYTES",
+    "BELIEF_SCHEMA_MAX_RECORD_SERIALIZED_BYTES",
     "BeliefStatePort",
     "CompatibleAgentStateSnapshot",
     "ContextCapacityExceeded",

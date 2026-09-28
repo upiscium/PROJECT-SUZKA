@@ -16,10 +16,16 @@ from suzka.belief import (
     BeliefEvidence,
     BeliefEvidenceType,
     BeliefEpistemicStatus,
+    BeliefLifecycle,
     BeliefMutationEvidence,
     BeliefProposition,
+    BeliefRecord,
+    BeliefRevisionOperation,
+    BeliefRevisionReason,
+    BeliefRevisionRecord,
     BeliefSubjectAdmission,
     BeliefSystem,
+    belief_id_for_proposition,
 )
 from suzka.cognition.surprisal_calculator import LossCalibration
 from suzka.config import Settings, load_settings
@@ -133,6 +139,18 @@ class BeliefLoopStub(LoopStub):
 
     def restore_belief_state(self, snapshot) -> None:
         self.belief_system = BeliefSystem.restore_snapshot(snapshot)
+
+
+class PortOnlyBeliefLoopStub(LoopStub):
+    def __init__(self, authority: BeliefSystem) -> None:
+        super().__init__(EmotionState(valence=0.0, arousal=0.0, optimal_loss=1.0))
+        self._authority = authority
+
+    def export_belief_state(self):
+        return self._authority.snapshot()
+
+    def restore_belief_state(self, snapshot) -> None:
+        self._authority = BeliefSystem.restore_snapshot(snapshot)
 
 
 class FailOnceBeliefLoopStub(BeliefLoopStub):
@@ -526,6 +544,148 @@ def test_belief_and_agent_state_byte_bounds_are_deterministic(
     )
     with pytest.raises(AgentStateSaveError):
         store.canonical_bytes(snapshot)
+
+
+def test_belief_schema_budget_is_derived_from_all_bounded_fields() -> None:
+    expected = (
+        agent_state_module._BELIEF_SCHEMA_EMPTY_SECTION_BYTES
+        + agent_state_module.BELIEF_MAX_RECORDS
+        * (agent_state_module.BELIEF_SCHEMA_MAX_RECORD_SERIALIZED_BYTES + 1)
+        - 1
+    )
+
+    assert agent_state_module.BELIEF_SCHEMA_MAX_SERIALIZED_BYTES == expected
+    assert agent_state_module.BELIEF_SCHEMA_MAX_SERIALIZED_BYTES == 45_395_318
+    assert (
+        agent_state_module.BELIEF_SCHEMA_MAX_SERIALIZED_BYTES
+        < agent_state_module.BELIEF_MAX_SERIALIZED_BYTES
+    )
+
+
+def test_maximally_populated_valid_belief_section_fits_the_schema_budget() -> None:
+    def sized_identifier(prefix: str, record_index: int, item_index: int) -> str:
+        base = f"{prefix}-{record_index:03d}-{item_index:03d}"
+        return base + "a" * (128 - len(base))
+
+    records: list[BeliefRecord] = []
+    for record_index in range(agent_state_module.BELIEF_MAX_RECORDS):
+        proposition = BeliefProposition(
+            "\U00010000" * 1_990 + f"{record_index:010d}",
+            "\U00010000" * 256,
+            "\U00010000" * 256,
+            "\U00010000" * 256,
+        )
+        evidence_refs = tuple(
+            sized_identifier("evidence", record_index, item_index)
+            for item_index in range(agent_state_module.BELIEF_MAX_EVIDENCE)
+        )
+        revision_evidence_refs = evidence_refs[:-1]
+        evidence = tuple(
+            BeliefEvidence(reference, BeliefEvidenceType.EXTERNAL_CLAIM)
+            for reference in evidence_refs
+        )
+        contexts = tuple(
+            sized_identifier("context", record_index, item_index)
+            for item_index in range(agent_state_module.BELIEF_MAX_CONTEXTS)
+        )
+        history: list[BeliefRevisionRecord] = []
+        create_event = sized_identifier("event", record_index, 1)
+        history.append(
+            BeliefRevisionRecord(
+                belief_id=belief_id_for_proposition(proposition.proposition_digest),
+                revision=0,
+                operation=BeliefRevisionOperation.CREATE,
+                reason=BeliefRevisionReason.CREATION,
+                created_at=NOW,
+                event_id=create_event,
+                event_sequence=1,
+                evidence_refs=evidence_refs,
+            )
+        )
+        latest_admission = BeliefSubjectAdmission(
+            proposition.proposition_digest,
+            evidence_refs,
+            sized_identifier("event", record_index, 2),
+            2,
+            AdmissionReason.SUBJECT_ENDORSEMENT,
+        )
+        history.append(
+            BeliefRevisionRecord(
+                belief_id=belief_id_for_proposition(proposition.proposition_digest),
+                revision=1,
+                operation=BeliefRevisionOperation.ADOPT,
+                reason=BeliefRevisionReason.SUBJECT_ADMISSION,
+                created_at=NOW,
+                previous_revision_digest=history[-1].record_digest,
+                event_id=latest_admission.event_id,
+                event_sequence=2,
+                evidence_refs=tuple(
+                    sorted((*revision_evidence_refs, latest_admission.admission_digest))
+                ),
+            )
+        )
+        for revision_number in range(2, agent_state_module.BELIEF_MAX_REVISIONS):
+            latest_admission = BeliefSubjectAdmission(
+                proposition.proposition_digest,
+                evidence_refs,
+                sized_identifier("event", record_index, revision_number + 1),
+                revision_number + 1,
+                AdmissionReason.SUBJECT_CORRECTION,
+            )
+            history.append(
+                BeliefRevisionRecord(
+                    belief_id=belief_id_for_proposition(proposition.proposition_digest),
+                    revision=revision_number,
+                    operation=BeliefRevisionOperation.CORRECT,
+                    reason=BeliefRevisionReason.CORRECTION,
+                    created_at=NOW,
+                    previous_revision_digest=history[-1].record_digest,
+                    event_id=latest_admission.event_id,
+                    event_sequence=revision_number + 1,
+                    evidence_refs=tuple(
+                        sorted(
+                            (*revision_evidence_refs, latest_admission.admission_digest)
+                        )
+                    ),
+                )
+            )
+        records.append(
+            BeliefRecord(
+                belief_id=belief_id_for_proposition(proposition.proposition_digest),
+                proposition=proposition,
+                lifecycle=BeliefLifecycle.ADOPTED,
+                epistemic_status=BeliefEpistemicStatus.ESTABLISHED,
+                confidence=1.2345678901234567e-300,
+                context_scope=contexts,
+                valid_from=NOW,
+                valid_until=NOW,
+                evidence=evidence,
+                subject_admission=latest_admission,
+                revision=agent_state_module.BELIEF_MAX_REVISIONS - 1,
+                revision_history=tuple(history),
+            )
+        )
+
+    authority = BeliefSystem(records).snapshot()
+    section = agent_state_module._belief_state_snapshot(authority)
+    payload = agent_state_module._canonical_json_bytes(section.model_dump(mode="json"))
+
+    assert len(records) == agent_state_module.BELIEF_MAX_RECORDS
+    assert len(payload) > 40_000_000
+    assert len(payload) <= agent_state_module.BELIEF_SCHEMA_MAX_SERIALIZED_BYTES
+
+
+def test_agent_state_uses_the_explicit_belief_port_for_ownership(tmp_path: Path) -> None:
+    authority = belief_system_with_proposal()
+    source = PortOnlyBeliefLoopStub(authority)
+    target = PortOnlyBeliefLoopStub(BeliefSystem())
+    store = make_store(tmp_path / "agent-state.json")
+
+    snapshot = store.capture(source, sequence=4)
+    store.restore_into(target, snapshot)
+
+    assert not hasattr(source, "belief_system")
+    assert target.export_belief_state() == source.export_belief_state()
 
 
 def test_v6_nonempty_belief_restore_requires_intrinsic_authority(

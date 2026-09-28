@@ -138,6 +138,8 @@ def _normalize_text(value: object, name: str, maximum: int) -> str:
         raise TypeError(f"{name} must be an exact string")
     for character in value:
         codepoint = ord(character)
+        if 0xD800 <= codepoint <= 0xDFFF:
+            raise ValueError(f"{name} contains a non-Unicode scalar value")
         if codepoint == 0 or codepoint == 127 or (
             codepoint < 32 and character not in "\t\n\r"
         ):
@@ -792,6 +794,7 @@ __all__ = [
     "BELIEF_MAX_EVIDENCE",
     "BELIEF_MAX_PROPOSITION_CODEPOINTS",
     "BELIEF_MAX_REVISIONS",
+    "BELIEF_MAX_REVISION",
     "BELIEF_PROPOSITION_DOMAIN",
     "BELIEF_RECORD_DOMAIN",
     "BELIEF_REVISION_DOMAIN",

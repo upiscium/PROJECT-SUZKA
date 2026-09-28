@@ -38,6 +38,8 @@ def test_proposition_normalization_and_literal_golden_digest() -> None:
         BeliefProposition("x" * 2_001)
     with pytest.raises(ValueError):
         BeliefProposition("a\x01b")
+    with pytest.raises(ValueError, match="Unicode scalar"):
+        BeliefProposition("\ud800")
 
 
 def test_structured_projection_is_optional_and_not_identity() -> None:

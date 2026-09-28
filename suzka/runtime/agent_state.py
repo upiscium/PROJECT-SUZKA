@@ -12,7 +12,16 @@ import os
 from pathlib import Path
 import stat
 import tempfile
-from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, cast, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Final,
+    Literal,
+    Protocol,
+    cast,
+    runtime_checkable,
+)
 
 from pydantic import (
     BaseModel,
@@ -29,9 +38,11 @@ from suzka.belief import (
     BELIEF_MAX_COMPONENT_CODEPOINTS,
     BELIEF_MAX_CONTEXTS,
     BELIEF_MAX_EVIDENCE,
+    BELIEF_MAX_EVENT_SEQUENCE,
     BELIEF_MAX_PROPOSITION_CODEPOINTS,
     BELIEF_MAX_REVISIONS,
     BELIEF_MAX_RECORDS,
+    BELIEF_MAX_REVISION,
     BELIEF_MAX_SERIALIZED_BYTES,
     BeliefEpistemicStatus,
     BeliefEvidenceType,
@@ -71,6 +82,7 @@ from suzka.identity.value_system import (
     recompute_seed_contract_digest,
 )
 from suzka.privacy import normalize_private_key
+from suzka.identifiers import MAX_IDENTIFIER_CODEPOINTS
 from suzka.runtime.context import (
     ContextFrame,
     ContextRegistry,
@@ -97,7 +109,11 @@ AGENT_STATE_MAX_SERIALIZED_BYTES = 128 * 1024 * 1024
 
 @runtime_checkable
 class BeliefStatePort(Protocol):
-    """Explicit immutable export/restore boundary owned by the runtime."""
+    """Runtime-owned persistence port; BeliefSystem remains authority owner.
+
+    AgentState may serialize and restore through this port, but it does not
+    receive mutation authority over Belief lifecycle, admission, or history.
+    """
 
     def export_belief_state(self) -> BeliefSystemSnapshot: ...
 
@@ -856,8 +872,119 @@ def _canonical_json_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
+_BELIEF_MAX_DATETIME_JSON = "9999-12-31T23:59:59.999999Z"
+_BELIEF_MAX_IDENTIFIER = "a" * MAX_IDENTIFIER_CODEPOINTS
+_BELIEF_MAX_BELIEF_ID = "b" * len("belief-" + "0" * 64)
+_BELIEF_MAX_DIGEST = "c" * 64
+_BELIEF_SCHEMA_MAX_EVENT_SEQUENCE = BELIEF_MAX_EVENT_SEQUENCE
+_BELIEF_SCHEMA_MAX_REVISION = BELIEF_MAX_REVISION
+# D7 reserves the longest JSON representation of a finite non-negative
+# binary64 confidence value accepted by the domain.  The current CPython
+# encoder emits at most 23 bytes for this range; one byte of slack keeps this
+# schema budget independent of a shorter future formatter.
+BELIEF_SCHEMA_MAX_FLOAT_JSON_BYTES: Final[int] = 24
+_BELIEF_SCHEMA_MAX_CONFIDENCE = 1.2345678901234567e-300
+
+
+def _schema_max_text(codepoints: int) -> str:
+    """Return a valid worst-case UTF-8 text sample for a code-point bound."""
+
+    return "\U00010000" * codepoints
+
+
+def _schema_max_enum_value(enum_type: type[Enum]) -> str:
+    return max((member.value for member in enum_type), key=len)
+
+
+def _schema_max_belief_revision() -> dict[str, object]:
+    return {
+        "belief_id": _BELIEF_MAX_BELIEF_ID,
+        "created_at": _BELIEF_MAX_DATETIME_JSON,
+        "event_id": _BELIEF_MAX_IDENTIFIER,
+        "event_sequence": _BELIEF_SCHEMA_MAX_EVENT_SEQUENCE,
+        "evidence_refs": [_BELIEF_MAX_IDENTIFIER] * BELIEF_MAX_EVIDENCE,
+        "operation": _schema_max_enum_value(BeliefRevisionOperation),
+        "previous_revision_digest": _BELIEF_MAX_DIGEST,
+        "reason": _schema_max_enum_value(BeliefRevisionReason),
+        "record_digest": _BELIEF_MAX_DIGEST,
+        "revision": _BELIEF_SCHEMA_MAX_REVISION,
+    }
+
+
+def _schema_max_belief_record() -> dict[str, object]:
+    return {
+        "belief_id": _BELIEF_MAX_BELIEF_ID,
+        "confidence": _BELIEF_SCHEMA_MAX_CONFIDENCE,
+        "context_scope": [_BELIEF_MAX_IDENTIFIER] * BELIEF_MAX_CONTEXTS,
+        "epistemic_status": _schema_max_enum_value(BeliefEpistemicStatus),
+        "evidence": [
+            {
+                "evidence_ref": _BELIEF_MAX_IDENTIFIER,
+                "evidence_type": _schema_max_enum_value(BeliefEvidenceType),
+            }
+        ]
+        * BELIEF_MAX_EVIDENCE,
+        "history_anchor_digest": _BELIEF_MAX_DIGEST,
+        "lifecycle": _schema_max_enum_value(BeliefLifecycle),
+        "proposition": {
+            "canonical_text": _schema_max_text(BELIEF_MAX_PROPOSITION_CODEPOINTS),
+            "object": _schema_max_text(BELIEF_MAX_COMPONENT_CODEPOINTS),
+            "predicate": _schema_max_text(BELIEF_MAX_COMPONENT_CODEPOINTS),
+            "proposition_digest": _BELIEF_MAX_DIGEST,
+            "subject": _schema_max_text(BELIEF_MAX_COMPONENT_CODEPOINTS),
+        },
+        "record_digest": _BELIEF_MAX_DIGEST,
+        "revision": _BELIEF_SCHEMA_MAX_REVISION,
+        "revision_history": [
+            _schema_max_belief_revision()
+        ]
+        * BELIEF_MAX_REVISIONS,
+        "schema_version": 1,
+        "subject_admission": {
+            "admission_digest": _BELIEF_MAX_DIGEST,
+            "event_id": _BELIEF_MAX_IDENTIFIER,
+            "event_sequence": _BELIEF_SCHEMA_MAX_EVENT_SEQUENCE,
+            "evidence_refs": [_BELIEF_MAX_IDENTIFIER] * BELIEF_MAX_EVIDENCE,
+            "proposition_digest": _BELIEF_MAX_DIGEST,
+            "reason": _schema_max_enum_value(BeliefSubjectAdmissionReason),
+        },
+        "superseded_by_id": _BELIEF_MAX_BELIEF_ID,
+        "supersedes_id": _BELIEF_MAX_BELIEF_ID,
+        "valid_from": _BELIEF_MAX_DATETIME_JSON,
+        "valid_until": _BELIEF_MAX_DATETIME_JSON,
+    }
+
+
+_BELIEF_SCHEMA_MAX_RECORD = _schema_max_belief_record()
+_BELIEF_SCHEMA_CONFIDENCE_JSON_BYTES = len(
+    json.dumps(
+        _BELIEF_SCHEMA_MAX_CONFIDENCE,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("ascii")
+)
+BELIEF_SCHEMA_MAX_RECORD_SERIALIZED_BYTES: Final[int] = len(
+    _canonical_json_bytes(_BELIEF_SCHEMA_MAX_RECORD)
+) + (BELIEF_SCHEMA_MAX_FLOAT_JSON_BYTES - _BELIEF_SCHEMA_CONFIDENCE_JSON_BYTES)
+_BELIEF_SCHEMA_EMPTY_SECTION_BYTES = len(
+    _canonical_json_bytes(
+        {"authority_digest": _BELIEF_MAX_DIGEST, "records": [], "schema_version": 1}
+    )
+)
+BELIEF_SCHEMA_MAX_SERIALIZED_BYTES: Final[int] = (
+    _BELIEF_SCHEMA_EMPTY_SECTION_BYTES
+    + BELIEF_MAX_RECORDS * (BELIEF_SCHEMA_MAX_RECORD_SERIALIZED_BYTES + 1)
+    - 1
+)
+
+
 class BeliefSystemStateSnapshot(_StateModel):
-    """Complete bounded intrinsic Belief authority embedded in AgentState v6."""
+    """Complete bounded intrinsic Belief authority embedded in AgentState v6.
+
+    ``BELIEF_SCHEMA_MAX_SERIALIZED_BYTES`` is a schema-derived upper bound for
+    this section; ``BELIEF_MAX_SERIALIZED_BYTES`` remains the runtime admission
+    cap and is intentionally larger than the derived maximum.
+    """
 
     schema_version: Literal[1] = 1
     records: tuple[BeliefRecordStateSnapshot, ...]
@@ -1511,7 +1638,12 @@ def _belief_state_port(main_loop: SuzkaMainLoop) -> BeliefStatePort | None:
 
 
 class AgentStateStore:
-    """Load, capture, restore, and atomically publish the R04 snapshot."""
+    """Persist runtime state without taking over domain authority.
+
+    AgentStateStore owns snapshot schema, migration, publication, and rollback
+    continuity.  BeliefSystem remains the owner of Belief mutation and
+    lifecycle authority behind ``BeliefStatePort``.
+    """
 
     def __init__(
         self,

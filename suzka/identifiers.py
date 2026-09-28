@@ -1,9 +1,13 @@
 """Dependency-neutral validation for shared opaque identifiers."""
 
 import re
+from typing import Final
 
 
-_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+MAX_IDENTIFIER_CODEPOINTS: Final = 128
+_IDENTIFIER = re.compile(
+    rf"[A-Za-z0-9][A-Za-z0-9._:-]{{0,{MAX_IDENTIFIER_CODEPOINTS - 1}}}\Z"
+)
 
 
 def validate_identifier(value: object) -> str:

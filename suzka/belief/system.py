@@ -240,10 +240,11 @@ class BeliefSystemSnapshot:
 def _revision_evidence_refs(
     record: BeliefRecord,
     admission: BeliefSubjectAdmission | None = None,
+    additional_admissions: tuple[BeliefSubjectAdmission, ...] = (),
 ) -> tuple[str, ...]:
     refs = {evidence.evidence_ref for evidence in record.evidence}
-    if admission is not None:
-        refs.add(admission.admission_digest)
+    admissions = (() if admission is None else (admission,)) + additional_admissions
+    refs.update(item.admission_digest for item in admissions)
     if len(refs) > BELIEF_MAX_EVIDENCE:
         raise BeliefCapacityExceeded("Belief revision evidence exceeds its bound")
     return tuple(sorted(refs))
@@ -432,8 +433,6 @@ class BeliefSystem:
             raise BeliefDomainError("correction cannot change proposition identity")
         if corrected.lifecycle is not current.lifecycle:
             raise BeliefDomainError("correction cannot change Belief lifecycle")
-        if corrected.subject_admission != current.subject_admission:
-            raise BeliefDomainError("correction cannot change subject admission")
         if corrected.supersedes_id != current.supersedes_id or corrected.superseded_by_id != current.superseded_by_id:
             raise BeliefDomainError("correction cannot change supersession links")
         subject_admission = self._require_subject_admission(
@@ -464,7 +463,8 @@ class BeliefSystem:
         successor: BeliefRecord,
         event: BeliefMutationEvidence | None = None,
         *,
-        admission: BeliefSubjectAdmission | None = None,
+        predecessor_admission: BeliefSubjectAdmission | None = None,
+        successor_admission: BeliefSubjectAdmission | None = None,
     ) -> tuple[BeliefRecord, BeliefRecord]:
         evidence = self._require_event(event)
         current = self._require_record(belief_id)
@@ -486,15 +486,19 @@ class BeliefSystem:
             or successor.revision_history
         ):
             raise BeliefDomainError("a successor must begin at revision zero")
-        subject_admission = self._require_subject_admission(
-            admission, successor, evidence
+        predecessor_admission = self._require_subject_admission(
+            predecessor_admission, current, evidence
+        )
+        successor_admission = self._require_subject_admission(
+            successor_admission, successor, evidence
         )
         old_revision = self._next_revision(
             current,
             BeliefRevisionOperation.SUPERSEDE,
             BeliefRevisionReason.SUPERSESSION,
             evidence,
-            subject_admission,
+            predecessor_admission,
+            (successor_admission,),
         )
         old_history, old_history_anchor_digest = self._append_revision(
             current, old_revision
@@ -518,11 +522,12 @@ class BeliefSystem:
             previous_revision_digest=successor_revision.record_digest,
             event_id=evidence.event_id,
             event_sequence=evidence.event_sequence,
-            evidence_refs=_revision_evidence_refs(successor, subject_admission),
+            evidence_refs=_revision_evidence_refs(successor, successor_admission),
         )
         superseded = replace(
             current,
             lifecycle=BeliefLifecycle.SUPERSEDED,
+            subject_admission=predecessor_admission,
             superseded_by_id=successor.belief_id,
             revision=current.revision + 1,
             revision_history=old_history,
@@ -531,7 +536,7 @@ class BeliefSystem:
         created_successor = replace(
             successor,
             lifecycle=BeliefLifecycle.ADOPTED,
-            subject_admission=subject_admission,
+            subject_admission=successor_admission,
             revision=1,
             revision_history=(successor_revision, successor_adoption_revision),
         )
@@ -620,6 +625,7 @@ class BeliefSystem:
         reason: BeliefRevisionReason,
         event: BeliefMutationEvidence,
         admission: BeliefSubjectAdmission | None = None,
+        additional_admissions: tuple[BeliefSubjectAdmission, ...] = (),
     ) -> BeliefRevisionRecord:
         if not current.revision_history or current.revision_history[-1].revision != current.revision:
             raise BeliefDomainError("Belief history does not include current authority")
@@ -634,7 +640,9 @@ class BeliefSystem:
             previous_revision_digest=current.revision_history[-1].record_digest,
             event_id=event.event_id,
             event_sequence=event.event_sequence,
-            evidence_refs=_revision_evidence_refs(current, admission),
+            evidence_refs=_revision_evidence_refs(
+                current, admission, additional_admissions
+            ),
         )
 
     @staticmethod
@@ -745,6 +753,23 @@ class BeliefSystem:
                 successor = record_map.get(record.superseded_by_id)
                 if successor is None or successor.supersedes_id != record.belief_id:
                     raise BeliefConflict("supersession links are not reciprocal")
+                successor_admission = successor.subject_admission
+                if (
+                    successor_admission is None
+                    or successor_admission.admission_digest
+                    not in record.revision_history[-1].evidence_refs
+                ):
+                    raise BeliefConflict(
+                        "supersession revision is missing successor admission proof"
+                    )
+                latest = record.revision_history[-1]
+                if (
+                    successor_admission.event_id != latest.event_id
+                    or successor_admission.event_sequence != latest.event_sequence
+                ):
+                    raise BeliefConflict(
+                        "supersession admissions must share the SUPERSEDE event"
+                    )
         cls._validate_supersession_graph(records, record_map)
 
     @staticmethod
@@ -826,6 +851,21 @@ class BeliefSystem:
             ):
                 raise BeliefDomainError(
                     "subject admission does not match the latest Belief revision"
+                )
+        if record.lifecycle is BeliefLifecycle.SUPERSEDED:
+            admission = record.subject_admission
+            latest = record.revision_history[-1]
+            if admission is None:
+                raise BeliefConflict(
+                    "superseded Beliefs require predecessor admission proof"
+                )
+            if (
+                admission.event_id != latest.event_id
+                or admission.event_sequence != latest.event_sequence
+                or admission.admission_digest not in latest.evidence_refs
+            ):
+                raise BeliefConflict(
+                    "supersession revision is missing predecessor admission proof"
                 )
         if record.supersedes_id == record.belief_id or record.superseded_by_id == record.belief_id:
             raise BeliefConflict("a Belief cannot supersede itself")
