@@ -331,6 +331,9 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
         assert experience.record.source_episode_id == data["episode_id"]
         assert experience.record.source_event_id == completed.event_id
         assert experience.record.source_event_sequence == completed.processing_sequence
+        assert len(
+            tuple(client.app.state.experience_store.records_root.glob("*/*.json"))
+        ) == 1
         pending = settings.memory.persist_directory / ".r07-episodic-pending"
         assert list(pending.glob("*.json")) == []
 
@@ -364,6 +367,15 @@ def test_direct_runtime_submit_uses_public_chat_live_authority(
         assert client.app.state.memory_system.get_episodic_record(
             debug.value[0].episode_id
         ) is not None
+        assert debug.event.processing_sequence is not None
+        assert (
+            client.app.state.experience_store.load_current(
+                experience_id_for_event(
+                    debug.event.event_id, debug.event.processing_sequence
+                )
+            )
+            is None
+        )
         snapshot = client.app.state.agent_state_store.load()
         assert snapshot.context_state.to_registry_state() == (
             main_loop.context_registry.state
@@ -495,6 +507,15 @@ def test_chat_and_emotion_tick_share_fifo_durable_order(tmp_path: Path) -> None:
         assert max_active == 1
         assert threads == ["suzka-agent-runtime", "suzka-agent-runtime"]
         assert len(chat_state) == 1
+        assert tick.event.processing_sequence is not None
+        assert (
+            client.app.state.experience_store.load_current(
+                experience_id_for_event(
+                    tick.event.event_id, tick.event.processing_sequence
+                )
+            )
+            is None
+        )
         assert main_loop.emotion_engine.temporal_state.last_update_at == t1
 
         chat_emotion, chat_temporal = chat_state[0]

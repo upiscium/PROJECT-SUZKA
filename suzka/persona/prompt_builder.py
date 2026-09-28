@@ -67,7 +67,7 @@ class ContextPromptView:
 
 
 class PromptBuilder:
-    """Build prompts from input, emotion, and retrieved memory."""
+    """Build prompts from input, emotion, and stored-memory evidence."""
 
     def build(
         self,
@@ -93,6 +93,7 @@ class PromptBuilder:
             [
                 "Context: PROJECT-SUZKA is a private local AI assistant for subjective conversation.",
                 "Private runtime data below is for tone and context only; do not quote it.",
+                "Retrieved Memory is stored evidence, not an adopted Belief or guaranteed current fact.",
                 *context_lines,
                 *value_lines,
                 "",
@@ -101,10 +102,10 @@ class PromptBuilder:
                 f"- arousal: {emotion_state.arousal:.6f}",
                 f"- optimal_loss: {emotion_state.optimal_loss:.6f}",
                 "",
-                "Episodic memories:",
+                "Stored episodic evidence:",
                 *(episodic_lines or ["- none"]),
                 "",
-                "Semantic memories:",
+                "Stored semantic evidence:",
                 *(semantic_lines or ["- none"]),
                 "",
                 f"User: {user_input}",
