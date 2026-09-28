@@ -10,9 +10,9 @@ from uuid import NAMESPACE_URL, uuid5
 import pytest
 from pydantic import ValidationError
 
-from kagya.config import Settings, load_settings
-from kagya.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
-from kagya.runtime.event_journal import (
+from suzka.config import Settings, load_settings
+from suzka.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
+from suzka.runtime.event_journal import (
     AbortOutcome,
     EventFailureCategory,
     EventRecoveryCategory,
@@ -33,7 +33,7 @@ from kagya.runtime.event_journal import (
     StartupParticipantOutcome,
     TransactionKind,
 )
-import kagya.runtime.event_journal as journal_module
+import suzka.runtime.event_journal as journal_module
 
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -358,16 +358,76 @@ def test_schema_is_strict_and_has_no_metadata_escape_hatch() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("lifecycle", "fields"),
+    [
+        (
+            EventLifecycle.CHECKPOINT,
+            {
+                "processing_sequence": 0,
+                "snapshot_sequence": 0,
+                "snapshot_hash": HASH_0,
+                "wal_generation_id": str(uuid5(NAMESPACE_URL, "forbidden-checkpoint-generation")),
+                "wal_record_id": str(uuid5(NAMESPACE_URL, "forbidden-checkpoint-record")),
+                "wal_record_hash": HASH_1,
+                "journal_lineage_id": str(uuid5(NAMESPACE_URL, "forbidden-checkpoint-lineage")),
+                "external_reconciliation_required": False,
+                "v3_migration_anchor_hash": HASH_2,
+            },
+        ),
+        (
+            EventLifecycle.TRANSACTION_COMPLETED,
+            {
+                "event_id": event("forbidden-transaction", 1).event_id,
+                "event_type": AgentEventType.CHAT,
+                "source": AgentEventSource.API_CHAT,
+                "processing_sequence": 1,
+                "transaction_id": str(uuid5(NAMESPACE_URL, "forbidden-transaction-id")),
+            },
+        ),
+        (
+            EventLifecycle.STARTUP_RECONCILIATION_COMPLETED,
+            {
+                "reconciliation_id": str(uuid5(NAMESPACE_URL, "forbidden-reconciliation")),
+                "recovery_id": str(uuid5(NAMESPACE_URL, "forbidden-recovery")),
+                "snapshot_sequence": 0,
+                "snapshot_hash": HASH_0,
+                "recovery_processing_high_water": 0,
+                "wal_generation_id": str(uuid5(NAMESPACE_URL, "forbidden-startup-generation")),
+                "wal_record_id": str(uuid5(NAMESPACE_URL, "forbidden-startup-record")),
+                "wal_record_hash": HASH_1,
+                "journal_lineage_id": str(uuid5(NAMESPACE_URL, "forbidden-startup-lineage")),
+            },
+        ),
+    ],
+)
+def test_adoption_epoch_is_baseline_only(
+    lifecycle: EventLifecycle, fields: dict[str, object]
+) -> None:
+    with pytest.raises(ValidationError):
+        EventJournalRecord.model_validate(
+            {
+                "schema_version": 3,
+                "record_id": str(uuid5(NAMESPACE_URL, f"forbidden-{lifecycle.value}")),
+                "timestamp": NOW,
+                "lifecycle": lifecycle,
+                "record_hash": HASH_0,
+                "adoption_epoch": 1,
+                **fields,
+            }
+        )
+
+
 def test_journal_config_is_strict_positive_and_backward_compatible() -> None:
     settings = load_settings(CONFIG_PATH)
-    assert settings.event_journal.path == Path(".kagya/event_journal.jsonl")
+    assert settings.event_journal.path == Path(".suzka/event_journal.jsonl")
     assert settings.event_journal.max_bytes == 1_048_576
     assert settings.event_journal.retained_files == 4
 
     pre_r05 = settings.model_dump(mode="python")
     pre_r05.pop("event_journal")
     compatible = Settings.model_validate(pre_r05)
-    assert compatible.event_journal.path == Path(".kagya/event_journal.jsonl")
+    assert compatible.event_journal.path == Path(".suzka/event_journal.jsonl")
     with pytest.raises(ValidationError):
         type(settings.event_journal).model_validate(
             {"path": "journal", "max_bytes": 0, "retained_files": 1}
@@ -1231,10 +1291,10 @@ def test_v1_v2_hash_and_byte_semantics_match_pre_v3_golden_values() -> None:
     )
 
     assert EventJournal._record_hash(v1) == (
-        "a4cec00324ac08ebf043a6e5b3ece3bf8f83482e847409fceb0214d0def5169b"
+        "1bfaadebc3d2012d5b16810ac51319deb2cd5690065cd8a06026447070d24784"
     )
     assert EventJournal._record_hash(v2) == (
-        "85fe822fa2841e479979ffead740bcbbcd7bd0bb3796b937092b69063d21cf64"
+        "ac4520b06240182a5b8468fe5b68ec0d13b6488050418c36dd115c45dcc0a1c5"
     )
     assert hashlib.sha256(EventJournal._record_bytes(v1)).hexdigest() == (
         "0b979ab3aeec278248c86d81647346522cb3e0a48e7064f1786bfbc4ad4caf30"
@@ -2308,6 +2368,62 @@ def test_u5_baseline_rejects_any_registry_other_than_the_fixed_registry(
         )
 
     assert value.records == before
+
+
+def test_u2_baseline_epoch_adopts_strict_superset_without_rewriting_history(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "u2-baseline.jsonl")
+    append_u5_baseline(value)
+    historical = value.path.read_bytes()
+    inspection = value.inspect()
+    baseline = inspection.baselines[-1]
+    registry = (
+        ParticipantBaseline(
+            participant_id="memory.episodic",
+            domain=ParticipantDomain.DURABLE_DOMAIN,
+        ),
+        ParticipantBaseline(
+            participant_id="memory.experience",
+            domain=ParticipantDomain.DURABLE_DOMAIN,
+        ),
+        ParticipantBaseline(
+            participant_id="session.turn",
+            domain=ParticipantDomain.EPHEMERAL_PROCESS,
+        ),
+    )
+    value.append_participant_baseline(
+        str(uuid5(NAMESPACE_URL, "u2-baseline")),
+        inspection.snapshot_sequence,
+        inspection.snapshot_hash,
+        inspection.processing_high_water,
+        baseline.wal_generation_id,
+        baseline.wal_record_id,
+        baseline.wal_record_hash,
+        baseline.journal_lineage_id,
+        registry,
+        adoption_epoch=1,
+    )
+
+    upgraded = value.inspect()
+    assert value.path.read_bytes().startswith(historical)
+    assert [item.adoption_epoch for item in upgraded.baselines] == [0, 1]
+    assert upgraded.baselines[-1].participant_registry == registry
+    after_upgrade = value.path.read_bytes()
+    with pytest.raises(ValueError):
+        value.append_participant_baseline(
+            str(uuid5(NAMESPACE_URL, "u2-repeat")),
+            upgraded.snapshot_sequence,
+            upgraded.snapshot_hash,
+            upgraded.processing_high_water,
+            upgraded.baselines[-1].wal_generation_id,
+            upgraded.baselines[-1].wal_record_id,
+            upgraded.baselines[-1].wal_record_hash,
+            upgraded.baselines[-1].journal_lineage_id,
+            registry,
+            adoption_epoch=2,
+        )
+    assert value.path.read_bytes() == after_upgrade
 
 
 def test_u5_canonically_hashed_noncurrent_baseline_fails_replay(

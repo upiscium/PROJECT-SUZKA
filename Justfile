@@ -6,18 +6,18 @@ default: check-all
 # =============================================================================
 
 # Lint the backend package and backend tests.
-lint target="kagya tests":
+lint target="suzka tests":
     @echo "==> Running Ruff on {{target}}..."
     uv run ruff check {{target}}
 
 # Format backend source/tests and apply safe Ruff fixes.
-format target="kagya tests":
+format target="suzka tests":
     @echo "==> Formatting {{target}}..."
     uv run ruff format {{target}}
     uv run ruff check --fix {{target}}
 
 # Type-check the actual backend package tree.
-typecheck target="kagya":
+typecheck target="suzka":
     @echo "==> Running Mypy on {{target}}..."
     uv run mypy {{target}}
 
@@ -38,8 +38,8 @@ frontend-build:
 
 # Start the FastAPI server.
 api:
-    @echo "==> Starting PROJECT-KAGYA FastAPI server..."
-    uv run python -m kagya.api.server
+    @echo "==> Starting PROJECT-SUZKA FastAPI server..."
+    uv run python -m suzka.api.server
 
 # =============================================================================
 # Composite validation

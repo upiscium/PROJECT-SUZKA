@@ -1,0 +1,46 @@
+"""Sleep cycle routes."""
+
+from typing import cast
+
+from fastapi import APIRouter, Depends
+
+from suzka.api.dependencies import (
+    get_agent_runtime,
+    get_sleep_cycle_manager,
+    require_admin,
+)
+from suzka.api.runtime_execution import execute
+from suzka.api.schemas.sleep import SleepRunResponse
+from suzka.learning import SleepCycleManager, SleepCycleResult
+from suzka.runtime import AgentEventSource, AgentEventType, AgentRuntime
+
+
+router = APIRouter(
+    prefix="/api/sleep", tags=["sleep"], dependencies=[Depends(require_admin)]
+)
+
+
+@router.post("/run", response_model=SleepRunResponse)
+def run_sleep(
+    manager: SleepCycleManager = Depends(get_sleep_cycle_manager),
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> SleepRunResponse:
+    result = cast(
+        SleepCycleResult,
+        execute(runtime, AgentEventType.SLEEP, AgentEventSource.API_SLEEP_RUN, manager.run),
+    )
+    result = manager.complete_post_commit(result)
+    return SleepRunResponse(
+        selected_episode_ids=result.selected_episode_ids,
+        semantic_memory_ids=result.semantic_memory_ids,
+        dream_dataset_path=result.dream_dataset_path,
+        adapter_id=None
+        if result.adapter_entry is None
+        else result.adapter_entry.adapter_id,
+        adapter_status=None
+        if result.adapter_entry is None
+        else result.adapter_entry.status.value,
+        dry_run=None
+        if result.training_result is None
+        else result.training_result.dry_run,
+    )

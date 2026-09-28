@@ -12,25 +12,34 @@ import pytest
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
-from kagya.api.server import create_app
-from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
-from kagya.config import Settings, load_settings
-from kagya.identity import (
+from suzka.api.server import create_app
+from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
+from suzka.config import Settings, load_settings
+from suzka.identity import (
     IdentityOrigin,
     OriginActor,
     OriginInputKind,
     ValueAdmissionStatus,
     ValueConflictDefinition,
     ValueDomainError,
+    ValueEvidence,
     ValueMutationEvidence,
+    ValueProposal,
+    ValueReason,
 )
-from kagya.learning import AdapterRegistry
-from kagya.memory import DualMemorySystem, EpisodicMemoryFormatError, MemoryContext
-from kagya.memory.episodic_participant import MemoryEpisodicParticipant
-from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
-from kagya.models import DummyProvider
-from kagya.persona import PromptBuilder
-from kagya.runtime import (
+from suzka.learning import AdapterRegistry
+from suzka.memory import (
+    DualMemorySystem,
+    EpisodicMemoryFormatError,
+    ExperienceStore,
+    MemoryContext,
+)
+from suzka.memory.episodic_participant import MemoryEpisodicParticipant
+from suzka.memory.experience_participant import experience_id_for_event
+from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
+from suzka.models import DummyProvider
+from suzka.persona import PromptBuilder
+from suzka.runtime import (
     AbortOutcome,
     AgentEvent,
     AgentEventOutcome,
@@ -55,6 +64,7 @@ from kagya.runtime import (
     ContextFrameSnapshot,
     ContextStateSnapshot,
     EmotionStateSnapshot,
+    SuzkaMainLoop,
     WorkingMemoryItemSnapshot,
     WorkingMemorySnapshot,
     WorkingMemoryResolution,
@@ -111,6 +121,11 @@ class FailOnSecondGenerationProvider(ThinkingProvider):
         if self.generation_count == 2:
             raise ValueError(PRIVATE_SENTINEL)
         return super().generate(prompt)
+
+
+class FailingSleepProvider(ThinkingProvider):
+    def generate(self, prompt: str) -> str:
+        raise ValueError(PRIVATE_SENTINEL)
 
 
 class RecordingRuntime(AgentRuntime):
@@ -298,22 +313,163 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
         assert episode.response == "Visible API answer."
         assert len(client.app.state.main_loop.session_state.turns) == 1
         records = client.app.state.event_journal.records
-        assert [record.lifecycle for record in records[-8:]] == [
+        assert [record.lifecycle for record in records[-9:]] == [
             EventLifecycle.ACCEPTED,
             EventLifecycle.STARTED,
             EventLifecycle.TRANSACTION_PREPARED,
             EventLifecycle.PREPARED,
             EventLifecycle.PARTICIPANT_FINALIZED,
             EventLifecycle.PARTICIPANT_FINALIZED,
+            EventLifecycle.PARTICIPANT_FINALIZED,
             EventLifecycle.TRANSACTION_COMPLETED,
             EventLifecycle.COMPLETED,
         ]
-        assert [record.participant_id for record in records[-4:-2]] == [
+        assert [record.participant_id for record in records[-5:-2]] == [
             "memory.episodic",
+            "memory.experience",
             "session.turn",
         ]
+        completed = records[-1]
+        assert completed.event_id is not None
+        assert completed.processing_sequence is not None
+        experience = client.app.state.experience_store.load_current(
+            experience_id_for_event(completed.event_id, completed.processing_sequence)
+        )
+        assert experience is not None
+        assert experience.record.source_episode_id == data["episode_id"]
+        assert experience.record.source_event_id == completed.event_id
+        assert experience.record.source_event_sequence == completed.processing_sequence
+        assert len(
+            tuple(client.app.state.experience_store.records_root.glob("*/*.json"))
+        ) == 1
         pending = settings.memory.persist_directory / ".r07-episodic-pending"
         assert list(pending.glob("*.json")) == []
+
+
+def test_repeated_real_memory_and_experience_reads_do_not_mutate_authority(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        memory = client.app.state.memory_system
+        memory.save_episodic(
+            "real stored semantic input",
+            "real stored semantic response",
+            emotion_arousal=0.9,
+        )
+        sleep_response = client.post("/api/sleep/run", headers=admin_headers())
+        assert sleep_response.status_code == 200
+        semantic_id = sleep_response.json()["semantic_memory_ids"][0]
+        assert memory.semantic_store.load_current(semantic_id) is not None
+        response = client.post(
+            "/api/chat",
+            json={"message": "real stored semantic", "attachments": [], "debug": False},
+        )
+        assert response.status_code == 200
+        episode_id = response.json()["episode_id"]
+        completed = client.app.state.event_journal.records[-1]
+        assert completed.event_id is not None
+        assert completed.processing_sequence is not None
+        experience_id = experience_id_for_event(
+            completed.event_id, completed.processing_sequence
+        )
+        assert memory.get_committed_episodic(episode_id) is not None
+        assert memory.get_committed_semantic(semantic_id) is not None
+        assert (
+            client.app.state.experience_store.load_current(experience_id) is not None
+        )
+
+        semantic_store = memory.semantic_store
+        experience_store = client.app.state.experience_store
+        semantic_bytes_before = {
+            path.relative_to(semantic_store.root): path.read_bytes()
+            for path in semantic_store.root.rglob("*.json")
+        }
+        experience_bytes_before = {
+            path.relative_to(experience_store.root): path.read_bytes()
+            for path in experience_store.root.rglob("*.json")
+        }
+        semantic_record_before = memory.get_committed_semantic(semantic_id)
+        experience_record_before = experience_store.load_current(experience_id)
+        db2_before = memory.db2.get(include=["documents", "metadatas"])
+        assert semantic_record_before is not None
+        assert experience_record_before is not None
+        before_belief = client.app.state.main_loop.belief_system.snapshot()
+        before_value = client.app.state.main_loop.value_system.snapshot()
+        for _ in range(3):
+            context = memory.retrieve_context("real stored semantic")
+            assert semantic_id in {record.id for record in context.db2_results}
+            assert memory.get_committed_semantic(semantic_id) is not None
+            assert memory.get_committed_episodic(episode_id) is not None
+            current = client.app.state.experience_store.load_current(experience_id)
+            assert current is not None
+            assert current.record.experience_id == experience_id
+
+        assert memory.get_committed_semantic(semantic_id) == semantic_record_before
+        experience_record_after = experience_store.load_current(experience_id)
+        assert experience_record_after is not None
+        assert experience_record_after.record == experience_record_before.record
+        assert (
+            experience_record_after.operation_digest
+            == experience_record_before.operation_digest
+        )
+        assert (
+            experience_record_after.source_episode_operation_digest
+            == experience_record_before.source_episode_operation_digest
+        )
+        assert {
+            path.relative_to(semantic_store.root): path.read_bytes()
+            for path in semantic_store.root.rglob("*.json")
+        } == semantic_bytes_before
+        assert {
+            path.relative_to(experience_store.root): path.read_bytes()
+            for path in experience_store.root.rglob("*.json")
+        } == experience_bytes_before
+        assert memory.db2.get(include=["documents", "metadatas"]) == db2_before
+        assert client.app.state.main_loop.belief_system.snapshot() == before_belief
+        assert client.app.state.main_loop.value_system.snapshot() == before_value
+
+
+def test_opaque_experience_evidence_and_proposal_do_not_mutate_value_authority(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path) as client:
+        response = client.post(
+            "/api/chat",
+            json={"message": "opaque Experience", "attachments": [], "debug": False},
+        )
+        assert response.status_code == 200
+        completed = client.app.state.event_journal.records[-1]
+        assert completed.event_id is not None
+        assert completed.processing_sequence is not None
+        experience_id = experience_id_for_event(
+            completed.event_id, completed.processing_sequence
+        )
+        current = client.app.state.experience_store.load_current(experience_id)
+        assert current is not None
+
+        before = client.app.state.main_loop.value_system.snapshot()
+        origin = IdentityOrigin(
+            OriginActor.EXTERNAL_SOURCE,
+            OriginInputKind.EVIDENCE,
+            ValueAdmissionStatus.UNCERTAIN,
+            source_ref=experience_id,
+        )
+        evidence = ValueEvidence(
+            evidence_ref=experience_id,
+            origin=origin,
+            reason=ValueReason.OBSERVATION,
+            evidence_refs=(experience_id,),
+        )
+        proposal = ValueProposal(
+            evidence_ref=experience_id,
+            origin=origin,
+            reason=ValueReason.PROPOSAL,
+            evidence_refs=(experience_id,),
+        )
+        assert evidence.evidence_ref == current.record.experience_id
+        assert proposal.evidence_ref == current.record.experience_id
+        client.app.state.main_loop.value_system.prompt_view(None)
+        assert client.app.state.main_loop.value_system.snapshot() == before
 
 
 def test_direct_runtime_submit_uses_public_chat_live_authority(
@@ -345,6 +501,15 @@ def test_direct_runtime_submit_uses_public_chat_live_authority(
         assert client.app.state.memory_system.get_episodic_record(
             debug.value[0].episode_id
         ) is not None
+        assert debug.event.processing_sequence is not None
+        assert (
+            client.app.state.experience_store.load_current(
+                experience_id_for_event(
+                    debug.event.event_id, debug.event.processing_sequence
+                )
+            )
+            is None
+        )
         snapshot = client.app.state.agent_state_store.load()
         assert snapshot.context_state.to_registry_state() == (
             main_loop.context_registry.state
@@ -359,6 +524,65 @@ def test_direct_runtime_submit_uses_public_chat_live_authority(
             main_loop.emotion_engine.state.arousal,
             main_loop.emotion_engine.state.optimal_loss,
         )
+
+
+def test_bound_chat_methods_reject_mismatched_runtime_events(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        main_loop = client.app.state.main_loop
+        runtime = client.app.state.agent_runtime
+        mismatches = (
+            (
+                AgentEventType.CHAT,
+                AgentEventSource.API_CHAT,
+                lambda: main_loop.chat_debug("wrong ordinary handler"),
+            ),
+            (
+                AgentEventType.DEBUG_CHAT,
+                AgentEventSource.API_CHAT_DEBUG,
+                lambda: main_loop.chat("wrong debug handler"),
+            ),
+        )
+        for event_type, source, handler in mismatches:
+            with pytest.raises(AgentRuntimeExecutionError) as raised:
+                runtime.submit(event_type, source, handler).result(timeout=10)
+            assert isinstance(raised.value.__cause__, RuntimeError)
+            assert "chat method does not match" in str(raised.value.__cause__)
+
+
+def test_injected_main_loop_store_is_used_as_startup_authority(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    memory = DualMemorySystem(settings)
+    store = ExperienceStore(tmp_path / "injected-experience")
+    loop = SuzkaMainLoop(settings, ThinkingProvider(), memory, experience_store=store)
+
+    with _client(tmp_path, settings=settings, main_loop=loop) as client:
+        assert client.app.state.experience_store is store
+        assert client.app.state.main_loop.experience_store is store
+        response = client.post(
+            "/api/chat", json={"message": "injected", "attachments": []}
+        )
+        assert response.status_code == 200
+        assert tuple(store.records_root.rglob("*.json"))
+
+
+def test_injected_main_loop_and_store_must_match(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    memory = DualMemorySystem(settings)
+    loop_store = ExperienceStore(tmp_path / "loop-experience")
+    app_store = ExperienceStore(tmp_path / "app-experience")
+    loop = SuzkaMainLoop(
+        settings, ThinkingProvider(), memory, experience_store=loop_store
+    )
+    client = _client(
+        tmp_path,
+        settings=settings,
+        main_loop=loop,
+        experience_store=app_store,
+    )
+
+    with pytest.raises(RuntimeError, match="do not match"):
+        with client:
+            pass
 
 
 def test_chat_and_emotion_tick_share_fifo_durable_order(tmp_path: Path) -> None:
@@ -415,8 +639,17 @@ def test_chat_and_emotion_tick_share_fifo_durable_order(tmp_path: Path) -> None:
         assert tick.event.processing_sequence == 2
         assert tick.value is None
         assert max_active == 1
-        assert threads == ["kagya-agent-runtime", "kagya-agent-runtime"]
+        assert threads == ["suzka-agent-runtime", "suzka-agent-runtime"]
         assert len(chat_state) == 1
+        assert tick.event.processing_sequence is not None
+        assert (
+            client.app.state.experience_store.load_current(
+                experience_id_for_event(
+                    tick.event.event_id, tick.event.processing_sequence
+                )
+            )
+            is None
+        )
         assert main_loop.emotion_engine.temporal_state.last_update_at == t1
 
         chat_emotion, chat_temporal = chat_state[0]
@@ -681,7 +914,7 @@ def test_session_context_continuity_survives_process_restart(tmp_path: Path) -> 
         assert frames[0].source_session_id == session_id
 
 
-def test_fresh_configured_bootstrap_publishes_v5_value_authority(
+def test_fresh_configured_bootstrap_publishes_v6_value_and_belief_authority(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -689,7 +922,8 @@ def test_fresh_configured_bootstrap_publishes_v5_value_authority(
     with _client(tmp_path, settings=settings) as client:
         snapshot = client.app.state.agent_state_store.load()
 
-        assert snapshot.schema_version == 5
+        assert snapshot.schema_version == 6
+        assert snapshot.belief_state.records == ()
         assert tuple(value.value_id for value in snapshot.value_state.values) == tuple(
             seed.value_id for seed in settings.values.seeds
         )
@@ -706,7 +940,7 @@ def test_fresh_configured_bootstrap_publishes_v5_value_authority(
         )
 
 
-def test_retained_v4_lazy_upgrade_preserves_bytes_then_publishes_v5(
+def test_retained_v4_lazy_upgrade_preserves_bytes_then_publishes_v6(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -746,7 +980,7 @@ def test_retained_v4_lazy_upgrade_preserves_bytes_then_publishes_v5(
         assert response.status_code == 200
 
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 5
+        assert upgraded.schema_version == 6
         assert tuple(value.value_id for value in upgraded.value_state.values) == (
             "care",
             "honesty",
@@ -800,7 +1034,7 @@ def test_retained_v2_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
         )
         assert response.status_code == 200
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 5
+        assert upgraded.schema_version == 6
         assert upgraded.context_state.current_context_id == "conversation.default"
         assert tuple(
             frame.context_id for frame in upgraded.context_state.frames
@@ -884,7 +1118,7 @@ def test_retained_v3_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
         )
         assert response.status_code == 200
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 5
+        assert upgraded.schema_version == 6
         assert len(upgraded.appraisal_state.calibration_entries) == 1
         assert upgraded.appraisal_state.calibration_entries[0].count == 1
         assert (
@@ -1065,6 +1299,18 @@ def test_api_chat_debug_is_ephemeral_and_not_persisted(tmp_path: Path) -> None:
             for path in settings.state_wal.directory.iterdir()
             if path.is_file()
         )
+        experience_root = client.app.state.experience_store.root
+        assert not experience_root.exists() or all(
+            PRIVATE_SENTINEL.encode() not in path.read_bytes()
+            for path in experience_root.rglob("*.json")
+        )
+        assert all(
+            "memory.experience"
+            not in {
+                item.participant_id for item in transaction.required_participants
+            }
+            for transaction in client.app.state.event_journal.inspect().completed_transactions
+        )
         assert len(client.app.state.main_loop.session_state.turns) == 1
 
 
@@ -1170,6 +1416,37 @@ def test_sleep_endpoint_returns_dry_run_result(tmp_path: Path) -> None:
             not in client.app.state.settings.sleep.dream_dataset_path.read_text(
                 encoding="utf-8"
             ).casefold()
+        )
+
+
+def test_sleep_handler_failure_before_internal_commit_leaves_no_semantic_authority(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings, provider=FailingSleepProvider()) as client:
+        client.app.state.memory_system.save_episodic(
+            "sleep failure input",
+            "sleep failure output",
+            emotion_arousal=0.9,
+        )
+
+        with pytest.raises(ValueError, match=PRIVATE_SENTINEL):
+            client.post("/api/sleep/run", headers=admin_headers())
+
+        store = client.app.state.memory_system.semantic_store
+        assert not tuple(store.records_root.rglob("*.json"))
+        assert not tuple(store.receipts_root.glob("*.json"))
+        assert client.app.state.memory_system.db2.get()["ids"] == []
+        sleep_records = tuple(
+            record
+            for record in client.app.state.event_journal.records
+            if record.event_type is AgentEventType.SLEEP
+        )
+        assert sleep_records
+        assert sleep_records[-1].lifecycle is EventLifecycle.FAILED
+        assert all(
+            record.lifecycle is not EventLifecycle.TRANSACTION_PREPARED
+            for record in sleep_records
         )
 
 
@@ -1524,7 +1801,7 @@ def test_sensitive_api_reports_missing_admin_token_config(tmp_path: Path) -> Non
             json={"message": "hello", "attachments": [], "debug": True},
         )
         assert response.status_code == 503
-        assert "KAGYA_TEST_ADMIN_TOKEN" in response.json()["detail"]
+        assert "SUZKA_TEST_ADMIN_TOKEN" in response.json()["detail"]
 
 
 def test_lifespan_owns_and_drains_one_runtime(tmp_path: Path) -> None:
@@ -2034,7 +2311,7 @@ def test_true_rollback_reconciles_external_state_before_runtime_acceptance(
 ) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
-        client.app.state.memory_system.save_semantic("rollback WM seed")
+        client.app.state.memory_system.save_legacy_semantic("rollback WM seed")
         assert (
             client.post(
                 "/api/chat", json={"message": "rollback WM seed", "attachments": []}
@@ -2377,7 +2654,7 @@ def test_matching_v0_snapshot_is_rewritten_after_journal_reconciliation(
         json.loads(settings.agent_state.path.read_text(encoding="utf-8"))[
             "schema_version"
         ]
-        == 5
+            == 6
     )
 
 
@@ -2466,7 +2743,7 @@ def test_snapshot_checkpoint_failure_returns_bounded_indeterminate_500(
     )
 
     with TestClient(app) as client:
-        client.app.state.memory_system.save_semantic("U5 durable WM seed")
+        client.app.state.memory_system.save_legacy_semantic("U5 durable WM seed")
         assert client.post(
             "/api/chat", json={"message": "U5 durable WM seed", "attachments": []}
         ).status_code == 200
@@ -2877,6 +3154,7 @@ def test_memory_prepare_failure_aborts_before_internal_commit(
         inspection = client.app.state.event_journal.inspect()
         assert inspection.aborted_transactions[0].abort_outcomes == (
             ("memory.episodic", AbortOutcome.ABORTED),
+            ("memory.experience", AbortOutcome.ALREADY_ABSENT),
         )
         assert not any(
             record.lifecycle is EventLifecycle.PREPARED
@@ -2918,6 +3196,7 @@ def test_session_finalize_failure_preserves_finalized_memory_and_internal_commit
         transaction = client.app.state.event_journal.inspect().open_transactions[0]
         assert transaction.participant_outcomes == (
             ("memory.episodic", ParticipantOutcome.FINALIZED),
+            ("memory.experience", ParticipantOutcome.FINALIZED),
         )
         assert transaction.unresolved_participants == ("session.turn",)
         assert transaction.reconciliation_reason is not None
@@ -3205,14 +3484,14 @@ def test_second_startup_cannot_touch_snapshot_before_journal_lease(
         assert settings.agent_state.path.read_bytes() == original
 
 
-def test_chat_commits_post_chat_working_memory_in_agent_state_v4(
+def test_chat_commits_post_chat_working_memory_in_agent_state_v6(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
     resolved_body = "U4-RESOLVED-BODY-SENTINEL"
 
     with _client(tmp_path, settings=settings) as client:
-        semantic_id = client.app.state.memory_system.save_semantic(resolved_body)
+        semantic_id = client.app.state.memory_system.save_legacy_semantic(resolved_body)
         response = client.post(
             "/api/chat",
             json={"message": resolved_body, "attachments": [], "debug": False},
@@ -3222,7 +3501,7 @@ def test_chat_commits_post_chat_working_memory_in_agent_state_v4(
         assert set(response.json()) == {"episode_id", "response", "emotion", "model"}
         snapshot = client.app.state.agent_state_store.load()
         authoritative_items = client.app.state.main_loop.working_memory.items
-        assert snapshot.schema_version == 5
+        assert snapshot.schema_version == 6
         assert snapshot.working_memory.revision == (
             client.app.state.main_loop.working_memory.revision
         )
@@ -3263,7 +3542,7 @@ def test_debug_projection_can_use_resolved_body_without_durable_leak(
     resolved_body = "U4-DEBUG-RESOLVED-BODY-SENTINEL"
 
     with _client(tmp_path, settings=settings) as client:
-        client.app.state.memory_system.save_semantic(resolved_body)
+        client.app.state.memory_system.save_legacy_semantic(resolved_body)
         response = client.post(
             "/api/chat/debug",
             headers=admin_headers(),
@@ -3292,7 +3571,7 @@ def test_handler_failure_restores_prior_canonical_working_memory(
 ) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
-        client.app.state.memory_system.save_semantic("U4 failure checkpoint marker")
+        client.app.state.memory_system.save_legacy_semantic("U4 failure checkpoint marker")
         first = client.post(
             "/api/chat",
             json={"message": "U4 failure checkpoint marker", "attachments": []},
@@ -3392,7 +3671,7 @@ def test_startup_does_not_resolve_noneligible_working_memory_refs(
     settings = _settings(tmp_path)
     marker = f"U5-{status.value}-working-memory-ref"
     with _client(tmp_path, settings=settings) as first:
-        source_id = first.app.state.memory_system.save_semantic(marker)
+        source_id = first.app.state.memory_system.save_legacy_semantic(marker)
         assert first.post(
             "/api/chat", json={"message": marker, "attachments": []}
         ).status_code == 200
@@ -3461,16 +3740,22 @@ def _client(
     runtime: AgentRuntime | AdmissionRuntime | None = None,
     provider: DummyProvider | None = None,
     timer: RecordingTimer | None = None,
+    main_loop: SuzkaMainLoop | None = None,
+    experience_store: ExperienceStore | None = None,
 ) -> TestClient:
     if configure_admin_token:
-        os.environ["KAGYA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
+        os.environ["SUZKA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
     else:
-        os.environ.pop("KAGYA_TEST_ADMIN_TOKEN", None)
+        os.environ.pop("SUZKA_TEST_ADMIN_TOKEN", None)
     app_settings = settings or _settings(tmp_path)
     app = create_app(app_settings)
     app.state.model_provider = provider or ThinkingProvider()
     app.state.memory_system = DualMemorySystem(app_settings)
     app.state.adapter_registry = AdapterRegistry(app_settings)
+    if experience_store is not None:
+        app.state.experience_store = experience_store
+    if main_loop is not None:
+        app.state.main_loop = main_loop
     if runtime is not None:
         app.state.agent_runtime = runtime
     if timer is not None:
@@ -3507,7 +3792,7 @@ def _settings(tmp_path: Path) -> Settings:
                 }
             ),
             "api": settings.api.model_copy(
-                update={"admin_token_env": "KAGYA_TEST_ADMIN_TOKEN"}
+                update={"admin_token_env": "SUZKA_TEST_ADMIN_TOKEN"}
             ),
             "agent_state": settings.agent_state.model_copy(
                 update={"path": tmp_path / "agent_state.json"}
@@ -3523,4 +3808,4 @@ def _settings(tmp_path: Path) -> Settings:
 
 
 def admin_headers() -> dict[str, str]:
-    return {"X-KAGYA-Admin-Token": ADMIN_TOKEN}
+    return {"X-SUZKA-Admin-Token": ADMIN_TOKEN}

@@ -1,0 +1,1237 @@
+"""ChromaDB-backed dual memory implementation."""
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import StrEnum
+import json
+import math
+from typing import Any
+from uuid import uuid4
+
+import chromadb
+from chromadb.api.types import Metadata
+
+from suzka.config import Settings
+from suzka.identifiers import validate_identifier
+from suzka.memory.consolidation import build_consolidation_prompt
+from suzka.memory.memory_evaluator import MemoryEvaluator
+from suzka.memory.memory_schema import (
+    EpisodicMemoryRecord,
+    MemoryContext,
+    MemoryRecordType,
+    SemanticMemoryRecord,
+)
+from suzka.memory.semantic_lifecycle import SemanticLifecycle, SemanticRevision
+from suzka.memory.semantic_store import (
+    SemanticStore,
+    SemanticStoreCorrupt,
+    SemanticStoreError,
+    SemanticStoreUnavailable,
+)
+from suzka.models import ModelProvider
+from suzka.privacy import PRIVATE_FIELD_KEYS, normalize_private_key, reject_private_fields, scrub_private_fields
+
+
+class DeterministicEmbeddingFunction:
+    """Small deterministic embedding function for local tests and bootstrap use."""
+
+    def __call__(self, input: Sequence[str]) -> list[list[float]]:
+        return [_embed_text(text) for text in input]
+
+    def embed_query(self, input: Sequence[str]) -> list[list[float]]:
+        return self(input)
+
+    def embed_documents(self, input: Sequence[str]) -> list[list[float]]:
+        return self(input)
+
+    @staticmethod
+    def name() -> str:
+        return "default"
+
+    @staticmethod
+    def is_legacy() -> bool:
+        return True
+
+
+def _resolve_embedding_function(embedding_function: Any | None) -> Any:
+    """Return the injected embedding function or the deterministic baseline adapter."""
+
+    if embedding_function is None:
+        return DeterministicEmbeddingFunction()
+    return embedding_function
+
+
+class EpisodicMemoryReadError(Exception):
+    """A bounded failure to read committed episodic Memory."""
+
+
+class EpisodicMemoryFormatError(Exception):
+    """Committed episodic Memory has malformed domain content."""
+
+
+class SemanticMemoryReadError(Exception):
+    """A bounded failure to read committed semantic Memory."""
+
+
+class SemanticMemoryFormatError(Exception):
+    """Committed semantic Memory has malformed domain content."""
+
+
+class SemanticMemoryWriteError(Exception):
+    """Direct Semantic DB2 writes are unavailable outside R07 coordination."""
+
+
+class SemanticProjectionStatus(StrEnum):
+    """Classification of one DB2 row against authoritative Semantic state."""
+
+    MISSING = "MISSING"
+    EXACT = "EXACT"
+    REPAIRABLE_STALE = "REPAIRABLE_STALE"
+    DIVERGENT = "DIVERGENT"
+
+
+SEMANTIC_PROJECTION_SCHEMA = "r12.semantic.v1"
+_R12_PROJECTION_FIELDS = frozenset(
+    {
+        "semantic_projection_schema",
+        "semantic_revision",
+        "semantic_revision_digest",
+        "semantic_content_digest",
+        "semantic_lifecycle",
+        "semantic_provenance_digest",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedEpisodicMemory:
+    """One committed DB1 document and its parsed metadata projection."""
+
+    document: str
+    metadata: dict[str, Any]
+    record: EpisodicMemoryRecord
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedSemanticMemory:
+    """One committed DB2 document and its parsed metadata projection."""
+
+    document: str
+    metadata: dict[str, Any]
+    record: SemanticMemoryRecord
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticProjectionInspection:
+    """Read-only DB2 projection classification."""
+
+    status: SemanticProjectionStatus
+    document: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class DualMemorySystem:
+    """Dual memory backed by DB1 hippocampus and DB2 cortex Chroma collections."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        embedding_function: Any | None = None,
+        evaluator: MemoryEvaluator | None = None,
+    ) -> None:
+        self.settings = settings
+        self.embedding_function = _resolve_embedding_function(embedding_function)
+        self.evaluator = evaluator or MemoryEvaluator()
+        self.client = chromadb.PersistentClient(path=str(settings.memory.persist_directory))
+        self.db1 = self.client.get_or_create_collection(
+            name=settings.memory.db1_collection,
+            embedding_function=self.embedding_function,
+        )
+        self.db2 = self.client.get_or_create_collection(
+            name=settings.memory.db2_collection,
+            embedding_function=self.embedding_function,
+        )
+        self.semantic_store = SemanticStore.from_memory_root(
+            settings.memory.persist_directory
+        )
+        self._scrub_legacy_private_records()
+
+    def save_episodic(
+        self,
+        user_input: str,
+        response: str,
+        *,
+        loss: float = 0.0,
+        emotion_valence: float = 0.0,
+        emotion_arousal: float = 0.0,
+        record_type: MemoryRecordType = MemoryRecordType.EPISODIC_LOG,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        extra_metadata = metadata or {}
+        reject_private_fields(extra_metadata, context="Episodic memory metadata")
+        episode_id = f"episode-{uuid4()}"
+        self._add_episodic(
+            episode_id,
+            user_input,
+            response,
+            loss=loss,
+            emotion_valence=emotion_valence,
+            emotion_arousal=emotion_arousal,
+            record_type=record_type,
+            created_at=_now_iso(),
+            metadata=extra_metadata,
+        )
+        return episode_id
+
+    def get_episodic_record(self, episode_id: str) -> EpisodicMemoryRecord | None:
+        """Return one committed DB1 record without consulting pending staging."""
+
+        committed = self.get_committed_episodic(episode_id)
+        return None if committed is None else committed.record
+
+    def get_committed_episodic(
+        self, episode_id: str
+    ) -> CommittedEpisodicMemory | None:
+        """Read one DB1 document and metadata together without repairing either."""
+
+        try:
+            result = self.db1.get(
+                ids=[episode_id], include=["documents", "metadatas"]
+            )
+        except Exception:
+            raise EpisodicMemoryReadError(
+                "Committed episodic Memory is unavailable"
+            ) from None
+        try:
+            ids, documents, metadatas = _strict_get_parts(result)
+            if not ids:
+                return None
+            if not isinstance(ids[0], str) or ids[0] != episode_id:
+                raise ValueError
+            metadata = _strict_metadata(metadatas[0])
+            record = _committed_episodic_record(episode_id, documents[0], metadata)
+        except Exception:
+            raise EpisodicMemoryFormatError(
+                "Committed episodic Memory is invalid"
+            ) from None
+        return CommittedEpisodicMemory(
+            document=documents[0], metadata=metadata, record=record
+        )
+
+    def get_committed_semantic(
+        self, semantic_id: str
+    ) -> CommittedSemanticMemory | None:
+        """Read exactly one DB2 document and metadata without repairing it."""
+
+        try:
+            result = self.db2.get(ids=[semantic_id], include=["documents", "metadatas"])
+        except Exception:
+            raise SemanticMemoryReadError(
+                "Committed semantic Memory is unavailable"
+            ) from None
+        try:
+            ids, documents, metadatas = _strict_get_parts(result)
+            if not ids:
+                return None
+            if not isinstance(ids[0], str) or ids[0] != semantic_id:
+                raise ValueError
+            metadata = _strict_metadata(metadatas[0])
+            if _has_r12_projection_fields(metadata) and not _is_r12_semantic_projection(
+                metadata
+            ):
+                raise ValueError
+            record = _committed_semantic_record(semantic_id, documents[0], metadata)
+        except Exception:
+            raise SemanticMemoryFormatError(
+                "Committed semantic Memory is invalid"
+            ) from None
+        if _is_r12_semantic_projection(metadata):
+            self._verify_new_semantic_projection(semantic_id, documents[0], metadata)
+        return CommittedSemanticMemory(
+            document=documents[0], metadata=metadata, record=record
+        )
+
+    def inspect_semantic_projection(
+        self,
+        semantic_id: str,
+        revision: SemanticRevision,
+        store: SemanticStore | None = None,
+    ) -> SemanticProjectionInspection:
+        """Classify DB2 without mutating it or consulting a model."""
+
+        if revision.semantic_id != semantic_id:
+            raise ValueError("Semantic projection identity is inconsistent")
+        current_store = store or self.semantic_store
+        raw = self._get_semantic_projection_raw(semantic_id)
+        if raw is None:
+            return SemanticProjectionInspection(
+                SemanticProjectionStatus.MISSING
+                if revision.lifecycle is SemanticLifecycle.ACTIVE
+                else SemanticProjectionStatus.EXACT
+            )
+        document, metadata = raw
+        if not _is_r12_semantic_projection(metadata):
+            return SemanticProjectionInspection(
+                SemanticProjectionStatus.DIVERGENT, document, metadata
+            )
+        row_revision = metadata.get("semantic_revision")
+        if type(row_revision) is not int or row_revision < 0:
+            return SemanticProjectionInspection(
+                SemanticProjectionStatus.DIVERGENT, document, metadata
+            )
+        try:
+            retained = current_store.load_revision(semantic_id, row_revision)
+        except SemanticStoreUnavailable as error:
+            raise SemanticMemoryReadError(
+                "Authoritative Semantic revision is unavailable"
+            ) from error
+        except SemanticStoreCorrupt as error:
+            raise SemanticMemoryFormatError(
+                "Authoritative Semantic revision is invalid"
+            ) from error
+        if retained is None:
+            return SemanticProjectionInspection(
+                SemanticProjectionStatus.DIVERGENT, document, metadata
+            )
+        expected_retained = semantic_projection_metadata(retained.revision)
+        if document != retained.revision.semantic_content or metadata != expected_retained:
+            return SemanticProjectionInspection(
+                SemanticProjectionStatus.DIVERGENT, document, metadata
+            )
+        if row_revision == revision.revision:
+            if retained.revision.revision_digest != revision.revision_digest:
+                return SemanticProjectionInspection(
+                    SemanticProjectionStatus.DIVERGENT, document, metadata
+                )
+            if revision.lifecycle is not SemanticLifecycle.ACTIVE:
+                return SemanticProjectionInspection(
+                    SemanticProjectionStatus.REPAIRABLE_STALE, document, metadata
+                )
+            return SemanticProjectionInspection(
+                SemanticProjectionStatus.EXACT, document, metadata
+            )
+        if row_revision < revision.revision:
+            return SemanticProjectionInspection(
+                SemanticProjectionStatus.REPAIRABLE_STALE, document, metadata
+            )
+        return SemanticProjectionInspection(
+            SemanticProjectionStatus.DIVERGENT, document, metadata
+        )
+
+    def project_semantic_revision(
+        self, revision: SemanticRevision, store: SemanticStore | None = None
+    ) -> SemanticProjectionStatus:
+        """Repair one projection only when its current bytes are safe to replace."""
+
+        inspection = self.inspect_semantic_projection(revision.semantic_id, revision, store)
+        if inspection.status is SemanticProjectionStatus.DIVERGENT:
+            raise SemanticMemoryFormatError("Semantic DB2 projection diverged")
+        if revision.lifecycle is not SemanticLifecycle.ACTIVE:
+            if inspection.status is SemanticProjectionStatus.REPAIRABLE_STALE:
+                self._delete_semantic_projection(revision.semantic_id)
+            return inspection.status
+        if inspection.status is SemanticProjectionStatus.EXACT:
+            return inspection.status
+        if inspection.status is SemanticProjectionStatus.REPAIRABLE_STALE:
+            self._delete_semantic_projection(revision.semantic_id)
+        try:
+            metadata = semantic_projection_metadata(revision)
+            self.db2.add(
+                ids=[revision.semantic_id],
+                documents=[revision.semantic_content],
+                metadatas=[metadata],
+            )
+        except Exception as error:
+            raise SemanticMemoryReadError(
+                "Semantic DB2 projection is unavailable"
+            ) from error
+        verified = self.inspect_semantic_projection(revision.semantic_id, revision, store)
+        if verified.status is not SemanticProjectionStatus.EXACT:
+            if verified.status is SemanticProjectionStatus.DIVERGENT:
+                raise SemanticMemoryFormatError("Semantic DB2 projection diverged")
+            raise SemanticMemoryReadError("Semantic DB2 projection is unverified")
+        return verified.status
+
+    def _get_semantic_projection_raw(
+        self, semantic_id: str
+    ) -> tuple[str, dict[str, Any]] | None:
+        try:
+            result = self.db2.get(ids=[semantic_id], include=["documents", "metadatas"])
+            ids, documents, metadatas = _strict_get_parts(result)
+            if not ids:
+                return None
+            if not isinstance(ids[0], str) or ids[0] != semantic_id:
+                raise ValueError
+            if not isinstance(documents[0], str):
+                raise ValueError
+            return documents[0], _strict_metadata(metadatas[0])
+        except SemanticMemoryReadError:
+            raise
+        except Exception as error:
+            raise SemanticMemoryReadError(
+                "Committed semantic Memory is unavailable"
+            ) from error
+
+    def _delete_semantic_projection(self, semantic_id: str) -> None:
+        try:
+            self.db2.delete(ids=[semantic_id])
+        except Exception as error:
+            raise SemanticMemoryReadError(
+                "Semantic DB2 projection is unavailable"
+            ) from error
+
+    def _verify_new_semantic_projection(
+        self, semantic_id: str, document: str, metadata: Mapping[str, Any]
+    ) -> None:
+        if not _is_r12_semantic_projection(metadata):
+            return
+        try:
+            current = self.semantic_store.load_current(semantic_id)
+        except SemanticStoreUnavailable as error:
+            raise SemanticMemoryReadError(
+                "Authoritative Semantic Memory is unavailable"
+            ) from error
+        except SemanticStoreError as error:
+            raise SemanticMemoryFormatError(
+                "Authoritative Semantic Memory is invalid"
+            ) from error
+        if current is None:
+            raise SemanticMemoryReadError(
+                "Authoritative Semantic Memory is unavailable"
+            )
+        if (
+            current.revision.lifecycle is not SemanticLifecycle.ACTIVE
+            or document != current.revision.semantic_content
+            or dict(metadata) != semantic_projection_metadata(current.revision)
+        ):
+            raise SemanticMemoryFormatError(
+                "Committed semantic projection is not authoritative"
+            )
+
+    def publish_coordinated_episodic(
+        self,
+        episode_id: str,
+        user_input: str,
+        response: str,
+        *,
+        loss: float | None,
+        emotion_valence: float,
+        emotion_arousal: float,
+        record_type: MemoryRecordType,
+        created_at: str,
+        coordination_schema: int | None = None,
+        context_id: str | None = None,
+        source_channel: str | None = None,
+        source_session_id: str | None = None,
+    ) -> None:
+        """Publish one already-validated deterministic coordinated record to DB1."""
+
+        self._add_episodic(
+            episode_id,
+            user_input,
+            response,
+            loss=loss,
+            emotion_valence=emotion_valence,
+            emotion_arousal=emotion_arousal,
+            record_type=record_type,
+            created_at=created_at,
+            metadata={},
+            coordinated=True,
+            coordination_schema=coordination_schema,
+            context_id=context_id,
+            source_channel=source_channel,
+            source_session_id=source_session_id,
+        )
+
+    def _add_episodic(
+        self,
+        episode_id: str,
+        user_input: str,
+        response: str,
+        *,
+        loss: float | None,
+        emotion_valence: float,
+        emotion_arousal: float,
+        record_type: MemoryRecordType,
+        created_at: str,
+        metadata: Mapping[str, Any],
+        coordinated: bool = False,
+        coordination_schema: int | None = None,
+        context_id: str | None = None,
+        source_channel: str | None = None,
+        source_session_id: str | None = None,
+    ) -> None:
+        record_metadata = canonical_episodic_metadata(
+            user_input,
+            response,
+            loss=loss,
+            emotion_valence=emotion_valence,
+            emotion_arousal=emotion_arousal,
+            record_type=record_type,
+            created_at=created_at,
+            metadata=metadata,
+            coordinated=coordinated,
+            coordination_schema=coordination_schema,
+            context_id=context_id,
+            source_channel=source_channel,
+            source_session_id=source_session_id,
+        )
+        self.db1.add(
+            ids=[episode_id],
+            documents=[canonical_episodic_document(user_input, response)],
+            metadatas=[record_metadata],
+        )
+
+    def save_semantic(
+        self,
+        text: str,
+        *,
+        source_episode_ids: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        raise SemanticMemoryWriteError(
+            "Coordinated Semantic publication is required"
+        )
+
+    def save_legacy_semantic(
+        self,
+        text: str,
+        *,
+        source_episode_ids: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """Explicit R09-compatible fixture/import writer; never use in production."""
+        source_ids = _copy_source_episode_ids(source_episode_ids)
+        context_id = self._derive_semantic_context_id(source_ids)
+        extra_metadata = metadata or {}
+        reject_private_fields(extra_metadata, context="Semantic memory metadata")
+        semantic_id = f"semantic-{uuid4()}"
+        record_metadata: dict[str, str | int | float | bool] = {
+            "text": text,
+            "source_episode_ids": json.dumps(source_ids),
+            "record_type": MemoryRecordType.SEMANTIC_MEMORY.value,
+            "created_at": _now_iso(),
+            "extra": json.dumps(extra_metadata),
+        }
+        if context_id is not None:
+            record_metadata["context_id"] = context_id
+        self.db2.add(ids=[semantic_id], documents=[text], metadatas=[record_metadata])
+        return semantic_id
+
+    def _derive_semantic_context_id(
+        self, source_episode_ids: Sequence[str]
+    ) -> str | None:
+        """Derive one Context only from every exact committed source record."""
+
+        if not source_episode_ids:
+            return None
+
+        source_contexts: list[str | None] = []
+        seen: set[str] = set()
+        for source_id in source_episode_ids:
+            if source_id in seen:
+                continue
+            seen.add(source_id)
+            committed = self.get_committed_episodic(source_id)
+            context_id = None if committed is None else committed.record.context_id
+            if context_id is not None:
+                try:
+                    context_id = _validate_semantic_context_id(context_id)
+                except (TypeError, ValueError):
+                    raise EpisodicMemoryFormatError(
+                        "Committed episodic Memory is invalid"
+                    ) from None
+            source_contexts.append(context_id)
+
+        if any(context_id is None for context_id in source_contexts):
+            return None
+        first_context_id = source_contexts[0]
+        if all(context_id == first_context_id for context_id in source_contexts):
+            return first_context_id
+        return None
+
+    def retrieve_context(self, query: str) -> MemoryContext:
+        db1_results = self.db1.query(
+            query_texts=[query],
+            n_results=self.settings.memory.db1_top_k,
+            where={"archived": False},
+        )
+        db2_results = self.db2.query(
+            query_texts=[query],
+            n_results=self.settings.memory.db2_top_k,
+        )
+        return MemoryContext(
+            db1_results=_episodic_records_from_query(db1_results),
+            db2_results=self._semantic_records_from_query(db2_results),
+        )
+
+    def _semantic_records_from_query(
+        self, result: Mapping[str, Any]
+    ) -> list[SemanticMemoryRecord]:
+        ids = _semantic_query_list(result.get("ids"))
+        documents = _semantic_query_list(result.get("documents"))
+        metadatas = _semantic_query_list(result.get("metadatas"))
+        if not (len(ids) == len(documents) == len(metadatas)):
+            raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+        records: list[SemanticMemoryRecord] = []
+        for record_id, document, metadata in zip(ids, documents, metadatas, strict=True):
+            if (
+                not isinstance(record_id, str)
+                or not isinstance(document, str)
+                or not isinstance(metadata, dict)
+            ):
+                raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+            record = _semantic_record_from_metadata(record_id, document, metadata)
+            if _is_r12_semantic_projection(metadata):
+                self._verify_new_semantic_projection(record_id, document, metadata)
+            records.append(record)
+        return records
+
+    def consolidate_to_semantic(self, model_provider: ModelProvider) -> list[str]:
+        raise SemanticMemoryWriteError(
+            "Coordinated Semantic publication is required"
+        )
+
+    def consolidate_to_legacy_semantic(self, model_provider: ModelProvider) -> list[str]:
+        """Explicit compatibility helper for pre-R12 consolidation fixtures."""
+        records = self._get_unarchived_episodic_records()
+        semantic_ids: list[str] = []
+        for record in records:
+            if not self.evaluator.should_consolidate(record):
+                continue
+            semantic_text = model_provider.generate(build_consolidation_prompt(record))
+            semantic_ids.append(
+                self.save_legacy_semantic(semantic_text, source_episode_ids=[record.id])
+            )
+            self._archive_episodic(record.id)
+        return semantic_ids
+
+    def _get_unarchived_episodic_records(self) -> list[EpisodicMemoryRecord]:
+        result = self.db1.get(where={"archived": False})
+        return _episodic_records_from_get(result)
+
+    def _archive_episodic(self, episode_id: str) -> None:
+        result = self.db1.get(ids=[episode_id], include=["metadatas"])
+        metadatas = result.get("metadatas") or []
+        if not metadatas:
+            return
+        metadata = dict(metadatas[0])
+        metadata["archived"] = True
+        self.db1.update(ids=[episode_id], metadatas=[metadata])
+
+    def _scrub_legacy_private_records(self) -> None:
+        """One-way sanitize pre-R02 records before they can be retrieved again."""
+
+        episodic = self.db1.get(include=["documents", "metadatas"])
+        episodic_ids = episodic.get("ids") or []
+        episodic_documents = episodic.get("documents") or []
+        episodic_metadatas = episodic.get("metadatas") or []
+        for record_id, document, raw_metadata in zip(
+            episodic_ids,
+            episodic_documents,
+            episodic_metadatas,
+            strict=False,
+        ):
+            metadata: dict[str, Any] = dict(raw_metadata or {})
+            sanitized = _sanitize_persisted_metadata(metadata)
+            visible_document = canonical_episodic_document(
+                str(sanitized.get("user_input", "")),
+                str(sanitized.get("response", "")),
+            )
+            if _is_coordinated_episodic_metadata(metadata):
+                try:
+                    _committed_episodic_record(str(record_id), document, metadata)
+                except ValueError:
+                    raise EpisodicMemoryFormatError(
+                        "Committed episodic Memory is invalid"
+                    ) from None
+                if sanitized != metadata or document != visible_document:
+                    raise EpisodicMemoryFormatError(
+                        "Committed episodic Memory is invalid"
+                    )
+                continue
+            if sanitized == metadata and document == visible_document:
+                continue
+            self.db1.delete(ids=[str(record_id)])
+            self.db1.add(
+                ids=[str(record_id)],
+                documents=[visible_document],
+                metadatas=[sanitized],
+            )
+
+        semantic = self.db2.get(include=["documents", "metadatas"])
+        semantic_ids = semantic.get("ids") or []
+        semantic_documents = semantic.get("documents") or []
+        semantic_metadatas = semantic.get("metadatas") or []
+        if not all(
+            isinstance(value, list)
+            for value in (semantic_ids, semantic_documents, semantic_metadatas)
+        ):
+            raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+        if not (
+            len(semantic_ids)
+            == len(semantic_documents)
+            == len(semantic_metadatas)
+        ):
+            raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+        for record_id, document, raw_metadata in zip(
+            semantic_ids, semantic_documents, semantic_metadatas, strict=True
+        ):
+            if (
+                not isinstance(record_id, str)
+                or not isinstance(document, str)
+                or not isinstance(raw_metadata, dict)
+            ):
+                raise SemanticMemoryFormatError(
+                    "Committed semantic Memory is invalid"
+                )
+            semantic_metadata: dict[str, Any] = dict(raw_metadata or {})
+            if _is_r12_semantic_projection(semantic_metadata):
+                try:
+                    _committed_semantic_record(str(record_id), document, semantic_metadata)
+                except Exception:
+                    raise SemanticMemoryFormatError(
+                        "Committed semantic Memory is invalid"
+                    ) from None
+                # New-format rows are immutable projections.  Startup
+                # reconciliation, not this compatibility scrub, owns repair.
+                continue
+            try:
+                _semantic_context_id_from_metadata(semantic_metadata)
+            except (TypeError, ValueError):
+                raise SemanticMemoryFormatError(
+                    "Committed semantic Memory is invalid"
+                ) from None
+            try:
+                _committed_semantic_record(
+                    str(record_id), document, semantic_metadata
+                )
+            except Exception:
+                raise SemanticMemoryFormatError(
+                    "Committed semantic Memory is invalid"
+                ) from None
+            # Legacy Semantic bytes are intentionally not rewritten at startup;
+            # the explicit import/fixture writer is the only compatibility path.
+
+
+def _embed_text(text: str) -> list[float]:
+    buckets = [0.0] * 16
+    for index, char in enumerate(text):
+        buckets[index % len(buckets)] += float(ord(char) % 31) / 31.0
+    magnitude = sum(value * value for value in buckets) ** 0.5 or 1.0
+    return [value / magnitude for value in buckets]
+
+
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def canonical_episodic_document(user_input: str, response: str) -> str:
+    """Build the authoritative visible DB1 episodic document."""
+
+    return f"User: {user_input}\nAssistant: {response}".strip()
+
+
+def canonical_episodic_metadata(
+    user_input: str,
+    response: str,
+    *,
+    loss: float | None,
+    emotion_valence: float,
+    emotion_arousal: float,
+    record_type: MemoryRecordType,
+    created_at: str,
+    metadata: Mapping[str, Any],
+    coordinated: bool = False,
+    coordination_schema: int | None = None,
+    context_id: str | None = None,
+    source_channel: str | None = None,
+    source_session_id: str | None = None,
+) -> Metadata:
+    """Build the authoritative DB1 metadata map for one episodic record."""
+
+    result: dict[str, str | int | float | bool] = {
+        "user_input": user_input,
+        "response": response,
+        "emotion_valence": float(emotion_valence),
+        "emotion_arousal": float(emotion_arousal),
+        "record_type": record_type.value,
+        "archived": False,
+        "created_at": created_at,
+        "extra": json.dumps(dict(metadata)),
+    }
+    if not coordinated:
+        if loss is None or isinstance(loss, bool) or not isinstance(loss, (int, float)) or not math.isfinite(loss):
+            raise ValueError("loss must be finite")
+        result["loss"] = float(loss)
+        if any(
+            value is not None
+            for value in (context_id, source_channel, source_session_id)
+        ):
+            raise ValueError("Uncoordinated episodic records do not support provenance")
+        return result
+    if coordination_schema is None:
+        coordination_schema = (
+            2
+            if any(
+                value is not None
+                for value in (context_id, source_channel, source_session_id)
+            )
+            else 1
+        )
+    if coordinated:
+        if type(coordination_schema) is not int or coordination_schema not in (1, 2, 3):
+            raise ValueError("unsupported coordination schema")
+        if coordination_schema in (2, 3):
+            _validate_provenance(context_id, source_channel, source_session_id)
+        elif any(value is not None for value in (context_id, source_channel, source_session_id)):
+            raise ValueError("schema 1 does not support provenance")
+        result["coordination_schema"] = coordination_schema
+        if coordination_schema == 3:
+            if loss is None:
+                result["loss_valid"] = False
+            else:
+                if isinstance(loss, bool) or not isinstance(loss, (int, float)) or not math.isfinite(loss):
+                    raise ValueError("loss must be finite")
+                result["loss"] = float(loss)
+                result["loss_valid"] = True
+        else:
+            if loss is None or isinstance(loss, bool) or not isinstance(loss, (int, float)) or not math.isfinite(loss):
+                raise ValueError("loss must be finite")
+            result["loss"] = float(loss)
+        if coordination_schema in (2, 3):
+            for key, value in (
+                ("context_id", context_id),
+                ("source_channel", source_channel),
+                ("source_session_id", source_session_id),
+            ):
+                if value is not None:
+                    result[key] = value
+    return result
+
+
+def _is_coordinated_episodic_metadata(metadata: Mapping[str, Any]) -> bool:
+    return "coordination_schema" in metadata or any(
+        key in metadata for key in ("context_id", "source_channel", "source_session_id")
+    )
+
+
+def _sanitize_persisted_metadata(metadata: Mapping[str, Any]) -> Metadata:
+    sanitized: dict[str, str | int | float | bool] = {}
+    for key, value in metadata.items():
+        if normalize_private_key(key) in PRIVATE_FIELD_KEYS:
+            continue
+        if key == "extra":
+            sanitized[key] = _sanitize_extra_metadata(value)
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            sanitized[key] = value
+    return sanitized
+
+
+def _sanitize_extra_metadata(value: Any) -> str:
+    if not isinstance(value, str):
+        return "{}"
+    try:
+        loaded = json.loads(value)
+    except json.JSONDecodeError:
+        return "{}"
+    if not isinstance(loaded, dict):
+        return "{}"
+    sanitized = scrub_private_fields(loaded)
+    return json.dumps(sanitized)
+
+
+def _validate_opaque_id(value: Any) -> str:
+    """Validate one shared opaque identifier."""
+
+    return validate_identifier(value)
+
+
+def _validate_provenance(
+    context_id: Any, source_channel: Any, source_session_id: Any
+) -> None:
+    values = (context_id, source_channel, source_session_id)
+    if all(value is None for value in values):
+        return
+    if context_id is None or source_channel is None:
+        raise ValueError
+    for value in values:
+        if value is not None:
+            _validate_opaque_id(value)
+
+
+def _provenance_from_metadata(
+    metadata: Mapping[str, Any],
+) -> tuple[int | None, str | None, str | None, str | None]:
+    provenance_keys = ("context_id", "source_channel", "source_session_id")
+    if "coordination_schema" not in metadata:
+        if any(key in metadata for key in provenance_keys) or "loss_valid" in metadata:
+            raise ValueError
+        return None, None, None, None
+    coordination_schema = metadata["coordination_schema"]
+    if type(coordination_schema) is not int or coordination_schema not in (1, 2, 3):
+        raise ValueError
+    if coordination_schema == 1:
+        if any(key in metadata for key in provenance_keys) or "loss_valid" in metadata:
+            raise ValueError
+        return 1, None, None, None
+    if coordination_schema == 3:
+        if type(metadata.get("loss_valid")) is not bool:
+            raise ValueError
+        if metadata["loss_valid"]:
+            if "loss" not in metadata or type(metadata["loss"]) not in (int, float) or not math.isfinite(float(metadata["loss"])):
+                raise ValueError
+        elif "loss" in metadata:
+            raise ValueError
+    elif "loss_valid" in metadata:
+        raise ValueError
+    values = tuple(metadata.get(key) for key in provenance_keys)
+    if any(key in metadata and type(metadata[key]) is not str for key in provenance_keys):
+        raise ValueError
+    _validate_provenance(*values)
+    return (coordination_schema, values[0], values[1], values[2])
+
+
+def _episodic_records_from_query(
+    result: Mapping[str, Any],
+) -> list[EpisodicMemoryRecord]:
+    ids = _first_result_list(result.get("ids"))
+    metadatas = _first_result_list(result.get("metadatas"))
+    return [
+        _episodic_record_from_metadata(record_id, metadata or {})
+        for record_id, metadata in zip(ids, metadatas, strict=False)
+    ]
+
+
+def _semantic_records_from_query(
+    result: Mapping[str, Any],
+) -> list[SemanticMemoryRecord]:
+    ids = _semantic_query_list(result.get("ids"))
+    documents = _semantic_query_list(result.get("documents"))
+    metadatas = _semantic_query_list(result.get("metadatas"))
+    if not (len(ids) == len(documents) == len(metadatas)):
+        raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+    records: list[SemanticMemoryRecord] = []
+    for record_id, document, metadata in zip(ids, documents, metadatas, strict=True):
+        if (
+            not isinstance(record_id, str)
+            or not isinstance(document, str)
+            or not isinstance(metadata, dict)
+        ):
+            raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+        records.append(_semantic_record_from_metadata(record_id, document, metadata))
+    return records
+
+
+def _strict_get_parts(
+    result: Mapping[str, Any],
+) -> tuple[list[Any], list[Any], list[Any]]:
+    ids = result.get("ids")
+    documents = result.get("documents")
+    metadatas = result.get("metadatas")
+    if (
+        not isinstance(ids, list)
+        or not isinstance(documents, list)
+        or not isinstance(metadatas, list)
+    ):
+        raise ValueError
+    if not ids and not documents and not metadatas:
+        return [], [], []
+    if not (len(ids) == len(documents) == len(metadatas) == 1):
+        raise ValueError
+    return ids, documents, metadatas
+
+
+def _strict_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError
+    return dict(value)
+
+
+def _committed_episodic_record(
+    record_id: str, document: Any, metadata: dict[str, Any]
+) -> EpisodicMemoryRecord:
+    if not isinstance(document, str):
+        raise ValueError
+    required = (
+        "user_input",
+        "response",
+        "emotion_valence",
+        "emotion_arousal",
+        "record_type",
+        "archived",
+        "created_at",
+        "extra",
+    )
+    if any(key not in metadata for key in required):
+        raise ValueError
+    (
+        coordination_schema,
+        context_id,
+        source_channel,
+        source_session_id,
+    ) = _provenance_from_metadata(metadata)
+    if not all(
+        isinstance(metadata[key], str)
+        for key in ("user_input", "response", "record_type", "created_at", "extra")
+    ):
+        raise ValueError
+    if not all(type(metadata[key]) in (int, float) for key in ("emotion_valence", "emotion_arousal")):
+        raise ValueError
+    if coordination_schema == 3:
+        loss = float(metadata["loss"]) if metadata["loss_valid"] else None
+    else:
+        if "loss" not in metadata or type(metadata["loss"]) not in (int, float):
+            raise ValueError
+        loss = float(metadata["loss"])
+    if loss is not None and not math.isfinite(loss):
+        raise ValueError
+    if not all(
+        math.isfinite(float(metadata[key]))
+        for key in ("emotion_valence", "emotion_arousal")
+    ):
+        raise ValueError
+    if type(metadata["archived"]) is not bool:
+        raise ValueError
+    if metadata["record_type"] not in (
+        MemoryRecordType.EPISODIC_LOG.value,
+        MemoryRecordType.THOUGHT_LOG.value,
+        MemoryRecordType.EXTRACTED_FACT.value,
+        MemoryRecordType.EVALUATION_LOG.value,
+    ):
+        raise ValueError
+    if (
+        canonical_episodic_document(metadata["user_input"], metadata["response"])
+        != document
+    ):
+        raise ValueError
+    extra = json.loads(metadata["extra"])
+    if not isinstance(extra, dict):
+        raise ValueError
+    reject_private_fields(extra, context="Committed episodic Memory metadata")
+    return EpisodicMemoryRecord(
+        id=record_id,
+        user_input=metadata["user_input"],
+        response=metadata["response"],
+        loss=loss,
+        emotion_valence=float(metadata["emotion_valence"]),
+        emotion_arousal=float(metadata["emotion_arousal"]),
+        record_type=MemoryRecordType(metadata["record_type"]),
+        archived=metadata["archived"],
+        created_at=metadata["created_at"],
+        metadata=extra,
+        context_id=context_id,
+        source_channel=source_channel,
+        source_session_id=source_session_id,
+        coordination_schema=coordination_schema,
+    )
+
+
+def _committed_semantic_record(
+    record_id: str, document: Any, metadata: dict[str, Any]
+) -> SemanticMemoryRecord:
+    required = ("text", "source_episode_ids", "record_type", "created_at", "extra")
+    if any(key not in metadata for key in required) or not isinstance(document, str):
+        raise ValueError
+    if not all(isinstance(metadata[key], str) for key in required):
+        raise ValueError
+    if metadata["record_type"] != MemoryRecordType.SEMANTIC_MEMORY.value:
+        raise ValueError
+    if metadata["text"] != document:
+        raise ValueError
+    context_id = _semantic_context_id_from_metadata(metadata)
+    source_episode_ids = json.loads(metadata["source_episode_ids"])
+    extra = json.loads(metadata["extra"])
+    if (
+        not isinstance(source_episode_ids, list)
+        or not all(isinstance(item, str) for item in source_episode_ids)
+        or not isinstance(extra, dict)
+    ):
+        raise ValueError
+    reject_private_fields(extra, context="Committed semantic Memory metadata")
+    return SemanticMemoryRecord(
+        id=record_id,
+        text=metadata["text"],
+        source_episode_ids=source_episode_ids,
+        record_type=MemoryRecordType.SEMANTIC_MEMORY,
+        created_at=metadata["created_at"],
+        metadata=extra,
+        context_id=context_id,
+    )
+
+
+def _episodic_records_from_get(
+    result: Mapping[str, Any],
+) -> list[EpisodicMemoryRecord]:
+    ids = result.get("ids") or []
+    metadatas = result.get("metadatas") or []
+    return [
+        _episodic_record_from_metadata(record_id, metadata or {})
+        for record_id, metadata in zip(ids, metadatas, strict=False)
+    ]
+
+
+def _episodic_record_from_metadata(
+    record_id: str, metadata: dict[str, Any]
+) -> EpisodicMemoryRecord:
+    try:
+        (
+            coordination_schema,
+            context_id,
+            source_channel,
+            source_session_id,
+        ) = _provenance_from_metadata(metadata)
+    except ValueError:
+        raise EpisodicMemoryFormatError(
+            "Committed episodic Memory is invalid"
+        ) from None
+    try:
+        if coordination_schema == 3:
+            loss = float(metadata["loss"]) if metadata["loss_valid"] else None
+        else:
+            if "loss" not in metadata or type(metadata["loss"]) not in (int, float):
+                raise ValueError
+            loss = float(metadata["loss"])
+        if loss is not None and not math.isfinite(loss):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise EpisodicMemoryFormatError(
+            "Committed episodic Memory is invalid"
+        ) from None
+    return EpisodicMemoryRecord(
+        id=record_id,
+        user_input=str(metadata.get("user_input", "")),
+        response=str(metadata.get("response", "")),
+        loss=loss,
+        emotion_valence=float(metadata.get("emotion_valence", 0.0)),
+        emotion_arousal=float(metadata.get("emotion_arousal", 0.0)),
+        record_type=MemoryRecordType(
+            str(metadata.get("record_type", MemoryRecordType.EPISODIC_LOG.value))
+        ),
+        archived=bool(metadata.get("archived", False)),
+        created_at=str(metadata.get("created_at", "")),
+        metadata=_loads_json_dict(metadata.get("extra")),
+        context_id=context_id,
+        source_channel=source_channel,
+        source_session_id=source_session_id,
+        coordination_schema=coordination_schema,
+    )
+
+
+def _semantic_record_from_metadata(
+    record_id: str, document: str, metadata: dict[str, Any]
+) -> SemanticMemoryRecord:
+    try:
+        return _committed_semantic_record(record_id, document, metadata)
+    except Exception:
+        raise SemanticMemoryFormatError(
+            "Committed semantic Memory is invalid"
+        ) from None
+
+
+def _first_result_list(value: Any) -> list[Any]:
+    if not value:
+        return []
+    return value[0] if isinstance(value[0], list) else value
+
+
+def _semantic_query_list(value: Any) -> list[Any]:
+    if not isinstance(value, list):
+        raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+    if value and isinstance(value[0], list):
+        if len(value) != 1:
+            raise SemanticMemoryFormatError("Committed semantic Memory is invalid")
+        return value[0]
+    return value
+
+
+def _is_r12_semantic_projection(metadata: Mapping[str, Any]) -> bool:
+    return metadata.get("semantic_projection_schema") == SEMANTIC_PROJECTION_SCHEMA
+
+
+def _has_r12_projection_fields(metadata: Mapping[str, Any]) -> bool:
+    return bool(_R12_PROJECTION_FIELDS.intersection(metadata))
+
+
+def semantic_projection_metadata(
+    revision: SemanticRevision,
+) -> dict[str, str | int | float | bool]:
+    """Build the strict searchable projection for one authoritative revision."""
+
+    if not isinstance(revision, SemanticRevision):
+        raise TypeError("revision must be SemanticRevision")
+    source_episode_ids = sorted(
+        {
+            edge.source_id
+            for edge in revision.source_edges
+            if edge.source_kind.value == "episodic"
+        }
+    )
+    metadata: dict[str, str | int | float | bool] = {
+        "semantic_projection_schema": SEMANTIC_PROJECTION_SCHEMA,
+        "semantic_revision": revision.revision,
+        "semantic_revision_digest": revision.revision_digest,
+        "semantic_content_digest": revision.content_digest,
+        "semantic_lifecycle": revision.lifecycle.value,
+        "semantic_provenance_digest": revision.provenance.digest,
+        "text": revision.semantic_content,
+        "source_episode_ids": json.dumps(
+            source_episode_ids, ensure_ascii=True, separators=(",", ":")
+        ),
+        "record_type": MemoryRecordType.SEMANTIC_MEMORY.value,
+        "created_at": revision.created_at.astimezone(UTC).isoformat(
+            timespec="microseconds"
+        ),
+        "extra": "{}",
+    }
+    if (
+        revision.provenance.classification.value == "single_context"
+        and len(revision.provenance.known_context_ids) == 1
+    ):
+        metadata["context_id"] = revision.provenance.known_context_ids[0]
+    return metadata
+
+
+def _loads_json_dict(value: Any) -> dict[str, Any]:
+    if not isinstance(value, str):
+        return {}
+    try:
+        loaded = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _loads_json_list(value: Any) -> list[str]:
+    if not isinstance(value, str):
+        return []
+    try:
+        loaded = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    return [str(item) for item in loaded] if isinstance(loaded, list) else []
+
+
+def _copy_source_episode_ids(source_episode_ids: list[str] | None) -> list[str]:
+    if source_episode_ids is None:
+        return []
+    if not isinstance(source_episode_ids, list):
+        raise TypeError("source_episode_ids must be a list of strings")
+    copied = list(source_episode_ids)
+    if any(type(source_id) is not str for source_id in copied):
+        raise TypeError("source_episode_ids must contain strings")
+    if any(not source_id for source_id in copied):
+        raise ValueError("source_episode_ids must contain non-empty strings")
+    return copied
+
+
+def _semantic_context_id_from_metadata(metadata: Mapping[str, Any]) -> str | None:
+    if "context_id" not in metadata:
+        return None
+    return _validate_semantic_context_id(metadata["context_id"])
+
+
+def _validate_semantic_context_id(value: Any) -> str:
+    return validate_identifier(value)

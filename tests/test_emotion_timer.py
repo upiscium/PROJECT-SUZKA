@@ -7,8 +7,8 @@ from typing import Any, Callable, cast
 
 import pytest
 
-from kagya.body import EmotionEngineAllostasis, EmotionState
-from kagya.runtime import (
+from suzka.body import EmotionEngineAllostasis, EmotionState
+from suzka.runtime import (
     AgentEvent,
     AgentEventOutcome,
     AgentEventSource,

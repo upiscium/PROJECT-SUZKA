@@ -9,14 +9,35 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from kagya.config import Settings, load_settings
-from kagya.runtime.agent_state import (
+from suzka.belief import (
+    AdmissionReason,
+    BeliefEvidence,
+    BeliefEvidenceType,
+    BeliefMutationEvidence,
+    BeliefProposition,
+    BeliefSubjectAdmission,
+    BeliefSystem,
+    belief_record_digest,
+)
+from suzka.config import Settings, load_settings
+from suzka.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
+from suzka.runtime.agent_state import (
+    AgentStateSnapshotV6,
+    AppraisalStateSnapshot,
     AgentStateSnapshotV2,
     AgentStateSnapshotV1,
+    BeliefEvidenceStateSnapshot,
+    BeliefPropositionStateSnapshot,
+    BeliefRecordStateSnapshot,
+    BeliefRevisionStateSnapshot,
+    BeliefSubjectAdmissionStateSnapshot,
+    BeliefSystemStateSnapshot,
+    ContextStateSnapshot,
     EmotionStateSnapshot,
+    ValueSystemStateSnapshot,
     WorkingMemorySnapshot,
 )
-from kagya.runtime.state_wal import (
+from suzka.runtime.state_wal import (
     RecoveryReason,
     Manifest,
     StateWAL,
@@ -52,21 +73,150 @@ def make_v1_snapshot(sequence: int, *, value: float = 0.1) -> AgentStateSnapshot
     )
 
 
+def make_v6_snapshot(
+    sequence: int, *, include_belief: bool = True, compacted: bool = False
+) -> AgentStateSnapshotV6:
+    timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    active_event: AgentEvent | None = None
+
+    def set_event(event_sequence: int) -> BeliefMutationEvidence:
+        nonlocal active_event
+        active_event = AgentEvent(
+            event_id=f"belief-event:{event_sequence}",
+            event_type=AgentEventType.CHAT,
+            source=AgentEventSource.API_CHAT,
+            requested_at=timestamp,
+            processing_sequence=event_sequence,
+        )
+        return BeliefMutationEvidence(
+            active_event.event_id, event_sequence, timestamp
+        )
+
+    system = BeliefSystem(event_provider=lambda: active_event)
+    records = ()
+    if include_belief:
+        evidence = (BeliefEvidence("claim:1", BeliefEvidenceType.EXTERNAL_CLAIM),)
+        record = system.create_proposal(
+            BeliefProposition("claim"),
+            set_event(1),
+            evidence=evidence,
+        )
+        if compacted:
+            admission = BeliefSubjectAdmission(
+                record.proposition.proposition_digest,
+                ("claim:1",),
+                "belief-event:2",
+                2,
+                AdmissionReason.SUBJECT_REVIEW,
+            )
+            record = system.adopt(record.belief_id, admission, set_event(2))
+            for revision_sequence in range(2, 42):
+                if revision_sequence == 2:
+                    continue
+                admission = BeliefSubjectAdmission(
+                    record.proposition.proposition_digest,
+                    ("claim:1",),
+                    f"belief-event:{revision_sequence}",
+                    revision_sequence,
+                    AdmissionReason.SUBJECT_CORRECTION,
+                )
+                record = system.correct(
+                    record.belief_id,
+                    record,
+                    set_event(revision_sequence),
+                    admission=admission,
+                )
+        records = (
+            BeliefRecordStateSnapshot(
+                belief_id=record.belief_id,
+                proposition=BeliefPropositionStateSnapshot(
+                    canonical_text=record.proposition.canonical_text,
+                    proposition_digest=record.proposition.proposition_digest,
+                ),
+                lifecycle=record.lifecycle.value,
+                epistemic_status=record.epistemic_status.value,
+                confidence=record.confidence,
+                context_scope=(),
+                evidence=tuple(
+                    BeliefEvidenceStateSnapshot(
+                        evidence_ref=item.evidence_ref,
+                        evidence_type=item.evidence_type.value,
+                    )
+                    for item in record.evidence
+                ),
+                revision=record.revision,
+                subject_admission=(
+                    None
+                    if record.subject_admission is None
+                    else BeliefSubjectAdmissionStateSnapshot(
+                        proposition_digest=record.subject_admission.proposition_digest,
+                        evidence_refs=record.subject_admission.evidence_refs,
+                        event_id=record.subject_admission.event_id,
+                        event_sequence=record.subject_admission.event_sequence,
+                        reason=record.subject_admission.reason.value,
+                        admission_digest=record.subject_admission.admission_digest,
+                    )
+                ),
+                revision_history=tuple(
+                    BeliefRevisionStateSnapshot(
+                        belief_id=revision.belief_id,
+                        revision=revision.revision,
+                        operation=revision.operation.value,
+                        reason=revision.reason.value,
+                        created_at=revision.created_at,
+                        previous_revision_digest=revision.previous_revision_digest,
+                        event_id=revision.event_id,
+                        event_sequence=revision.event_sequence,
+                        evidence_refs=revision.evidence_refs,
+                        record_digest=revision.record_digest,
+                    )
+                    for revision in record.revision_history
+                ),
+                history_anchor_digest=record.history_anchor_digest,
+                record_digest=belief_record_digest(record),
+            ),
+        )
+    return AgentStateSnapshotV6(
+        saved_at=timestamp,
+        last_processed_event_sequence=sequence,
+        emotion_state=EmotionStateSnapshot(
+            valence=0.1, arousal=0.2, optimal_loss=1.0
+        ),
+        working_memory=WorkingMemorySnapshot(revision=0, items=()),
+        context_state=ContextStateSnapshot(
+            revision=0,
+            current_context_id=None,
+            frames=(),
+            interlocutor_bindings=(),
+        ),
+        appraisal_state=AppraisalStateSnapshot(
+            calibration_entries=(), last_emotion_update_at=None
+        ),
+        value_state=ValueSystemStateSnapshot(
+            values=(), conflicts=(), histories=(), evidence_ledgers=()
+        ),
+        belief_state=BeliefSystemStateSnapshot(
+            records=records,
+            authority_digest=system.snapshot().authority_digest,
+        ),
+    )
+
+
 def make_wal(tmp_path: Path) -> StateWAL:
     return StateWAL(tmp_path / "wal")
 
 
 def test_wal_config_is_strict_and_backward_compatible() -> None:
     settings = load_settings(CONFIG_PATH)
-    assert settings.state_wal.directory == Path(".kagya/private/state_wal")
+    assert settings.state_wal.directory == Path(".suzka/private/state_wal")
 
     pre_r06 = settings.model_dump(mode="python")
     pre_r06.pop("state_wal")
     compatible = Settings.model_validate(pre_r06)
-    assert compatible.state_wal.directory == Path(".kagya/private/state_wal")
+    assert compatible.state_wal.directory == Path(".suzka/private/state_wal")
     with pytest.raises(ValidationError):
         type(settings.state_wal).model_validate(
-            {"directory": ".kagya/private/state_wal", "unexpected": True}
+            {"directory": ".suzka/private/state_wal", "unexpected": True}
         )
 
 
@@ -273,6 +423,53 @@ def test_reconstruct_by_sequence_hash_and_record(tmp_path: Path) -> None:
         wal.reconstruct(record_id=transition.record_id).last_processed_event_sequence
         == 12
     )
+
+
+def test_v6_wal_reconstructs_nonempty_belief_without_replay(tmp_path: Path) -> None:
+    wal = make_wal(tmp_path)
+    initial = make_v6_snapshot(0, include_belief=False)
+    candidate = make_v6_snapshot(1)
+    wal.bootstrap(initial, 0)
+    transition = wal.append_transition(
+        event_id=uuid4(),
+        event_type="state.transition",
+        event_source="test",
+        processing_sequence=1,
+        prior_snapshot=initial,
+        candidate_snapshot=candidate,
+    )
+
+    assert wal.reconstruct(sequence=0) == initial
+    assert initial.belief_state.records == ()
+    reconstructed = wal.reconstruct(record_id=transition.record_id)
+    assert reconstructed == candidate
+    assert len(reconstructed.belief_state.records) == 1
+    assert reconstructed.belief_state.authority_digest == (
+        candidate.belief_state.authority_digest
+    )
+
+
+def test_v6_wal_reconstructs_compacted_belief_history_without_replay(
+    tmp_path: Path,
+) -> None:
+    wal = make_wal(tmp_path)
+    initial = make_v6_snapshot(0, include_belief=False)
+    candidate = make_v6_snapshot(41, compacted=True)
+    wal.bootstrap(initial, 0)
+    transition = wal.append_transition(
+        event_id=uuid4(),
+        event_type="state.transition",
+        event_source="test",
+        processing_sequence=41,
+        prior_snapshot=initial,
+        candidate_snapshot=candidate,
+    )
+
+    reconstructed = wal.reconstruct(record_id=transition.record_id)
+    record = reconstructed.belief_state.records[0]
+    assert len(record.revision_history) == 32
+    assert record.history_anchor_digest is not None
+    assert reconstructed == candidate
 
 
 def test_retained_v1_records_preserve_exact_snapshot_and_record_hashes(
@@ -739,7 +936,7 @@ def test_permissive_private_parent_is_hardened(tmp_path: Path) -> None:
 
 
 def test_missing_private_parent_chain_is_created_and_durable(tmp_path: Path) -> None:
-    private = tmp_path / "state" / ".kagya" / "private"
+    private = tmp_path / "state" / ".suzka" / "private"
     wal = StateWAL(private / "state_wal")
 
     wal.bootstrap(make_snapshot(0), 0)

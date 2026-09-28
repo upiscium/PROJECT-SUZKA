@@ -3,11 +3,11 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
-from kagya.runtime import ContextType
+from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
+from suzka.runtime import ContextType
 
 from test_fastapi_backend import PRIVATE_SENTINEL, _client, admin_headers
-from kagya.runtime import EventLifecycle
+from suzka.runtime import EventLifecycle
 
 
 def _seed(client: TestClient) -> tuple[str, str]:

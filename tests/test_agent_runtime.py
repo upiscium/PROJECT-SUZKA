@@ -5,8 +5,8 @@ import traceback
 
 import pytest
 
-from kagya.config.schema import Settings
-from kagya.runtime import (
+from suzka.config.schema import Settings
+from suzka.runtime import (
     AgentEventOutcome,
     AgentEventSource,
     AgentEventType,
@@ -228,16 +228,26 @@ def test_checkpoint_failure_fail_stops_runtime() -> None:
             )
 
     handler_ran = Event()
+    release_handler = Event()
     runtime = AgentRuntime(2, internal_commit_checkpoint=checkpoint)
     runtime.start()
+
+    def fail_handler() -> None:
+        handler_ran.set()
+        assert release_handler.wait(timeout=2)
+
     failed = runtime.submit(
         AgentEventType.CHAT,
         AgentEventSource.API_CHAT,
-        handler_ran.set,
+        fail_handler,
     )
-    succeeding = runtime.submit(
-        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "ok"
-    )
+    try:
+        assert handler_ran.wait(timeout=2)
+        succeeding = runtime.submit(
+            AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "ok"
+        )
+    finally:
+        release_handler.set()
 
     with pytest.raises(AgentRuntimeDurabilityError) as error:
         failed.result(timeout=2)
@@ -379,7 +389,7 @@ def test_concurrent_producers_share_one_consumer_and_preserve_local_order() -> N
 
     assert sorted(sequences) == list(range(1, event_count + 1))
     consumer_threads = {outcome.value[2] for outcome in all_outcomes}
-    assert consumer_threads == {"kagya-agent-runtime"}
+    assert consumer_threads == {"suzka-agent-runtime"}
     assert consumer_threads.isdisjoint({producer.name for producer in producers})
 
     for producer_id, outcomes in producer_outcomes.items():
@@ -558,7 +568,7 @@ def test_current_event_is_only_visible_during_the_active_handler() -> None:
 
     assert outcome.value == "done"
     assert outcome.event is observed["event"]
-    assert observed["worker"] == "kagya-agent-runtime"
+    assert observed["worker"] == "suzka-agent-runtime"
     assert runtime.current_event() is None
 
 
@@ -1196,6 +1206,8 @@ def test_handler_failure_checkpoint_consumes_sequence_and_runtime_continues() ->
 
 
 def test_handler_failure_checkpoint_failure_stops_later_handlers() -> None:
+    handler_started = Event()
+    release_failure = Event()
     later_ran = Event()
 
     def fail_handler_checkpoint(_event) -> None:
@@ -1205,12 +1217,16 @@ def test_handler_failure_checkpoint_failure_stops_later_handlers() -> None:
     runtime.start()
 
     def fail() -> None:
+        handler_started.set()
+        assert release_failure.wait(timeout=2)
         raise ValueError("domain failure")
 
     failed = runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, fail)
+    assert handler_started.wait(timeout=2)
     later = runtime.submit(
         AgentEventType.CHAT, AgentEventSource.API_CHAT, later_ran.set
     )
+    release_failure.set()
     with pytest.raises(AgentRuntimeDurabilityError) as error:
         failed.result(timeout=2)
     with pytest.raises(AgentRuntimeDurabilityError):

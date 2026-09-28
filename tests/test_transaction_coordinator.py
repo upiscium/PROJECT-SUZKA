@@ -7,7 +7,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
-from kagya.runtime import (
+from suzka.runtime import (
     AbortOutcome,
     AgentEvent,
     AgentEventSource,
@@ -19,6 +19,7 @@ from kagya.runtime import (
     ParticipantCapability,
     ParticipantDivergedError,
     ParticipantOutcome,
+    ParticipantRequirement,
     SessionState,
     SessionTurnOperation,
     SessionTurnParticipant,
@@ -158,6 +159,68 @@ def test_no_transaction_is_a_true_no_op(tmp_path: Path) -> None:
     transaction_coordinator.finalize_event(item, commit_internal(value, item))
 
     assert public == {"answer": "ok"}
+    assert not any(record.transaction_id for record in value.records)
+
+
+def test_failing_retention_callback_is_skipped_for_ordinary_participant(
+    tmp_path: Path,
+) -> None:
+    value = journal(tmp_path / "events.jsonl")
+    item = event("ordinary-retention")
+    start(value, item)
+    participant = FakeParticipant("ordinary.participant")
+    callback_calls: list[tuple[str, ...]] = []
+
+    def failing_retention(
+        requirements: tuple[ParticipantRequirement, ...],
+    ) -> None:
+        callback_calls.append(tuple(x.participant_id for x in requirements))
+        if any(x.participant_id == "memory.semantic" for x in requirements):
+            raise OSError(PRIVATE_SENTINEL)
+
+    transaction_coordinator = TransactionCoordinator(
+        value,
+        lambda _event, _evidence: None,
+        before_prepare=failing_retention,
+    )
+
+    assert transaction_coordinator.prepare_result(
+        item, CoordinatedResult("public", (participant,))
+    ) == "public"
+    assert callback_calls == [("ordinary.participant",)]
+    assert participant.calls == ["prepare"]
+    assert any(record.transaction_id for record in value.records)
+
+
+def test_failing_retention_callback_blocks_semantic_plan_before_declaration(
+    tmp_path: Path,
+) -> None:
+    value = journal(tmp_path / "events.jsonl")
+    item = event("semantic-retention")
+    start(value, item)
+    participant = FakeParticipant("memory.semantic")
+    callback_calls: list[tuple[str, ...]] = []
+
+    def failing_retention(
+        requirements: tuple[ParticipantRequirement, ...],
+    ) -> None:
+        callback_calls.append(tuple(x.participant_id for x in requirements))
+        raise OSError(PRIVATE_SENTINEL)
+
+    transaction_coordinator = TransactionCoordinator(
+        value,
+        lambda _event, _evidence: None,
+        before_prepare=failing_retention,
+    )
+
+    with pytest.raises(TransactionPreparationError) as error:
+        transaction_coordinator.prepare_result(
+            item, CoordinatedResult("public", (participant,))
+        )
+
+    assert_bounded(error.value)
+    assert callback_calls == [("memory.semantic",)]
+    assert participant.calls == []
     assert not any(record.transaction_id for record in value.records)
 
 

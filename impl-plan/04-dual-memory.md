@@ -6,11 +6,11 @@ Implement initial ChromaDB-backed Dual Memory with DB1 episodic memory and DB2 s
 
 ## Target Files
 
-- `kagya/memory/__init__.py`
-- `kagya/memory/memory_schema.py`
-- `kagya/memory/dual_memory_system.py`
-- `kagya/memory/memory_evaluator.py`
-- `kagya/memory/consolidation.py`
+- `suzka/memory/__init__.py`
+- `suzka/memory/memory_schema.py`
+- `suzka/memory/dual_memory_system.py`
+- `suzka/memory/memory_evaluator.py`
+- `suzka/memory/consolidation.py`
 - `tests/test_dual_memory_system.py`
 
 ## Data Model Requirements

@@ -6,12 +6,12 @@ Implement the lightweight cognition/body primitives that are independent of memo
 
 ## Target Files
 
-- `kagya/cognition/__init__.py`
-- `kagya/cognition/surprisal_calculator.py`
-- `kagya/body/__init__.py`
-- `kagya/body/emotion_engine.py`
-- `kagya/persona/__init__.py`
-- `kagya/persona/response_postprocessor.py`
+- `suzka/cognition/__init__.py`
+- `suzka/cognition/surprisal_calculator.py`
+- `suzka/body/__init__.py`
+- `suzka/body/emotion_engine.py`
+- `suzka/persona/__init__.py`
+- `suzka/persona/response_postprocessor.py`
 - `tests/test_surprisal_calculator.py`
 - `tests/test_emotion_engine.py`
 - `tests/test_response_postprocessor.py`

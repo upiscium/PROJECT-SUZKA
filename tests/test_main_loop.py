@@ -5,11 +5,18 @@ from pathlib import Path
 
 import pytest
 
-from kagya.body import EmotionEngineAllostasis, EmotionState
-from kagya.cognition import LossCalibration, LossInvalidReason, model_key
-from kagya.identity import ValuePromptView
-from kagya.config import Settings, load_settings
-from kagya.memory import (
+from suzka.body import EmotionEngineAllostasis, EmotionState
+from suzka.belief import (
+    BeliefDomainError,
+    BeliefEvidence,
+    BeliefEvidenceType,
+    BeliefMutationEvidence,
+    BeliefProposition,
+)
+from suzka.cognition import LossCalibration, LossInvalidReason, model_key
+from suzka.identity import ValuePromptView
+from suzka.config import Settings, load_settings
+from suzka.memory import (
     DualMemorySystem,
     EpisodicMemoryRecord,
     MemoryContext,
@@ -17,14 +24,14 @@ from kagya.memory import (
     SemanticMemoryReadError,
     SemanticMemoryRecord,
 )
-from kagya.runtime.context import ContextType
-from kagya.models import DummyProvider
-from kagya.persona import ContextPromptView, PromptBuilder
-from kagya.runtime import (
+from suzka.runtime.context import ContextType
+from suzka.models import DummyProvider
+from suzka.persona import ContextPromptView, PromptBuilder
+from suzka.runtime import (
     ChatContextSelectors,
     CoordinatedResult,
     ContextRegistry,
-    KagyaMainLoop,
+    SuzkaMainLoop,
     TransactionBinding,
     TransactionBoundValue,
     TransactionKind,
@@ -34,7 +41,13 @@ from kagya.runtime import (
     WorkingMemorySourceKind,
     WorkingMemoryView,
 )
-from kagya.runtime.main_loop import DebugChatTrace
+from suzka.runtime.main_loop import DebugChatTrace
+from suzka.runtime.agent_runtime import (
+    AgentEvent,
+    AgentEventSource,
+    AgentEventType,
+    AgentRuntime,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -72,7 +85,7 @@ def test_dummy_provider_drives_user_input_to_public_response_end_to_end(
     provider = ThinkingDummyProvider()
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
-    loop = KagyaMainLoop(settings, provider, memory)
+    loop = SuzkaMainLoop(settings, provider, memory)
 
     plan = loop.chat("hello")
     result = _materialize(plan)
@@ -87,14 +100,62 @@ def test_dummy_provider_drives_user_input_to_public_response_end_to_end(
     assert not hasattr(result, "memory_context")
 
 
+def test_belief_mutation_requires_the_active_runtime_event(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = SuzkaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
+    event = AgentEvent(
+        event_id="event:1",
+        event_type=AgentEventType.CHAT,
+        source=AgentEventSource.API_CHAT,
+        requested_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        processing_sequence=1,
+    )
+    with pytest.raises(BeliefDomainError, match="active runtime event"):
+        loop.belief_system.create_proposal(
+            BeliefProposition("claim"),
+            BeliefMutationEvidence("forged-event", 99, event.requested_at),
+            evidence=(BeliefEvidence("claim:1", BeliefEvidenceType.EXTERNAL_CLAIM),),
+        )
+
+    assert loop.belief_system.records == ()
+
+
+def test_belief_mutation_uses_the_bound_runtime_event_not_caller_evidence(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = SuzkaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
+    runtime = AgentRuntime(2, allow_volatile=True)
+    loop.bind_runtime(runtime)
+    runtime.start()
+
+    def mutate() -> object:
+        return loop._belief_system.create_proposal(
+            BeliefProposition("runtime-bound claim"),
+            evidence=(BeliefEvidence("claim:runtime", BeliefEvidenceType.EXTERNAL_CLAIM),),
+        )
+
+    result = runtime.submit(
+        AgentEventType.CHAT,
+        AgentEventSource.API_CHAT,
+        mutate,
+    ).result(timeout=5)
+    runtime.shutdown()
+
+    assert result.value.belief_id.startswith("belief-")
+    assert loop.export_belief_state().records
+
+
 def test_main_loop_passively_owns_configured_or_injected_working_memory(
     tmp_path: Path,
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     provider = ThinkingDummyProvider()
-    configured = KagyaMainLoop(settings, provider, DualMemorySystem(settings))
+    configured = SuzkaMainLoop(settings, provider, DualMemorySystem(settings))
     injected = WorkingMemory(item_capacity=1, projection_max_bytes=7)
-    explicit = KagyaMainLoop(
+    explicit = SuzkaMainLoop(
         settings, provider, DualMemorySystem(settings), working_memory=injected
     )
 
@@ -117,7 +178,7 @@ def test_emotion_tick_only_advances_emotion_temporal_state(tmp_path: Path) -> No
         temporal_state=None,
         clock=lambda: timestamp,
     )
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings,
         ThinkingDummyProvider(),
         DualMemorySystem(settings),
@@ -148,7 +209,7 @@ def test_main_loop_accepts_context_registry_without_creating_or_selecting_contex
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     registry = ContextRegistry()
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings,
         ThinkingDummyProvider(),
         DualMemorySystem(settings),
@@ -173,7 +234,7 @@ def test_chat_computation_uses_live_context_authority(
             db2_results=[SemanticMemoryRecord("live-source", "live body")]
         ),
     )
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings,
         ThinkingDummyProvider(),
         memory,
@@ -192,7 +253,7 @@ def test_chat_computation_uses_live_context_authority(
     assert loop.emotion_engine.state != before_emotion
     assert plan.participants[0].operation.context_id == "conversation.default"
 
-    debug_loop = KagyaMainLoop(
+    debug_loop = SuzkaMainLoop(
         settings,
         ThinkingDummyProvider(),
         memory,
@@ -219,7 +280,7 @@ def test_ordinary_and_debug_chat_use_working_memory_without_prompt_mutation(
         0.8,
         0.8,
     )
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings,
         ThinkingDummyProvider(),
         memory,
@@ -236,7 +297,7 @@ def test_ordinary_and_debug_chat_use_working_memory_without_prompt_mutation(
 
 def test_debug_trace_exposes_private_thought_only_ephemerally(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings,
         ThinkingDummyProvider(),
         DualMemorySystem(settings),
@@ -255,7 +316,7 @@ def test_main_loop_resolves_committed_body_and_passes_view_to_prompt_builder(
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
-    semantic_id = memory.save_semantic("committed body")
+    semantic_id = memory.save_legacy_semantic("committed body")
     captured: list[object] = []
 
     class CapturingPromptBuilder:
@@ -270,7 +331,7 @@ def test_main_loop_resolves_committed_body_and_passes_view_to_prompt_builder(
             db2_results=[SemanticMemoryRecord(semantic_id, "stale retrieval body")]
         ),
     )
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings,
         ThinkingDummyProvider(),
         memory,
@@ -313,7 +374,7 @@ def test_main_loop_passes_committed_active_values_to_prompt_builder(
                 value_view=value_view,
             )
 
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings,
         ThinkingDummyProvider(),
         DualMemorySystem(settings),
@@ -338,7 +399,7 @@ def test_main_loop_uses_detached_committed_value_projection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings,
         ThinkingDummyProvider(),
         DualMemorySystem(settings),
@@ -362,7 +423,7 @@ def test_prompt_builder_projection_keywords_preserve_injected_builder_shapes(
     tmp_path: Path,
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings,
         ThinkingDummyProvider(),
         DualMemorySystem(settings),
@@ -468,7 +529,7 @@ def test_retrieval_failure_does_not_age_working_memory(
         raise RuntimeError("retrieval failed")
 
     monkeypatch.setattr(memory, "retrieve_context", fail)
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings, ThinkingDummyProvider(), memory, working_memory=working_memory
     )
     before = (working_memory.revision, working_memory.items)
@@ -496,7 +557,7 @@ def test_retrieval_candidates_are_admitted_in_exact_cross_kind_order(
     )
     monkeypatch.setattr(memory, "retrieve_context", lambda _query: context)
     working = WorkingMemory(item_capacity=4, projection_max_bytes=100)
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings, ThinkingDummyProvider(), memory, working_memory=working
     )
 
@@ -526,7 +587,7 @@ def test_prior_working_memory_decays_and_retrieved_reference_reactivates(
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
-    retrieved_id = memory.save_semantic("retrieved exact body")
+    retrieved_id = memory.save_legacy_semantic("retrieved exact body")
     working = WorkingMemory(item_capacity=2, projection_max_bytes=100)
     working.admit(WorkingMemorySourceKind.SEMANTIC, retrieved_id, 0.5, 0.4)
     working.admit(WorkingMemorySourceKind.SEMANTIC, "semantic-not-retrieved", 0.5, 0.4)
@@ -537,7 +598,7 @@ def test_prior_working_memory_decays_and_retrieved_reference_reactivates(
             db2_results=[SemanticMemoryRecord(retrieved_id, "ignored stale body")]
         ),
     )
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings, ThinkingDummyProvider(), memory, working_memory=working
     )
 
@@ -561,8 +622,8 @@ def test_oversized_exact_source_is_excluded_and_smaller_source_is_prompted(
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
-    large_id = memory.save_semantic("X" * 20)
-    small_id = memory.save_semantic("fits")
+    large_id = memory.save_legacy_semantic("X" * 20)
+    small_id = memory.save_legacy_semantic("fits")
     monkeypatch.setattr(
         memory,
         "retrieve_context",
@@ -574,7 +635,7 @@ def test_oversized_exact_source_is_excluded_and_smaller_source_is_prompted(
         ),
     )
     working = WorkingMemory(item_capacity=2, projection_max_bytes=5)
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings, ThinkingDummyProvider(), memory, working_memory=working
     )
 
@@ -609,7 +670,7 @@ def test_missing_and_archived_references_remain_but_do_not_enter_prompt(
             db2_results=[SemanticMemoryRecord(missing_id, "untrusted missing")],
         ),
     )
-    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
+    loop = SuzkaMainLoop(settings, ThinkingDummyProvider(), memory)
 
     result, trace = _materialize(loop.chat_debug("status query"))
 
@@ -642,7 +703,7 @@ def test_exact_source_failure_is_bounded_and_chat_continues(
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
-    source_id = memory.save_semantic("source body must stay absent")
+    source_id = memory.save_legacy_semantic("source body must stay absent")
     monkeypatch.setattr(
         memory,
         "retrieve_context",
@@ -655,7 +716,7 @@ def test_exact_source_failure_is_bounded_and_chat_continues(
         raise error_type("PRIVATE RAW SOURCE DETAIL")
 
     monkeypatch.setattr(memory, "get_committed_semantic", fail_exact)
-    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
+    loop = SuzkaMainLoop(settings, ThinkingDummyProvider(), memory)
 
     result, trace = _materialize(loop.chat_debug("failure query"))
 
@@ -674,7 +735,7 @@ def test_malformed_exact_source_is_not_prompted_or_repaired(
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
-    source_id = memory.save_semantic("authoritative document")
+    source_id = memory.save_legacy_semantic("authoritative document")
     stored = memory.db2.get(ids=[source_id], include=["metadatas"])
     metadata = dict(stored["metadatas"][0])
     metadata["text"] = "conflicting metadata body"
@@ -689,7 +750,7 @@ def test_malformed_exact_source_is_not_prompted_or_repaired(
             db2_results=[SemanticMemoryRecord(source_id, "untrusted retrieval body")]
         ),
     )
-    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
+    loop = SuzkaMainLoop(settings, ThinkingDummyProvider(), memory)
 
     result, trace = _materialize(loop.chat_debug("malformed query"))
 
@@ -711,9 +772,9 @@ def test_select_and_prompt_build_are_pure_after_explicit_chat_mutations(
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
-    semantic_id = memory.save_semantic("pure source")
+    semantic_id = memory.save_legacy_semantic("pure source")
     working = WorkingMemory(item_capacity=1, projection_max_bytes=100)
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings, ThinkingDummyProvider(), memory, working_memory=working
     )
     original_select = working.select_contextual
@@ -748,7 +809,7 @@ def test_current_future_episode_is_absent_from_its_own_working_memory_view(
     tmp_path: Path,
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings, ThinkingDummyProvider(), DualMemorySystem(settings)
     )
 
@@ -774,14 +835,14 @@ def test_ordinary_and_debug_apply_equivalent_working_memory_semantics(
             0.6,
             0.4,
         )
-    ordinary_loop = KagyaMainLoop(
+    ordinary_loop = SuzkaMainLoop(
         settings,
         ThinkingDummyProvider(),
         DualMemorySystem(settings),
         working_memory=ordinary_working,
     )
     debug_settings = _settings_for_tmp_memory(tmp_path / "debug")
-    debug_loop = KagyaMainLoop(
+    debug_loop = SuzkaMainLoop(
         debug_settings,
         ThinkingDummyProvider(),
         DualMemorySystem(debug_settings),
@@ -828,7 +889,7 @@ def test_ordinary_and_debug_apply_equivalent_working_memory_semantics(
 def test_computation_does_not_write_memory_or_session(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
-    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), memory)
+    loop = SuzkaMainLoop(settings, ThinkingDummyProvider(), memory)
 
     plan = loop.chat_debug("remember this")
     result, trace = _materialize(plan)
@@ -847,7 +908,7 @@ def test_visible_response_does_not_contain_think_tags_or_private_sentinel(
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     result = _materialize(
-        KagyaMainLoop(
+        SuzkaMainLoop(
             settings,
             ThinkingDummyProvider(),
             DualMemorySystem(settings),
@@ -861,7 +922,7 @@ def test_visible_response_does_not_contain_think_tags_or_private_sentinel(
 
 def test_emotion_state_changes_after_loss_calculation(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
-    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
+    loop = SuzkaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
     before = loop.emotion_engine.state
 
     result = _materialize(loop.chat("emotion update"))
@@ -874,7 +935,7 @@ def test_main_loop_default_loss_calibration_uses_configured_model_keys(
     tmp_path: Path,
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
-    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
+    loop = SuzkaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
 
     expected = tuple(
         sorted(
@@ -909,7 +970,7 @@ def test_main_loop_accepts_only_exactly_matching_injected_calibration(
     calibration = LossCalibration(
         approved, initial_baseline=1.0, initial_scale=1.0, minimum_scale=0.01
     )
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings,
         ThinkingDummyProvider(),
         DualMemorySystem(settings),
@@ -924,7 +985,7 @@ def test_main_loop_accepts_only_exactly_matching_injected_calibration(
         minimum_scale=0.01,
     )
     with pytest.raises(ValueError, match="approved keys"):
-        KagyaMainLoop(
+        SuzkaMainLoop(
             settings,
             ThinkingDummyProvider(),
             DualMemorySystem(settings),
@@ -934,7 +995,7 @@ def test_main_loop_accepts_only_exactly_matching_injected_calibration(
 
 def test_main_loop_passes_u2_emotion_policy_to_default_engine(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
-    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
+    loop = SuzkaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
 
     assert loop.emotion_engine.adaptation_rate == settings.emotion.decay_rate
     assert (
@@ -957,7 +1018,7 @@ def test_main_loop_ordinary_chat_uses_structured_appraisal_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
-    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
+    loop = SuzkaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
     calls: list[tuple[str, object]] = []
 
     def fail_legacy(*_args: object, **_kwargs: object) -> None:
@@ -1032,7 +1093,7 @@ def test_invalid_loss_generates_without_calibration_or_optimal_loss_mutation(
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     memory = DualMemorySystem(settings)
-    loop = KagyaMainLoop(settings, provider_type(), memory)
+    loop = SuzkaMainLoop(settings, provider_type(), memory)
     before_state = loop.emotion_engine.state
     before_calibration = loop.loss_calibration.export()
 
@@ -1070,8 +1131,8 @@ def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
     provider = ThinkingDummyProvider()
     memory = DualMemorySystem(settings)
     memory.save_episodic("old episode", "old answer")
-    memory.save_semantic("stable semantic memory")
-    loop = KagyaMainLoop(settings, provider, memory)
+    memory.save_legacy_semantic("stable semantic memory")
+    loop = SuzkaMainLoop(settings, provider, memory)
 
     _result, trace = _materialize(loop.chat_debug("old semantic query"))
 
@@ -1090,14 +1151,14 @@ def test_prompt_includes_emotion_and_retrieved_memory(tmp_path: Path) -> None:
 def test_prompt_uses_plain_visible_answer_contract(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
     _result, trace = _materialize(
-        KagyaMainLoop(
+        SuzkaMainLoop(
             settings,
             ThinkingDummyProvider(),
             DualMemorySystem(settings),
         ).chat_debug("answer naturally")
     )
 
-    assert trace.prompt.startswith("Context: PROJECT-KAGYA")
+    assert trace.prompt.startswith("Context: PROJECT-SUZKA")
     assert "private local AI assistant" in trace.prompt
     assert "Private runtime data below is for tone and context only" in trace.prompt
     assert "User: answer naturally\nAssistant:" in trace.prompt
@@ -1105,7 +1166,7 @@ def test_prompt_uses_plain_visible_answer_contract(tmp_path: Path) -> None:
 
 def test_chat_plan_has_fixed_memory_then_session_participants(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
-    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
+    loop = SuzkaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
 
     plan = loop.chat("plan")
 
@@ -1118,7 +1179,7 @@ def test_chat_plan_has_fixed_memory_then_session_participants(tmp_path: Path) ->
 
 def test_chat_uses_default_context_provenance(tmp_path: Path) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
-    loop = KagyaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
+    loop = SuzkaMainLoop(settings, ThinkingDummyProvider(), DualMemorySystem(settings))
 
     plan = loop.chat("no context")
 
@@ -1137,7 +1198,7 @@ def test_chat_captures_current_context_once_and_freezes_it(
         "context-a", ContextType.CONVERSATION, "chat", "session-a"
     )
     registry.set_current(frame.context_id)
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings,
         ThinkingDummyProvider(),
         DualMemorySystem(settings),
@@ -1171,7 +1232,7 @@ def test_chat_context_switch_after_compute_does_not_change_frozen_provenance(
     first = registry.create("context-a", ContextType.CONVERSATION, "chat")
     second = registry.create("context-b", ContextType.CONVERSATION, "web")
     registry.set_current(first.context_id)
-    loop = KagyaMainLoop(
+    loop = SuzkaMainLoop(
         settings,
         ThinkingDummyProvider(),
         DualMemorySystem(settings),

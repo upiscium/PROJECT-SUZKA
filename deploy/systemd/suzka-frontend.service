@@ -1,0 +1,20 @@
+[Unit]
+Description=PROJECT-SUZKA Next.js frontend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=suzka
+Group=suzka
+WorkingDirectory=/opt/project-suzka/frontend
+EnvironmentFile=/etc/project-suzka/frontend.env
+Environment=HOSTNAME=127.0.0.1
+Environment=PORT=3000
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env npm run start
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

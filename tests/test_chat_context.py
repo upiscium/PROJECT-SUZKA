@@ -6,12 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from kagya.body import EmotionState
-from kagya.config import Settings, load_settings
-from kagya.memory import DualMemorySystem, MemoryRecordType
-from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
-from kagya.persona import ContextPromptView, PromptBuilder
-from kagya.runtime import (
+from suzka.body import EmotionState
+from suzka.config import Settings, load_settings
+from suzka.memory import DualMemorySystem, MemoryRecordType
+from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
+from suzka.persona import ContextPromptView, PromptBuilder
+from suzka.runtime import (
     ChatContextSelectors,
     ContextConflict,
     ContextNotFound,
@@ -74,7 +74,7 @@ def test_session_context_id_is_deterministic_and_never_falls_back() -> None:
     expected = (
         "conversation.session."
         + hashlib.sha256(
-            b"PROJECT-KAGYA:R09:CHAT-SESSION:V1\0" + session_id.encode("ascii")
+            b"PROJECT-SUZKA:R09:CHAT-SESSION:V1\0" + session_id.encode("ascii")
         ).hexdigest()
     )
 
@@ -393,7 +393,7 @@ def test_real_semantic_provenance_reaches_contextual_selection(
         context_id=current.context_id,
         source_channel="chat",
     )
-    semantic_id = memory.save_semantic(
+    semantic_id = memory.save_legacy_semantic(
         "semantic body", source_episode_ids=[episode_id]
     )
     working = WorkingMemory(item_capacity=1, projection_max_bytes=100)

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const BACKEND_URL = process.env.KAGYA_BACKEND_URL ?? "http://127.0.0.1:8000";
-const ADMIN_TOKEN = process.env.KAGYA_ADMIN_TOKEN;
+const BACKEND_URL = process.env.SUZKA_BACKEND_URL ?? "http://127.0.0.1:8000";
+const ADMIN_TOKEN = process.env.SUZKA_ADMIN_TOKEN;
 
 type RouteContext = { params: Promise<{ path: string[] }> };
 
@@ -26,7 +26,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
 
 async function proxyAdminRequest(request: NextRequest, context: RouteContext): Promise<NextResponse> {
   if (!ADMIN_TOKEN) {
-    return NextResponse.json({ detail: "KAGYA_ADMIN_TOKEN is not configured" }, { status: 503 });
+    return NextResponse.json({ detail: "SUZKA_ADMIN_TOKEN is not configured" }, { status: 503 });
   }
 
   const { path } = await context.params;
@@ -42,7 +42,7 @@ async function proxyAdminRequest(request: NextRequest, context: RouteContext): P
     method: request.method,
     headers: {
       "Content-Type": request.headers.get("Content-Type") ?? "application/json",
-      "X-KAGYA-Admin-Token": ADMIN_TOKEN,
+      "X-SUZKA-Admin-Token": ADMIN_TOKEN,
     },
     body,
   });

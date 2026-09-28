@@ -27,7 +27,7 @@ describe("api client", () => {
     await api.debugChat({ message: "hello", attachments: [], debug: true });
 
     expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/chat/debug", expect.objectContaining({ method: "POST" }));
-    expect(fetchMock.mock.calls[0][1]?.headers).not.toHaveProperty("X-KAGYA-Admin-Token");
+    expect(fetchMock.mock.calls[0][1]?.headers).not.toHaveProperty("X-SUZKA-Admin-Token");
   });
 
   it("adapter actions call backend lifecycle endpoints", async () => {

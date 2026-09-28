@@ -4,13 +4,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from kagya.identity.origin import (
+from suzka.identity.origin import (
     IdentityOrigin,
     OriginActor,
     OriginInputKind,
     ValueAdmissionStatus,
 )
-from kagya.identity.value_system import (
+from suzka.identity.value_system import (
     ValueConflictDefinition,
     ValueDomainError,
     ValueEvidence,
@@ -411,8 +411,8 @@ def test_refs_conflicts_and_non_authoritative_types() -> None:
 
 def test_seed_digest_golden_and_changed_field() -> None:
     seed = _seed()
-    payload = b'kagya.identity.value-seed/v1\x00{"allowed_update_rate":0.1,"concept":"Protect the wellbeing of the subject.","confidence":0.9,"context_ids":[],"initial_strength":0.8,"name":"care","negotiability":0.2,"polarity":1,"protectedness":0.6,"scope":"subject","stability":0.7,"value_id":"value-1"}'
-    expected = "081ba5fbfc1075cfa2246790e137080f9eb500e4ecf1e3f42b6c322ef641e146"
+    payload = b'suzka.identity.value-seed/v1\x00{"allowed_update_rate":0.1,"concept":"Protect the wellbeing of the subject.","confidence":0.9,"context_ids":[],"initial_strength":0.8,"name":"care","negotiability":0.2,"polarity":1,"protectedness":0.6,"scope":"subject","stability":0.7,"value_id":"value-1"}'
+    expected = "a6a17378651f53d7dac78ce6d331d01dac3b4f4459bd9dd2353680a869777faf"
     assert canonical_seed_payload(seed) == payload
     assert expected == hashlib.sha256(payload).hexdigest()
     assert validate_seed_contract_digest(seed, expected) == expected
@@ -1042,7 +1042,7 @@ def test_revision_state_and_record_digests_are_canonical() -> None:
     value = _mutable_value()
     payload = canonical_value_state_payload(value)
     expected_payload = (
-        b'kagya.identity.value-state/v1\x00{"allowed_update_rate":0.1,"concept":"Protect the wellbeing of the subject.",'
+        b'suzka.identity.value-state/v1\x00{"allowed_update_rate":0.1,"concept":"Protect the wellbeing of the subject.",'
         b'"confidence":1.0,"context_ids":[],'
         b'"evidence_refs":["seed-value-1"],"frozen":false,"name":"care",'
         b'"negotiability":1.0,"opposition_count":0,"origin":{"actor":"self","admission":"self_endorsed",'

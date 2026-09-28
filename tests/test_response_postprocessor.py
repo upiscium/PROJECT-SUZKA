@@ -1,4 +1,4 @@
-from kagya.persona import ResponsePostprocessor
+from suzka.persona import ResponsePostprocessor
 
 
 def test_complete_think_blocks_are_extracted_ephemerally() -> None:
@@ -77,7 +77,7 @@ def test_visible_response_normalizes_common_project_name_variants() -> None:
 
     processed = postprocessor.process("PROJECT-KAGAYA helps locally.")
 
-    assert processed.visible_response == "PROJECT-KAGYA helps locally."
+    assert processed.visible_response == "PROJECT-SUZKA helps locally."
 
 
 def test_visible_response_collapses_repeated_comma_word_tails() -> None:

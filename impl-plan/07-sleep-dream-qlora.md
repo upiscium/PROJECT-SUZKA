@@ -6,9 +6,9 @@ Implement sleep-time consolidation, dream dataset generation, and QLoRA training
 
 ## Target Files
 
-- `kagya/learning/sleep_consolidation.py`
-- `kagya/learning/dream_dataset_generator.py`
-- `kagya/learning/qlora_trainer.py`
+- `suzka/learning/sleep_consolidation.py`
+- `suzka/learning/dream_dataset_generator.py`
+- `suzka/learning/qlora_trainer.py`
 
 ## Sleep Cycle Requirements
 

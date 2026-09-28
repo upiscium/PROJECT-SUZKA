@@ -8,9 +8,9 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
-from kagya.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
-from kagya.cognition import CognitiveAppraiser, LossCalibration, SurprisalCalculator
-from kagya.identity import (
+from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
+from suzka.cognition import CognitiveAppraiser, LossCalibration, SurprisalCalculator
+from suzka.identity import (
     IdentityOrigin,
     OriginActor,
     OriginInputKind,
@@ -22,12 +22,12 @@ from kagya.identity import (
     ValueSelfAdmission,
     ValueSystem,
 )
-from kagya.memory import DualMemorySystem
-from kagya.memory.working_memory_resolver import MemoryWorkingMemoryResolver
-from kagya.models import ModelProvider
-from kagya.persona.prompt_builder import PromptBuilder
-from kagya.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
-from kagya.runtime.agent_state import (
+from suzka.memory import DualMemorySystem
+from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
+from suzka.models import ModelProvider
+from suzka.persona.prompt_builder import PromptBuilder
+from suzka.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
+from suzka.runtime.agent_state import (
     AgentStateSaveError,
     AgentStateSaveStage,
     AgentStateSnapshotV4,
@@ -45,13 +45,13 @@ from kagya.runtime.agent_state import (
     WorkingMemoryItemSnapshot,
     WorkingMemorySnapshot,
 )
-from kagya.runtime.context import ContextRegistry, ContextType
-from kagya.runtime.working_memory import (
+from suzka.runtime.context import ContextRegistry, ContextType
+from suzka.runtime.working_memory import (
     WorkingMemory,
     WorkingMemorySourceKind,
     working_memory_item_id,
 )
-from kagya.runtime.event_journal import (
+from suzka.runtime.event_journal import (
     EventFailureCategory,
     EventJournalInspection,
     EventJournal,
@@ -64,13 +64,13 @@ from kagya.runtime.event_journal import (
     ParticipantRequirement,
     TransactionKind,
 )
-from kagya.runtime.state_recovery import (
+from suzka.runtime.state_recovery import (
     InternalCommitClassification,
     StateRecoveryCoordinator,
     StateRecoveryError,
     StateRecoveryResult,
 )
-from kagya.runtime.state_wal import (
+from suzka.runtime.state_wal import (
     RecoveryReason,
     StateWAL,
     StateWALError,
@@ -524,6 +524,7 @@ def test_committed_before_crash_v5_reconstructs_value_without_replay(
 ) -> None:
     seed = value_seed()
     store, journal, wal = configured_graph(tmp_path, seed)
+    store.save(capture_v5(store, 0, ValueSystem.from_seed_declarations((seed,))))
     recovery = StateRecoveryCoordinator(store, journal, wal)
     initial = recovery.prepare_startup().snapshot
     assert isinstance(initial, AgentStateSnapshotV5)

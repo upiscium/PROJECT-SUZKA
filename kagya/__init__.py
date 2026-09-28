@@ -1,1 +1,0 @@
-"""PROJECT-KAGYA package."""

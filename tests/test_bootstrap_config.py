@@ -5,16 +5,16 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from kagya.api.server import app
-from kagya.config import Settings, load_settings
-from kagya.config.schema import (
+from suzka.api.server import app
+from suzka.config import Settings, load_settings
+from suzka.config.schema import (
     AppraisalSettings,
     EmotionSettings,
     ValueConflictSettings,
     ValueSeedSettings,
     ValueSystemSettings,
 )
-from kagya.identity.value_system import (
+from suzka.identity.value_system import (
     ValueScope,
     recompute_seed_contract_digest,
 )

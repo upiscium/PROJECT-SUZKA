@@ -1,5 +1,5 @@
 project:
-  name: PROJECT-KAGYA
+  name: PROJECT-SUZKA
   environment: development
 
 model:
@@ -22,7 +22,7 @@ emotion:
   decay_rate: 0.05
 
 memory:
-  persist_directory: .kagya/chroma
+  persist_directory: .suzka/chroma
   db1_collection: hippocampus
   db2_collection: cortex
   db1_top_k: 5
@@ -36,12 +36,12 @@ working_memory:
 
 sleep:
   enabled: true
-  dream_dataset_path: .kagya/dreams/dream_dataset.jsonl
+  dream_dataset_path: .suzka/dreams/dream_dataset.jsonl
   min_emotion_score: 0.75
   max_episodes_per_cycle: 100
 
 qlora:
-  output_dir: .kagya/adapters
+  output_dir: .suzka/adapters
   dry_run: true
   r: 16
   alpha: 32
@@ -53,10 +53,10 @@ qlora:
   max_steps: 10
 
 adapter_registry:
-  path: .kagya/adapter_registry.json
-  eval_result_dir: .kagya/eval_results
+  path: .suzka/adapter_registry.json
+  eval_result_dir: .suzka/eval_results
   eval_sets:
-    - .kagya/eval_sets/default.json
+    - .suzka/eval_sets/default.json
   trial_threshold: 0.8
   reject_threshold: 0.4
   allowed_states:
@@ -71,7 +71,7 @@ adapter_registry:
 api:
   host: 127.0.0.1
   port: 8000
-  admin_token_env: KAGYA_ADMIN_TOKEN
+  admin_token_env: SUZKA_ADMIN_TOKEN
   cors_origins:
     - http://localhost:3000
     - http://127.0.0.1:3000
@@ -84,15 +84,15 @@ runtime:
   queue_capacity: 64
 
 agent_state:
-  path: .kagya/agent_state.json
+  path: .suzka/agent_state.json
 
 event_journal:
-  path: .kagya/event_journal.jsonl
+  path: .suzka/event_journal.jsonl
   max_bytes: 1048576
   retained_files: 4
 
 state_wal:
-  directory: .kagya/private/state_wal
+  directory: .suzka/private/state_wal
 
 values:
   seeds:

@@ -1,0 +1,741 @@
+"""Startup-only reconciliation of external transaction participants.
+
+The coordinator consumes Journal, snapshot, and WAL evidence but does not own any
+of those authorities.  It is deliberately separate from live event execution so
+startup can never replay handlers or recover request payloads.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from uuid import UUID, uuid5
+
+from suzka.memory.dual_memory_system import (
+    DualMemorySystem,
+    SemanticMemoryFormatError,
+    SemanticMemoryReadError,
+    SemanticProjectionStatus,
+)
+from suzka.memory.episodic_participant import (
+    MEMORY_EPISODIC_PARTICIPANT_ID,
+    MemoryEpisodicParticipant,
+)
+from suzka.memory.experience_participant import (
+    MEMORY_EXPERIENCE_PARTICIPANT_ID,
+    MemoryExperienceParticipant,
+)
+from suzka.memory.experience_store import ExperienceStore
+from suzka.memory.semantic_participant import (
+    MEMORY_SEMANTIC_PARTICIPANT_ID,
+    MemorySemanticParticipant,
+)
+from suzka.memory.semantic_store import SemanticStore, SemanticStoreError
+from suzka.runtime.agent_runtime import AgentEvent
+from suzka.runtime.event_journal import (
+    EventJournal,
+    EventJournalIntegrityError,
+    EventJournalParticipantBaseline,
+    EventJournalRecord,
+    EventJournalStartupReconciliation,
+    EventJournalTransaction,
+    EventLifecycle,
+    EventRecoveryCategory,
+    AbortOutcome,
+    ParticipantBaseline,
+    ParticipantCapability,
+    ParticipantDomain,
+    ParticipantOutcome,
+    ParticipantRequirement,
+    StartupParticipantOutcome,
+    startup_participant_aggregate_digest,
+)
+from suzka.runtime.session_participant import (
+    SESSION_TURN_PARTICIPANT_ID,
+    inspect_reset_session_operation,
+)
+from suzka.runtime.state_recovery import (
+    InternalCommitClassification,
+    StateRecoveryCoordinator,
+    StateRecoveryError,
+    StateRecoveryResult,
+)
+from suzka.runtime.transaction_coordinator import (
+    ParticipantDivergedError,
+    ParticipantUnavailableError,
+    ReconcilableTransactionParticipant,
+    TransactionBinding,
+    UnsupportedParticipantReconciliationError,
+)
+
+
+_RECONCILIATION_NAMESPACE = UUID("0b941247-478c-5e32-9142-d82b165a330f")
+
+
+class StartupReconciliationError(StateRecoveryError, EventJournalIntegrityError):
+    """Startup evidence is ambiguous and runtime admission must fail closed."""
+
+
+@dataclass(frozen=True, slots=True)
+class StartupReconciliationResult:
+    recovery: StateRecoveryResult
+    participants_consistent: bool
+    degraded_reason: str | None = None
+
+
+class StartupReconciliationCoordinator:
+    """Resolve open transactions and a true-rollback external recovery gate."""
+
+    participant_registry = (
+        ParticipantBaseline(
+            participant_id=MEMORY_EPISODIC_PARTICIPANT_ID,
+            domain=ParticipantDomain.DURABLE_DOMAIN,
+        ),
+        ParticipantBaseline(
+            participant_id=MEMORY_EXPERIENCE_PARTICIPANT_ID,
+            domain=ParticipantDomain.DURABLE_DOMAIN,
+        ),
+        ParticipantBaseline(
+            participant_id=MEMORY_SEMANTIC_PARTICIPANT_ID,
+            domain=ParticipantDomain.DURABLE_DOMAIN,
+        ),
+        ParticipantBaseline(
+            participant_id=SESSION_TURN_PARTICIPANT_ID,
+            domain=ParticipantDomain.EPHEMERAL_PROCESS,
+        ),
+    )
+
+    def __init__(
+        self,
+        journal: EventJournal,
+        state_recovery: StateRecoveryCoordinator,
+        memory: DualMemorySystem,
+        experience_store: ExperienceStore | None = None,
+        semantic_store: SemanticStore | None = None,
+        semantic_checkpoint_covers: Callable[[EventJournalTransaction], bool]
+        | None = None,
+    ) -> None:
+        self.journal = journal
+        self.state_recovery = state_recovery
+        self.memory = memory
+        self.experience_store = experience_store or ExperienceStore.from_memory_root(
+            memory.settings.memory.persist_directory
+        )
+        self.semantic_store = semantic_store or SemanticStore.from_memory_root(
+            memory.settings.memory.persist_directory
+        )
+        self.semantic_checkpoint_covers = semantic_checkpoint_covers
+
+    def reconcile_open_transactions(self) -> tuple[bool, str | None]:
+        """Resolve Path A without replaying an event handler or model call."""
+
+        transactions = sorted(
+            self.journal.inspect().open_transactions,
+            key=lambda item: item.transaction_id,
+        )
+        for transaction in transactions:
+            proof = self.state_recovery.inspect_transaction_commit(transaction)
+            if proof.classification is InternalCommitClassification.AMBIGUOUS:
+                raise StartupReconciliationError(
+                    "Open transaction internal commit evidence is ambiguous"
+                )
+            try:
+                if proof.classification is InternalCommitClassification.PRE_INTERNAL:
+                    self._abort_transaction(transaction)
+                else:
+                    self._roll_forward_transaction(transaction)
+            except (
+                ParticipantDivergedError,
+                ParticipantUnavailableError,
+                UnsupportedParticipantReconciliationError,
+            ):
+                return False, "external_participant_reconciliation_required"
+        return True, None
+
+    def reconcile_terminal_semantic_projections(self) -> tuple[bool, str | None]:
+        """Reconcile DB2 only from terminal, Journal-proven Semantic authority."""
+
+        try:
+            entries = self.semantic_store.iter_current()
+            inspection = self.journal.inspect()
+        except SemanticStoreError:
+            return False, "semantic_authority_unavailable"
+
+        terminal_transactions = (
+            *inspection.completed_transactions,
+            *inspection.reconciled_transactions,
+        )
+        for entry in entries:
+            matching = []
+            for transaction in terminal_transactions:
+                if (
+                    transaction.event_id != entry.revision.event_id
+                    or transaction.processing_sequence != entry.revision.event_sequence
+                ):
+                    continue
+                requirement = next(
+                    (
+                        item
+                        for item in transaction.required_participants
+                        if item.participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID
+                    ),
+                    None,
+                )
+                if requirement is None or requirement.operation_digest != entry.operation_digest:
+                    continue
+                if not any(
+                    participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID
+                    for participant_id, _outcome in transaction.participant_outcomes
+                ):
+                    continue
+                matching.append(transaction)
+            if len(matching) != 1:
+                return False, "semantic_terminal_proof_unavailable"
+            try:
+                inspection_result = self.memory.inspect_semantic_projection(
+                    entry.revision.semantic_id, entry.revision, self.semantic_store
+                )
+                if inspection_result.status is SemanticProjectionStatus.DIVERGENT:
+                    return False, "semantic_projection_diverged"
+                if inspection_result.status in {
+                    SemanticProjectionStatus.MISSING,
+                    SemanticProjectionStatus.REPAIRABLE_STALE,
+                }:
+                    self.memory.project_semantic_revision(
+                        entry.revision, self.semantic_store
+                    )
+            except SemanticMemoryFormatError:
+                return False, "semantic_projection_diverged"
+            except SemanticMemoryReadError:
+                return False, "semantic_projection_unavailable"
+        return True, None
+
+    def ensure_adoption_baseline(
+        self, recovery: StateRecoveryResult
+    ) -> EventJournalParticipantBaseline:
+        """Establish the fixed participant epoch before normal admission."""
+
+        return self.state_recovery.establish_participant_baseline(
+            recovery, self.participant_registry
+        )
+
+    def resume_prepared_gate_clear(self) -> bool:
+        """Finish a crash window after CLEAR_PREPARED, including a prior WAL CAS."""
+
+        inspection = self.journal.inspect()
+        clear = inspection.open_gate_clear
+        if clear is None:
+            return False
+        baseline = next(
+            (
+                item
+                for item in inspection.baselines
+                if item.baseline_id == clear.baseline_id
+            ),
+            None,
+        )
+        reconciliation = next(
+            (
+                item
+                for item in inspection.completed_startup_reconciliations
+                if item.reconciliation_id == clear.reconciliation_id
+            ),
+            None,
+        )
+        if baseline is None or reconciliation is None:
+            raise StartupReconciliationError("Prepared gate clear proof is incomplete")
+        snapshot = self.state_recovery.state_store.load()
+        snapshot_hash = self.state_recovery.state_store.snapshot_hash(snapshot)
+        wal = self.state_recovery.wal.inspect()
+        manifest = wal.active_manifest
+        if manifest is None:
+            raise StartupReconciliationError("Prepared gate clear WAL is unavailable")
+        resumed = StateRecoveryResult(
+            snapshot,
+            snapshot_hash,
+            clear.processing_high_water,
+            manifest,
+            manifest.external_reconciliation_required,
+        )
+        cleared = self.state_recovery.clear_recovery_gate(
+            resumed, reconciliation, baseline, clear
+        )
+        self.journal.append_cleared(
+            clear.baseline_id,
+            clear.reconciliation_id,
+            clear.recovery_id,
+            clear.snapshot_sequence,
+            clear.snapshot_hash,
+            clear.processing_high_water,
+            clear.wal_generation_id,
+            clear.wal_record_id,
+            clear.wal_record_hash,
+            clear.journal_lineage_id,
+        )
+        self.ensure_adoption_baseline(cleared)
+        return True
+
+    def reconcile_recovery_gate(
+        self, recovery: StateRecoveryResult
+    ) -> StartupReconciliationResult:
+        """Resolve Path B and clear only a proof-bound true-rollback gate."""
+
+        if not recovery.external_reconciliation_required:
+            return StartupReconciliationResult(recovery, True)
+        inspection = self.journal.inspect()
+        recovery_record = self._true_rollback_record(inspection.records)
+        if recovery_record is None:
+            raise StartupReconciliationError(
+                "External gate has no true rollback completion proof"
+            )
+        if not inspection.baselines:
+            return StartupReconciliationResult(
+                recovery, False, "participant_baseline_unavailable"
+            )
+        baseline = inspection.baselines[-1]
+        if (
+            recovery_record.snapshot_sequence is None
+            or recovery_record.recovery_processing_high_water is None
+            or recovery_record.snapshot_sequence < baseline.snapshot_sequence
+            or recovery_record.recovery_processing_high_water
+            < baseline.processing_high_water
+            or inspection.journal_lineage_id != baseline.journal_lineage_id
+        ):
+            return StartupReconciliationResult(
+                recovery, False, "participant_history_not_provable"
+            )
+        transactions = tuple(
+            sorted(
+                (
+                    transaction
+                    for transaction in (
+                        *inspection.completed_transactions,
+                        *inspection.reconciled_transactions,
+                    )
+                    if baseline.processing_high_water
+                    < transaction.processing_sequence
+                    <= recovery_record.recovery_processing_high_water
+                ),
+                key=lambda item: item.transaction_id,
+            )
+        )
+        requirements = self._aggregate_requirements(
+            transactions, baseline.participant_registry
+        )
+        reconciliation = self._startup_reconciliation(
+            recovery_record, baseline, requirements
+        )
+        known = {item[0] for item in reconciliation.participant_outcomes}
+        try:
+            for requirement in requirements:
+                if requirement.participant_id in known:
+                    continue
+                outcome = self._reconcile_aggregate_participant(
+                    requirement.participant_id, transactions
+                )
+                self.journal.append_startup_participant_reconciled(
+                    reconciliation.reconciliation_id,
+                    reconciliation.recovery_id,
+                    reconciliation.snapshot_sequence,
+                    reconciliation.snapshot_hash,
+                    reconciliation.recovery_processing_high_water,
+                    reconciliation.wal_generation_id,
+                    reconciliation.wal_record_id,
+                    reconciliation.wal_record_hash,
+                    reconciliation.journal_lineage_id,
+                    requirement.participant_id,
+                    requirement.operation_digest,
+                    outcome,
+                )
+            reconciliation = self._complete_startup(reconciliation)
+        except (
+            ParticipantDivergedError,
+            ParticipantUnavailableError,
+            UnsupportedParticipantReconciliationError,
+        ):
+            return StartupReconciliationResult(
+                recovery, False, "external_participant_reconciliation_required"
+            )
+
+        clear = self.journal.inspect().open_gate_clear
+        if clear is None:
+            self.journal.append_clear_prepared(
+                baseline.baseline_id,
+                reconciliation.reconciliation_id,
+                reconciliation.recovery_id,
+                reconciliation.snapshot_sequence,
+                reconciliation.snapshot_hash,
+                reconciliation.recovery_processing_high_water,
+                reconciliation.wal_generation_id,
+                reconciliation.wal_record_id,
+                reconciliation.wal_record_hash,
+                reconciliation.journal_lineage_id,
+            )
+            clear = self.journal.inspect().open_gate_clear
+        if clear is None:
+            raise StartupReconciliationError("Gate clear preparation is unavailable")
+        cleared = self.state_recovery.clear_recovery_gate(
+            recovery, reconciliation, baseline, clear
+        )
+        self.journal.append_cleared(
+            baseline.baseline_id,
+            reconciliation.reconciliation_id,
+            reconciliation.recovery_id,
+            reconciliation.snapshot_sequence,
+            reconciliation.snapshot_hash,
+            reconciliation.recovery_processing_high_water,
+            reconciliation.wal_generation_id,
+            reconciliation.wal_record_id,
+            reconciliation.wal_record_hash,
+            reconciliation.journal_lineage_id,
+        )
+        # The rollback was reconciled under the historical registry.  Only now,
+        # at the newly clean current boundary, may the runtime adopt a strict
+        # superset registry for subsequent transactions.
+        self.ensure_adoption_baseline(cleared)
+        return StartupReconciliationResult(cleared, True)
+
+    def _abort_transaction(self, transaction: EventJournalTransaction) -> None:
+        event = self._event(transaction)
+        known = {item[0] for item in transaction.abort_outcomes}
+        for requirement in transaction.required_participants:
+            if (
+                requirement.participant_id in known
+                or ParticipantCapability.ABORT not in requirement.capabilities
+            ):
+                continue
+            binding = self._binding(transaction, requirement)
+            if requirement.participant_id == MEMORY_EPISODIC_PARTICIPANT_ID:
+                outcome = MemoryEpisodicParticipant.abort_pending(self.memory, binding)
+            elif requirement.participant_id == MEMORY_EXPERIENCE_PARTICIPANT_ID:
+                outcome = MemoryExperienceParticipant.abort_pending(
+                    self.memory, self.experience_store, binding
+                )
+            elif requirement.participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID:
+                outcome = MemorySemanticParticipant.abort_pending(
+                    self.memory, self.semantic_store, binding
+                )
+            elif requirement.participant_id == SESSION_TURN_PARTICIPANT_ID:
+                outcome = AbortOutcome.ALREADY_ABSENT
+            else:
+                raise UnsupportedParticipantReconciliationError(
+                    "Participant abort resolver is not registered"
+                )
+            self.journal.append_participant_aborted(
+                event,
+                transaction.transaction_id,
+                requirement.participant_id,
+                requirement.operation_digest,
+                outcome,
+            )
+        current = self._transaction(transaction.transaction_id)
+        abort_required = {
+            item.participant_id
+            for item in current.required_participants
+            if ParticipantCapability.ABORT in item.capabilities
+        }
+        if {item[0] for item in current.abort_outcomes} != abort_required:
+            raise ParticipantUnavailableError("Participant abort is incomplete")
+        self.journal.append_transaction_aborted(event, transaction.transaction_id)
+
+    def _roll_forward_transaction(
+        self, transaction: EventJournalTransaction
+    ) -> None:
+        event = self._event(transaction)
+        known = {item[0] for item in transaction.participant_outcomes}
+        for requirement in transaction.required_participants:
+            if requirement.participant_id in known:
+                continue
+            if requirement.participant_id == MEMORY_EPISODIC_PARTICIPANT_ID:
+                outcome = self._memory_participant(
+                    transaction, requirement
+                ).finalize(self._binding(transaction, requirement))
+            elif requirement.participant_id == MEMORY_EXPERIENCE_PARTICIPANT_ID:
+                outcome = self._experience_participant(
+                    transaction, requirement
+                ).finalize(self._binding(transaction, requirement))
+            elif requirement.participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID:
+                outcome = self._semantic_participant(
+                    transaction, requirement
+                ).finalize(self._binding(transaction, requirement))
+            elif requirement.participant_id == SESSION_TURN_PARTICIPANT_ID:
+                inspect_reset_session_operation(
+                    transaction.transaction_id,
+                    requirement.participant_id,
+                    requirement.operation_digest,
+                )
+                outcome = ParticipantOutcome.ALREADY_CONSISTENT
+            else:
+                raise UnsupportedParticipantReconciliationError(
+                    "Participant resolver is not registered"
+                )
+            self.journal.append_participant_finalized(
+                event,
+                transaction.transaction_id,
+                requirement.participant_id,
+                requirement.operation_digest,
+                outcome,
+            )
+        if transaction.reconciliation_reason is None:
+            self.journal.append_transaction_completed(event, transaction.transaction_id)
+        else:
+            self.journal.append_transaction_reconciled(event, transaction.transaction_id)
+
+    def _startup_reconciliation(
+        self,
+        recovery: EventJournalRecord,
+        baseline: EventJournalParticipantBaseline,
+        requirements: tuple[ParticipantRequirement, ...],
+    ) -> EventJournalStartupReconciliation:
+        if (
+            recovery.recovery_id is None
+            or recovery.snapshot_sequence is None
+            or recovery.snapshot_hash is None
+            or recovery.recovery_processing_high_water is None
+            or recovery.wal_generation_id is None
+            or recovery.wal_record_id is None
+            or recovery.wal_record_hash is None
+        ):
+            raise StartupReconciliationError("Recovery evidence is incomplete")
+        reconciliation_id = str(
+            uuid5(
+                _RECONCILIATION_NAMESPACE,
+                f"{baseline.baseline_id}:{recovery.recovery_id}",
+            )
+        )
+        inspection = self.journal.inspect()
+        existing = next(
+            (
+                item
+                for item in (
+                    *inspection.open_startup_reconciliations,
+                    *inspection.completed_startup_reconciliations,
+                )
+                if item.reconciliation_id == reconciliation_id
+            ),
+            None,
+        )
+        if existing is not None:
+            if existing.required_participants != requirements:
+                raise StartupReconciliationError(
+                    "Startup reconciliation aggregate changed"
+                )
+            return existing
+        self.journal.append_startup_reconciliation_prepared(
+            reconciliation_id,
+            recovery.recovery_id,
+            recovery.snapshot_sequence,
+            recovery.snapshot_hash,
+            recovery.recovery_processing_high_water,
+            recovery.wal_generation_id,
+            recovery.wal_record_id,
+            recovery.wal_record_hash,
+            baseline.journal_lineage_id,
+            requirements,
+        )
+        return self.journal.inspect().open_startup_reconciliations[-1]
+
+    def _complete_startup(
+        self, reconciliation: EventJournalStartupReconciliation
+    ) -> EventJournalStartupReconciliation:
+        if reconciliation.completed:
+            return reconciliation
+        current = next(
+            item
+            for item in self.journal.inspect().open_startup_reconciliations
+            if item.reconciliation_id == reconciliation.reconciliation_id
+        )
+        self.journal.append_startup_reconciliation_completed(
+            current.reconciliation_id,
+            current.recovery_id,
+            current.snapshot_sequence,
+            current.snapshot_hash,
+            current.recovery_processing_high_water,
+            current.wal_generation_id,
+            current.wal_record_id,
+            current.wal_record_hash,
+            current.journal_lineage_id,
+        )
+        return next(
+            item
+            for item in self.journal.inspect().completed_startup_reconciliations
+            if item.reconciliation_id == current.reconciliation_id
+        )
+
+    def _reconcile_aggregate_participant(
+        self,
+        participant_id: str,
+        transactions: tuple[EventJournalTransaction, ...],
+    ) -> StartupParticipantOutcome:
+        if (
+            participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID
+            and self.semantic_checkpoint_covers is not None
+        ):
+            transactions = tuple(
+                transaction
+                for transaction in transactions
+                if not self.semantic_checkpoint_covers(transaction)
+            )
+        rolled_forward = False
+        for transaction in transactions:
+            requirement = next(
+                (
+                    item
+                    for item in transaction.required_participants
+                    if item.participant_id == participant_id
+                ),
+                None,
+            )
+            if requirement is None:
+                continue
+            if participant_id == SESSION_TURN_PARTICIPANT_ID:
+                inspect_reset_session_operation(
+                    transaction.transaction_id,
+                    participant_id,
+                    requirement.operation_digest,
+                )
+                continue
+            participant: ReconcilableTransactionParticipant
+            if participant_id == MEMORY_EPISODIC_PARTICIPANT_ID:
+                participant = self._memory_participant(transaction, requirement)
+            elif participant_id == MEMORY_EXPERIENCE_PARTICIPANT_ID:
+                participant = self._experience_participant(transaction, requirement)
+            elif participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID:
+                participant = self._semantic_participant(transaction, requirement)
+            else:
+                raise UnsupportedParticipantReconciliationError(
+                    "Participant resolver is not registered"
+                )
+            binding = self._binding(transaction, requirement)
+            try:
+                participant.inspect_reconciliation(binding)
+            except ParticipantUnavailableError:
+                participant.reconcile(binding)
+                rolled_forward = True
+        return (
+            StartupParticipantOutcome.ROLLED_FORWARD
+            if rolled_forward
+            else StartupParticipantOutcome.VERIFIED_CONSISTENT
+        )
+
+    @staticmethod
+    def _aggregate_requirements(
+        transactions: tuple[EventJournalTransaction, ...],
+        participant_registry: tuple[ParticipantBaseline, ...],
+    ) -> tuple[ParticipantRequirement, ...]:
+        result: list[ParticipantRequirement] = []
+        for baseline in participant_registry:
+            participant_id = baseline.participant_id
+            digest = startup_participant_aggregate_digest(
+                transactions, participant_id
+            )
+            result.append(
+                ParticipantRequirement(
+                    participant_id=participant_id,
+                    operation_digest=digest,
+                    capabilities=(
+                        ParticipantCapability.IDEMPOTENT_FINALIZE,
+                        ParticipantCapability.INSPECT_RECONCILE,
+                        ParticipantCapability.PREPARE,
+                    ),
+                )
+            )
+        return tuple(result)
+
+    @staticmethod
+    def _binding(
+        transaction: EventJournalTransaction, requirement: ParticipantRequirement
+    ) -> TransactionBinding:
+        return TransactionBinding(
+            transaction_id=transaction.transaction_id,
+            event_id=transaction.event_id,
+            processing_sequence=transaction.processing_sequence,
+            participant_id=requirement.participant_id,
+            operation_digest=requirement.operation_digest,
+            transaction_kind=transaction.kind,
+        )
+
+    def _memory_participant(
+        self,
+        transaction: EventJournalTransaction,
+        requirement: ParticipantRequirement,
+    ) -> MemoryEpisodicParticipant:
+        if requirement.participant_id != MEMORY_EPISODIC_PARTICIPANT_ID:
+            raise UnsupportedParticipantReconciliationError(
+                "Abort participant resolver is not registered"
+            )
+        return MemoryEpisodicParticipant.from_pending(
+            self.memory,
+            transaction.transaction_id,
+            requirement.participant_id,
+            requirement.operation_digest,
+        )
+
+    def _experience_participant(
+        self,
+        transaction: EventJournalTransaction,
+        requirement: ParticipantRequirement,
+    ) -> MemoryExperienceParticipant:
+        if requirement.participant_id != MEMORY_EXPERIENCE_PARTICIPANT_ID:
+            raise UnsupportedParticipantReconciliationError(
+                "Experience participant resolver is not registered"
+            )
+        return MemoryExperienceParticipant.from_pending(
+            self.memory,
+            self.experience_store,
+            transaction.transaction_id,
+            requirement.participant_id,
+            requirement.operation_digest,
+            event_id=transaction.event_id,
+            processing_sequence=transaction.processing_sequence,
+        )
+
+    def _semantic_participant(
+        self,
+        transaction: EventJournalTransaction,
+        requirement: ParticipantRequirement,
+    ) -> MemorySemanticParticipant:
+        if requirement.participant_id != MEMORY_SEMANTIC_PARTICIPANT_ID:
+            raise UnsupportedParticipantReconciliationError(
+                "Semantic participant resolver is not registered"
+            )
+        return MemorySemanticParticipant.from_pending(
+            self.memory,
+            self.semantic_store,
+            transaction.transaction_id,
+            requirement.participant_id,
+            requirement.operation_digest,
+            event_id=transaction.event_id,
+            processing_sequence=transaction.processing_sequence,
+        )
+
+    @staticmethod
+    def _event(transaction: EventJournalTransaction) -> AgentEvent:
+        return AgentEvent(
+            event_id=transaction.event_id,
+            event_type=transaction.event_type,
+            source=transaction.source,
+            requested_at=datetime.now(timezone.utc),
+            processing_sequence=transaction.processing_sequence,
+        )
+
+    def _transaction(self, transaction_id: str) -> EventJournalTransaction:
+        return next(
+            item
+            for item in self.journal.inspect().open_transactions
+            if item.transaction_id == transaction_id
+        )
+
+    @staticmethod
+    def _true_rollback_record(
+        records: tuple[EventJournalRecord, ...],
+    ) -> EventJournalRecord | None:
+        matches = [
+            record
+            for record in records
+            if record.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+            and record.recovery_category is EventRecoveryCategory.TRUE_ROLLBACK
+            and record.external_reconciliation_required is True
+        ]
+        return matches[-1] if matches else None

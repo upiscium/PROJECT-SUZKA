@@ -6,10 +6,10 @@ Implement safe adapter lifecycle management and score-based evaluation gates.
 
 ## Target Files
 
-- `kagya/learning/__init__.py`
-- `kagya/learning/adapter_registry.py`
-- `kagya/learning/adapter_evaluator.py`
-- `kagya/learning/eval_sets.py`
+- `suzka/learning/__init__.py`
+- `suzka/learning/adapter_registry.py`
+- `suzka/learning/adapter_evaluator.py`
+- `suzka/learning/eval_sets.py`
 - `tests/test_adapter_registry.py`
 - `tests/test_adapter_evaluator.py`
 

@@ -1,14 +1,14 @@
-"""U4 PromptBuilder contract tests."""
+"""PromptBuilder contract tests."""
 
-from kagya.body import EmotionState
-from kagya.identity import (
+from suzka.body import EmotionState
+from suzka.identity import (
     ValueSeedDeclaration,
     ValuePromptView,
     ValueScope,
     ValueSystem,
 )
-from kagya.persona import PromptBuilder
-from kagya.runtime import (
+from suzka.persona import PromptBuilder
+from suzka.runtime import (
     WorkingMemoryDecision,
     WorkingMemoryDecisionReason,
     WorkingMemorySelection,
@@ -68,7 +68,7 @@ def test_build_groups_selected_items_and_renders_empty_sections() -> None:
         ),
     )
 
-    assert prompt.index("Episodic memories:") < prompt.index("- none")
+    assert prompt.index("Stored episodic evidence:") < prompt.index("- none")
     assert prompt.index("semantic one") < prompt.index("semantic two")
     assert prompt.count("- none") == 1
 
@@ -100,6 +100,25 @@ def test_build_is_purely_repeatable() -> None:
     second = PromptBuilder().build("hello", EmotionState(), memory_view)
 
     assert first == second
+
+
+def test_build_labels_factual_semantic_content_as_stored_evidence() -> None:
+    prompt = PromptBuilder().build(
+        "hello",
+        EmotionState(),
+        view(
+            selection(
+                WorkingMemorySourceKind.SEMANTIC,
+                "The user lives in Paris.",
+            )
+        ),
+    )
+
+    assert "Stored semantic evidence:\n- The user lives in Paris." in prompt
+    assert "Semantic memories:" not in prompt
+    assert "Active Beliefs:" not in prompt
+    assert "adopted Belief" in prompt
+    assert "guaranteed current fact" in prompt
 
 
 def test_build_renders_bounded_active_value_projection_deterministically() -> None:
