@@ -15,8 +15,9 @@ from threading import RLock
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE
 from suzka.privacy import normalize_private_key
 from suzka.runtime.agent_state import (
     AgentStateStore,
@@ -71,15 +72,28 @@ class BaselineRecord(_StrictModel):
     record_id: UUID
     generation_id: UUID
     created_at: datetime
-    baseline_snapshot_sequence: int = Field(ge=0)
+    baseline_snapshot_sequence: int = Field(
+        ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE
+    )
     baseline_snapshot_hash: str = Field(min_length=64, max_length=64)
     baseline_snapshot: CompatibleAgentStateSnapshot
-    journal_processing_high_water: int = Field(ge=0)
+    journal_processing_high_water: int = Field(
+        ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE
+    )
     predecessor_generation_id: UUID | None = None
     predecessor_generation_hash: str | None = None
     reason: RecoveryReason
     previous_record_hash: str | None
     record_hash: str = Field(min_length=64, max_length=64)
+
+    @field_validator(
+        "baseline_snapshot_sequence", "journal_processing_high_water", mode="before"
+    )
+    @classmethod
+    def require_exact_persisted_sequence(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("persisted processing sequence must be an integer")
+        return value
 
 
 class TransitionRecord(_StrictModel):
@@ -92,14 +106,30 @@ class TransitionRecord(_StrictModel):
     event_id: UUID
     event_type: str = Field(min_length=1, max_length=128)
     event_source: str = Field(min_length=1, max_length=128)
-    processing_sequence: int = Field(ge=0)
-    prior_snapshot_sequence: int = Field(ge=0)
+    processing_sequence: int = Field(ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE)
+    prior_snapshot_sequence: int = Field(
+        ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE
+    )
     prior_snapshot_hash: str = Field(min_length=64, max_length=64)
-    candidate_snapshot_sequence: int = Field(ge=0)
+    candidate_snapshot_sequence: int = Field(
+        ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE
+    )
     candidate_snapshot_hash: str = Field(min_length=64, max_length=64)
     candidate_snapshot: CompatibleAgentStateSnapshot
     previous_record_hash: str = Field(min_length=64, max_length=64)
     record_hash: str = Field(min_length=64, max_length=64)
+
+    @field_validator(
+        "processing_sequence",
+        "prior_snapshot_sequence",
+        "candidate_snapshot_sequence",
+        mode="before",
+    )
+    @classmethod
+    def require_exact_persisted_sequence(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("persisted processing sequence must be an integer")
+        return value
 
 
 class Manifest(_StrictModel):
@@ -117,16 +147,27 @@ class Manifest(_StrictModel):
 class BootAnchor(_StrictModel):
     schema_version: Literal[1]
     command_version: Literal[1]
-    snapshot_sequence: int = Field(ge=0)
+    snapshot_sequence: int = Field(ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE)
     snapshot_hash: str = Field(min_length=64, max_length=64)
     generation_id: UUID
     anchored_record_id: UUID
     anchored_record_hash: str = Field(min_length=64, max_length=64)
-    journal_processing_high_water: int = Field(ge=0)
+    journal_processing_high_water: int = Field(
+        ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE
+    )
     journal_tail_record_id: UUID | None
     journal_tail_record_hash: str | None
     journal_lineage_id: UUID
     anchor_hash: str = Field(min_length=64, max_length=64)
+
+    @field_validator(
+        "snapshot_sequence", "journal_processing_high_water", mode="before"
+    )
+    @classmethod
+    def require_exact_persisted_sequence(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("persisted processing sequence must be an integer")
+        return value
 
 
 class StateWALInspection(_StrictModel):
@@ -216,6 +257,24 @@ def _record_json(model: BaseModel, domain: str) -> tuple[dict[str, Any], str]:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _validate_sequence(value: object, field: str) -> int:
+    if (
+        type(value) is not int
+        or value < 0
+        or value > MAX_PERSISTED_EVENT_SEQUENCE
+    ):
+        raise StateWALFormatError(f"{field} is outside its bound")
+    return value
+
+
+def _snapshot_sequence(snapshot: CompatibleAgentStateSnapshot) -> int:
+    try:
+        value = snapshot.last_processed_event_sequence
+    except AttributeError:
+        raise StateWALFormatError("snapshot sequence is unavailable") from None
+    return _validate_sequence(value, "snapshot sequence")
 
 
 class StateWAL:
@@ -431,6 +490,7 @@ class StateWAL:
 
     def _snapshot_hash_value(self, snapshot: CompatibleAgentStateSnapshot) -> str:
         try:
+            _snapshot_sequence(snapshot)
             # Validate the union directly.  Round-tripping through a generic
             # dump is needlessly lossy for retained v1/v2 records (and makes it
             # easier for a newer adapter to normalize a retained shape).
@@ -465,6 +525,10 @@ class StateWAL:
         prepared_recovery_id: UUID | None = None,
         allow_invalid_current: bool = False,
     ) -> Manifest:
+        _snapshot_sequence(snapshot)
+        _validate_sequence(
+            journal_processing_high_water, "journal processing high-water"
+        )
         self._prepare_for_write()
         invalid_current_detected = False
         try:
@@ -1012,8 +1076,16 @@ class StateWAL:
         prior_snapshot: CompatibleAgentStateSnapshot,
         candidate_snapshot: CompatibleAgentStateSnapshot,
     ) -> TransitionRecord:
+        _validate_sequence(processing_sequence, "processing sequence")
+        _snapshot_sequence(prior_snapshot)
+        _snapshot_sequence(candidate_snapshot)
         inspection = self.inspect()
         assert inspection.active_manifest is not None
+        if any(
+            isinstance(record, TransitionRecord) and record.event_id == event_id
+            for record in inspection.records
+        ):
+            raise StateWALConflictError("event identifier is already retained in WAL")
         prior_hash = self._snapshot_hash_value(prior_snapshot)
         candidate_hash = self._snapshot_hash_value(candidate_snapshot)
         if (
@@ -1096,6 +1168,10 @@ class StateWAL:
         journal_tail_record_hash: str | None = None,
         journal_lineage_id: UUID,
     ) -> BootAnchor:
+        _validate_sequence(snapshot_sequence, "snapshot sequence")
+        _validate_sequence(
+            journal_processing_high_water, "journal processing high-water"
+        )
         inspection = self.inspect()
         if (
             inspection.active_manifest is None
@@ -1192,6 +1268,7 @@ class StateWAL:
         snapshot_hash: str,
     ) -> CompatibleAgentStateSnapshot:
         """Verify through an exact externally bound record, ignoring later bytes."""
+        _validate_sequence(snapshot_sequence, "snapshot sequence")
 
         if not _HASH_RE.fullmatch(record_hash) or not _HASH_RE.fullmatch(snapshot_hash):
             raise StateWALFormatError("bound WAL identity is invalid")
@@ -1306,6 +1383,8 @@ class StateWAL:
         snapshot_hash: str | None = None,
         record_id: UUID | None = None,
     ) -> CompatibleAgentStateSnapshot:
+        if sequence is not None:
+            _validate_sequence(sequence, "snapshot sequence")
         inspection = self.inspect()
         found: CompatibleAgentStateSnapshot | None = None
         for record in inspection.records:

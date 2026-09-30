@@ -6,6 +6,7 @@ import traceback
 import pytest
 
 from suzka.config.schema import Settings
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE
 from suzka.runtime import (
     AgentEventOutcome,
     AgentEventSource,
@@ -98,6 +99,33 @@ def test_initial_sequence_is_used_for_first_event() -> None:
     runtime.shutdown()
 
     assert outcome.event.processing_sequence == 8
+
+
+def test_runtime_rejects_next_sequence_without_consumption() -> None:
+    runtime = AgentRuntime(
+        1, initial_sequence=MAX_PERSISTED_EVENT_SEQUENCE - 1
+    )
+    runtime.start()
+
+    outcome = runtime.submit(
+        AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "maximum"
+    ).result(timeout=2)
+    with pytest.raises(AgentRuntimeAdmissionBlocked) as error:
+        runtime.submit(AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: "over")
+
+    runtime.shutdown()
+
+    assert outcome.event.processing_sequence == MAX_PERSISTED_EVENT_SEQUENCE
+    assert error.value.event.processing_sequence is None
+
+
+def test_runtime_does_not_start_when_processing_sequence_is_exhausted() -> None:
+    runtime = AgentRuntime(1, initial_sequence=MAX_PERSISTED_EVENT_SEQUENCE)
+
+    with pytest.raises(RuntimeError, match="exhausted"):
+        runtime.start()
+
+    assert runtime.status is AgentRuntimeStatus.CREATED
 
 
 def test_pre_admission_guard_rejects_without_acceptance_or_sequence() -> None:
@@ -324,7 +352,9 @@ def test_cancelled_future_still_runs_checkpoint() -> None:
     assert checkpoint_sequences == [1, 2]
 
 
-@pytest.mark.parametrize("initial_sequence", [-1, True, 1.5])
+@pytest.mark.parametrize(
+    "initial_sequence", [-1, True, 1.5, MAX_PERSISTED_EVENT_SEQUENCE + 1]
+)
 def test_invalid_initial_sequence_is_rejected(initial_sequence: object) -> None:
     with pytest.raises(ValueError):
         AgentRuntime(1, initial_sequence=initial_sequence)  # type: ignore[arg-type]

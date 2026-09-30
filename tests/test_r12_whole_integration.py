@@ -138,7 +138,7 @@ R12_F_MATRIX: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "F15",
         (
-            "tests/test_agent_state.py::test_v6_round_trip_preserves_intrinsic_belief_authority_without_replay",
+            "tests/test_agent_state.py::test_v7_round_trip_preserves_intrinsic_belief_authority_without_replay",
             "tests/test_state_wal.py::test_v6_wal_reconstructs_nonempty_belief_without_replay",
         ),
     ),

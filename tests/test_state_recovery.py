@@ -22,6 +22,7 @@ from suzka.identity import (
     ValueSelfAdmission,
     ValueSystem,
 )
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE
 from suzka.memory import DualMemorySystem
 from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from suzka.models import ModelProvider
@@ -735,6 +736,31 @@ def test_normal_commit_order_and_artifacts_are_durable(
     assert evidence.processing_sequence == 1
     assert journal.inspect().records[-2].lifecycle is EventLifecycle.PREPARED
     assert journal.inspect().records[-1].lifecycle is EventLifecycle.COMPLETED
+
+
+def test_exhausted_candidate_is_rejected_before_journal_wal_or_state_change(
+    tmp_path: Path,
+) -> None:
+    recovery, store, journal, wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    item = event("exhausted-candidate", 1)
+    start_event(journal, item)
+    candidate = snapshot(MAX_PERSISTED_EVENT_SEQUENCE).model_copy(
+        update={"last_processed_event_sequence": MAX_PERSISTED_EVENT_SEQUENCE + 1}
+    )
+    journal_before = journal.path.read_bytes()
+    state_before = store.path.read_bytes()
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    generation_before = generation.read_bytes()
+
+    with pytest.raises(StateRecoveryError):
+        recovery.commit_internal_candidate(item, initial, candidate)
+
+    assert journal.path.read_bytes() == journal_before
+    assert store.path.read_bytes() == state_before
+    assert generation.read_bytes() == generation_before
 
 
 def test_internal_commit_publishes_state_but_leaves_event_prepared(

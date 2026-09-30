@@ -32,6 +32,7 @@ from suzka.runtime import (
     TransactionPreparationError,
     TransactionKind,
 )
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE
 
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -529,6 +530,24 @@ def test_transaction_identity_binds_event_sequence_and_kind(tmp_path: Path) -> N
     assert original != value.derive_transaction_id(
         event("identity", 1), TransactionKind.MAINTENANCE_MUTATION
     )
+
+
+def test_transaction_identity_accepts_maximum_and_rejects_one_over(
+    tmp_path: Path,
+) -> None:
+    value = coordinator(journal(tmp_path / "sequence-bound.jsonl"))
+
+    maximum = value.derive_transaction_id(
+        event("maximum-sequence", MAX_PERSISTED_EVENT_SEQUENCE),
+        TransactionKind.EVENT_MUTATION,
+    )
+    assert str(UUID(maximum)) == maximum
+
+    with pytest.raises(TransactionPreparationError):
+        value.derive_transaction_id(
+            event("one-over-sequence", MAX_PERSISTED_EVENT_SEQUENCE + 1),
+            TransactionKind.EVENT_MUTATION,
+        )
 
 
 def test_transaction_identity_ignores_participant_order_and_private_payload(

@@ -9,6 +9,7 @@ from threading import RLock
 from typing import Generic, Protocol, TypeVar, cast, runtime_checkable
 from uuid import UUID, uuid5
 
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE
 from suzka.runtime.agent_runtime import AgentEvent
 from suzka.runtime.event_journal import (
     AbortOutcome,
@@ -50,9 +51,9 @@ def validate_transaction_binding(binding: TransactionBinding) -> bool:
     if (
         str(parsed_event_id) != binding.event_id
         or str(parsed_transaction_id) != binding.transaction_id
-        or isinstance(sequence, bool)
-        or not isinstance(sequence, int)
+        or type(sequence) is not int
         or sequence <= 0
+        or sequence > MAX_PERSISTED_EVENT_SEQUENCE
         or not isinstance(binding.transaction_kind, TransactionKind)
     ):
         return False
@@ -186,9 +187,9 @@ class TransactionCoordinator:
             identity_invalid = True
         if (
             identity_invalid
-            or isinstance(sequence, bool)
-            or not isinstance(sequence, int)
+            or type(sequence) is not int
             or sequence <= 0
+            or sequence > MAX_PERSISTED_EVENT_SEQUENCE
             or not isinstance(transaction_kind, TransactionKind)
         ):
             raise TransactionPreparationError("Transaction identity is invalid")
@@ -205,7 +206,9 @@ class TransactionCoordinator:
     ) -> object:
         sequence = event.processing_sequence
         if (
-            sequence is None
+            type(sequence) is not int
+            or sequence <= 0
+            or sequence > MAX_PERSISTED_EVENT_SEQUENCE
             or event.event_id in self._live
             or not isinstance(result.transaction_kind, TransactionKind)
             or not isinstance(result.participants, tuple)
@@ -382,6 +385,28 @@ class TransactionCoordinator:
     def _finalize_event(
         self, event: AgentEvent, evidence: InternalCommitEvidence
     ) -> None:
+        if (
+            type(event.processing_sequence) is not int
+            or event.processing_sequence <= 0
+            or event.processing_sequence > MAX_PERSISTED_EVENT_SEQUENCE
+        ):
+            raise TransactionFinalizationError(
+                "Internal commit event identity is invalid"
+            )
+        if (
+            isinstance(evidence, InternalCommitEvidence)
+            and (
+                type(evidence.processing_sequence) is not int
+                or evidence.processing_sequence <= 0
+                or evidence.processing_sequence > MAX_PERSISTED_EVENT_SEQUENCE
+                or type(evidence.snapshot_sequence) is not int
+                or evidence.snapshot_sequence < 0
+                or evidence.snapshot_sequence > MAX_PERSISTED_EVENT_SEQUENCE
+            )
+        ):
+            raise TransactionFinalizationError(
+                "Internal commit evidence is invalid"
+            )
         live = self._live.get(event.event_id)
         if live is None:
             if any(

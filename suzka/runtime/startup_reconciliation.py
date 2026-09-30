@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID, uuid5
 
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE
 from suzka.memory.dual_memory_system import (
     DualMemorySystem,
     SemanticMemoryFormatError,
@@ -84,6 +85,17 @@ class StartupReconciliationResult:
     degraded_reason: str | None = None
 
 
+def _require_sequence(value: object, field: str, *, positive: bool = False) -> int:
+    minimum = 1 if positive else 0
+    if (
+        type(value) is not int
+        or value < minimum
+        or value > MAX_PERSISTED_EVENT_SEQUENCE
+    ):
+        raise StartupReconciliationError(f"{field} is outside its bound")
+    return value
+
+
 class StartupReconciliationCoordinator:
     """Resolve open transactions and a true-rollback external recovery gate."""
 
@@ -134,6 +146,12 @@ class StartupReconciliationCoordinator:
             self.journal.inspect().open_transactions,
             key=lambda item: item.transaction_id,
         )
+        for transaction in transactions:
+            _require_sequence(
+                transaction.processing_sequence,
+                "transaction processing sequence",
+                positive=True,
+            )
         for transaction in transactions:
             proof = self.state_recovery.inspect_transaction_commit(transaction)
             if proof.classification is InternalCommitClassification.AMBIGUOUS:
@@ -283,6 +301,11 @@ class StartupReconciliationCoordinator:
 
         if not recovery.external_reconciliation_required:
             return StartupReconciliationResult(recovery, True)
+        _require_sequence(recovery.processing_high_water, "processing high-water")
+        _require_sequence(
+            recovery.snapshot.last_processed_event_sequence,
+            "recovery snapshot sequence",
+        )
         inspection = self.journal.inspect()
         recovery_record = self._true_rollback_record(inspection.records)
         if recovery_record is None:
@@ -320,6 +343,12 @@ class StartupReconciliationCoordinator:
                 key=lambda item: item.transaction_id,
             )
         )
+        for transaction in transactions:
+            _require_sequence(
+                transaction.processing_sequence,
+                "transaction processing sequence",
+                positive=True,
+            )
         requirements = self._aggregate_requirements(
             transactions, baseline.participant_registry
         )
@@ -498,6 +527,22 @@ class StartupReconciliationCoordinator:
             or recovery.wal_record_hash is None
         ):
             raise StartupReconciliationError("Recovery evidence is incomplete")
+        _require_sequence(
+            recovery.snapshot_sequence,
+            "recovery snapshot sequence",
+        )
+        _require_sequence(
+            recovery.recovery_processing_high_water,
+            "recovery processing high-water",
+        )
+        _require_sequence(
+            baseline.snapshot_sequence,
+            "participant baseline snapshot sequence",
+        )
+        _require_sequence(
+            baseline.processing_high_water,
+            "participant baseline processing high-water",
+        )
         reconciliation_id = str(
             uuid5(
                 _RECONCILIATION_NAMESPACE,
@@ -647,6 +692,11 @@ class StartupReconciliationCoordinator:
     def _binding(
         transaction: EventJournalTransaction, requirement: ParticipantRequirement
     ) -> TransactionBinding:
+        _require_sequence(
+            transaction.processing_sequence,
+            "transaction processing sequence",
+            positive=True,
+        )
         return TransactionBinding(
             transaction_id=transaction.transaction_id,
             event_id=transaction.event_id,
@@ -712,6 +762,11 @@ class StartupReconciliationCoordinator:
 
     @staticmethod
     def _event(transaction: EventJournalTransaction) -> AgentEvent:
+        _require_sequence(
+            transaction.processing_sequence,
+            "transaction processing sequence",
+            positive=True,
+        )
         return AgentEvent(
             event_id=transaction.event_id,
             event_type=transaction.event_type,

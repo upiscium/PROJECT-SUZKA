@@ -11,6 +11,8 @@ from threading import Condition, Thread, current_thread
 from typing import Any, Callable, Generic, TypeVar, cast
 from uuid import uuid4
 
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE
+
 
 class AgentEventType(str, Enum):
     CHAT = "chat"
@@ -163,11 +165,13 @@ class AgentRuntime:
         ):
             raise ValueError("queue_capacity must be greater than zero")
         if (
-            isinstance(initial_sequence, bool)
-            or not isinstance(initial_sequence, int)
+            type(initial_sequence) is not int
             or initial_sequence < 0
+            or initial_sequence > MAX_PERSISTED_EVENT_SEQUENCE
         ):
-            raise ValueError("initial_sequence must be a non-negative integer")
+            raise ValueError(
+                "initial_sequence must be a bounded non-negative integer"
+            )
         self._queue_capacity = queue_capacity
         self._pre_admission_guard = pre_admission_guard
         self._admission_checkpoint = admission_checkpoint
@@ -222,6 +226,8 @@ class AgentRuntime:
                 raise RuntimeError("AgentRuntime cannot be restarted")
             if self._status is AgentRuntimeStatus.ACCEPTING:
                 return
+            if self._sequence >= MAX_PERSISTED_EVENT_SEQUENCE:
+                raise RuntimeError("AgentRuntime processing sequence is exhausted")
             if not self._durability_configured and not self._allow_volatile:
                 raise RuntimeError(
                     "AgentRuntime durability lifecycle is not configured"
@@ -256,11 +262,13 @@ class AgentRuntime:
         """Bind mandatory durable lifecycle collaborators before startup."""
 
         if (
-            isinstance(initial_sequence, bool)
-            or not isinstance(initial_sequence, int)
+            type(initial_sequence) is not int
             or initial_sequence < 0
+            or initial_sequence > MAX_PERSISTED_EVENT_SEQUENCE
         ):
-            raise ValueError("initial_sequence must be a non-negative integer")
+            raise ValueError(
+                "initial_sequence must be a bounded non-negative integer"
+            )
         with self._condition:
             if self._status is not AgentRuntimeStatus.CREATED:
                 raise RuntimeError(
@@ -304,6 +312,8 @@ class AgentRuntime:
                 raise AgentRuntimeStopped(event)
             if len(self._pending) >= self._queue_capacity:
                 raise AgentRuntimeQueueFull(event)
+            if self._sequence + len(self._pending) >= MAX_PERSISTED_EVENT_SEQUENCE:
+                raise AgentRuntimeAdmissionBlocked(event)
             if self._pre_admission_guard is not None:
                 try:
                     admitted = self._pre_admission_guard(event)
@@ -366,6 +376,11 @@ class AgentRuntime:
                     self._status = AgentRuntimeStatus.STOPPED
                     self._condition.notify_all()
                     return
+                if self._sequence >= MAX_PERSISTED_EVENT_SEQUENCE:
+                    self._fail_stop_locked(
+                        phase=AgentRuntimeDurabilityPhase.STARTED
+                    )
+                    continue
                 pending = self._pending.popleft()
                 self._sequence += 1
                 event = replace(pending.event, processing_sequence=self._sequence)

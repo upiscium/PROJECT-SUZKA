@@ -914,7 +914,7 @@ def test_session_context_continuity_survives_process_restart(tmp_path: Path) -> 
         assert frames[0].source_session_id == session_id
 
 
-def test_fresh_configured_bootstrap_publishes_v6_value_and_belief_authority(
+def test_fresh_configured_bootstrap_publishes_v7_value_and_belief_authority(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -922,7 +922,7 @@ def test_fresh_configured_bootstrap_publishes_v6_value_and_belief_authority(
     with _client(tmp_path, settings=settings) as client:
         snapshot = client.app.state.agent_state_store.load()
 
-        assert snapshot.schema_version == 6
+        assert snapshot.schema_version == 7
         assert snapshot.belief_state.records == ()
         assert tuple(value.value_id for value in snapshot.value_state.values) == tuple(
             seed.value_id for seed in settings.values.seeds
@@ -940,7 +940,7 @@ def test_fresh_configured_bootstrap_publishes_v6_value_and_belief_authority(
         )
 
 
-def test_retained_v4_lazy_upgrade_preserves_bytes_then_publishes_v6(
+def test_retained_v4_lazy_upgrade_preserves_bytes_then_publishes_v7(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -980,7 +980,7 @@ def test_retained_v4_lazy_upgrade_preserves_bytes_then_publishes_v6(
         assert response.status_code == 200
 
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 6
+        assert upgraded.schema_version == 7
         assert tuple(value.value_id for value in upgraded.value_state.values) == (
             "care",
             "honesty",
@@ -1034,7 +1034,7 @@ def test_retained_v2_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
         )
         assert response.status_code == 200
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 6
+        assert upgraded.schema_version == 7
         assert upgraded.context_state.current_context_id == "conversation.default"
         assert tuple(
             frame.context_id for frame in upgraded.context_state.frames
@@ -1118,7 +1118,7 @@ def test_retained_v3_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
         )
         assert response.status_code == 200
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 6
+        assert upgraded.schema_version == 7
         assert len(upgraded.appraisal_state.calibration_entries) == 1
         assert upgraded.appraisal_state.calibration_entries[0].count == 1
         assert (
@@ -2654,7 +2654,7 @@ def test_matching_v0_snapshot_is_rewritten_after_journal_reconciliation(
         json.loads(settings.agent_state.path.read_text(encoding="utf-8"))[
             "schema_version"
         ]
-            == 6
+                == 7
     )
 
 
@@ -3484,7 +3484,7 @@ def test_second_startup_cannot_touch_snapshot_before_journal_lease(
         assert settings.agent_state.path.read_bytes() == original
 
 
-def test_chat_commits_post_chat_working_memory_in_agent_state_v6(
+def test_chat_commits_post_chat_working_memory_in_agent_state_v7(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -3501,7 +3501,7 @@ def test_chat_commits_post_chat_working_memory_in_agent_state_v6(
         assert set(response.json()) == {"episode_id", "response", "emotion", "model"}
         snapshot = client.app.state.agent_state_store.load()
         authoritative_items = client.app.state.main_loop.working_memory.items
-        assert snapshot.schema_version == 6
+        assert snapshot.schema_version == 7
         assert snapshot.working_memory.revision == (
             client.app.state.main_loop.working_memory.revision
         )
