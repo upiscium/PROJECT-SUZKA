@@ -17,6 +17,7 @@ from suzka.motivation.common import (
     R13_MAX_DEPENDENCY_REFS,
     R13_MAX_EVIDENCE_REFS,
     R13_MAX_REVISION,
+    R13_MAX_REVISION_HISTORY,
     R13_SCHEMA_VERSION,
     Deadline,
     R13Reference,
@@ -42,6 +43,9 @@ GOAL_DOMAIN: Final = b"PROJECT-SUZKA:R13:GOAL:V1\0"
 GOAL_ID_DOMAIN: Final = b"PROJECT-SUZKA:R13:GOAL-ID:V1\0"
 GOAL_PROPOSAL_DOMAIN: Final = b"PROJECT-SUZKA:R13:GOAL-PROPOSAL:V1\0"
 GOAL_ADMISSION_DOMAIN: Final = b"PROJECT-SUZKA:R13:GOAL-ADMISSION:V1\0"
+GOAL_SUBJECT_TRANSITION_DOMAIN: Final = (
+    b"PROJECT-SUZKA:R13:GOAL-SUBJECT-TRANSITION:V1\0"
+)
 GOAL_REVISION_DOMAIN: Final = b"PROJECT-SUZKA:R13:GOAL-REVISION:V1\0"
 
 GOAL_TARGET_KINDS: Final = frozenset(
@@ -301,6 +305,116 @@ class GoalSubjectAdmission:
         return self.admission_digest
 
 
+@dataclass(frozen=True, slots=True)
+class GoalSubjectTransitionProof:
+    """Fresh event-bound proof shape for a post-admission subject decision."""
+
+    goal_id: str
+    proposal_digest: str
+    operation: GoalRevisionOperation
+    reason: GoalRevisionReason
+    previous_lifecycle_state: GoalLifecycle
+    evidence_refs: tuple[str, ...]
+    event_id: str
+    event_sequence: int
+    transition_digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        goal_id = validate_identifier(self.goal_id)
+        proposal_digest = validate_digest(self.proposal_digest, "proposal_digest")
+        _enum(self.operation, GoalRevisionOperation, "operation")
+        _enum(self.reason, GoalRevisionReason, "reason")
+        _enum(
+            self.previous_lifecycle_state,
+            GoalLifecycle,
+            "previous_lifecycle_state",
+        )
+        allowed = {
+            (
+                GoalRevisionOperation.ADOPT,
+                GoalRevisionReason.SUBJECT_ADMISSION,
+                GoalLifecycle.DEFERRED,
+            ),
+            (
+                GoalRevisionOperation.DEFER,
+                GoalRevisionReason.SUBJECT_DEFERRED,
+                GoalLifecycle.ADOPTED,
+            ),
+            (
+                GoalRevisionOperation.DEFER,
+                GoalRevisionReason.SUBJECT_DEFERRED,
+                GoalLifecycle.DEFERRED,
+            ),
+            (
+                GoalRevisionOperation.ABANDON,
+                GoalRevisionReason.SUBJECT_ABANDONED,
+                GoalLifecycle.ADOPTED,
+            ),
+            (
+                GoalRevisionOperation.ABANDON,
+                GoalRevisionReason.SUBJECT_ABANDONED,
+                GoalLifecycle.DEFERRED,
+            ),
+        }
+        if (
+            self.operation,
+            self.reason,
+            self.previous_lifecycle_state,
+        ) not in allowed:
+            raise ValueError("Goal subject transition proof has an invalid transition")
+        evidence_refs = canonical_identifier_refs(
+            self.evidence_refs,
+            "evidence_refs",
+            maximum=R13_MAX_EVIDENCE_REFS,
+            allow_empty=False,
+        )
+        event_id, event_sequence = canonical_event(
+            self.event_id,
+            self.event_sequence,
+        )
+        if event_id is None or event_sequence is None:
+            raise AssertionError("required Goal transition event was lost")
+        object.__setattr__(self, "goal_id", goal_id)
+        object.__setattr__(self, "proposal_digest", proposal_digest)
+        object.__setattr__(self, "evidence_refs", evidence_refs)
+        object.__setattr__(self, "event_id", event_id)
+        object.__setattr__(self, "event_sequence", event_sequence)
+        object.__setattr__(
+            self,
+            "transition_digest",
+            digest_payload(
+                GOAL_SUBJECT_TRANSITION_DOMAIN,
+                {
+                    "event_id": event_id,
+                    "event_sequence": event_sequence,
+                    "evidence_refs": list(evidence_refs),
+                    "goal_id": goal_id,
+                    "operation": self.operation.value,
+                    "previous_lifecycle_state": self.previous_lifecycle_state.value,
+                    "proposal_digest": proposal_digest,
+                    "reason": self.reason.value,
+                },
+            ),
+        )
+
+    @property
+    def digest(self) -> str:
+        return self.transition_digest
+
+    def canonical_value(self) -> dict[str, object]:
+        return {
+            "event_id": self.event_id,
+            "event_sequence": self.event_sequence,
+            "evidence_refs": list(self.evidence_refs),
+            "goal_id": self.goal_id,
+            "operation": self.operation.value,
+            "previous_lifecycle_state": self.previous_lifecycle_state.value,
+            "proposal_digest": self.proposal_digest,
+            "reason": self.reason.value,
+            "transition_digest": self.transition_digest,
+        }
+
+
 def _revision_fields(record: GoalRevisionRecord) -> dict[str, object]:
     return {
         "created_at": record.created_at.isoformat(timespec="microseconds").replace(
@@ -417,10 +531,12 @@ class GoalRevisionRecord:
 
 def _require_goal_transition(
     *,
+    goal_id: str,
     lifecycle: GoalLifecycle,
     revision_history: tuple[GoalRevisionRecord, ...],
     history_anchor: RevisionCompactionAnchor | None,
     admission: GoalSubjectAdmission | None,
+    subject_transition_proofs: tuple[GoalSubjectTransitionProof, ...],
     outcome_evidence_refs: tuple[R13Reference, ...],
     proposal_digest: str,
 ) -> None:
@@ -439,6 +555,7 @@ def _require_goal_transition(
             GoalRevisionOperation.FAIL: GoalLifecycle.FAILED,
         },
         GoalLifecycle.DEFERRED: {
+            GoalRevisionOperation.ADOPT: GoalLifecycle.ADOPTED,
             GoalRevisionOperation.DEFER: GoalLifecycle.DEFERRED,
             GoalRevisionOperation.ABANDON: GoalLifecycle.ABANDONED,
             GoalRevisionOperation.COMPLETE: GoalLifecycle.COMPLETED,
@@ -448,6 +565,66 @@ def _require_goal_transition(
         GoalLifecycle.COMPLETED: {},
         GoalLifecycle.FAILED: {},
     }
+    subject_operations = {
+        GoalRevisionOperation.ADOPT,
+        GoalRevisionOperation.DEFER,
+        GoalRevisionOperation.ABANDON,
+    }
+    used_proofs: set[str] = set()
+
+    def validate_subject_transition(
+        *,
+        previous_state: GoalLifecycle,
+        operation: GoalRevisionOperation,
+        reason: GoalRevisionReason,
+        event_id: str | None,
+        event_sequence: int | None,
+        evidence_refs: tuple[str, ...],
+        initial: bool,
+    ) -> None:
+        if operation not in subject_operations:
+            return
+        if initial:
+            if admission is None:
+                raise ValueError("initial Goal decision lacks subject admission")
+            expected_evidence = tuple(
+                sorted((*admission.evidence_refs, admission.admission_digest))
+            )
+            if evidence_refs != expected_evidence:
+                raise ValueError(
+                    "initial Goal decision must bind its exact subject admission"
+                )
+            if event_id != admission.event_id or event_sequence != admission.event_sequence:
+                raise ValueError(
+                    "initial Goal decision is not bound to its admission event"
+                )
+            return
+
+        matches = [
+            proof
+            for proof in subject_transition_proofs
+            if proof.transition_digest in evidence_refs
+        ]
+        if len(matches) != 1:
+            raise ValueError("Goal transition requires one fresh subject proof")
+        proof = matches[0]
+        expected_evidence = tuple(
+            sorted((*proof.evidence_refs, proof.transition_digest))
+        )
+        if (
+            proof.goal_id != goal_id
+            or proof.proposal_digest != proposal_digest
+            or proof.operation is not operation
+            or proof.reason is not reason
+            or proof.previous_lifecycle_state is not previous_state
+            or proof.event_id != event_id
+            or proof.event_sequence != event_sequence
+            or evidence_refs != expected_evidence
+        ):
+            raise ValueError("Goal subject proof does not match its transition")
+        if proof.transition_digest in used_proofs:
+            raise ValueError("Goal subject proof cannot authorize multiple transitions")
+        used_proofs.add(proof.transition_digest)
 
     if history_anchor is None:
         state: GoalLifecycle | None = None
@@ -497,17 +674,15 @@ def _require_goal_transition(
         else:
             if transitions[anchor_previous_state].get(anchor_operation) is not state:
                 raise ValueError("Goal anchor hides an invalid lifecycle transition")
-            if admission is None or admission.admission_digest not in (
-                history_anchor.through_evidence_refs
-            ):
-                raise ValueError("Goal anchor lacks its subject admission witness")
-            if anchor_previous_state is GoalLifecycle.PROPOSED and (
-                history_anchor.through_event_id != admission.event_id
-                or history_anchor.through_event_sequence != admission.event_sequence
-            ):
-                raise ValueError(
-                    "initial Goal anchor is not bound to its admission event"
-                )
+            validate_subject_transition(
+                previous_state=anchor_previous_state,
+                operation=anchor_operation,
+                reason=anchor_reason,
+                event_id=history_anchor.through_event_id,
+                event_sequence=history_anchor.through_event_sequence,
+                evidence_refs=history_anchor.through_evidence_refs,
+                initial=anchor_previous_state is GoalLifecycle.PROPOSED,
+            )
 
     for item in revision_history:
         if state is None:
@@ -526,15 +701,15 @@ def _require_goal_transition(
             raise ValueError("Goal history contains an invalid lifecycle transition")
         if item.previous_lifecycle_state is not state:
             raise ValueError("Goal revision prior lifecycle state is inconsistent")
-        if admission is None or admission.admission_digest not in item.evidence_refs:
-            raise ValueError("Goal transition lacks its subject admission witness")
-        if state is GoalLifecycle.PROPOSED and (
-            item.event_id != admission.event_id
-            or item.event_sequence != admission.event_sequence
-        ):
-            raise ValueError(
-                "initial Goal transition is not bound to its admission event"
-            )
+        validate_subject_transition(
+            previous_state=state,
+            operation=item.operation,
+            reason=item.reason,
+            event_id=item.event_id,
+            event_sequence=item.event_sequence,
+            evidence_refs=item.evidence_refs,
+            initial=state is GoalLifecycle.PROPOSED,
+        )
         if item.operation in {
             GoalRevisionOperation.COMPLETE,
             GoalRevisionOperation.FAIL,
@@ -548,6 +723,11 @@ def _require_goal_transition(
 
     if state is not lifecycle:
         raise ValueError("Goal history does not reach its lifecycle")
+    proof_digests = {proof.transition_digest for proof in subject_transition_proofs}
+    if len(proof_digests) != len(subject_transition_proofs):
+        raise ValueError("Goal subject transition proofs must be unique")
+    if used_proofs != proof_digests:
+        raise ValueError("Goal subject transition proofs must be referenced exactly once")
 
 
 def _record_fields(record: GoalRecord) -> dict[str, object]:
@@ -596,6 +776,9 @@ def _record_fields(record: GoalRecord) -> dict[str, object]:
             for item in record.revision_history
         ],
         "schema_version": record.schema_version,
+        "subject_transition_proofs": [
+            proof.canonical_value() for proof in record.subject_transition_proofs
+        ],
         "subject_admission": None
         if record.subject_admission is None
         else record.subject_admission.admission_digest,
@@ -626,6 +809,7 @@ class GoalRecord:
     conflicts: tuple[str, ...] = ()
     outcome_evidence_refs: tuple[R13Reference, ...] = ()
     subject_admission: GoalSubjectAdmission | None = None
+    subject_transition_proofs: tuple[GoalSubjectTransitionProof, ...] = ()
     revision: int = 0
     revision_history: tuple[GoalRevisionRecord, ...] = ()
     history_anchor: RevisionCompactionAnchor | None = None
@@ -679,6 +863,22 @@ class GoalRecord:
             self.subject_admission, GoalSubjectAdmission
         ):
             raise TypeError("subject_admission must be GoalSubjectAdmission")
+        if type(self.subject_transition_proofs) is not tuple or any(
+            not isinstance(proof, GoalSubjectTransitionProof)
+            for proof in self.subject_transition_proofs
+        ):
+            raise TypeError(
+                "subject_transition_proofs must contain GoalSubjectTransitionProof values"
+            )
+        if len(self.subject_transition_proofs) > R13_MAX_REVISION_HISTORY + 1:
+            raise ValueError("subject_transition_proofs exceeds its bound")
+        proof_digests = tuple(
+            proof.transition_digest for proof in self.subject_transition_proofs
+        )
+        if proof_digests != tuple(sorted(set(proof_digests))):
+            raise ValueError(
+                "subject_transition_proofs must be sorted and unique"
+            )
         if self.lifecycle is GoalLifecycle.PROPOSED:
             if self.subject_admission is not None:
                 raise ValueError("proposed Goals cannot carry subject admission")
@@ -741,10 +941,12 @@ class GoalRecord:
             revision_digest=goal_revision_digest,
         )
         _require_goal_transition(
+            goal_id=goal_id,
             lifecycle=self.lifecycle,
             revision_history=self.revision_history,
             history_anchor=self.history_anchor,
             admission=self.subject_admission,
+            subject_transition_proofs=self.subject_transition_proofs,
             outcome_evidence_refs=outcomes,
             proposal_digest=proposal,
         )
@@ -807,6 +1009,7 @@ __all__ = [
     "GOAL_ORIGIN_KINDS",
     "GOAL_PROPOSAL_DOMAIN",
     "GOAL_REVISION_DOMAIN",
+    "GOAL_SUBJECT_TRANSITION_DOMAIN",
     "GOAL_TARGET_KINDS",
     "GoalAdmissionProof",
     "GoalAdmissionReason",
@@ -816,6 +1019,7 @@ __all__ = [
     "GoalRevisionReason",
     "GoalRevisionRecord",
     "GoalSubjectAdmission",
+    "GoalSubjectTransitionProof",
     "GoalTargetReference",
     "canonical_goal_payload",
     "canonical_goal_revision_payload",

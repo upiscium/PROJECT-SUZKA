@@ -3,16 +3,22 @@
 from dataclasses import fields
 from enum import Enum
 import math
+import subprocess
+import sys
 
 import pytest
 
 from suzka.motivation import (
-    R13_AGENT_STATE_CAP_BYTES,
-    R12_BELIEF_SCHEMA_MAX_BYTES,
     R13_SCHEMA_SIZE_BUDGET,
     canonical_r13_schema_size_budget,
     derive_r13_schema_size_budget,
     validate_r13_schema_size_budget,
+)
+from suzka.runtime.agent_state import (
+    AGENT_STATE_FUTURE_STATE_RESERVE_BYTES,
+    AGENT_STATE_MAX_SERIALIZED_BYTES,
+    AGENT_STATE_V7_BASE_MAX_SERIALIZED_BYTES,
+    project_agent_state_schema_max_bytes,
 )
 from suzka.motivation.bounds import (
     R13_MAX_FLOAT_HEX,
@@ -73,17 +79,59 @@ from suzka.motivation.motivation import (
 )
 
 
-def test_schema_budget_is_reproducible_and_leaves_v7_capacity() -> None:
+def test_schema_budget_is_reproducible_and_preserves_the_v8_future_reserve() -> None:
     budget = derive_r13_schema_size_budget()
     assert budget == R13_SCHEMA_SIZE_BUDGET
     assert validate_r13_schema_size_budget() == budget
+    assert R13_MAX_RECORDS_PER_DOMAIN == 32
+    assert R13_MAX_CANDIDATES_PER_DOMAIN == 32
     assert budget.aggregate_r13_bytes == R13_SCHEMA_MAX_AGGREGATE_BYTES
     assert budget.has_provisional_capacity_headroom
-    assert (
-        budget.aggregate_r13_bytes + R12_BELIEF_SCHEMA_MAX_BYTES
-        < R13_AGENT_STATE_CAP_BYTES
+    assert budget.agent_state_cap_bytes == AGENT_STATE_MAX_SERIALIZED_BYTES
+    assert budget.agent_state_v7_base_bytes == (
+        AGENT_STATE_V7_BASE_MAX_SERIALIZED_BYTES
     )
+    assert budget.agent_state_v7_base_bytes == 85_826_260
+    assert budget.aggregate_r13_bytes == 18_759_305
+    assert budget.projected_agent_state_v8_bytes == 104_585_585
+    assert budget.agent_state_future_state_reserve_bytes == (
+        AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
+    )
+    assert budget.projected_agent_state_v8_with_reserve_bytes == (
+        project_agent_state_schema_max_bytes(
+            schema_version=8,
+            added_field_maxima={"motivation_state": budget.aggregate_r13_bytes},
+        )
+    )
+    assert budget.projected_agent_state_v8_with_reserve_bytes == 121_362_801
+    assert budget.remaining_after_r13_bytes == 29_632_143
+    assert budget.remaining_after_r13_bytes >= (
+        budget.agent_state_future_state_reserve_bytes
+    )
+    assert budget.remaining_after_reserve_bytes == 12_854_927
+    assert budget.remaining_after_reserve_bytes >= 0
     assert canonical_r13_schema_size_budget() == canonical_r13_schema_size_budget()
+
+
+def test_importing_pure_r13_contracts_does_not_import_runtime_or_models() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import suzka.motivation; "
+                "assert 'suzka.runtime' not in sys.modules; "
+                "assert 'suzka.runtime.agent_state' not in sys.modules; "
+                "assert 'torch' not in sys.modules; "
+                "assert 'transformers' not in sys.modules"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(

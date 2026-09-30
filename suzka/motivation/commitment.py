@@ -17,6 +17,7 @@ from suzka.motivation.common import (
     R13_MAX_EVIDENCE_REFS,
     R13_MAX_RELATED_REFS,
     R13_MAX_REVISION,
+    R13_MAX_REVISION_HISTORY,
     R13_MAX_SCOPE_CODEPOINTS,
     R13_MAX_SCOPE_ITEMS,
     R13_SCHEMA_VERSION,
@@ -47,6 +48,9 @@ COMMITMENT_PROPOSAL_DOMAIN: Final = (
 )
 COMMITMENT_ADMISSION_DOMAIN: Final = (
     b"PROJECT-SUZKA:R13:COMMITMENT-ADMISSION:V1\0"
+)
+COMMITMENT_SUBJECT_TRANSITION_DOMAIN: Final = (
+    b"PROJECT-SUZKA:R13:COMMITMENT-SUBJECT-TRANSITION:V1\0"
 )
 COMMITMENT_REVISION_DOMAIN: Final = (
     b"PROJECT-SUZKA:R13:COMMITMENT-REVISION:V1\0"
@@ -337,6 +341,118 @@ class CommitmentSubjectAdmission:
         return self.admission_digest
 
 
+@dataclass(frozen=True, slots=True)
+class CommitmentSubjectTransitionProof:
+    """Fresh event-bound proof shape for releasing or renegotiating responsibility."""
+
+    commitment_id: str
+    proposal_digest: str
+    beneficiary: R13Reference
+    scope: tuple[str, ...]
+    deadline: Deadline
+    operation: CommitmentRevisionOperation
+    reason: CommitmentRevisionReason
+    previous_lifecycle_state: CommitmentLifecycle
+    evidence_refs: tuple[str, ...]
+    event_id: str
+    event_sequence: int
+    transition_digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        commitment_id = validate_identifier(self.commitment_id)
+        proposal_digest = validate_digest(self.proposal_digest, "proposal_digest")
+        if commitment_id != commitment_id_for_proposal(proposal_digest):
+            raise ValueError("commitment_id is not derived from proposal_digest")
+        if (
+            not isinstance(self.beneficiary, R13Reference)
+            or self.beneficiary.kind not in COMMITMENT_BENEFICIARY_KINDS
+        ):
+            raise ValueError("beneficiary has an unauthorized reference kind")
+        scope = _scope(self.scope)
+        deadline = coerce_deadline(self.deadline)
+        _enum(self.operation, CommitmentRevisionOperation, "operation")
+        _enum(self.reason, CommitmentRevisionReason, "reason")
+        _enum(
+            self.previous_lifecycle_state,
+            CommitmentLifecycle,
+            "previous_lifecycle_state",
+        )
+        if (
+            self.previous_lifecycle_state is not CommitmentLifecycle.ACTIVE
+            or (self.operation, self.reason)
+            not in {
+                (
+                    CommitmentRevisionOperation.RELEASE,
+                    CommitmentRevisionReason.SUBJECT_RELEASE,
+                ),
+                (
+                    CommitmentRevisionOperation.RENEGOTIATE,
+                    CommitmentRevisionReason.SUBJECT_RENEGOTIATION,
+                ),
+            }
+        ):
+            raise ValueError("Commitment subject transition proof has an invalid transition")
+        evidence_refs = canonical_identifier_refs(
+            self.evidence_refs,
+            "evidence_refs",
+            maximum=R13_MAX_EVIDENCE_REFS,
+            allow_empty=False,
+        )
+        event_id, event_sequence = canonical_event(
+            self.event_id,
+            self.event_sequence,
+        )
+        if event_id is None or event_sequence is None:
+            raise AssertionError("required Commitment transition event was lost")
+        object.__setattr__(self, "commitment_id", commitment_id)
+        object.__setattr__(self, "proposal_digest", proposal_digest)
+        object.__setattr__(self, "scope", scope)
+        object.__setattr__(self, "deadline", deadline)
+        object.__setattr__(self, "evidence_refs", evidence_refs)
+        object.__setattr__(self, "event_id", event_id)
+        object.__setattr__(self, "event_sequence", event_sequence)
+        object.__setattr__(
+            self,
+            "transition_digest",
+            digest_payload(
+                COMMITMENT_SUBJECT_TRANSITION_DOMAIN,
+                {
+                    "beneficiary": self.beneficiary.canonical_value(),
+                    "commitment_id": commitment_id,
+                    "deadline": deadline.canonical_value(),
+                    "event_id": event_id,
+                    "event_sequence": event_sequence,
+                    "evidence_refs": list(evidence_refs),
+                    "operation": self.operation.value,
+                    "previous_lifecycle_state": self.previous_lifecycle_state.value,
+                    "proposal_digest": proposal_digest,
+                    "reason": self.reason.value,
+                    "scope": list(scope),
+                },
+            ),
+        )
+
+    @property
+    def digest(self) -> str:
+        return self.transition_digest
+
+    def canonical_value(self) -> dict[str, object]:
+        return {
+            "beneficiary": self.beneficiary.canonical_value(),
+            "commitment_id": self.commitment_id,
+            "deadline": self.deadline.canonical_value(),
+            "event_id": self.event_id,
+            "event_sequence": self.event_sequence,
+            "evidence_refs": list(self.evidence_refs),
+            "operation": self.operation.value,
+            "previous_lifecycle_state": self.previous_lifecycle_state.value,
+            "proposal_digest": self.proposal_digest,
+            "reason": self.reason.value,
+            "scope": list(self.scope),
+            "transition_digest": self.transition_digest,
+        }
+
+
 def _revision_fields(record: CommitmentRevisionRecord) -> dict[str, object]:
     return {
         "commitment_id": record.commitment_id,
@@ -451,10 +567,16 @@ class CommitmentRevisionRecord:
 
 def _require_commitment_transition(
     *,
+    commitment_id: str,
+    proposal_digest: str,
+    beneficiary: R13Reference,
+    scope: tuple[str, ...],
+    deadline: Deadline,
     lifecycle: CommitmentLifecycle,
     revision_history: tuple[CommitmentRevisionRecord, ...],
     history_anchor: RevisionCompactionAnchor | None,
     admission: CommitmentSubjectAdmission | None,
+    subject_transition_proofs: tuple[CommitmentSubjectTransitionProof, ...],
     outcome_evidence_refs: tuple[R13Reference, ...],
 ) -> None:
     """Derive responsibility lifecycle through the retained transition suffix."""
@@ -474,6 +596,74 @@ def _require_commitment_transition(
         CommitmentLifecycle.FULFILLED: {},
         CommitmentLifecycle.BREACHED: {},
     }
+    used_proofs: set[str] = set()
+
+    def validate_subject_transition(
+        *,
+        previous_state: CommitmentLifecycle,
+        operation: CommitmentRevisionOperation,
+        reason: CommitmentRevisionReason,
+        event_id: str | None,
+        event_sequence: int | None,
+        evidence_refs: tuple[str, ...],
+        initial: bool,
+    ) -> None:
+        if operation is CommitmentRevisionOperation.ADMIT and initial:
+            if admission is None:
+                raise ValueError("Commitment activation lacks subject admission")
+            expected_evidence = tuple(
+                sorted((*admission.evidence_refs, admission.admission_digest))
+            )
+            if evidence_refs != expected_evidence:
+                raise ValueError(
+                    "Commitment activation must bind its exact subject admission"
+                )
+            if event_id != admission.event_id or event_sequence != admission.event_sequence:
+                raise ValueError(
+                    "Commitment activation is not bound to its admission event"
+                )
+            return
+        if operation not in {
+            CommitmentRevisionOperation.RELEASE,
+            CommitmentRevisionOperation.RENEGOTIATE,
+        }:
+            return
+
+        matches = [
+            proof
+            for proof in subject_transition_proofs
+            if proof.transition_digest in evidence_refs
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "Commitment transition requires one fresh subject proof"
+            )
+        proof = matches[0]
+        expected_evidence = tuple(
+            sorted((*proof.evidence_refs, proof.transition_digest))
+        )
+        if (
+            initial
+            or proof.commitment_id != commitment_id
+            or proof.proposal_digest != proposal_digest
+            or proof.beneficiary != beneficiary
+            or proof.scope != scope
+            or proof.deadline != deadline
+            or proof.operation is not operation
+            or proof.reason is not reason
+            or proof.previous_lifecycle_state is not previous_state
+            or proof.event_id != event_id
+            or proof.event_sequence != event_sequence
+            or evidence_refs != expected_evidence
+        ):
+            raise ValueError(
+                "Commitment subject proof does not match its transition"
+            )
+        if proof.transition_digest in used_proofs:
+            raise ValueError(
+                "Commitment subject proof cannot authorize multiple transitions"
+            )
+        used_proofs.add(proof.transition_digest)
 
     if history_anchor is None:
         state: CommitmentLifecycle | None = None
@@ -529,19 +719,28 @@ def _require_commitment_transition(
                 raise ValueError(
                     "Commitment anchor hides an invalid lifecycle transition"
                 )
-            if admission is None or admission.admission_digest not in (
-                history_anchor.through_evidence_refs
-            ):
-                raise ValueError(
-                    "Commitment anchor lacks its subject admission witness"
-                )
-            if anchor_previous_state is CommitmentLifecycle.PROPOSED and (
-                history_anchor.through_event_id != admission.event_id
-                or history_anchor.through_event_sequence != admission.event_sequence
-            ):
-                raise ValueError(
-                    "Commitment anchor is not bound to its admission event"
-                )
+            validate_subject_transition(
+                previous_state=anchor_previous_state,
+                operation=anchor_operation,
+                reason=anchor_reason,
+                event_id=history_anchor.through_event_id,
+                event_sequence=history_anchor.through_event_sequence,
+                evidence_refs=history_anchor.through_evidence_refs,
+                initial=anchor_previous_state is CommitmentLifecycle.PROPOSED,
+            )
+            if anchor_operation in {
+                CommitmentRevisionOperation.FULFILL,
+                CommitmentRevisionOperation.BREACH,
+            }:
+                required_outcomes = {
+                    item.reference for item in outcome_evidence_refs
+                }
+                if not required_outcomes.issubset(
+                    history_anchor.through_evidence_refs
+                ):
+                    raise ValueError(
+                        "Commitment anchor lacks its verified outcome evidence"
+                    )
 
     for item in revision_history:
         if state is None:
@@ -564,17 +763,15 @@ def _require_commitment_transition(
             raise ValueError(
                 "Commitment revision prior lifecycle state is inconsistent"
             )
-        if admission is None or admission.admission_digest not in item.evidence_refs:
-            raise ValueError(
-                "Commitment transition lacks its subject admission witness"
-            )
-        if state is CommitmentLifecycle.PROPOSED and (
-            item.event_id != admission.event_id
-            or item.event_sequence != admission.event_sequence
-        ):
-            raise ValueError(
-                "Commitment activation is not bound to its admission event"
-            )
+        validate_subject_transition(
+            previous_state=state,
+            operation=item.operation,
+            reason=item.reason,
+            event_id=item.event_id,
+            event_sequence=item.event_sequence,
+            evidence_refs=item.evidence_refs,
+            initial=state is CommitmentLifecycle.PROPOSED,
+        )
         if item.operation in {
             CommitmentRevisionOperation.FULFILL,
             CommitmentRevisionOperation.BREACH,
@@ -588,6 +785,15 @@ def _require_commitment_transition(
 
     if state is not lifecycle:
         raise ValueError("Commitment history does not reach its lifecycle")
+    proof_digests = {
+        proof.transition_digest for proof in subject_transition_proofs
+    }
+    if len(proof_digests) != len(subject_transition_proofs):
+        raise ValueError("Commitment subject transition proofs must be unique")
+    if used_proofs != proof_digests:
+        raise ValueError(
+            "Commitment subject transition proofs must be referenced exactly once"
+        )
 
 
 def _record_fields(record: CommitmentRecord) -> dict[str, object]:
@@ -643,6 +849,9 @@ def _record_fields(record: CommitmentRecord) -> dict[str, object]:
         "schema_version": record.schema_version,
         "scope": list(record.scope),
         "subject": record.subject,
+        "subject_transition_proofs": [
+            proof.canonical_value() for proof in record.subject_transition_proofs
+        ],
     }
 
 
@@ -670,6 +879,7 @@ class CommitmentRecord:
     desire_refs: tuple[R13Reference, ...] = ()
     lifecycle: CommitmentLifecycle = CommitmentLifecycle.PROPOSED
     subject_admission: CommitmentSubjectAdmission | None = None
+    subject_transition_proofs: tuple[CommitmentSubjectTransitionProof, ...] = ()
     outcome_evidence_refs: tuple[R13Reference, ...] = ()
     revision: int = 0
     revision_history: tuple[CommitmentRevisionRecord, ...] = ()
@@ -721,6 +931,20 @@ class CommitmentRecord:
             self.subject_admission, CommitmentSubjectAdmission
         ):
             raise TypeError("subject_admission must be CommitmentSubjectAdmission")
+        if type(self.subject_transition_proofs) is not tuple or any(
+            not isinstance(proof, CommitmentSubjectTransitionProof)
+            for proof in self.subject_transition_proofs
+        ):
+            raise TypeError(
+                "subject_transition_proofs must contain CommitmentSubjectTransitionProof values"
+            )
+        if len(self.subject_transition_proofs) > R13_MAX_REVISION_HISTORY + 1:
+            raise ValueError("subject_transition_proofs exceeds its bound")
+        proof_digests = tuple(
+            proof.transition_digest for proof in self.subject_transition_proofs
+        )
+        if proof_digests != tuple(sorted(set(proof_digests))):
+            raise ValueError("subject_transition_proofs must be sorted and unique")
         _enum(self.lifecycle, CommitmentLifecycle, "lifecycle")
         if self.lifecycle is CommitmentLifecycle.PROPOSED:
             if self.subject_admission is not None:
@@ -794,10 +1018,16 @@ class CommitmentRecord:
             revision_digest=commitment_revision_digest,
         )
         _require_commitment_transition(
+            commitment_id=commitment_id,
+            proposal_digest=proposal,
+            beneficiary=self.beneficiary,
+            scope=scope,
+            deadline=deadline,
             lifecycle=self.lifecycle,
             revision_history=self.revision_history,
             history_anchor=self.history_anchor,
             admission=self.subject_admission,
+            subject_transition_proofs=self.subject_transition_proofs,
             outcome_evidence_refs=outcomes,
         )
         object.__setattr__(self, "record_digest", commitment_record_digest(self))
@@ -828,6 +1058,7 @@ __all__ = [
     "COMMITMENT_ORIGIN_KINDS",
     "COMMITMENT_PROPOSAL_DOMAIN",
     "COMMITMENT_REVISION_DOMAIN",
+    "COMMITMENT_SUBJECT_TRANSITION_DOMAIN",
     "CommitmentAdmissionProof",
     "CommitmentAdmissionReason",
     "CommitmentLifecycle",
@@ -837,6 +1068,7 @@ __all__ = [
     "CommitmentRevisionReason",
     "CommitmentRevisionRecord",
     "CommitmentSubjectAdmission",
+    "CommitmentSubjectTransitionProof",
     "canonical_commitment_payload",
     "canonical_commitment_revision_payload",
     "commitment_id_for_fields",

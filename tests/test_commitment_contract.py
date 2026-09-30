@@ -13,6 +13,7 @@ from suzka.motivation.commitment import (
     CommitmentRevisionReason,
     CommitmentRevisionRecord,
     CommitmentSubjectAdmission,
+    CommitmentSubjectTransitionProof,
     commitment_id_for_fields,
     commitment_proposal_digest,
 )
@@ -141,7 +142,9 @@ def admitted_terminal_history(
         CommitmentLifecycle.PROPOSED,
         event_id=admission.event_id,
         event_sequence=admission.event_sequence,
-        evidence_refs=(admission.admission_digest,),
+        evidence_refs=tuple(
+            sorted((*admission.evidence_refs, admission.admission_digest))
+        ),
         previous_revision_digest=genesis.record_digest,
     )
     final = CommitmentRevisionRecord(
@@ -171,7 +174,9 @@ def test_proposal_and_active_responsibility_are_distinct() -> None:
             CommitmentRevisionOperation.ADMIT,
             CommitmentRevisionReason.SUBJECT_ADMISSION,
             event_id=admission.event_id,
-            evidence_refs=(admission.admission_digest,),
+            evidence_refs=tuple(
+                sorted((*admission.evidence_refs, admission.admission_digest))
+            ),
         ),
     )
     assert proposed.commitment_id == active.commitment_id
@@ -214,20 +219,59 @@ def test_operator_proposal_is_not_subject_admission_and_release_is_not_fulfillme
     with pytest.raises(ValueError):
         make_commitment(lifecycle=CommitmentLifecycle.RELEASED)
     admission = admission_for(proposed)
+    release_proof = CommitmentSubjectTransitionProof(
+        proposed.commitment_id,
+        proposed.proposal_digest,
+        proposed.beneficiary,
+        proposed.scope,
+        proposed.deadline,
+        CommitmentRevisionOperation.RELEASE,
+        CommitmentRevisionReason.SUBJECT_RELEASE,
+        CommitmentLifecycle.ACTIVE,
+        ("event:release",),
+        "runtime:event-release",
+        3,
+    )
+    release_history = admitted_terminal_history(
+        proposed,
+        admission,
+        CommitmentRevisionOperation.RELEASE,
+        CommitmentRevisionReason.SUBJECT_RELEASE,
+        event_id=release_proof.event_id,
+        evidence_refs=tuple(
+            sorted((*release_proof.evidence_refs, release_proof.transition_digest))
+        ),
+    )
+    stale_admission_history = admitted_terminal_history(
+        proposed,
+        admission,
+        CommitmentRevisionOperation.RELEASE,
+        CommitmentRevisionReason.SUBJECT_RELEASE,
+        event_id="runtime:event-release",
+        evidence_refs=tuple(
+            sorted((*admission.evidence_refs, admission.admission_digest))
+        ),
+    )
+    with pytest.raises(ValueError, match="fresh subject proof"):
+        make_commitment(
+            lifecycle=CommitmentLifecycle.RELEASED,
+            subject_admission=admission,
+            revision=2,
+            revision_history=stale_admission_history,
+        )
+    with pytest.raises(ValueError, match="fresh subject proof"):
+        make_commitment(
+            lifecycle=CommitmentLifecycle.RELEASED,
+            subject_admission=admission,
+            revision=2,
+            revision_history=release_history,
+        )
     released = make_commitment(
         lifecycle=CommitmentLifecycle.RELEASED,
         subject_admission=admission,
+        subject_transition_proofs=(release_proof,),
         revision=2,
-        revision_history=admitted_terminal_history(
-            proposed,
-            admission,
-            CommitmentRevisionOperation.RELEASE,
-            CommitmentRevisionReason.SUBJECT_RELEASE,
-            event_id="runtime:event-release",
-            evidence_refs=tuple(
-                sorted((admission.admission_digest, "event:release"))
-            ),
-        ),
+        revision_history=release_history,
     )
     assert released.lifecycle is CommitmentLifecycle.RELEASED
     reactivation = CommitmentRevisionRecord(
@@ -239,7 +283,9 @@ def test_operator_proposal_is_not_subject_admission_and_release_is_not_fulfillme
         CommitmentLifecycle.RELEASED,
         event_id="runtime:event-reactivate",
         event_sequence=4,
-        evidence_refs=(admission.admission_digest,),
+        evidence_refs=tuple(
+            sorted((*admission.evidence_refs, admission.admission_digest))
+        ),
         previous_revision_digest=released.revision_history[-1].record_digest,
     )
     with pytest.raises(ValueError, match="invalid lifecycle transition"):
@@ -260,7 +306,7 @@ def test_operator_proposal_is_not_subject_admission_and_release_is_not_fulfillme
                 CommitmentRevisionOperation.FULFILL,
                 CommitmentRevisionReason.VERIFIED_OUTCOME,
                 event_id="runtime:event-fulfill",
-                evidence_refs=(admission.admission_digest,),
+                evidence_refs=("event:fulfill",),
             ),
         )
     outcome = R13Reference(R13ReferenceKind.EVENT, "event:verified")
@@ -275,12 +321,71 @@ def test_operator_proposal_is_not_subject_admission_and_release_is_not_fulfillme
             CommitmentRevisionOperation.FULFILL,
             CommitmentRevisionReason.VERIFIED_OUTCOME,
             event_id="runtime:event-fulfill",
-            evidence_refs=tuple(
-                sorted((admission.admission_digest, outcome.reference))
-            ),
+            evidence_refs=(outcome.reference,),
         ),
     )
     assert fulfilled.lifecycle is CommitmentLifecycle.FULFILLED
+
+
+def test_commitment_renegotiation_requires_its_own_subject_proof() -> None:
+    proposed = make_commitment()
+    admission = admission_for(proposed)
+    proof = CommitmentSubjectTransitionProof(
+        proposed.commitment_id,
+        proposed.proposal_digest,
+        proposed.beneficiary,
+        proposed.scope,
+        proposed.deadline,
+        CommitmentRevisionOperation.RENEGOTIATE,
+        CommitmentRevisionReason.SUBJECT_RENEGOTIATION,
+        CommitmentLifecycle.ACTIVE,
+        ("event:renegotiate",),
+        "runtime:event-renegotiate",
+        3,
+    )
+    history = admitted_terminal_history(
+        proposed,
+        admission,
+        CommitmentRevisionOperation.RENEGOTIATE,
+        CommitmentRevisionReason.SUBJECT_RENEGOTIATION,
+        event_id=proof.event_id,
+        evidence_refs=tuple(
+            sorted((*proof.evidence_refs, proof.transition_digest))
+        ),
+    )
+    stale_admission_history = admitted_terminal_history(
+        proposed,
+        admission,
+        CommitmentRevisionOperation.RENEGOTIATE,
+        CommitmentRevisionReason.SUBJECT_RENEGOTIATION,
+        event_id="runtime:event-renegotiate",
+        evidence_refs=tuple(
+            sorted((*admission.evidence_refs, admission.admission_digest))
+        ),
+    )
+    with pytest.raises(ValueError, match="fresh subject proof"):
+        make_commitment(
+            lifecycle=CommitmentLifecycle.RENEGOTIATED,
+            subject_admission=admission,
+            revision=2,
+            revision_history=stale_admission_history,
+        )
+    with pytest.raises(ValueError, match="fresh subject proof"):
+        make_commitment(
+            lifecycle=CommitmentLifecycle.RENEGOTIATED,
+            subject_admission=admission,
+            revision=2,
+            revision_history=history,
+        )
+    renegotiated = make_commitment(
+        lifecycle=CommitmentLifecycle.RENEGOTIATED,
+        subject_admission=admission,
+        subject_transition_proofs=(proof,),
+        revision=2,
+        revision_history=history,
+    )
+
+    assert renegotiated.lifecycle is CommitmentLifecycle.RENEGOTIATED
 
 
 def test_desire_is_only_a_reference_and_scope_bounds_are_explicit() -> None:

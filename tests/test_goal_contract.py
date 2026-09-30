@@ -20,6 +20,7 @@ from suzka.motivation.goal import (
     GoalRevisionReason,
     GoalRevisionRecord,
     GoalSubjectAdmission,
+    GoalSubjectTransitionProof,
     goal_id_for_target,
     goal_proposal_digest,
     validate_goal_reference_graph,
@@ -136,7 +137,9 @@ def admitted_terminal_history(
         goal.proposal_digest,
         event_id=admission.event_id,
         event_sequence=admission.event_sequence,
-        evidence_refs=(admission.admission_digest,),
+        evidence_refs=tuple(
+            sorted((*admission.evidence_refs, admission.admission_digest))
+        ),
         previous_revision_digest=genesis.record_digest,
     )
     final = GoalRevisionRecord(
@@ -192,7 +195,9 @@ def test_external_proposal_is_not_adoption_and_admission_is_exact() -> None:
             GoalRevisionReason.SUBJECT_ADMISSION,
             event_id=admission.event_id,
             event_sequence=admission.event_sequence,
-            evidence_refs=(admission.admission_digest,),
+            evidence_refs=tuple(
+                sorted((*admission.evidence_refs, admission.admission_digest))
+            ),
         ),
     )
     assert proposed.lifecycle is GoalLifecycle.PROPOSED
@@ -203,6 +208,96 @@ def test_external_proposal_is_not_adoption_and_admission_is_exact() -> None:
         make_goal(lifecycle=GoalLifecycle.PROPOSED, subject_admission=admission)
     changed_admission = replace(admission, event_sequence=3)
     assert changed_admission.digest != admission.digest
+
+
+@pytest.mark.parametrize(
+    ("operation", "reason", "next_lifecycle"),
+    [
+        (
+            GoalRevisionOperation.DEFER,
+            GoalRevisionReason.SUBJECT_DEFERRED,
+            GoalLifecycle.DEFERRED,
+        ),
+        (
+            GoalRevisionOperation.ABANDON,
+            GoalRevisionReason.SUBJECT_ABANDONED,
+            GoalLifecycle.ABANDONED,
+        ),
+    ],
+)
+def test_post_admission_goal_decisions_require_fresh_transition_proofs(
+    operation: GoalRevisionOperation,
+    reason: GoalRevisionReason,
+    next_lifecycle: GoalLifecycle,
+) -> None:
+    proposed = make_goal()
+    admission = GoalSubjectAdmission(
+        proposed.goal_id,
+        proposed.proposal_digest,
+        (EVIDENCE.reference,),
+        "event:admit-before-transition",
+        2,
+        GoalAdmissionReason.SUBJECT_ENDORSEMENT,
+    )
+    adopted = make_goal(
+        lifecycle=GoalLifecycle.ADOPTED,
+        subject_admission=admission,
+        revision=1,
+        revision_history=transition_history(
+            proposed,
+            GoalRevisionOperation.ADOPT,
+            GoalRevisionReason.SUBJECT_ADMISSION,
+            event_id=admission.event_id,
+            event_sequence=admission.event_sequence,
+            evidence_refs=tuple(
+                sorted((*admission.evidence_refs, admission.admission_digest))
+            ),
+        ),
+    )
+    stale = GoalRevisionRecord(
+        adopted.goal_id,
+        2,
+        operation,
+        reason,
+        datetime(2026, 1, 1, tzinfo=UTC),
+        GoalLifecycle.ADOPTED,
+        adopted.proposal_digest,
+        event_id="event:later-subject-decision",
+        event_sequence=3,
+        evidence_refs=(admission.admission_digest,),
+        previous_revision_digest=adopted.revision_history[-1].record_digest,
+    )
+    with pytest.raises(ValueError, match="fresh subject proof"):
+        replace(
+            adopted,
+            lifecycle=next_lifecycle,
+            revision=2,
+            revision_history=(*adopted.revision_history, stale),
+        )
+
+    proof = GoalSubjectTransitionProof(
+        adopted.goal_id,
+        adopted.proposal_digest,
+        operation,
+        reason,
+        GoalLifecycle.ADOPTED,
+        (f"request:decision:{operation.value}",),
+        "event:later-subject-decision",
+        3,
+    )
+    revision = replace(
+        stale,
+        evidence_refs=tuple(sorted((*proof.evidence_refs, proof.transition_digest))),
+    )
+    decided = replace(
+        adopted,
+        lifecycle=next_lifecycle,
+        revision=2,
+        revision_history=(*adopted.revision_history, revision),
+        subject_transition_proofs=(proof,),
+    )
+
+    assert decided.lifecycle is next_lifecycle
 
 
 def test_creation_and_adoption_may_share_their_exact_event_witness() -> None:
@@ -237,7 +332,9 @@ def test_creation_and_adoption_may_share_their_exact_event_witness() -> None:
         proposed.proposal_digest,
         event_id=admission.event_id,
         event_sequence=admission.event_sequence,
-        evidence_refs=(admission.admission_digest,),
+        evidence_refs=tuple(
+            sorted((*admission.evidence_refs, admission.admission_digest))
+        ),
         previous_revision_digest=genesis.record_digest,
     )
 
@@ -251,7 +348,7 @@ def test_creation_and_adoption_may_share_their_exact_event_witness() -> None:
     assert adopted.lifecycle is GoalLifecycle.ADOPTED
 
 
-def test_deferred_goal_cannot_reuse_stale_admission_to_reactivate() -> None:
+def test_deferred_goal_requires_fresh_event_bound_proof_to_reactivate() -> None:
     proposed = make_goal()
     admission = GoalSubjectAdmission(
         proposed.goal_id,
@@ -271,7 +368,9 @@ def test_deferred_goal_cannot_reuse_stale_admission_to_reactivate() -> None:
             GoalRevisionReason.SUBJECT_DEFERRED,
             event_id=admission.event_id,
             event_sequence=admission.event_sequence,
-            evidence_refs=(admission.admission_digest,),
+            evidence_refs=tuple(
+                sorted((*admission.evidence_refs, admission.admission_digest))
+            ),
         ),
     )
     reactivation = GoalRevisionRecord(
@@ -288,12 +387,45 @@ def test_deferred_goal_cannot_reuse_stale_admission_to_reactivate() -> None:
         previous_revision_digest=deferred.revision_history[-1].record_digest,
     )
 
-    with pytest.raises(ValueError, match="invalid lifecycle transition"):
+    with pytest.raises(ValueError, match="fresh subject proof"):
         replace(
             deferred,
             lifecycle=GoalLifecycle.ADOPTED,
             revision=2,
             revision_history=(*deferred.revision_history, reactivation),
+        )
+
+    proof = GoalSubjectTransitionProof(
+        deferred.goal_id,
+        deferred.proposal_digest,
+        GoalRevisionOperation.ADOPT,
+        GoalRevisionReason.SUBJECT_ADMISSION,
+        GoalLifecycle.DEFERRED,
+        ("request:re-adopt",),
+        "event:reactivate",
+        3,
+    )
+    reactivation = replace(
+        reactivation,
+        evidence_refs=tuple(sorted((*proof.evidence_refs, proof.transition_digest))),
+    )
+    reactivated = replace(
+        deferred,
+        lifecycle=GoalLifecycle.ADOPTED,
+        revision=2,
+        revision_history=(*deferred.revision_history, reactivation),
+        subject_transition_proofs=(proof,),
+    )
+    assert reactivated.lifecycle is GoalLifecycle.ADOPTED
+
+    mismatched_proof = replace(proof, event_sequence=4)
+    with pytest.raises(ValueError, match="fresh subject proof"):
+        replace(
+            deferred,
+            lifecycle=GoalLifecycle.ADOPTED,
+            revision=2,
+            revision_history=(*deferred.revision_history, reactivation),
+            subject_transition_proofs=(mismatched_proof,),
         )
 
 
@@ -320,10 +452,30 @@ def test_goal_compaction_anchor_recomputes_its_anchored_revision_digest() -> Non
         evidence_refs=(EVIDENCE.reference,),
     )
     revisions = [genesis]
+    transition_proofs = []
     previous = genesis.record_digest
     for number in range(1, 9):
         event_id = admission.event_id if number == 1 else f"event:defer:{number}"
         event_sequence = admission.event_sequence if number == 1 else number + 1
+        if number == 1:
+            decision_evidence = tuple(
+                sorted((*admission.evidence_refs, admission.admission_digest))
+            )
+        else:
+            proof = GoalSubjectTransitionProof(
+                proposed.goal_id,
+                proposed.proposal_digest,
+                GoalRevisionOperation.DEFER,
+                GoalRevisionReason.SUBJECT_DEFERRED,
+                GoalLifecycle.DEFERRED,
+                (f"request:defer:{number}",),
+                event_id,
+                event_sequence,
+            )
+            transition_proofs.append(proof)
+            decision_evidence = tuple(
+                sorted((*proof.evidence_refs, proof.transition_digest))
+            )
         revision = GoalRevisionRecord(
             proposed.goal_id,
             number,
@@ -336,7 +488,7 @@ def test_goal_compaction_anchor_recomputes_its_anchored_revision_digest() -> Non
             proposed.proposal_digest,
             event_id=event_id,
             event_sequence=event_sequence,
-            evidence_refs=(admission.admission_digest,),
+            evidence_refs=decision_evidence,
             previous_revision_digest=previous,
         )
         revisions.append(revision)
@@ -362,6 +514,9 @@ def test_goal_compaction_anchor_recomputes_its_anchored_revision_digest() -> Non
         revision=8,
         revision_history=tuple(revisions[1:]),
         history_anchor=anchor,
+        subject_transition_proofs=tuple(
+            sorted(transition_proofs, key=lambda proof: proof.transition_digest)
+        ),
     )
 
     assert deferred.lifecycle is GoalLifecycle.DEFERRED
@@ -430,7 +585,7 @@ def test_compacted_goal_anchor_must_retain_its_initial_admission_proof() -> None
         through_proposal_digest=proposed.proposal_digest,
     )
 
-    with pytest.raises(ValueError, match="lacks its subject admission witness"):
+    with pytest.raises(ValueError, match="exact subject admission"):
         make_goal(
             lifecycle=GoalLifecycle.DEFERRED,
             subject_admission=admission,
@@ -438,6 +593,117 @@ def test_compacted_goal_anchor_must_retain_its_initial_admission_proof() -> None
             revision_history=tuple(retained),
             history_anchor=anchor,
         )
+
+
+def test_compacted_post_admission_goal_transition_retains_fresh_proof() -> None:
+    proposed = make_goal()
+    admission = GoalSubjectAdmission(
+        proposed.goal_id,
+        proposed.proposal_digest,
+        (EVIDENCE.reference,),
+        "event:initial-defer",
+        2,
+        GoalAdmissionReason.SUBJECT_REVIEW,
+    )
+    genesis = proposed.revision_history[0]
+    initial_defer = GoalRevisionRecord(
+        proposed.goal_id,
+        1,
+        GoalRevisionOperation.DEFER,
+        GoalRevisionReason.SUBJECT_DEFERRED,
+        datetime(2026, 1, 1, tzinfo=UTC),
+        GoalLifecycle.PROPOSED,
+        proposed.proposal_digest,
+        event_id=admission.event_id,
+        event_sequence=admission.event_sequence,
+        evidence_refs=tuple(
+            sorted((*admission.evidence_refs, admission.admission_digest))
+        ),
+        previous_revision_digest=genesis.record_digest,
+    )
+    anchor_proof = GoalSubjectTransitionProof(
+        proposed.goal_id,
+        proposed.proposal_digest,
+        GoalRevisionOperation.DEFER,
+        GoalRevisionReason.SUBJECT_DEFERRED,
+        GoalLifecycle.DEFERRED,
+        ("request:defer:2",),
+        "event:defer:2",
+        3,
+    )
+    anchor_revision = GoalRevisionRecord(
+        proposed.goal_id,
+        2,
+        GoalRevisionOperation.DEFER,
+        GoalRevisionReason.SUBJECT_DEFERRED,
+        datetime(2026, 1, 1, tzinfo=UTC),
+        GoalLifecycle.DEFERRED,
+        proposed.proposal_digest,
+        event_id=anchor_proof.event_id,
+        event_sequence=anchor_proof.event_sequence,
+        evidence_refs=tuple(
+            sorted((*anchor_proof.evidence_refs, anchor_proof.transition_digest))
+        ),
+        previous_revision_digest=initial_defer.record_digest,
+    )
+    proofs = [anchor_proof]
+    retained = []
+    previous_digest = anchor_revision.record_digest
+    for number in range(3, 11):
+        proof = GoalSubjectTransitionProof(
+            proposed.goal_id,
+            proposed.proposal_digest,
+            GoalRevisionOperation.DEFER,
+            GoalRevisionReason.SUBJECT_DEFERRED,
+            GoalLifecycle.DEFERRED,
+            (f"request:defer:{number}",),
+            f"event:defer:{number}",
+            number + 1,
+        )
+        revision = GoalRevisionRecord(
+            proposed.goal_id,
+            number,
+            GoalRevisionOperation.DEFER,
+            GoalRevisionReason.SUBJECT_DEFERRED,
+            datetime(2026, 1, 1, tzinfo=UTC),
+            GoalLifecycle.DEFERRED,
+            proposed.proposal_digest,
+            event_id=proof.event_id,
+            event_sequence=proof.event_sequence,
+            evidence_refs=tuple(sorted((*proof.evidence_refs, proof.transition_digest))),
+            previous_revision_digest=previous_digest,
+        )
+        retained.append(revision)
+        proofs.append(proof)
+        previous_digest = revision.record_digest
+
+    anchor = RevisionCompactionAnchor(
+        authority_id=proposed.goal_id,
+        through_revision=2,
+        through_digest=anchor_revision.record_digest,
+        through_created_at=anchor_revision.created_at,
+        through_evidence_refs=anchor_revision.evidence_refs,
+        through_previous_revision_digest=initial_defer.record_digest,
+        through_state=GoalLifecycle.DEFERRED.value,
+        through_previous_state=GoalLifecycle.DEFERRED.value,
+        through_operation=GoalRevisionOperation.DEFER.value,
+        through_reason=GoalRevisionReason.SUBJECT_DEFERRED.value,
+        through_event_id=anchor_revision.event_id,
+        through_event_sequence=anchor_revision.event_sequence,
+        through_proposal_digest=proposed.proposal_digest,
+    )
+    compacted = make_goal(
+        lifecycle=GoalLifecycle.DEFERRED,
+        subject_admission=admission,
+        subject_transition_proofs=tuple(
+            sorted(proofs, key=lambda proof: proof.transition_digest)
+        ),
+        revision=10,
+        revision_history=tuple(retained),
+        history_anchor=anchor,
+    )
+
+    assert compacted.lifecycle is GoalLifecycle.DEFERRED
 
 
 def test_subject_abandonment_is_not_verified_failure() -> None:
@@ -460,7 +726,9 @@ def test_subject_abandonment_is_not_verified_failure() -> None:
             GoalRevisionReason.SUBJECT_ABANDONED,
             event_id=admission.event_id,
             event_sequence=admission.event_sequence,
-            evidence_refs=tuple(sorted((admission.admission_digest, "event:abandon"))),
+            evidence_refs=tuple(
+                sorted((*admission.evidence_refs, admission.admission_digest))
+            ),
         ),
     )
     assert not abandoned.outcome_evidence_refs
@@ -496,7 +764,7 @@ def test_subject_abandonment_is_not_verified_failure() -> None:
                 GoalRevisionReason.VERIFIED_OUTCOME,
                 event_id="runtime:event-fail",
                 event_sequence=3,
-                evidence_refs=(admission.admission_digest,),
+                evidence_refs=("event:outcome-missing",),
             ),
         )
     outcome = R13Reference(R13ReferenceKind.EVENT, "event:verified")
@@ -512,9 +780,7 @@ def test_subject_abandonment_is_not_verified_failure() -> None:
             GoalRevisionReason.VERIFIED_OUTCOME,
             event_id="runtime:event-fail",
             event_sequence=3,
-            evidence_refs=tuple(
-                sorted((admission.admission_digest, outcome.reference))
-            ),
+            evidence_refs=(outcome.reference,),
         ),
     )
     assert failed.lifecycle is GoalLifecycle.FAILED

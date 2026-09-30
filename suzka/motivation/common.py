@@ -17,6 +17,7 @@ import re
 from typing import Callable, Final, TypeVar
 
 from suzka.identifiers import validate_identifier
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE, MAX_PERSISTED_REVISION
 
 
 class _ClosedStrEnum(str, Enum):
@@ -48,8 +49,8 @@ class R13ReferenceKind(_ClosedStrEnum):
 
 
 R13_SCHEMA_VERSION: Final = 1
-R13_MAX_EVENT_SEQUENCE: Final = 2**63 - 1
-R13_MAX_REVISION: Final = 2**31 - 1
+R13_MAX_EVENT_SEQUENCE: Final = MAX_PERSISTED_EVENT_SEQUENCE
+R13_MAX_REVISION: Final = MAX_PERSISTED_REVISION
 R13_MAX_IDENTIFIER_CODEPOINTS: Final = 128
 R13_MAX_TEXT_CODEPOINTS: Final = 1_024
 R13_MAX_SHORT_TEXT_CODEPOINTS: Final = 256
@@ -65,8 +66,9 @@ R13_MAX_RECORDS_PER_DOMAIN: Final = 32
 R13_MAX_CANDIDATES_PER_DOMAIN: Final = 32
 
 R13_AGENT_STATE_CAP_BYTES: Final = 128 * 1024 * 1024
-# Frozen R12 sizing evidence used only by U1's feasibility calculation.  U5
-# still owns the final complete-v7 proof and may derive this from its schema.
+# Frozen R12 Belief sizing evidence retained for domain-level budget reporting.
+# U1 feasibility also projects the integrated AgentState v7 schema into the
+# future R13 v8 root and reserves the requested R14+ capacity.
 R12_BELIEF_SCHEMA_MAX_BYTES: Final = 47_541_622
 
 R13_REFERENCE_DOMAIN: Final = b"PROJECT-SUZKA:R13:REFERENCE:V1\0"

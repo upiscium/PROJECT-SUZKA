@@ -2,9 +2,9 @@
 
 The bounds here are contract inputs, not runtime capacity authority.  They
 construct worst-case canonical JSON shapes from every declared field bound and
-derive exact byte maxima.  U5 must carry these bounds into AgentState v7 and
-prove the complete snapshot, but U1 must leave a feasible path under the
-existing 128 MiB whole-state cap.
+derive exact byte maxima.  R13's future AgentState v8 projection is checked
+against the integrated v7 schema, its exact root envelope, and the reserved
+R14+ capacity under the existing 128 MiB whole-state cap.
 """
 
 from __future__ import annotations
@@ -34,6 +34,8 @@ from suzka.motivation.common import (
     R13_MAX_SCOPE_CODEPOINTS,
     R13_MAX_SCOPE_ITEMS,
     R13_MAX_TEXT_CODEPOINTS,
+    Deadline,
+    R13Reference,
     R13ReferenceKind,
     R13_SCHEMA_VERSION,
     canonical_json,
@@ -47,6 +49,8 @@ from suzka.motivation.commitment import (
     CommitmentRevisionOperation,
     CommitmentRevisionReason,
     CommitmentRevisionRecord,
+    CommitmentSubjectTransitionProof,
+    commitment_id_for_proposal,
 )
 from suzka.motivation.goal import (
     GOAL_EVIDENCE_KINDS,
@@ -57,6 +61,7 @@ from suzka.motivation.goal import (
     GoalRevisionOperation,
     GoalRevisionReason,
     GoalRevisionRecord,
+    GoalSubjectTransitionProof,
 )
 from suzka.motivation.motivation import (
     MOTIVATION_RELATED_KINDS,
@@ -69,6 +74,28 @@ from suzka.motivation.motivation import (
     MotivationRevisionReason,
     MotivationRevisionRecord,
 )
+
+# Frozen capacity inputs copied from the integrated #277 AgentState v7 public
+# budget.  Tests cross-check these values and the exact outer-envelope formula
+# against AgentState's schema projector; the pure R13 package must not import
+# ``suzka.runtime`` just to read its persisted-state size constants.
+R13_AGENT_STATE_V7_BASE_MAX_BYTES: Final[int] = 85_826_260
+R13_AGENT_STATE_FUTURE_RESERVE_BYTES: Final[int] = 16 * 1024 * 1024
+
+
+def _project_agent_state_v8_without_reserve(r13_aggregate_bytes: int) -> int:
+    """Project R13's top-level field over the complete integrated v7 base."""
+
+    if type(r13_aggregate_bytes) is not int or r13_aggregate_bytes <= 0:
+        raise ValueError("R13 aggregate maximum must be a positive byte count")
+    schema_version_delta = len(canonical_json(8)) - len(canonical_json(7))
+    added_root_field_overhead = len(canonical_json("motivation_state")) + 2
+    return (
+        R13_AGENT_STATE_V7_BASE_MAX_BYTES
+        + schema_version_delta
+        + added_root_field_overhead
+        + r13_aggregate_bytes
+    )
 
 
 R13_MAX_HISTORY = R13_MAX_REVISION_HISTORY
@@ -294,6 +321,57 @@ def _max_scope_items() -> list[str]:
     ]
 
 
+def _max_goal_subject_transition_proof_shape() -> dict[str, object]:
+    candidates = []
+    for operation, reason, previous_state in (
+        ("adopt", "subject_admission", "deferred"),
+        ("defer", "subject_deferred", "adopted"),
+        ("defer", "subject_deferred", "deferred"),
+        ("abandon", "subject_abandoned", "adopted"),
+        ("abandon", "subject_abandoned", "deferred"),
+    ):
+        proof = GoalSubjectTransitionProof(
+            goal_id=_max_digest(),
+            proposal_digest=_max_digest(),
+            operation=GoalRevisionOperation(operation),
+            reason=GoalRevisionReason(reason),
+            previous_lifecycle_state=GoalLifecycle(previous_state),
+            evidence_refs=tuple(_max_ids(R13_MAX_EVIDENCE_REFS)),
+            event_id="e" * R13_MAX_REF,
+            event_sequence=R13_MAX_EVENT_SEQUENCE,
+        )
+        candidates.append(proof.canonical_value())
+    return max(candidates, key=lambda value: len(canonical_json(value)))
+
+
+def _max_commitment_subject_transition_proof_shape() -> dict[str, object]:
+    beneficiary = R13Reference(
+        R13ReferenceKind.EXTERNAL_PARTY,
+        "r" * (R13_MAX_REF - 2) + "00",
+    )
+    candidates = []
+    proposal_digest = _max_digest()
+    for operation, reason in (
+        ("release", "subject_release"),
+        ("renegotiate", "subject_renegotiation"),
+    ):
+        proof = CommitmentSubjectTransitionProof(
+            commitment_id=commitment_id_for_proposal(proposal_digest),
+            proposal_digest=proposal_digest,
+            beneficiary=beneficiary,
+            scope=tuple(_max_scope_items()),
+            deadline=Deadline(_R13_MAX_DATETIME_VALUE),
+            operation=CommitmentRevisionOperation(operation),
+            reason=CommitmentRevisionReason(reason),
+            previous_lifecycle_state=CommitmentLifecycle.ACTIVE,
+            evidence_refs=tuple(_max_ids(R13_MAX_EVIDENCE_REFS)),
+            event_id="e" * R13_MAX_REF,
+            event_sequence=R13_MAX_EVENT_SEQUENCE,
+        )
+        candidates.append(proof.canonical_value())
+    return max(candidates, key=lambda value: len(canonical_json(value)))
+
+
 def max_motivation_record_shape() -> dict[str, object]:
     source_kind = _longest_reference_kind(MOTIVATION_SOURCE_KINDS)
     target_kind = _longest_reference_kind(MOTIVATION_TARGET_KINDS)
@@ -375,6 +453,10 @@ def max_goal_record_shape() -> dict[str, object]:
         "revision_history": [dict(revision) for _ in range(R13_MAX_HISTORY)],
         "schema_version": R13_SCHEMA_VERSION,
         "subject_admission": _max_digest(),
+        "subject_transition_proofs": [
+            _max_goal_subject_transition_proof_shape()
+            for _ in range(R13_MAX_REVISION_HISTORY + 1)
+        ],
         "target": _max_ref(target_kind),
     }
 
@@ -423,6 +505,9 @@ def max_commitment_record_shape() -> dict[str, object]:
         "schema_version": R13_SCHEMA_VERSION,
         "scope": _max_scope_items(),
         "subject": _max_text(R13_MAX_TEXT),
+        "subject_transition_proofs": [
+            _max_commitment_subject_transition_proof_shape()
+        ],
     }
 
 
@@ -509,24 +594,44 @@ class R13SchemaSizeBudget:
     motivation_candidate_section_bytes: int
     aggregate_r13_bytes: int
     agent_state_cap_bytes: int = R13_AGENT_STATE_CAP_BYTES
+    agent_state_v7_base_bytes: int = R13_AGENT_STATE_V7_BASE_MAX_BYTES
+    agent_state_future_state_reserve_bytes: int = R13_AGENT_STATE_FUTURE_RESERVE_BYTES
+    projected_agent_state_v8_bytes: int = 0
+    projected_agent_state_v8_with_reserve_bytes: int = 0
     r12_belief_schema_bytes: int = R12_BELIEF_SCHEMA_MAX_BYTES
 
     @property
-    def remaining_after_r12_and_r13_bytes(self) -> int:
+    def remaining_after_r13_bytes(self) -> int:
+        """Bytes below the hard cap before reserving R14+ capacity."""
+
+        return self.agent_state_cap_bytes - self.projected_agent_state_v8_bytes
+
+    @property
+    def remaining_after_reserve_bytes(self) -> int:
+        """Additional headroom after the requested future-state reserve."""
+
         return (
             self.agent_state_cap_bytes
-            - self.r12_belief_schema_bytes
-            - self.aggregate_r13_bytes
+            - self.projected_agent_state_v8_with_reserve_bytes
         )
 
     @property
     def has_provisional_capacity_headroom(self) -> bool:
-        return self.remaining_after_r12_and_r13_bytes > 0
+        return (
+            self.projected_agent_state_v8_with_reserve_bytes
+            <= self.agent_state_cap_bytes
+            and self.remaining_after_r13_bytes
+            >= self.agent_state_future_state_reserve_bytes
+        )
 
     def canonical_value(self) -> dict[str, int]:
         return {
             "aggregate_r13_bytes": self.aggregate_r13_bytes,
             "agent_state_cap_bytes": self.agent_state_cap_bytes,
+            "agent_state_future_state_reserve_bytes": (
+                self.agent_state_future_state_reserve_bytes
+            ),
+            "agent_state_v7_base_bytes": self.agent_state_v7_base_bytes,
             "commitment_record_bytes": self.commitment_record_bytes,
             "commitment_revision_bytes": self.commitment_revision_bytes,
             "commitment_section_bytes": self.commitment_section_bytes,
@@ -538,8 +643,13 @@ class R13SchemaSizeBudget:
             "motivation_record_bytes": self.motivation_record_bytes,
             "motivation_revision_bytes": self.motivation_revision_bytes,
             "motivation_section_bytes": self.motivation_section_bytes,
+            "projected_agent_state_v8_bytes": self.projected_agent_state_v8_bytes,
+            "projected_agent_state_v8_with_reserve_bytes": (
+                self.projected_agent_state_v8_with_reserve_bytes
+            ),
             "r12_belief_schema_bytes": self.r12_belief_schema_bytes,
-            "remaining_after_r12_and_r13_bytes": self.remaining_after_r12_and_r13_bytes,
+            "remaining_after_reserve_bytes": self.remaining_after_reserve_bytes,
+            "remaining_after_r13_bytes": self.remaining_after_r13_bytes,
         }
 
 
@@ -561,6 +671,11 @@ def derive_r13_schema_size_budget() -> R13SchemaSizeBudget:
             "schema_version": R13_SCHEMA_VERSION,
         }
     )
+    aggregate_bytes = len(aggregate)
+    projected_v8 = _project_agent_state_v8_without_reserve(aggregate_bytes)
+    projected_v8_with_reserve = (
+        projected_v8 + R13_AGENT_STATE_FUTURE_RESERVE_BYTES
+    )
     return R13SchemaSizeBudget(
         motivation_revision_bytes=_max_revision_payload_bytes(
             _first_revision_shape(motivation)
@@ -577,7 +692,9 @@ def derive_r13_schema_size_budget() -> R13SchemaSizeBudget:
         goal_section_bytes=len(canonical_json(goal_section)),
         commitment_section_bytes=len(canonical_json(commitment_section)),
         motivation_candidate_section_bytes=len(canonical_json(candidate_section)),
-        aggregate_r13_bytes=len(aggregate),
+        aggregate_r13_bytes=aggregate_bytes,
+        projected_agent_state_v8_bytes=projected_v8,
+        projected_agent_state_v8_with_reserve_bytes=projected_v8_with_reserve,
     )
 
 
@@ -616,7 +733,7 @@ def validate_r13_schema_size_budget(
         raise ValueError("R13 schema budget does not match its declared bounds")
     if not actual.has_provisional_capacity_headroom:
         raise ValueError(
-            "R13 provisional bounds leave no capacity headroom under the AgentState cap"
+            "R13 AgentState v8 projection does not preserve the R14+ reserve under the hard cap"
         )
     return actual
 
