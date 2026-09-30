@@ -9,6 +9,7 @@ import stat
 from threading import RLock
 from uuid import UUID, uuid4, uuid5
 
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE
 from suzka.runtime.agent_runtime import AgentEvent
 from suzka.runtime.agent_state import (
     AgentStateConfigurationDrift,
@@ -115,6 +116,25 @@ _PARTICIPANT_BASELINE_NAMESPACE = UUID(
 )
 
 
+def _require_sequence(value: object, field: str, *, positive: bool = False) -> int:
+    minimum = 1 if positive else 0
+    if (
+        type(value) is not int
+        or value < minimum
+        or value > MAX_PERSISTED_EVENT_SEQUENCE
+    ):
+        raise StateRecoveryError(f"{field} is outside its bound")
+    return value
+
+
+def _snapshot_sequence(snapshot: CompatibleAgentStateSnapshot, field: str) -> int:
+    try:
+        value = snapshot.last_processed_event_sequence
+    except AttributeError:
+        raise StateRecoveryError(f"{field} is unavailable") from None
+    return _require_sequence(value, field)
+
+
 class StateRecoveryCoordinator:
     """Verify and coordinate Journal, WAL, and snapshot boundaries."""
 
@@ -137,6 +157,8 @@ class StateRecoveryCoordinator:
         """Adopt a strictly larger participant registry at a clean boundary."""
 
         with self._lock:
+            _require_sequence(result.processing_high_water, "processing high-water")
+            _snapshot_sequence(result.snapshot, "recovery snapshot sequence")
             journal = self.journal.inspect()
             latest = journal.baselines[-1] if journal.baselines else None
             if latest is not None:
@@ -464,6 +486,8 @@ class StateRecoveryCoordinator:
     ) -> StateRecoveryResult:
         """Clear external reconciliation only after re-verifying all proof."""
         with self._lock:
+            _snapshot_sequence(result.snapshot, "recovery snapshot sequence")
+            _require_sequence(result.processing_high_water, "processing high-water")
             journal = self.journal.inspect()
             current = next(
                 (item for item in journal.completed_startup_reconciliations
@@ -1012,9 +1036,13 @@ class StateRecoveryCoordinator:
         candidate_snapshot: CompatibleAgentStateSnapshot,
     ) -> InternalCommitEvidence:
 
-        sequence = event.processing_sequence
-        if sequence is None:
-            raise StateRecoveryError("State transition event has no sequence")
+        sequence = _require_sequence(
+            event.processing_sequence, "event processing sequence", positive=True
+        )
+        _snapshot_sequence(prior_snapshot, "prior snapshot sequence")
+        _snapshot_sequence(
+            candidate_snapshot, "candidate snapshot sequence"
+        )
         inspection = self.wal.inspect()
         manifest = inspection.active_manifest
         if manifest is None or manifest.external_reconciliation_required:
@@ -1072,6 +1100,17 @@ class StateRecoveryCoordinator:
         event: AgentEvent,
         evidence: InternalCommitEvidence,
     ) -> None:
+        if not isinstance(evidence, InternalCommitEvidence):
+            raise StateRecoveryError("Internal commit evidence is invalid")
+        _require_sequence(
+            event.processing_sequence, "event processing sequence", positive=True
+        )
+        _require_sequence(
+            evidence.processing_sequence, "commit processing sequence", positive=True
+        )
+        _require_sequence(
+            evidence.snapshot_sequence, "commit snapshot sequence"
+        )
         self._verify_internal_commit(event, evidence)
         self.journal.append_completed(
             event,
@@ -1087,10 +1126,19 @@ class StateRecoveryCoordinator:
         event: AgentEvent,
         evidence: InternalCommitEvidence,
     ) -> None:
-        sequence = event.processing_sequence
+        if not isinstance(evidence, InternalCommitEvidence):
+            raise StateRecoveryError("Internal commit evidence is invalid")
+        sequence = _require_sequence(
+            event.processing_sequence, "event processing sequence", positive=True
+        )
+        _require_sequence(
+            evidence.processing_sequence, "commit processing sequence", positive=True
+        )
+        _require_sequence(
+            evidence.snapshot_sequence, "commit snapshot sequence"
+        )
         if (
-            sequence is None
-            or evidence.event_id != event.event_id
+            evidence.event_id != event.event_id
             or evidence.processing_sequence != sequence
             or evidence.snapshot_sequence != sequence
         ):
@@ -1163,6 +1211,8 @@ class StateRecoveryCoordinator:
 
         if result.external_reconciliation_required:
             return
+        _snapshot_sequence(result.snapshot, "boot anchor snapshot sequence")
+        _require_sequence(result.processing_high_water, "processing high-water")
         inspection = self.wal.inspect()
         journal = self.journal.inspect()
         manifest = inspection.active_manifest
@@ -1207,6 +1257,7 @@ class StateRecoveryCoordinator:
                     "StateWAL cannot bootstrap inconsistent current state"
                 ) from None
             snapshot = self.state_store.load()
+        _snapshot_sequence(snapshot, "bootstrap snapshot sequence")
         snapshot_hash = self.state_store.snapshot_hash(snapshot)
         if journal.records:
             recovery = self.journal.apply_planned_reconciliation(
@@ -1220,6 +1271,7 @@ class StateRecoveryCoordinator:
             if recovery is not None
             else snapshot.last_processed_event_sequence
         )
+        _require_sequence(high_water, "bootstrap processing high-water")
         manifest = self.wal.bootstrap(snapshot, high_water)
         inspection = self.wal.inspect()
         assert inspection.baseline_record_id is not None
@@ -1266,6 +1318,8 @@ class StateRecoveryCoordinator:
             assert isinstance(baseline, BaselineRecord)
             high_water = baseline.journal_processing_high_water
             post = journal
+        _snapshot_sequence(snapshot, "migration snapshot sequence")
+        _require_sequence(high_water, "migration processing high-water")
         manifest = wal.active_manifest
         if (
             manifest is None
@@ -1305,6 +1359,8 @@ class StateRecoveryCoordinator:
         generation_id: UUID | None = None,
         invalid_current: bool = False,
     ) -> StateRecoveryResult:
+        _snapshot_sequence(target, "recovery target sequence")
+        _require_sequence(journal.processing_high_water, "processing high-water")
         self._ensure_participant_baseline_covers_recovery(
             journal, target, category
         )
@@ -1404,6 +1460,12 @@ class StateRecoveryCoordinator:
         if len(journal.open_recoveries) != 1:
             raise StateRecoveryError("Journal recovery lifecycle is ambiguous")
         pending = journal.open_recoveries[0]
+        _require_sequence(
+            pending.processing_high_water, "pending recovery processing high-water"
+        )
+        _require_sequence(
+            pending.snapshot_sequence, "pending recovery snapshot sequence"
+        )
         try:
             target = self.wal.reconstruct(
                 sequence=pending.snapshot_sequence,
@@ -1476,6 +1538,12 @@ class StateRecoveryCoordinator:
         if len(journal.open_recoveries) != 1:
             raise StateRecoveryError("Journal recovery lifecycle is ambiguous")
         pending = journal.open_recoveries[0]
+        _require_sequence(
+            pending.processing_high_water, "pending recovery processing high-water"
+        )
+        _require_sequence(
+            pending.snapshot_sequence, "pending recovery snapshot sequence"
+        )
         self._ensure_participant_baseline_covers_recovery(
             journal, target, pending.category
         )
@@ -1626,6 +1694,8 @@ class StateRecoveryCoordinator:
     def _finish_event_reconciliation(
         self, result: StateRecoveryResult
     ) -> StateRecoveryResult:
+        _snapshot_sequence(result.snapshot, "recovery snapshot sequence")
+        _require_sequence(result.processing_high_water, "processing high-water")
         recovery = self.journal.apply_planned_reconciliation(
             result.snapshot.last_processed_event_sequence,
             result.snapshot_hash,
@@ -1642,6 +1712,8 @@ class StateRecoveryCoordinator:
         exact: bool = False,
         rollback: bool = False,
     ) -> StateRecoveryResult:
+        _snapshot_sequence(snapshot, "recovery snapshot sequence")
+        _require_sequence(high_water, "processing high-water")
         inspection = self.wal.inspect()
         manifest = inspection.active_manifest
         if manifest is None:

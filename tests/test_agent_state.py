@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import traceback
 from typing import cast
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -54,6 +55,7 @@ from suzka.runtime import (
     AgentStateSnapshotV4,
     AgentStateSnapshotV5,
     AgentStateSnapshotV6,
+    AgentStateSnapshotV7,
     AppraisalStateSnapshot,
     AgentStateStore,
     CalibrationEntrySnapshot,
@@ -69,11 +71,14 @@ from suzka.runtime import (
     WorkingMemoryRetentionReason,
     WorkingMemorySourceKind,
     working_memory_item_id,
-    ValueSystemStateSnapshot,
+    ValueSystemStateSnapshotV7,
     BeliefSystemStateSnapshot,
 )
 import suzka.runtime.agent_state as agent_state_module
 from suzka.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
+from suzka.runtime.event_journal import EventJournal
+from suzka.runtime.state_recovery import StateRecoveryCoordinator
+from suzka.runtime.state_wal import StateWAL
 
 
 NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
@@ -139,6 +144,12 @@ class BeliefLoopStub(LoopStub):
 
     def restore_belief_state(self, snapshot) -> None:
         self.belief_system = BeliefSystem.restore_snapshot(snapshot)
+
+
+class ValueBeliefLoopStub(BeliefLoopStub):
+    def __init__(self, value_system: ValueSystem, belief_system: BeliefSystem) -> None:
+        super().__init__(belief_system)
+        self.value_system = value_system
 
 
 class PortOnlyBeliefLoopStub(LoopStub):
@@ -470,7 +481,7 @@ def test_v5_round_trip_preserves_complete_value_authority_without_replay(
     assert target.value_system.history(seed.value_id).history_anchor_revision == 1
 
 
-def test_v6_round_trip_preserves_intrinsic_belief_authority_without_replay(
+def test_v7_round_trip_preserves_intrinsic_belief_authority_without_replay(
     tmp_path: Path,
 ) -> None:
     source_system = belief_system_with_proposal()
@@ -478,13 +489,13 @@ def test_v6_round_trip_preserves_intrinsic_belief_authority_without_replay(
     source = BeliefLoopStub(source_system)
 
     snapshot = store.capture(source, sequence=4)
-    assert isinstance(snapshot, AgentStateSnapshotV6)
+    assert isinstance(snapshot, AgentStateSnapshotV7)
     assert len(snapshot.belief_state.records) == 1
     store.save(snapshot)
 
     target = BeliefLoopStub(BeliefSystem())
     loaded = store.load()
-    assert isinstance(loaded, AgentStateSnapshotV6)
+    assert isinstance(loaded, AgentStateSnapshotV7)
     store.restore_into(target, loaded)
 
     assert target.belief_system.snapshot() == source_system.snapshot()
@@ -493,7 +504,7 @@ def test_v6_round_trip_preserves_intrinsic_belief_authority_without_replay(
     )
 
 
-def test_v6_round_trip_preserves_compacted_belief_history_without_replay(
+def test_v7_round_trip_preserves_compacted_belief_history_without_replay(
     tmp_path: Path,
 ) -> None:
     source_system = belief_system_with_compacted_history()
@@ -501,7 +512,7 @@ def test_v6_round_trip_preserves_compacted_belief_history_without_replay(
     source = BeliefLoopStub(source_system)
 
     snapshot = store.capture(source, sequence=41)
-    assert isinstance(snapshot, AgentStateSnapshotV6)
+    assert isinstance(snapshot, AgentStateSnapshotV7)
     assert len(snapshot.belief_state.records[0].revision_history) == 32
     assert snapshot.belief_state.records[0].history_anchor_digest is not None
     store.save(snapshot)
@@ -514,6 +525,175 @@ def test_v6_round_trip_preserves_compacted_belief_history_without_replay(
     assert target.belief_system.records[0].history_anchor_digest == (
         source_system.records[0].history_anchor_digest
     )
+
+
+def test_legacy_v6_value_history_migrates_lazily_to_lossless_v7(
+    tmp_path: Path,
+) -> None:
+    seed = value_seed(value_id="value-v7-capacity", name="continuity")
+    source_system = value_system_with_history(seed)
+    store = make_store(tmp_path / "agent_state.json")
+
+    legacy_v5 = store.capture(ValueLoopStub(source_system), sequence=34)
+    assert isinstance(legacy_v5, AgentStateSnapshotV5)
+    legacy_v6 = AgentStateSnapshotV6(
+        saved_at=legacy_v5.saved_at,
+        last_processed_event_sequence=legacy_v5.last_processed_event_sequence,
+        emotion_state=legacy_v5.emotion_state,
+        working_memory=legacy_v5.working_memory,
+        context_state=legacy_v5.context_state,
+        appraisal_state=legacy_v5.appraisal_state,
+        value_state=legacy_v5.value_state,
+        belief_state=agent_state_module._belief_state_snapshot(
+            BeliefSystem().snapshot()
+        ),
+    )
+    store.save(legacy_v6)
+    legacy_bytes = store.path.read_bytes()
+
+    loaded_v6 = store.load()
+    assert isinstance(loaded_v6, AgentStateSnapshotV6)
+    assert store.path.read_bytes() == legacy_bytes
+
+    restored = ValueBeliefLoopStub(ValueSystem(), BeliefSystem())
+    store.restore_into(restored, loaded_v6)
+    assert restored.value_system.snapshot() == source_system.snapshot()
+    assert len(
+        restored.value_system.history(seed.value_id).records
+    ) == ValueSystem.MAX_REVISION_RECORDS
+
+    candidate = store.capture(restored, sequence=35)
+    assert isinstance(candidate, AgentStateSnapshotV7)
+    assert len(candidate.value_state.histories[0].records) == (
+        ValueSystem.MAX_REVISION_RECORDS
+    )
+    assert candidate.value_state.histories[0].history_anchor_revision == (
+        source_system.history(seed.value_id).history_anchor_revision
+    )
+    assert len(store.canonical_bytes(candidate)) < len(
+        store.canonical_bytes(legacy_v6)
+    )
+    first_history = candidate.value_state.histories[0]
+    first_record = first_history.records[0]
+    delta = first_record.after_state_delta
+    tampered_delta = delta.model_copy(
+        update={"strength": 0.0 if delta.strength else 1.0}
+    )
+    tampered_record = first_record.model_copy(
+        update={"after_state_delta": tampered_delta}
+    )
+    tampered_history = first_history.model_copy(
+        update={
+            "records": (tampered_record, *first_history.records[1:]),
+        }
+    )
+    tampered_value_state = candidate.value_state.model_copy(
+        update={"histories": (tampered_history, *candidate.value_state.histories[1:])}
+    )
+    tampered_candidate = candidate.model_copy(
+        update={"value_state": tampered_value_state}
+    )
+    with pytest.raises(AgentStateLoadError, match="ValueSystem snapshot is invalid"):
+        store.canonical_bytes(tampered_candidate)
+
+    store.save(candidate)
+    loaded_v7 = store.load()
+    assert isinstance(loaded_v7, AgentStateSnapshotV7)
+    assert loaded_v7.value_state.schema_version == 2
+    assert len(loaded_v7.value_state.histories[0].records) == (
+        ValueSystem.MAX_REVISION_RECORDS
+    )
+    restored_v7 = ValueBeliefLoopStub(ValueSystem(), BeliefSystem())
+    store.restore_into(restored_v7, loaded_v7)
+    assert restored_v7.value_system.snapshot() == source_system.snapshot()
+
+    wal = StateWAL(tmp_path / "state_wal")
+    wal.bootstrap(legacy_v6, 34)
+    wal.append_transition(
+        event_id=uuid4(),
+        event_type="state.transition",
+        event_source="test",
+        processing_sequence=35,
+        prior_snapshot=legacy_v6,
+        candidate_snapshot=loaded_v7,
+    )
+    assert wal.reconstruct(sequence=34) == legacy_v6
+    assert wal.reconstruct(sequence=35) == loaded_v7
+
+
+def test_authoritative_normal_commit_migrates_v6_to_v7_without_losing_value_history(
+    tmp_path: Path,
+) -> None:
+    seed = value_seed(value_id="value-v6-normal-commit", name="continuity")
+    source_system = value_system_with_history(seed)
+    store = AgentStateStore(
+        tmp_path / "agent_state.json",
+        baseline_surprisal=1.0,
+        value_seeds=(seed,),
+        clock=lambda: NOW,
+    )
+    legacy_v5 = store.capture(ValueLoopStub(source_system), sequence=34)
+    assert isinstance(legacy_v5, AgentStateSnapshotV5)
+    legacy_v6 = AgentStateSnapshotV6(
+        saved_at=legacy_v5.saved_at,
+        last_processed_event_sequence=legacy_v5.last_processed_event_sequence,
+        emotion_state=legacy_v5.emotion_state,
+        working_memory=legacy_v5.working_memory,
+        context_state=legacy_v5.context_state,
+        appraisal_state=legacy_v5.appraisal_state,
+        value_state=legacy_v5.value_state,
+        belief_state=agent_state_module._belief_state_snapshot(
+            BeliefSystem().snapshot()
+        ),
+    )
+    store.save(legacy_v6)
+    legacy_bytes = store.path.read_bytes()
+    journal = EventJournal(
+        tmp_path / "event_journal.jsonl", 100_000, 4, clock=lambda: NOW
+    )
+    wal = StateWAL(tmp_path / "state_wal")
+    recovery = StateRecoveryCoordinator(store, journal, wal)
+
+    try:
+        startup = recovery.prepare_startup()
+        assert startup.snapshot == legacy_v6
+        assert store.path.read_bytes() == legacy_bytes
+
+        restored = ValueBeliefLoopStub(ValueSystem(), BeliefSystem())
+        store.restore_into(restored, startup.snapshot)
+        item = AgentEvent(
+            str(uuid4()),
+            AgentEventType.CHAT,
+            AgentEventSource.API_CHAT,
+            NOW,
+            35,
+        )
+        journal.append_accepted(item)
+        journal.append_started(item)
+        candidate = store.capture(restored, sequence=35)
+        assert isinstance(candidate, AgentStateSnapshotV7)
+        assert len(candidate.value_state.histories[0].records) == (
+            ValueSystem.MAX_REVISION_RECORDS
+        )
+
+        evidence = recovery.commit_internal_candidate(
+            item, startup.snapshot, candidate
+        )
+        recovery.complete_committed_event(item, evidence)
+
+        committed = store.load()
+        assert isinstance(committed, AgentStateSnapshotV7)
+        assert committed.value_state.histories[0].records == (
+            candidate.value_state.histories[0].records
+        )
+        assert store.path.read_bytes() != legacy_bytes
+        restored_after_commit = ValueBeliefLoopStub(ValueSystem(), BeliefSystem())
+        store.restore_into(restored_after_commit, committed)
+        assert restored_after_commit.value_system.snapshot() == source_system.snapshot()
+        assert wal.reconstruct(sequence=34) == legacy_v6
+        assert wal.reconstruct(sequence=35) == committed
+    finally:
+        journal.close()
 
 
 def test_belief_and_agent_state_byte_bounds_are_deterministic(
@@ -1433,9 +1613,9 @@ def test_missing_snapshot_returns_safe_configured_default(tmp_path: Path) -> Non
         arousal=0.0,
         optimal_loss=2.5,
     )
-    assert isinstance(snapshot, AgentStateSnapshotV6)
-    assert snapshot.schema_version == 6
-    assert snapshot.value_state == ValueSystemStateSnapshot(
+    assert isinstance(snapshot, AgentStateSnapshotV7)
+    assert snapshot.schema_version == 7
+    assert snapshot.value_state == ValueSystemStateSnapshotV7(
         values=(), conflicts=(), histories=(), evidence_ledgers=()
     )
     assert snapshot.belief_state.records == ()
@@ -1477,7 +1657,7 @@ def test_v0_migrates_strictly_to_v4(tmp_path: Path) -> None:
 
     migrated = make_store(path).load()
 
-    assert migrated == AgentStateSnapshotV6(
+    assert migrated == AgentStateSnapshotV7(
         saved_at=NOW,
         last_processed_event_sequence=7,
         emotion_state=EmotionStateSnapshot(
@@ -1495,7 +1675,7 @@ def test_v0_migrates_strictly_to_v4(tmp_path: Path) -> None:
         appraisal_state=AppraisalStateSnapshot(
             calibration_entries=(), last_emotion_update_at=None
         ),
-            value_state=ValueSystemStateSnapshot(
+            value_state=ValueSystemStateSnapshotV7(
                 values=(), conflicts=(), histories=(), evidence_ledgers=()
             ),
             belief_state=BeliefSystemStateSnapshot(
@@ -1970,7 +2150,7 @@ def test_ensure_published_stabilizes_bootstrap_and_v0_snapshot(tmp_path: Path) -
     migrated = legacy_store.load()
     legacy_store.ensure_published(migrated)
     assert legacy_path.read_bytes() == legacy_store.canonical_bytes(migrated)
-    assert json.loads(legacy_path.read_text(encoding="utf-8"))["schema_version"] == 6
+    assert json.loads(legacy_path.read_text(encoding="utf-8"))["schema_version"] == 7
 
 
 def test_ensure_published_does_not_rewrite_identical_canonical_snapshot(

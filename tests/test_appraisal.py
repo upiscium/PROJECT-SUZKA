@@ -11,6 +11,7 @@ from suzka.cognition import (
     LossInvalidReason,
     LossMeasurement,
 )
+from suzka.runtime.agent_state import AppraisalStateSnapshot, CalibrationEntrySnapshot
 
 
 MODEL_KEY = "model." + "a" * 64
@@ -175,3 +176,24 @@ def test_same_novelty_with_explicit_goal_and_threat_evidence_differs() -> None:
         AppraisalReasonCode.GOAL_PROGRESS,
         AppraisalReasonCode.THREAT,
     )
+
+
+def test_appraisal_calibration_entry_capacity_is_64_and_atomic() -> None:
+    def entry(index: int) -> CalibrationEntrySnapshot:
+        return CalibrationEntrySnapshot(
+            model_key=f"model.{index:064x}", count=0, mean=0.0, m2=0.0
+        )
+
+    maximum = tuple(entry(index) for index in range(64))
+    state = AppraisalStateSnapshot(
+        calibration_entries=maximum, last_emotion_update_at=None
+    )
+
+    assert len(state.calibration_entries) == 64
+
+    with pytest.raises(ValueError, match="bounded"):
+        AppraisalStateSnapshot(
+            calibration_entries=(*maximum, entry(64)), last_emotion_update_at=None
+        )
+
+    assert len(state.calibration_entries) == 64

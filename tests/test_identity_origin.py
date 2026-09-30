@@ -2,12 +2,14 @@ import pytest
 
 from suzka.identity.origin import (
     IdentityOrigin,
+    ORIGIN_MAX_EVENT_SEQUENCE,
     OriginActor,
     OriginInputKind,
     ValueAdmissionStatus,
     recompute_origin_id,
     validate_origin_id,
 )
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE
 
 
 def test_closed_enum_values() -> None:
@@ -117,3 +119,26 @@ def test_malformed_optional_fields_are_rejected(kwargs: dict[str, object]) -> No
     base.update(kwargs)
     with pytest.raises((TypeError, ValueError)):
         IdentityOrigin(**base)
+
+
+def test_origin_event_sequence_uses_the_shared_finite_bound() -> None:
+    assert ORIGIN_MAX_EVENT_SEQUENCE == MAX_PERSISTED_EVENT_SEQUENCE
+    assert IdentityOrigin.MAX_EVENT_SEQUENCE == MAX_PERSISTED_EVENT_SEQUENCE
+    accepted = IdentityOrigin(
+        OriginActor.USER,
+        OriginInputKind.REQUEST,
+        ValueAdmissionStatus.PENDING,
+        event_id="event-max",
+        event_sequence=MAX_PERSISTED_EVENT_SEQUENCE,
+    )
+    assert accepted.event_sequence == MAX_PERSISTED_EVENT_SEQUENCE
+
+    for sequence in (True, 1.0, MAX_PERSISTED_EVENT_SEQUENCE + 1):
+        with pytest.raises((TypeError, ValueError)):
+            IdentityOrigin(
+                OriginActor.USER,
+                OriginInputKind.REQUEST,
+                ValueAdmissionStatus.PENDING,
+                event_id="event-overflow",
+                event_sequence=sequence,
+            )

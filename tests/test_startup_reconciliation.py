@@ -23,6 +23,7 @@ from suzka.experience import (
     ExperienceRevisionRecord,
     experience_record_digest,
 )
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE
 from suzka.memory import DualMemorySystem, MemoryRecordType
 from suzka.memory.episodic_participant import (
     EpisodicWrite,
@@ -56,8 +57,11 @@ from suzka.runtime.event_journal import (
     EventJournal,
     EventJournalAppendError,
     EventJournalAppendStage,
+    EventJournalTransaction,
     EventLifecycle,
+    ParticipantCapability,
     ParticipantOutcome,
+    ParticipantRequirement,
     TransactionKind,
 )
 from suzka.runtime.startup_reconciliation import (
@@ -364,6 +368,30 @@ def test_clean_startup_establishes_one_adoption_baseline(tmp_path: Path) -> None
     assert repeated == baseline
     assert len(journal.inspect().baselines) == 1
     assert journal.path.read_bytes() == before
+
+
+def test_startup_binding_rejects_exhausted_processing_sequence() -> None:
+    transaction = EventJournalTransaction(
+        transaction_id="transaction",
+        event_id="event",
+        event_type=AgentEventType.CHAT,
+        source=AgentEventSource.API_CHAT,
+        processing_sequence=MAX_PERSISTED_EVENT_SEQUENCE + 1,
+        kind=TransactionKind.EVENT_MUTATION,
+        required_participants=(),
+        participant_outcomes=(),
+    )
+    requirement = ParticipantRequirement(
+        participant_id="test.participant",
+        operation_digest="a" * 64,
+        capabilities=(
+            ParticipantCapability.IDEMPOTENT_FINALIZE,
+            ParticipantCapability.PREPARE,
+        ),
+    )
+
+    with pytest.raises(StartupReconciliationError):
+        StartupReconciliationCoordinator._binding(transaction, requirement)
 
 
 def test_true_rollback_before_adoption_baseline_remains_gated(

@@ -12,6 +12,7 @@ from threading import RLock
 from typing import TYPE_CHECKING, Protocol
 
 from suzka.identifiers import validate_identifier
+from suzka.limits import MAX_PERSISTED_REVISION
 from suzka.runtime.context import ContextRelation
 
 if TYPE_CHECKING:
@@ -272,6 +273,8 @@ class WorkingMemory:
                     raise ValueError("Working Memory item is duplicated")
                 restored[item.item_id] = item
                 source_references.add(source_reference)
+            if len(restored) > MAX_ITEM_CAPACITY:
+                raise ValueError("Working Memory state exceeds maximum capacity")
             if len(restored) > self._item_capacity:
                 raise ValueError("Working Memory state exceeds configured capacity")
             self._items = restored
@@ -302,6 +305,7 @@ class WorkingMemory:
         item_id = working_memory_item_id(source_kind, source_id)
         with self._lock:
             self._require_mutation_available()
+            self._require_revision_available()
             self._revision += 1
             existing = self._items.get(item_id)
             if existing is None:
@@ -374,6 +378,7 @@ class WorkingMemory:
                     )
                 )
             if updated != self._items:
+                self._require_revision_available()
                 self._items = updated
                 self._revision += 1
             return tuple(self._items[item_id] for item_id in sorted(self._items))
@@ -387,6 +392,7 @@ class WorkingMemory:
             self._require_mutation_available()
             if item_id not in self._items:
                 return False
+            self._require_revision_available()
             del self._items[item_id]
             self._revision += 1
             return True
@@ -691,6 +697,10 @@ class WorkingMemory:
         if self._selecting:
             raise RuntimeError("Working Memory cannot mutate during selection")
 
+    def _require_revision_available(self) -> None:
+        if self._revision >= MAX_PERSISTED_REVISION:
+            raise ValueError("Working Memory revision capacity is exhausted")
+
     def _rank_key(
         self, item: WorkingMemoryItem
     ) -> tuple[float, float, float, int, int, str]:
@@ -706,8 +716,7 @@ class WorkingMemory:
 
 def _bounded_int(value: int, name: str, maximum: int) -> int:
     if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
+        type(value) is not int
         or not 0 < value <= maximum
     ):
         raise ValueError(f"{name} must be an integer in 1..{maximum}")
@@ -736,8 +745,10 @@ def _strict_unit_float(value: object, name: str) -> float:
 
 
 def _nonnegative_revision(value: int, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
+    if value > MAX_PERSISTED_REVISION:
+        raise ValueError(f"{name} exceeds the persisted revision bound")
     return value
 
 

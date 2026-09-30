@@ -11,7 +11,9 @@ from suzka.cognition import (
     SurprisalCalculator,
     model_key,
 )
+from suzka.limits import MAX_CALIBRATION_SAMPLE_COUNT
 from suzka.models import DummyProvider
+import suzka.cognition.surprisal_calculator as surprisal_module
 
 
 class RecordingProvider(DummyProvider):
@@ -112,6 +114,18 @@ def test_duplicate_approved_keys_canonicalize_and_state_is_sorted() -> None:
     )
 
 
+def test_approved_model_key_capacity_is_64_and_one_over_is_rejected() -> None:
+    approved = tuple(key("dummy", f"model-{index}") for index in range(64))
+    state = calibration(*approved)
+
+    assert len(state.approved_keys) == 64
+
+    with pytest.raises(ValueError, match="bounded"):
+        calibration(*approved, key("dummy", "model-64"))
+
+    assert len(state.approved_keys) == 64
+
+
 def test_first_sample_uses_explicit_warm_baseline_and_scale() -> None:
     model = key()
     state = calibration(model, baseline=2.0, scale=4.0, minimum=0.1)
@@ -203,6 +217,48 @@ def test_exact_restore_round_trip_replaces_state() -> None:
     restored.restore_exact(exported)
 
     assert restored.export() == exported
+
+
+def test_calibration_count_bound_accepts_maximum_and_rejects_one_over_atomically() -> None:
+    model = key()
+    state = calibration(model)
+    maximum = CalibrationEntry(model, MAX_CALIBRATION_SAMPLE_COUNT, 1.0, 0.0)
+    state.restore_exact((maximum,))
+    before = state.export()
+
+    with pytest.raises(ValueError, match="persisted bound"):
+        state.restore_exact(
+            (_forged_entry(model, MAX_CALIBRATION_SAMPLE_COUNT + 1, 1.0, 0.0),)
+        )
+
+    assert state.export() == before
+
+
+def test_calibration_count_rejects_integer_subclasses() -> None:
+    class IntegerSubclass(int):
+        pass
+
+    model = key()
+    with pytest.raises(TypeError):
+        CalibrationEntry(model, IntegerSubclass(1), 1.0, 0.0)
+
+
+def test_calibration_sample_rejects_one_over_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        surprisal_module, "MAX_CALIBRATION_SAMPLE_COUNT", 2
+    )
+    model = key()
+    state = calibration(model)
+    state.sample(model, 1.0)
+    state.sample(model, 2.0)
+    before = state.export()
+
+    with pytest.raises(ValueError, match="sample count"):
+        state.sample(model, 3.0)
+
+    assert state.export() == before
 
 
 def _forged_entry(model: str, count: object, mean: object, m2: object) -> CalibrationEntry:

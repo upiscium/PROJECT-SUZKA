@@ -11,6 +11,11 @@ from suzka.identity.origin import (
     ValueAdmissionStatus,
 )
 from suzka.identity.value_system import (
+    VALUE_MAX_APPLIED_EVIDENCE_REFS,
+    VALUE_MAX_AUTHORITATIVE_VALUES,
+    VALUE_MAX_EVENT_SEQUENCE,
+    VALUE_MAX_REVISION,
+    VALUE_MAX_REVISION_RECORDS,
     ValueConflictDefinition,
     ValueDomainError,
     ValueEvidence,
@@ -37,8 +42,10 @@ from suzka.identity.value_system import (
     recompute_seed_contract_digest,
     validate_revision_record_digest,
     validate_seed_contract_digest,
+    validate_value_history_immutable_basis,
     value_state_digest,
 )
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE, MAX_PERSISTED_REVISION
 
 
 def _origin(
@@ -107,6 +114,62 @@ def _event(event_id: str = "event-1", event_sequence: int = 0) -> ValueMutationE
         event_sequence=event_sequence,
         recorded_at=datetime(2026, 1, 1, tzinfo=timezone.utc)
         + timedelta(seconds=event_sequence),
+    )
+
+
+def _revision_record(**changes: object) -> ValueRevisionRecord:
+    fields: dict[str, object] = {
+        "value_id": "value-1",
+        "from_revision": 0,
+        "to_revision": 1,
+        "before_digest": "0" * 64,
+        "after_state_projection": _value(revision=1, evidence_refs=()),
+        "after_digest": value_state_digest(_value(revision=1, evidence_refs=())),
+        "operation": ValueRevisionOperation.UPDATE,
+        "origin_id": _origin().origin_id,
+        "evidence_refs": (),
+        "event_id": "event-1",
+        "event_sequence": 0,
+        "recorded_at": _event().recorded_at,
+    }
+    fields.update(changes)
+    return ValueRevisionRecord(**fields)  # type: ignore[arg-type]
+
+
+def _max_revision_system(
+    *, origin: IdentityOrigin | None = None
+) -> ValueSystem:
+    current = _value(
+        revision=MAX_PERSISTED_REVISION,
+        origin=origin or _origin(),
+        evidence_refs=(),
+    )
+    record = ValueRevisionRecord(
+        value_id=current.value_id,
+        from_revision=MAX_PERSISTED_REVISION - 1,
+        to_revision=MAX_PERSISTED_REVISION,
+        before_digest="0" * 64,
+        after_state_projection=current,
+        after_digest=value_state_digest(current),
+        operation=ValueRevisionOperation.UPDATE,
+        origin_id=current.origin.origin_id,
+        evidence_refs=(),
+        event_id="max-event",
+        event_sequence=0,
+        recorded_at=_event().recorded_at,
+        previous_record_digest="1" * 64,
+    )
+    history = ValueRevisionHistory(
+        "value-1",
+        history_anchor_revision=MAX_PERSISTED_REVISION - 1,
+        history_anchor_digest="1" * 64,
+        history_anchor_state_digest="0" * 64,
+        records=(record,),
+    )
+    return ValueSystem.restore(
+        values={"value-1": current},
+        histories={"value-1": history},
+        evidence_ledgers={"value-1": ()},
     )
 
 
@@ -348,11 +411,96 @@ def test_scalar_bounds_are_strict(field: str) -> None:
         _value(**{field: 1})
 
 
-@pytest.mark.parametrize("revision", [True, -1, 1.0, "1"])
+@pytest.mark.parametrize(
+    "revision", [True, -1, 1.0, "1", MAX_PERSISTED_REVISION + 1]
+)
 def test_revision_requires_a_nonnegative_exact_integer(revision: object) -> None:
     with pytest.raises((TypeError, ValueError)):
         _value(revision=revision)
     assert _value(revision=0).revision == 0
+    assert _value(revision=MAX_PERSISTED_REVISION).revision == MAX_PERSISTED_REVISION
+
+
+def test_value_revision_record_counters_are_bounded_and_exact() -> None:
+    assert _revision_record(
+        after_state_projection=_value(revision=MAX_PERSISTED_REVISION, evidence_refs=()),
+        to_revision=MAX_PERSISTED_REVISION,
+        from_revision=MAX_PERSISTED_REVISION - 1,
+        after_digest=value_state_digest(
+            _value(revision=MAX_PERSISTED_REVISION, evidence_refs=())
+        ),
+    ).to_revision == MAX_PERSISTED_REVISION
+
+    for field, value in (
+        ("from_revision", True),
+        ("from_revision", MAX_PERSISTED_REVISION + 1),
+        ("to_revision", True),
+        ("to_revision", MAX_PERSISTED_REVISION + 1),
+        ("event_sequence", True),
+        ("event_sequence", MAX_PERSISTED_EVENT_SEQUENCE + 1),
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            _revision_record(**{field: value})
+
+    rollback = _revision_record(
+        operation=ValueRevisionOperation.ROLLBACK,
+        target_revision=MAX_PERSISTED_REVISION,
+    )
+    assert rollback.target_revision == MAX_PERSISTED_REVISION
+    for target in (True, MAX_PERSISTED_REVISION + 1):
+        with pytest.raises((TypeError, ValueError)):
+            _revision_record(
+                operation=ValueRevisionOperation.ROLLBACK,
+                target_revision=target,
+            )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("from_revision", -2),
+        ("from_revision", 1.0),
+        ("from_revision", "1"),
+        ("to_revision", -1),
+        ("to_revision", 1.0),
+        ("to_revision", "1"),
+        ("event_sequence", -1),
+        ("event_sequence", 1.0),
+        ("event_sequence", "1"),
+    ],
+)
+def test_value_revision_record_counters_reject_non_exact_values(
+    field: str, value: object
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        _revision_record(**{field: value})
+
+    history = _max_revision_system().history("value-1")
+    with pytest.raises((TypeError, ValueError)):
+        replace(history, history_anchor_revision=value)
+
+
+def test_public_value_capacity_constants_retain_owner_bounds() -> None:
+    assert VALUE_MAX_AUTHORITATIVE_VALUES == 128
+    assert VALUE_MAX_REVISION_RECORDS == 32
+    assert VALUE_MAX_APPLIED_EVIDENCE_REFS == 512
+    assert VALUE_MAX_REVISION == MAX_PERSISTED_REVISION
+    assert VALUE_MAX_EVENT_SEQUENCE == MAX_PERSISTED_EVENT_SEQUENCE
+    assert ValueSystem.MAX_AUTHORITATIVE_VALUES == VALUE_MAX_AUTHORITATIVE_VALUES
+    assert ValueSystem.MAX_REVISION_RECORDS == VALUE_MAX_REVISION_RECORDS
+    assert (
+        ValueSystem.MAX_APPLIED_EVIDENCE_REFS == VALUE_MAX_APPLIED_EVIDENCE_REFS
+    )
+    assert ValueSystem.MAX_REVISION == VALUE_MAX_REVISION
+    assert ValueSystem.MAX_EVENT_SEQUENCE == VALUE_MAX_EVENT_SEQUENCE
+
+
+def test_history_anchor_revision_is_bounded_and_exact() -> None:
+    history = _max_revision_system().history("value-1")
+    assert history.history_anchor_revision == MAX_PERSISTED_REVISION - 1
+    for anchor in (True, MAX_PERSISTED_REVISION + 1):
+        with pytest.raises((TypeError, ValueError)):
+            replace(history, history_anchor_revision=anchor)
 
 
 def test_authoritative_value_ids_are_unique() -> None:
@@ -588,6 +736,15 @@ def test_evidence_and_proposal_do_not_mutate_value_state() -> None:
 
 def test_mutation_evidence_requires_canonical_utc() -> None:
     assert _event().recorded_at.tzinfo is timezone.utc
+    assert ValueMutationEvidence(
+        "event-max", MAX_PERSISTED_EVENT_SEQUENCE, _event().recorded_at
+    ).event_sequence == MAX_PERSISTED_EVENT_SEQUENCE
+    with pytest.raises(ValueError):
+        ValueMutationEvidence(
+            "event-overflow",
+            MAX_PERSISTED_EVENT_SEQUENCE + 1,
+            _event().recorded_at,
+        )
     with pytest.raises(ValueError):
         ValueMutationEvidence("event-1", 0, datetime(2026, 1, 1))
     with pytest.raises(ValueError):
@@ -869,6 +1026,68 @@ def test_freeze_unfreeze_and_frozen_updates_have_no_hidden_mutation() -> None:
     )
 
 
+def test_revision_overflow_is_rejected_before_any_owner_mutation() -> None:
+    update_system = _max_revision_system()
+    update_before = update_system.snapshot()
+    with pytest.raises(ValueDomainError):
+        update_system.apply_update(
+            _admission(
+                event_id="revision-overflow-update",
+                event_sequence=1,
+                evidence_ref="revision-overflow-update",
+            ),
+            _event("revision-overflow-update", 1),
+        )
+    assert update_system.snapshot() == update_before
+
+    freeze_system = _max_revision_system()
+    freeze_event = _event("revision-overflow-freeze", 2)
+    freeze_before = freeze_system.snapshot()
+    with pytest.raises(ValueDomainError):
+        freeze_system.freeze(
+            "value-1",
+            freeze_event,
+            governance_origin=_governance_origin(freeze_event, "api.values.freeze"),
+        )
+    assert freeze_system.snapshot() == freeze_before
+
+    rollback_system = _max_revision_system()
+    rollback_event = _event("revision-overflow-rollback", 3)
+    rollback_before = rollback_system.snapshot()
+    with pytest.raises(ValueDomainError):
+        rollback_system.rollback(
+            "value-1",
+            MAX_PERSISTED_REVISION,
+            rollback_event,
+            governance_origin=_governance_origin(
+                rollback_event, "api.values.rollback"
+            ),
+        )
+    assert rollback_system.snapshot() == rollback_before
+
+    inherited_origin = IdentityOrigin(
+        OriginActor.INHERITED,
+        OriginInputKind.LEGACY,
+        ValueAdmissionStatus.UNCERTAIN,
+        source_ref="legacy-source",
+        event_id="legacy-event",
+        event_sequence=0,
+    )
+    review_system = _max_revision_system(origin=inherited_origin)
+    review_event = _event("revision-overflow-review", 4)
+    review_before = review_system.snapshot()
+    with pytest.raises(ValueDomainError):
+        review_system.review_origin(
+            "value-1",
+            ValueOriginReviewDecision.ACCEPT_PROVENANCE,
+            review_event,
+            governance_origin=_governance_origin(
+                review_event, "api.values.origin_review"
+            ),
+        )
+    assert review_system.snapshot() == review_before
+
+
 def test_governance_freeze_accepts_quarantined_values_and_binds_origin() -> None:
     quarantine = _value(
         origin=IdentityOrigin(
@@ -1036,6 +1255,114 @@ def test_origin_review_rejects_self_and_system_lineage() -> None:
                     event, "api.values.origin_review"
                 ),
             )
+
+
+def test_immutable_value_history_basis_covers_real_owner_transitions() -> None:
+    system = ValueSystem((_mutable_value(),))
+    update = system.apply_update(_admission(), _event())
+    assert update.revision_record is not None
+    update_history = system.history("value-1")
+    assert validate_value_history_immutable_basis(update_history) is update_history
+
+    freeze_event = _event("basis-freeze", 1)
+    system.freeze(
+        "value-1",
+        freeze_event,
+        governance_origin=_governance_origin(freeze_event, "api.values.freeze"),
+    )
+    freeze_history = system.history("value-1")
+    assert validate_value_history_immutable_basis(freeze_history) is freeze_history
+
+    rollback_event = _event("basis-rollback", 2)
+    system.rollback(
+        "value-1",
+        1,
+        rollback_event,
+        governance_origin=_governance_origin(rollback_event, "api.values.rollback"),
+    )
+    rollback_history = system.history("value-1")
+    assert validate_value_history_immutable_basis(rollback_history) is rollback_history
+
+    original_origin = IdentityOrigin(
+        OriginActor.INHERITED,
+        OriginInputKind.LEGACY,
+        ValueAdmissionStatus.UNCERTAIN,
+    )
+    reviewed_system = ValueSystem(
+        (_value(origin=original_origin, evidence_refs=()),)
+    )
+    review_event = _event("basis-review", 3)
+    reviewed_system.review_origin(
+        "value-1",
+        ValueOriginReviewDecision.ACCEPT_PROVENANCE,
+        review_event,
+        governance_origin=_governance_origin(
+            review_event, "api.values.origin_review"
+        ),
+    )
+    reject_event = _event("basis-review-reject", 4)
+    reviewed_system.review_origin(
+        "value-1",
+        ValueOriginReviewDecision.REJECT,
+        reject_event,
+        governance_origin=_governance_origin(
+            reject_event, "api.values.origin_review"
+        ),
+    )
+    review_history = reviewed_system.history("value-1")
+    assert validate_value_history_immutable_basis(review_history) is review_history
+
+
+def test_immutable_value_history_basis_rejects_drifted_retained_projection() -> None:
+    source = _restorable_system()
+    first, second = source.history("value-1").records
+    changed_projection = replace(second.after_state_projection, name="changed-name")
+    changed_record = replace(
+        second,
+        after_state_projection=changed_projection,
+        after_digest=value_state_digest(changed_projection),
+    )
+
+    with pytest.raises(ValueError, match="immutable state basis"):
+        ValueRevisionHistory("value-1", records=(first, changed_record))
+
+
+def test_immutable_value_history_basis_allows_only_origin_admission_changes() -> None:
+    source = _restorable_system()
+    first, second = source.history("value-1").records
+    changed_admission = replace(
+        second.after_state_projection.origin,
+        admission=ValueAdmissionStatus.PENDING,
+    )
+    admission_projection = replace(
+        second.after_state_projection,
+        origin=changed_admission,
+    )
+    admission_record = replace(
+        second,
+        after_state_projection=admission_projection,
+        after_digest=value_state_digest(admission_projection),
+    )
+    admission_history = ValueRevisionHistory(
+        "value-1", records=(first, admission_record)
+    )
+    assert (
+        validate_value_history_immutable_basis(admission_history)
+        is admission_history
+    )
+
+    changed_origin = replace(
+        second.after_state_projection.origin,
+        source_ref="changed-origin",
+    )
+    origin_projection = replace(second.after_state_projection, origin=changed_origin)
+    origin_record = replace(
+        second,
+        after_state_projection=origin_projection,
+        after_digest=value_state_digest(origin_projection),
+    )
+    with pytest.raises(ValueError, match="immutable state basis"):
+        ValueRevisionHistory("value-1", records=(first, origin_record))
 
 
 def test_revision_state_and_record_digests_are_canonical() -> None:
@@ -1303,6 +1630,34 @@ def test_value_system_snapshot_round_trip_is_replay_free() -> None:
     assert restored.histories == source.histories
     assert restored.evidence_ledgers == source.evidence_ledgers
     assert restored.evidence_ledger_digests == source.evidence_ledger_digests
+
+
+def test_restore_rejects_ledger_missing_retained_after_state_evidence() -> None:
+    source = _restorable_system(update_count=33)
+    snapshot = source.snapshot()
+    history = snapshot.histories[0]
+    current_refs = set(source.value_map[history.value_id].evidence_refs)
+    evidence_ref = next(
+        ref
+        for record in history.records
+        for ref in record.after_state_projection.evidence_refs
+        if ref not in current_refs
+    )
+    ledger = dict(snapshot.evidence_ledgers)[history.value_id]
+    assert evidence_ref in ledger
+    assert evidence_ref not in current_refs
+    shortened_ledger = tuple(ref for ref in ledger if ref != evidence_ref)
+    altered = replace(
+        snapshot,
+        evidence_ledgers=((history.value_id, shortened_ledger),),
+        evidence_ledger_digests=((
+            history.value_id,
+            evidence_ledger_digest(history.value_id, shortened_ledger),
+        ),),
+    )
+
+    with pytest.raises(ValueDomainError, match="retained Value state evidence"):
+        ValueSystem.restore_snapshot(altered)
 
 
 def test_revision_history_rejects_broken_state_continuity() -> None:

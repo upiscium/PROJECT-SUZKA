@@ -10,6 +10,7 @@ from threading import RLock
 from typing import cast
 
 from suzka.identifiers import validate_identifier
+from suzka.limits import MAX_PERSISTED_REVISION
 
 
 MAX_CONTEXTS = 1024
@@ -147,7 +148,7 @@ def _refs(values: Iterable[object], limit: int) -> tuple[str, ...]:
 
 
 def _revision(value: object) -> int:
-    if type(value) is not int or value < 0:
+    if type(value) is not int or not 0 <= value <= MAX_PERSISTED_REVISION:
         raise ContextStateInvalid("invalid revision")
     return value
 
@@ -264,8 +265,13 @@ class ContextRegistry:
             )
 
     def _tick(self) -> int:
+        self._require_revision_available()
         self._revision += 1
         return self._revision
+
+    def _require_revision_available(self) -> None:
+        if self._revision >= MAX_PERSISTED_REVISION:
+            raise ContextCapacityExceeded("context revision capacity exceeded")
 
     def _now(self) -> datetime:
         try:
@@ -327,6 +333,7 @@ class ContextRegistry:
                     raise ContextStateInvalid("current context must be active")
             if self._current == context_id:
                 return
+            self._require_revision_available()
             self._current = context_id
             self._tick()
 
