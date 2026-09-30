@@ -20,9 +20,11 @@ from suzka.belief import (
     belief_record_digest,
 )
 from suzka.config import Settings, load_settings
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE
 from suzka.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 from suzka.runtime.agent_state import (
     AgentStateSnapshotV6,
+    AgentStateSnapshotV7,
     AppraisalStateSnapshot,
     AgentStateSnapshotV2,
     AgentStateSnapshotV1,
@@ -36,6 +38,7 @@ from suzka.runtime.agent_state import (
     EmotionStateSnapshot,
     ValueSystemStateSnapshot,
     WorkingMemorySnapshot,
+    default_agent_state_snapshot,
 )
 from suzka.runtime.state_wal import (
     RecoveryReason,
@@ -323,6 +326,70 @@ def test_noncontiguous_state_sequences_are_valid(tmp_path: Path) -> None:
     assert wal.reconstruct(sequence=12).last_processed_event_sequence == 12
 
 
+def test_wal_accepts_maximum_persisted_sequence(tmp_path: Path) -> None:
+    wal = make_wal(tmp_path)
+
+    manifest = wal.bootstrap(
+        make_snapshot(MAX_PERSISTED_EVENT_SEQUENCE),
+        MAX_PERSISTED_EVENT_SEQUENCE,
+    )
+
+    inspection = wal.inspect()
+    assert inspection.active_manifest == manifest
+    assert inspection.latest_snapshot_sequence == MAX_PERSISTED_EVENT_SEQUENCE
+    assert (
+        inspection.records[0].baseline_snapshot_sequence
+        == MAX_PERSISTED_EVENT_SEQUENCE
+    )
+    assert (
+        inspection.records[0].journal_processing_high_water
+        == MAX_PERSISTED_EVENT_SEQUENCE
+    )
+
+
+def test_wal_one_over_sequence_is_rejected_without_append_or_consumption(
+    tmp_path: Path,
+) -> None:
+    wal = make_wal(tmp_path)
+    prior = make_snapshot(MAX_PERSISTED_EVENT_SEQUENCE - 1)
+    candidate = make_snapshot(MAX_PERSISTED_EVENT_SEQUENCE - 1).model_copy(
+        update={"last_processed_event_sequence": MAX_PERSISTED_EVENT_SEQUENCE + 1}
+    )
+    wal.bootstrap(prior, MAX_PERSISTED_EVENT_SEQUENCE - 1)
+    before = wal.inspect()
+    manifest = before.active_manifest
+    assert manifest is not None
+    generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    before_bytes = generation.read_bytes()
+
+    with pytest.raises(StateWALError):
+        wal.append_transition(
+            event_id=uuid4(),
+            event_type="state.transition",
+            event_source="test",
+            processing_sequence=MAX_PERSISTED_EVENT_SEQUENCE + 1,
+            prior_snapshot=prior,
+            candidate_snapshot=candidate,
+        )
+
+    after = wal.inspect()
+    assert after.records == before.records
+    assert after.record_hashes == before.record_hashes
+    assert generation.read_bytes() == before_bytes
+    assert after.latest_snapshot_sequence == MAX_PERSISTED_EVENT_SEQUENCE - 1
+
+
+def test_wal_rejects_one_over_bootstrap_before_creating_artifacts(
+    tmp_path: Path,
+) -> None:
+    wal = make_wal(tmp_path)
+
+    with pytest.raises(StateWALError):
+        wal.bootstrap(make_snapshot(0), MAX_PERSISTED_EVENT_SEQUENCE + 1)
+
+    assert not wal.root.exists()
+
+
 def test_append_requires_processing_sequence_equal_candidate_sequence(
     tmp_path: Path,
 ) -> None:
@@ -336,6 +403,36 @@ def test_append_requires_processing_sequence_equal_candidate_sequence(
             prior_snapshot=make_snapshot(10),
             candidate_snapshot=make_snapshot(12),
         )
+
+
+def test_append_duplicate_event_id_is_rejected_before_generation_write(
+    tmp_path: Path,
+) -> None:
+    wal, manifest = bootstrap(tmp_path, 10)
+    event_id = uuid4()
+    wal.append_transition(
+        event_id=event_id,
+        event_type="state.transition",
+        event_source="test",
+        processing_sequence=11,
+        prior_snapshot=make_snapshot(10),
+        candidate_snapshot=make_snapshot(11),
+    )
+    path = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    before_bytes = path.read_bytes()
+
+    with pytest.raises(StateWALConflictError, match="event identifier"):
+        wal.append_transition(
+            event_id=event_id,
+            event_type="state.transition",
+            event_source="test",
+            processing_sequence=12,
+            prior_snapshot=make_snapshot(11),
+            candidate_snapshot=make_snapshot(12),
+        )
+
+    assert path.read_bytes() == before_bytes
+    assert wal.inspect().latest_snapshot_sequence == 11
 
 
 def test_append_failure_is_bounded_without_cause_context(tmp_path: Path) -> None:
@@ -537,6 +634,37 @@ def test_mixed_v1_then_v2_wal_reconstructs_exact_snapshots(tmp_path: Path) -> No
     assert wal.reconstruct(sequence=0) == v1_initial
     assert wal.reconstruct(sequence=1) == v1_candidate
     assert wal.reconstruct(sequence=2) == v2_candidate
+
+
+def test_mixed_v6_then_v7_wal_reconstructs_exact_snapshots(tmp_path: Path) -> None:
+    wal = make_wal(tmp_path)
+    v6_initial = make_v6_snapshot(5, include_belief=False)
+    v7_candidate = default_agent_state_snapshot(
+        1.0,
+        saved_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    ).model_copy(update={"last_processed_event_sequence": 6})
+    assert isinstance(v6_initial, AgentStateSnapshotV6)
+    assert isinstance(v7_candidate, AgentStateSnapshotV7)
+    baseline = wal.bootstrap(v6_initial, 5)
+    transition = wal.append_transition(
+        event_id=uuid4(),
+        event_type="state.transition",
+        event_source="test",
+        processing_sequence=6,
+        prior_snapshot=v6_initial,
+        candidate_snapshot=v7_candidate,
+    )
+
+    inspection = wal.inspect()
+    assert inspection.records[0].baseline_snapshot == v6_initial
+    assert inspection.records[1].candidate_snapshot == v7_candidate
+    assert (
+        inspection.records[1].previous_record_hash
+        == baseline.active_baseline_record_hash
+    )
+    assert inspection.records[1].record_hash == transition.record_hash
+    assert wal.reconstruct(sequence=5) == v6_initial
+    assert wal.reconstruct(sequence=6) == v7_candidate
 
 
 def test_first_internal_commit_uses_v1_prior_and_emits_v2_without_migration(

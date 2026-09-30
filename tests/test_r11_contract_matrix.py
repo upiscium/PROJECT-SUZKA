@@ -59,7 +59,7 @@ R11_F_MATRIX: tuple[tuple[str, str], ...] = (
     ),
     (
         "F11",
-        "tests/test_fastapi_backend.py::test_retained_v4_lazy_upgrade_preserves_bytes_then_publishes_v6",
+        "tests/test_fastapi_backend.py::test_retained_v4_lazy_upgrade_preserves_bytes_then_publishes_v7",
     ),
     (
         "F12",

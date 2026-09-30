@@ -7,9 +7,10 @@ import json
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Final, TypeVar, cast
+from typing import ClassVar, Final, TypeVar, cast
 
 from suzka.identifiers import validate_identifier
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE
 
 
 class _ClosedStrEnum(str, Enum):
@@ -47,6 +48,7 @@ class ValueAdmissionStatus(_ClosedStrEnum):
 
 
 _ORIGIN_DOMAIN: Final = "suzka.identity.origin/v1"
+ORIGIN_MAX_EVENT_SEQUENCE: Final[int] = MAX_PERSISTED_EVENT_SEQUENCE
 _ACTIVE: Final = frozenset(
     {ValueAdmissionStatus.SELF_ENDORSED, ValueAdmissionStatus.SYSTEM_AUTHORIZED}
 )
@@ -61,6 +63,16 @@ def _enum(
     if type(value) is not enum_type:
         raise TypeError(f"{name} must be a {enum_type.__name__}")
     return cast(_OriginEnum, value)
+
+
+def _bounded_event_sequence(value: object) -> int:
+    if type(value) is not int:
+        raise TypeError("event_sequence must be an exact integer")
+    if not 0 <= value <= ORIGIN_MAX_EVENT_SEQUENCE:
+        raise ValueError(
+            f"event_sequence must be between 0 and {ORIGIN_MAX_EVENT_SEQUENCE}"
+        )
+    return value
 
 
 def _canonical_provenance(origin: IdentityOrigin) -> bytes:
@@ -102,6 +114,8 @@ def validate_origin_id(origin: IdentityOrigin) -> str:
 class IdentityOrigin:
     """Strict immutable provenance record with a deterministic origin identity."""
 
+    MAX_EVENT_SEQUENCE: ClassVar[int] = ORIGIN_MAX_EVENT_SEQUENCE
+
     actor: OriginActor
     input_kind: OriginInputKind
     admission: ValueAdmissionStatus
@@ -125,8 +139,7 @@ class IdentityOrigin:
             if value is not None:
                 validate_identifier(value)
         if self.event_sequence is not None:
-            if type(self.event_sequence) is not int or self.event_sequence < 0:
-                raise ValueError("event_sequence must be a nonnegative exact integer")
+            _bounded_event_sequence(self.event_sequence)
         if type(self.confidence) is not float or not math.isfinite(self.confidence):
             raise TypeError("confidence must be a finite float")
         if not 0.0 <= self.confidence <= 1.0:

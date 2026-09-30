@@ -26,6 +26,7 @@ from pydantic import (
     model_validator,
 )
 
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE, MAX_PERSISTED_REVISION
 from suzka.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 
 
@@ -182,10 +183,14 @@ class EventJournalRecord(_JournalModel):
     event_id: str | None = None
     event_type: AgentEventType | None = None
     source: AgentEventSource | None = None
-    processing_sequence: int | None = Field(default=None, ge=0)
+    processing_sequence: int | None = Field(
+        default=None, ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE
+    )
     state_hash_before: str | None = None
     state_hash_after: str | None = None
-    snapshot_sequence: int | None = Field(default=None, ge=0)
+    snapshot_sequence: int | None = Field(
+        default=None, ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE
+    )
     snapshot_hash: str | None = None
     failure_category: EventFailureCategory | None = None
     previous_record_hash: str | None = None
@@ -196,7 +201,9 @@ class EventJournalRecord(_JournalModel):
     migration_previous_v1_hash: str | None = None
     journal_lineage_id: str | None = None
     recovery_id: str | None = None
-    recovery_processing_high_water: int | None = Field(default=None, ge=0)
+    recovery_processing_high_water: int | None = Field(
+        default=None, ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE
+    )
     recovery_category: EventRecoveryCategory | None = None
     external_reconciliation_required: bool | None = None
     migration_previous_v2_hash: str | None = None
@@ -215,7 +222,21 @@ class EventJournalRecord(_JournalModel):
     unresolved_participants: tuple[str, ...] | None = None
     baseline_id: str | None = None
     participant_registry: tuple[ParticipantBaseline, ...] | None = None
-    adoption_epoch: int | None = Field(default=None, ge=0)
+    adoption_epoch: int | None = Field(
+        default=None, ge=0, le=MAX_PERSISTED_REVISION
+    )
+
+    @field_validator(
+        "processing_sequence",
+        "snapshot_sequence",
+        "recovery_processing_high_water",
+        mode="before",
+    )
+    @classmethod
+    def require_exact_persisted_sequence(cls, value: object) -> object:
+        if value is not None and type(value) is not int:
+            raise ValueError("persisted processing sequence must be an integer")
+        return value
 
     @field_validator("record_id", "event_id")
     @classmethod
@@ -832,9 +853,18 @@ class EventJournalRecord(_JournalModel):
 
 
 class EventJournalRecovery(_JournalModel):
-    processing_high_water: int = Field(ge=0)
-    snapshot_sequence: int = Field(ge=0)
+    processing_high_water: int = Field(
+        ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE
+    )
+    snapshot_sequence: int = Field(ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE)
     snapshot_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("processing_high_water", "snapshot_sequence", mode="before")
+    @classmethod
+    def require_exact_persisted_sequence(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("persisted processing sequence must be an integer")
+        return value
 
 
 class EventJournalError(Exception):
@@ -1280,6 +1310,14 @@ class EventJournal:
         snapshot_hash: str | None = None,
     ) -> EventJournalInspection:
         """Return verified evidence without appending, rotating, or migrating."""
+        if snapshot_sequence is not None and (
+            type(snapshot_sequence) is not int
+            or snapshot_sequence < 0
+            or snapshot_sequence > MAX_PERSISTED_EVENT_SEQUENCE
+        ):
+            raise ValueError("canonical snapshot sequence is outside its bound")
+        if snapshot_sequence is not None and snapshot_hash is not None:
+            self._validate_snapshot_identity(snapshot_sequence, snapshot_hash)
         with self._lock:
             self._require_authority()
             records = self._read_records_unlocked()
@@ -1868,6 +1906,8 @@ class EventJournal:
             ):
                 raise ValueError("participant baseline registry is not a strict superset")
             expected_epoch = latest.adoption_epoch + 1
+            if expected_epoch > MAX_PERSISTED_REVISION:
+                raise ValueError("participant baseline adoption epoch capacity is exhausted")
             if adoption_epoch is None:
                 record_adoption_epoch = expected_epoch
             elif adoption_epoch != expected_epoch:
@@ -1950,6 +1990,12 @@ class EventJournal:
         self._validate_snapshot_identity(snapshot_sequence, snapshot_hash)
         if processing_high_water is None:
             processing_high_water = snapshot_sequence
+        if (
+            type(processing_high_water) is not int
+            or processing_high_water < 0
+            or processing_high_water > MAX_PERSISTED_EVENT_SEQUENCE
+        ):
+            raise ValueError("processing high-water is outside its bound")
         if processing_high_water < snapshot_sequence:
             raise ValueError("processing high-water precedes snapshot")
         with self._lock:
@@ -2251,6 +2297,19 @@ class EventJournal:
                 )
             validation_failure: EventJournalAppendError | None = None
             try:
+                verified = self._verify_records(records)
+                if lifecycle is EventLifecycle.ACCEPTED and (
+                    self._sequence_capacity_exhausted(verified)
+                ):
+                    raise EventJournalAppendError(
+                        EventJournalAppendStage.VALIDATE, published=False
+                    )
+                if event.processing_sequence is not None and (
+                    type(event.processing_sequence) is not int
+                    or event.processing_sequence < 0
+                    or event.processing_sequence > MAX_PERSISTED_EVENT_SEQUENCE
+                ):
+                    raise ValueError("event processing sequence is outside its bound")
                 fields.setdefault("schema_version", self._active_schema(records))
                 record = self._make_record(
                     lifecycle,
@@ -2282,6 +2341,12 @@ class EventJournal:
         wal_record_hash: str | None = None,
     ) -> None:
         self._validate_snapshot_identity(snapshot_sequence, snapshot_hash)
+        if processing_high_water is not None and (
+            type(processing_high_water) is not int
+            or processing_high_water < 0
+            or processing_high_water > MAX_PERSISTED_EVENT_SEQUENCE
+        ):
+            raise ValueError("processing high-water is outside its bound")
         with self._lock:
             self._require_authority()
             records = self._read_records_unlocked()
@@ -2607,6 +2672,21 @@ class EventJournal:
                 "EventJournal size cannot be inspected"
             ) from error
         rotated_count = len(self._rotated_paths_unlocked())
+        records = self._read_records_unlocked()
+        if records and self._sequence_capacity_exhausted(
+            self._verify_records(records)
+        ):
+            return EventJournalAdmissionStatus(
+                False,
+                "processing_sequence_exhausted",
+                active_bytes,
+                self.max_bytes,
+                rotated_count,
+                self.retained_files,
+                False,
+                False,
+                False,
+            )
         if active_bytes <= self.max_bytes:
             return EventJournalAdmissionStatus(
                 True,
@@ -2632,6 +2712,17 @@ class EventJournal:
             safe_rotation,
             lifecycle_blocked,
             proof_blocked,
+        )
+
+    @staticmethod
+    def _sequence_capacity_exhausted(verified: _VerifiedJournal) -> bool:
+        reserved = sum(
+            state.lifecycle is EventLifecycle.ACCEPTED
+            for state in verified.open_events
+        )
+        return (
+            verified.processing_high_water + reserved
+            >= MAX_PERSISTED_EVENT_SEQUENCE
         )
 
     def _rotation_decision_unlocked(self) -> tuple[bool, bool, bool]:
@@ -2978,6 +3069,15 @@ class EventJournal:
         high_water = checkpoint.processing_sequence
         snapshot_sequence = checkpoint.snapshot_sequence
         snapshot_hash = checkpoint.snapshot_hash
+        if (
+            type(high_water) is not int
+            or type(snapshot_sequence) is not int
+            or high_water > MAX_PERSISTED_EVENT_SEQUENCE
+            or snapshot_sequence > MAX_PERSISTED_EVENT_SEQUENCE
+        ):
+            raise EventJournalIntegrityError(
+                "EventJournal processing sequence is outside its bound"
+            )
         journal_lineage_id = checkpoint.journal_lineage_id
         wal_generation_id = checkpoint.wal_generation_id
         wal_record_id = checkpoint.wal_record_id
@@ -3739,7 +3839,9 @@ class EventJournal:
                     or accepted_queue[0] != record.event_id
                 ):
                     raise EventJournalIntegrityError("Started lifecycle is impossible")
-                if record.processing_sequence != high_water + 1:
+                if high_water >= MAX_PERSISTED_EVENT_SEQUENCE or (
+                    record.processing_sequence != high_water + 1
+                ):
                     raise EventJournalIntegrityError("Processing sequence has a gap")
                 high_water = record.processing_sequence
                 processing_event_id = record.event_id
@@ -4101,9 +4203,9 @@ class EventJournal:
     @staticmethod
     def _validate_snapshot_identity(sequence: int, snapshot_hash: str) -> None:
         if (
-            isinstance(sequence, bool)
-            or not isinstance(sequence, int)
+            type(sequence) is not int
             or sequence < 0
+            or sequence > MAX_PERSISTED_EVENT_SEQUENCE
             or not isinstance(snapshot_hash, str)
             or _HASH_PATTERN.fullmatch(snapshot_hash) is None
         ):

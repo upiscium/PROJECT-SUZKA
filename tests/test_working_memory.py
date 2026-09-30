@@ -15,6 +15,7 @@ from suzka.body import EmotionEngineAllostasis, EmotionState
 from suzka.cognition import LossCalibration
 from suzka.config import Settings, load_settings
 from suzka.identity import ValueSystem
+from suzka.limits import MAX_PERSISTED_REVISION
 from suzka.memory import DualMemorySystem, MemoryRecordType
 from suzka.memory.dual_memory_system import (
     EpisodicMemoryFormatError,
@@ -41,6 +42,7 @@ from suzka.runtime import (
 )
 from suzka.runtime.context import ContextRegistry
 from suzka.runtime.event_journal import EventJournal
+import suzka.runtime.working_memory as working_memory_module
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -273,6 +275,73 @@ def test_restore_exact_rejects_capacity_decrease_but_accepts_larger_capacity() -
     assert larger.items == source.items
 
 
+def test_restore_exact_accepts_maximum_revision_and_rejects_one_over_atomically() -> None:
+    source = WorkingMemory(item_capacity=1, projection_max_bytes=10)
+    item = admit(source, "episode-revision-bound")
+    maximum_item = replace(
+        item,
+        created_revision=MAX_PERSISTED_REVISION,
+        last_activated_revision=MAX_PERSISTED_REVISION,
+    )
+    target = WorkingMemory(item_capacity=1, projection_max_bytes=10)
+    target.restore_exact(MAX_PERSISTED_REVISION, (maximum_item,))
+    before = (target.revision, target.items)
+
+    with pytest.raises(ValueError, match="persisted revision bound"):
+        target.restore_exact(MAX_PERSISTED_REVISION + 1, (maximum_item,))
+
+    assert (target.revision, target.items) == before
+
+
+def test_revision_capacity_rejects_one_over_before_working_memory_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(working_memory_module, "MAX_PERSISTED_REVISION", 2)
+    memory = WorkingMemory(item_capacity=2, projection_max_bytes=10)
+    admit(memory, "episode-revision-one")
+    admit(memory, "episode-revision-two")
+    before = (memory.revision, memory.items)
+
+    with pytest.raises(ValueError, match="revision"):
+        admit(memory, "episode-revision-three")
+
+    assert (memory.revision, memory.items) == before
+
+
+@pytest.mark.parametrize("operation", ["advance", "forget"])
+def test_revision_capacity_guards_other_mutations_atomically(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    monkeypatch.setattr(working_memory_module, "MAX_PERSISTED_REVISION", 1)
+    memory = WorkingMemory(item_capacity=1, projection_max_bytes=10)
+    item = admit(memory, "episode-revision-operation")
+    before = (memory.revision, memory.items)
+
+    with pytest.raises(ValueError, match="revision"):
+        if operation == "advance":
+            memory.advance()
+        else:
+            memory.forget(item.item_id)
+
+    assert (memory.revision, memory.items) == before
+
+
+def test_restore_exact_rejects_snapshot_above_maximum_item_capacity_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = WorkingMemory(item_capacity=2, projection_max_bytes=10)
+    admit(source, "episode-cardinality-one")
+    admit(source, "episode-cardinality-two")
+    target = WorkingMemory(item_capacity=2, projection_max_bytes=10)
+    before = (target.revision, target.items)
+    monkeypatch.setattr(working_memory_module, "MAX_ITEM_CAPACITY", 1)
+
+    with pytest.raises(ValueError, match="maximum capacity"):
+        target.restore_exact(source.revision, source.items)
+
+    assert (target.revision, target.items) == before
+
+
 @pytest.mark.parametrize(
     "revision,item_change",
     [
@@ -305,6 +374,23 @@ def test_restore_exact_rejects_malformed_canonical_state_without_mutation(
     assert (target.revision, target.items) == before == (1, (retained,))
 
 
+def test_persisted_revision_rejects_integer_subclasses() -> None:
+    class IntegerSubclass(int):
+        pass
+
+    source = WorkingMemory(item_capacity=1, projection_max_bytes=10)
+    item = admit(source, "episode-exact-revision")
+    target = WorkingMemory(item_capacity=1, projection_max_bytes=10)
+
+    with pytest.raises(ValueError):
+        target.restore_exact(IntegerSubclass(1), (item,))
+    with pytest.raises(ValueError):
+        target.restore_exact(1, (replace(item, created_revision=IntegerSubclass(1)),))
+
+    assert target.revision == 0
+    assert target.items == ()
+
+
 def test_restore_exact_rejects_duplicate_identity_and_source_reference() -> None:
     source = WorkingMemory(item_capacity=1, projection_max_bytes=10)
     item = admit(source, "episode-duplicate-restore")
@@ -326,6 +412,24 @@ def test_capacity_revision_and_budget_are_read_only() -> None:
         memory.projection_max_bytes = 200  # type: ignore[misc]
     with pytest.raises(AttributeError):
         memory.revision = 9  # type: ignore[misc]
+
+
+def test_working_memory_capacity_arguments_require_exact_integers() -> None:
+    class IntegerSubclass(int):
+        pass
+
+    for field in ("item_capacity", "projection_max_bytes"):
+        with pytest.raises(ValueError):
+            WorkingMemory(
+                **{
+                    "item_capacity": IntegerSubclass(1)
+                    if field == "item_capacity"
+                    else 1,
+                    "projection_max_bytes": IntegerSubclass(1)
+                    if field == "projection_max_bytes"
+                    else 1,
+                }
+            )
 
 
 def test_resolver_cannot_reenter_authoritative_mutation() -> None:

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from suzka.identifiers import validate_identifier
+from suzka.limits import MAX_PERSISTED_REVISION
 import suzka.runtime.context as context_module
 from suzka.runtime import (
     MAX_CONTEXTS,
@@ -558,6 +559,49 @@ def test_finite_capacity_exhaustion_is_atomic_without_eviction(
     with pytest.raises(ContextCapacityExceeded, match="binding capacity"):
         registry.upsert_interlocutor_binding("ref-b", confidence=0.5)
     assert registry.state == before
+
+
+def test_revision_capacity_accepts_maximum_and_rejects_one_over_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(context_module, "MAX_PERSISTED_REVISION", 2)
+    registry = ContextRegistry(clock=DeterministicClock())
+    create_context(registry, "context-a")
+    registry.set_current("context-a")
+    before = registry.state
+
+    with pytest.raises(ContextCapacityExceeded, match="revision capacity"):
+        registry.set_current(None)
+
+    assert registry.state == before
+
+
+def test_restore_rejects_revision_one_over_owner_bound_without_mutation() -> None:
+    valid = nontrivial_registry().state
+    maximum = replace(valid, revision=MAX_PERSISTED_REVISION)
+    target = ContextRegistry()
+    target.restore_exact(maximum)
+    before = target.state
+
+    with pytest.raises(ContextStateInvalid, match="revision"):
+        target.restore_exact(replace(valid, revision=MAX_PERSISTED_REVISION + 1))
+
+    assert target.state == before
+
+
+def test_restore_rejects_integer_subclass_revisions_without_mutation() -> None:
+    class IntegerSubclass(int):
+        pass
+
+    valid = nontrivial_registry().state
+    target = ContextRegistry()
+
+    with pytest.raises(ContextStateInvalid, match="revision"):
+        target.restore_exact(replace(valid, revision=IntegerSubclass(valid.revision)))
+
+    assert target.state.revision == 0
+    assert target.state.frames == ()
+    assert target.state.interlocutor_bindings == ()
 
 
 def test_participant_evidence_and_relation_capacities_fail_before_mutation(

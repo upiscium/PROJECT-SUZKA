@@ -11,6 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from suzka.config import Settings, load_settings
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE, MAX_PERSISTED_REVISION
 from suzka.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 from suzka.runtime.event_journal import (
     AbortOutcome,
@@ -606,6 +607,75 @@ def test_processing_sequence_gap_is_rejected_before_append(tmp_path: Path) -> No
 
     assert error.value.stage is EventJournalAppendStage.VALIDATE
     assert error.value.published is False
+
+
+def test_maximum_processing_sequence_is_accepted_without_overflow(
+    tmp_path: Path,
+) -> None:
+    value = journal(tmp_path / "maximum.jsonl")
+    value.verify_and_reconcile(MAX_PERSISTED_EVENT_SEQUENCE - 1, HASH_0)
+    item = event("maximum", MAX_PERSISTED_EVENT_SEQUENCE)
+
+    value.append_accepted(item)
+    value.append_started(item)
+
+    assert value.inspect().processing_high_water == MAX_PERSISTED_EVENT_SEQUENCE
+
+
+def test_one_over_processing_sequence_is_rejected_atomically(
+    tmp_path: Path,
+) -> None:
+    value = journal(tmp_path / "one-over.jsonl")
+    value.verify_and_reconcile(MAX_PERSISTED_EVENT_SEQUENCE - 1, HASH_0)
+    item = event("one-over")
+    value.append_accepted(item)
+    before = value.records
+
+    with pytest.raises(EventJournalAppendError) as error:
+        value.append_started(event("one-over", MAX_PERSISTED_EVENT_SEQUENCE + 1))
+
+    assert error.value.stage is EventJournalAppendStage.VALIDATE
+    assert error.value.published is False
+    assert value.records == before
+    assert value.inspect().processing_high_water == MAX_PERSISTED_EVENT_SEQUENCE - 1
+
+
+def test_exhausted_journal_rejects_acceptance_without_append_or_consumption(
+    tmp_path: Path,
+) -> None:
+    value = journal(tmp_path / "exhausted.jsonl")
+    value.verify_and_reconcile(MAX_PERSISTED_EVENT_SEQUENCE, HASH_0)
+    before = value.records
+    before_bytes = value.path.read_bytes()
+
+    with pytest.raises(EventJournalAppendError) as error:
+        value.append_accepted(event("exhausted"))
+
+    assert error.value.stage is EventJournalAppendStage.VALIDATE
+    assert error.value.published is False
+    assert value.records == before
+    assert value.path.read_bytes() == before_bytes
+    assert not value.append_accepted_if_admission_available(event("still-exhausted"))
+    assert value.records == before
+
+
+def test_pending_acceptance_reserves_final_processing_sequence_slot(
+    tmp_path: Path,
+) -> None:
+    value = journal(tmp_path / "reserved-sequence.jsonl")
+    value.verify_and_reconcile(MAX_PERSISTED_EVENT_SEQUENCE - 1, HASH_0)
+    first = event("reserved-first")
+    value.append_accepted(first)
+    before = value.records
+
+    with pytest.raises(EventJournalAppendError) as error:
+        value.append_accepted(event("reserved-second"))
+
+    assert error.value.stage is EventJournalAppendStage.VALIDATE
+    assert error.value.published is False
+    assert value.records == before
+    assert not value.append_accepted_if_admission_available(event("reserved-third"))
+    value.append_started(event("reserved-first", MAX_PERSISTED_EVENT_SEQUENCE))
 
 
 def test_fifo_and_single_processing_order_is_enforced_before_append(
@@ -2424,6 +2494,19 @@ def test_u2_baseline_epoch_adopts_strict_superset_without_rewriting_history(
             adoption_epoch=2,
         )
     assert value.path.read_bytes() == after_upgrade
+
+
+def test_participant_baseline_adoption_epoch_has_a_finite_persisted_bound(
+    tmp_path: Path,
+) -> None:
+    value = bootstrap_v3(tmp_path / "u2-baseline-epoch-bound.jsonl")
+    append_u5_baseline(value)
+    record = value.records[-1]
+    raw = record.model_dump(mode="python")
+    raw["adoption_epoch"] = MAX_PERSISTED_REVISION + 1
+
+    with pytest.raises(ValidationError):
+        EventJournalRecord.model_validate(raw)
 
 
 def test_u5_canonically_hashed_noncurrent_baseline_fails_replay(

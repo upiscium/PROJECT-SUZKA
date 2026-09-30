@@ -11,11 +11,13 @@ import re
 import sys
 from typing import Final, Iterable
 
+from suzka.limits import MAX_CALIBRATION_SAMPLE_COUNT
 from suzka.models import ModelProvider
 
 
 MODEL_KEY_DOMAIN: Final[bytes] = b"PROJECT-SUZKA:R10:CALIBRATION-MODEL:V1\0"
 _MODEL_KEY_PATTERN: Final[re.Pattern[str]] = re.compile(r"model\.[0-9a-f]{64}")
+_MAX_APPROVED_KEYS: Final[int] = 64
 
 
 def _is_model_key(value: object) -> bool:
@@ -99,6 +101,8 @@ def _validate_calibration_values(
         raise ValueError("model_key must be an opaque model key")
     if type(count) is not int or count < 0:
         raise TypeError("count must be a non-negative integer")
+    if count > MAX_CALIBRATION_SAMPLE_COUNT:
+        raise ValueError("calibration sample count exceeds its persisted bound")
     mean_value = _finite_number(mean, "mean")
     m2_value = _finite_number(m2, "m2")
     if m2_value < 0.0:
@@ -186,7 +190,7 @@ class LossCalibration:
         except TypeError as error:
             raise TypeError("approved_keys must be an iterable of model keys") from error
         canonical_keys = tuple(sorted(set(keys)))
-        if not canonical_keys or len(canonical_keys) > 64:
+        if not canonical_keys or len(canonical_keys) > _MAX_APPROVED_KEYS:
             raise ValueError("approved keys must be non-empty and bounded")
         if any(not _is_model_key(key) for key in canonical_keys):
             raise ValueError("approved keys must be opaque model keys")
@@ -215,6 +219,8 @@ class LossCalibration:
 
         if type(state) is not tuple:
             raise TypeError("calibration state must be a tuple")
+        if len(state) > _MAX_APPROVED_KEYS:
+            raise ValueError("calibration state exceeds its maximum cardinality")
         candidate: dict[str, CalibrationEntry] = {}
         previous_key: str | None = None
         for entry in state:
@@ -238,6 +244,10 @@ class LossCalibration:
             raise ValueError("model_key is not approved")
         sample = _finite_number(loss, "loss")
         old = self._entries.get(key, CalibrationEntry(key, 0, 0.0, 0.0))
+        if key not in self._entries and len(self._entries) >= _MAX_APPROVED_KEYS:
+            raise ValueError("calibration entry capacity is exhausted")
+        if old.count >= MAX_CALIBRATION_SAMPLE_COUNT:
+            raise ValueError("calibration sample count capacity is exhausted")
         baseline = self._initial_baseline if old.count == 0 else old.mean
         if old.count > 1:
             scale = math.sqrt(old.m2 / (old.count - 1))

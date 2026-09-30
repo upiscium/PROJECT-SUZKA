@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from types import MappingProxyType
-from typing import Final, TypeVar, cast
+from typing import ClassVar, Final, TypeVar, cast
 
 from suzka.identifiers import validate_identifier
 from suzka.identity.origin import (
@@ -19,6 +19,7 @@ from suzka.identity.origin import (
     OriginInputKind,
     ValueAdmissionStatus,
 )
+from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE, MAX_PERSISTED_REVISION
 
 __all__ = [
     "IdentityOrigin",
@@ -48,6 +49,18 @@ __all__ = [
     "ValueState",
     "ValueSystemSnapshot",
     "ValueSystem",
+    "VALUE_MAX_APPLIED_EVIDENCE_REFS",
+    "VALUE_MAX_AUTHORITATIVE_VALUES",
+    "VALUE_MAX_CONCEPT_CODEPOINTS",
+    "VALUE_MAX_CONTEXT_IDS",
+    "VALUE_MAX_CONFLICTS",
+    "VALUE_MAX_EVENT_SEQUENCE",
+    "VALUE_MAX_EVIDENCE_REFS",
+    "VALUE_MAX_NAME_CODEPOINTS",
+    "VALUE_MAX_OPPOSITION_COUNT",
+    "VALUE_MAX_REFS",
+    "VALUE_MAX_REVISION",
+    "VALUE_MAX_REVISION_RECORDS",
     "canonical_evidence_ledger_payload",
     "canonical_revision_record_payload",
     "canonical_seed_payload",
@@ -57,6 +70,7 @@ __all__ = [
     "recompute_seed_contract_digest",
     "validate_seed_contract_digest",
     "validate_revision_record_digest",
+    "validate_value_history_immutable_basis",
     "value_state_digest",
 ]
 
@@ -100,13 +114,28 @@ class ValueMutationStatus(str, Enum):
     FROZEN = "frozen"
 
 
-_NAME_LIMIT: Final = 128
-_CONCEPT_LIMIT: Final = 2048
-_MAX_REFS: Final = 16
-_MAX_AUTHORITATIVE_VALUES: Final = 128
-_MAX_REVISION_RECORDS: Final = 32
-_MAX_APPLIED_EVIDENCE_REFS: Final = 512
-_MAX_OPPOSITION_COUNT: Final = 6
+VALUE_MAX_NAME_CODEPOINTS: Final[int] = 128
+VALUE_MAX_CONCEPT_CODEPOINTS: Final[int] = 2048
+VALUE_MAX_REFS: Final[int] = 16
+VALUE_MAX_CONTEXT_IDS: Final[int] = VALUE_MAX_REFS
+VALUE_MAX_EVIDENCE_REFS: Final[int] = VALUE_MAX_REFS
+VALUE_MAX_AUTHORITATIVE_VALUES: Final[int] = 128
+VALUE_MAX_CONFLICTS: Final[int] = (
+    VALUE_MAX_AUTHORITATIVE_VALUES * (VALUE_MAX_AUTHORITATIVE_VALUES - 1) // 2
+)
+VALUE_MAX_REVISION_RECORDS: Final[int] = 32
+VALUE_MAX_APPLIED_EVIDENCE_REFS: Final[int] = 512
+VALUE_MAX_OPPOSITION_COUNT: Final[int] = 6
+VALUE_MAX_REVISION: Final[int] = MAX_PERSISTED_REVISION
+VALUE_MAX_EVENT_SEQUENCE: Final[int] = MAX_PERSISTED_EVENT_SEQUENCE
+
+_NAME_LIMIT: Final = VALUE_MAX_NAME_CODEPOINTS
+_CONCEPT_LIMIT: Final = VALUE_MAX_CONCEPT_CODEPOINTS
+_MAX_REFS: Final = VALUE_MAX_REFS
+_MAX_AUTHORITATIVE_VALUES: Final = VALUE_MAX_AUTHORITATIVE_VALUES
+_MAX_REVISION_RECORDS: Final = VALUE_MAX_REVISION_RECORDS
+_MAX_APPLIED_EVIDENCE_REFS: Final = VALUE_MAX_APPLIED_EVIDENCE_REFS
+_MAX_OPPOSITION_COUNT: Final = VALUE_MAX_OPPOSITION_COUNT
 _PROMPT_CONCEPT_MAX_BYTES: Final = 256
 _EVENT_UPDATE_BUDGET: Final = 0.10
 _SEED_DOMAIN: Final = "suzka.identity.value-seed/v1"
@@ -117,6 +146,14 @@ _LEDGER_DOMAIN: Final = "suzka.identity.value-evidence-ledger/v1"
 
 
 _ValueEnum = TypeVar("_ValueEnum", bound=Enum)
+
+
+def _bounded_counter(value: object, name: str, maximum: int) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an exact integer")
+    if not 0 <= value <= maximum:
+        raise ValueError(f"{name} must be between 0 and {maximum}")
+    return value
 
 
 def _enum(value: object, enum_type: type[_ValueEnum], name: str) -> _ValueEnum:
@@ -293,8 +330,7 @@ class ValueState:
 
     def __post_init__(self) -> None:
         validate_identifier(self.value_id)
-        if type(self.revision) is not int or self.revision < 0:
-            raise TypeError("revision must be a nonnegative exact integer")
+        _bounded_counter(self.revision, "revision", VALUE_MAX_REVISION)
         _text(self.name, "name", _NAME_LIMIT)
         _optional_text(self.concept, "concept", _CONCEPT_LIMIT)
         scope = _enum(self.scope, ValueScope, "scope")
@@ -520,6 +556,15 @@ class ValueNotFound(ValueDomainError):
     """The requested stored Value does not exist."""
 
 
+def _next_revision(revision: int) -> int:
+    """Return the next persisted revision without allowing integer overflow."""
+
+    _bounded_counter(revision, "revision", VALUE_MAX_REVISION)
+    if revision == VALUE_MAX_REVISION:
+        raise ValueDomainError("Value revision has reached its persisted bound")
+    return revision + 1
+
+
 @dataclass(frozen=True, slots=True)
 class ValueMutationEvidence:
     """Explicit event identity supplied by the future runtime integration."""
@@ -530,8 +575,9 @@ class ValueMutationEvidence:
 
     def __post_init__(self) -> None:
         validate_identifier(self.event_id)
-        if type(self.event_sequence) is not int or self.event_sequence < 0:
-            raise TypeError("event_sequence must be a nonnegative exact integer")
+        _bounded_counter(
+            self.event_sequence, "event_sequence", VALUE_MAX_EVENT_SEQUENCE
+        )
         _validate_utc_datetime(self.recorded_at)
 
 
@@ -720,8 +766,11 @@ class ValueRevisionRecord:
         validate_identifier(self.value_id)
         if type(self.from_revision) is not int:
             raise TypeError("from_revision must be an exact integer")
-        if type(self.to_revision) is not int:
-            raise TypeError("to_revision must be an exact integer")
+        if not -1 <= self.from_revision <= VALUE_MAX_REVISION:
+            raise ValueError(
+                "from_revision must be the genesis marker or a bounded revision"
+            )
+        _bounded_counter(self.to_revision, "to_revision", VALUE_MAX_REVISION)
         _enum(self.operation, ValueRevisionOperation, "operation")
         if self.operation is ValueRevisionOperation.ADMISSION:
             if (self.from_revision, self.to_revision) != (-1, 0):
@@ -729,8 +778,9 @@ class ValueRevisionRecord:
         elif self.from_revision < 0 or self.to_revision != self.from_revision + 1:
             raise ValueError("ordinary records must increment revision exactly once")
         if self.operation is ValueRevisionOperation.ROLLBACK:
-            if type(self.target_revision) is not int or self.target_revision < 0:
-                raise TypeError("rollback records require a nonnegative target revision")
+            _bounded_counter(
+                self.target_revision, "target_revision", VALUE_MAX_REVISION
+            )
         elif self.target_revision is not None:
             raise ValueError("only rollback records may name a target revision")
         if not isinstance(self.after_state_projection, ValueState):
@@ -752,8 +802,9 @@ class ValueRevisionRecord:
         refs = _refs(self.evidence_refs, "evidence_refs")
         object.__setattr__(self, "evidence_refs", refs)
         validate_identifier(self.event_id)
-        if type(self.event_sequence) is not int or self.event_sequence < 0:
-            raise TypeError("event_sequence must be a nonnegative exact integer")
+        _bounded_counter(
+            self.event_sequence, "event_sequence", VALUE_MAX_EVENT_SEQUENCE
+        )
         _validate_utc_datetime(self.recorded_at)
         if self.previous_record_digest is not None:
             _validate_sha256_digest(self.previous_record_digest, "previous_record_digest")
@@ -767,6 +818,8 @@ class ValueRevisionRecord:
 @dataclass(frozen=True, slots=True)
 class ValueRevisionHistory:
     """A bounded retained suffix and its immutable compaction anchor."""
+
+    MAX_RECORDS: ClassVar[int] = VALUE_MAX_REVISION_RECORDS
 
     value_id: str
     history_anchor_revision: int | None = None
@@ -786,8 +839,11 @@ class ValueRevisionHistory:
         ):
             raise ValueError("history anchor fields must be all present or all absent")
         if self.history_anchor_revision is not None:
-            if type(self.history_anchor_revision) is not int or self.history_anchor_revision < 0:
-                raise TypeError("history_anchor_revision must be a nonnegative exact integer")
+            _bounded_counter(
+                self.history_anchor_revision,
+                "history_anchor_revision",
+                VALUE_MAX_REVISION,
+            )
             _validate_sha256_digest(self.history_anchor_digest, "history_anchor_digest")
             _validate_sha256_digest(
                 self.history_anchor_state_digest, "history_anchor_state_digest"
@@ -830,6 +886,8 @@ class ValueRevisionHistory:
             expected_before = record.after_digest
             previous_record = record
 
+        validate_value_history_immutable_basis(self)
+
     def validate(self) -> ValueRevisionHistory:
         """Re-run immutable chain validation and return this history."""
 
@@ -860,6 +918,56 @@ class ValueRevisionHistory:
             history_anchor_state_digest=anchor_state_digest,
             records=records,
         )
+
+
+def _immutable_value_state_basis(value: ValueState) -> tuple[object, ...]:
+    """Return the fields shared by every retained Value after-state."""
+
+    origin = value.origin
+    return (
+        value.value_id,
+        value.name,
+        value.concept,
+        value.scope,
+        value.context_ids,
+        value.stability,
+        value.protectedness,
+        value.negotiability,
+        value.allowed_update_rate,
+        value.seed_contract_digest,
+        origin.actor,
+        origin.input_kind,
+        origin.source_ref,
+        origin.event_id,
+        origin.context_id,
+        origin.event_sequence,
+        origin.confidence,
+        origin.origin_id,
+    )
+
+
+def validate_value_history_immutable_basis(
+    history: ValueRevisionHistory,
+) -> ValueRevisionHistory:
+    """Validate the lossless immutable basis of retained Value projections.
+
+    Revision, evidence, mutable appraisal fields, freeze state, and origin
+    admission are intentionally excluded: those fields are allowed to change
+    during the Value authority's existing transitions.
+    """
+
+    if not isinstance(history, ValueRevisionHistory):
+        raise TypeError("history must be a ValueRevisionHistory")
+    if not history.records:
+        return history
+    first = history.records[0].after_state_projection
+    expected = _immutable_value_state_basis(first)
+    for record in history.records[1:]:
+        if _immutable_value_state_basis(record.after_state_projection) != expected:
+            raise ValueError(
+                "retained Value projections do not share an immutable state basis"
+            )
+    return history
 
 
 @dataclass(frozen=True, slots=True)
@@ -986,7 +1094,12 @@ class ValueSystem:
     """Process-local authority for bounded Value mutation and revision history."""
 
     EVENT_UPDATE_BUDGET: Final[float] = _EVENT_UPDATE_BUDGET
-    MAX_AUTHORITATIVE_VALUES: Final[int] = _MAX_AUTHORITATIVE_VALUES
+    MAX_AUTHORITATIVE_VALUES: Final[int] = VALUE_MAX_AUTHORITATIVE_VALUES
+    MAX_CONFLICTS: Final[int] = VALUE_MAX_CONFLICTS
+    MAX_REVISION_RECORDS: Final[int] = VALUE_MAX_REVISION_RECORDS
+    MAX_APPLIED_EVIDENCE_REFS: Final[int] = VALUE_MAX_APPLIED_EVIDENCE_REFS
+    MAX_REVISION: Final[int] = VALUE_MAX_REVISION
+    MAX_EVENT_SEQUENCE: Final[int] = VALUE_MAX_EVENT_SEQUENCE
 
     def __init__(
         self,
@@ -1330,6 +1443,11 @@ class ValueSystem:
         evidence: ValueMutationEvidence,
         target_revision: int | None = None,
     ) -> ValueRevisionRecord:
+        # Keep the owner-side overflow guard at the common revision-record
+        # boundary as well as at each mutation planner.  Record construction
+        # must never be able to turn a bounded current revision into an
+        # overflowing persisted revision.
+        _next_revision(before.revision)
         history = self._histories[before.value_id]
         previous = history.last_record
         return ValueRevisionRecord(
@@ -1486,7 +1604,7 @@ class ValueSystem:
         )
         return replace(
             value,
-            revision=value.revision + 1,
+            revision=_next_revision(value.revision),
             polarity=polarity,
             strength=strength,
             confidence=confidence,
@@ -1656,7 +1774,7 @@ class ValueSystem:
                 value_id=value_id,
                 value=value,
             )
-        updated = replace(value, revision=value.revision + 1, frozen=frozen)
+        updated = replace(value, revision=_next_revision(value.revision), frozen=frozen)
         operation = (
             ValueRevisionOperation.FREEZE
             if frozen
@@ -1708,8 +1826,7 @@ class ValueSystem:
         _validate_governance_origin(
             governance_origin, evidence, "api.values.rollback"
         )
-        if type(target_revision) is not int or target_revision < 0:
-            raise TypeError("target_revision must be a nonnegative exact integer")
+        _bounded_counter(target_revision, "target_revision", VALUE_MAX_REVISION)
         current = self.get(value_id)
         history = self._histories[value_id]
         target_record = next(
@@ -1725,7 +1842,7 @@ class ValueSystem:
         target = target_record.after_state_projection
         restored = replace(
             current,
-            revision=current.revision + 1,
+            revision=_next_revision(current.revision),
             polarity=target.polarity,
             strength=target.strength,
             confidence=target.confidence,
@@ -1901,7 +2018,9 @@ class ValueSystem:
         )
         if reviewed_origin.origin_id != value.origin.origin_id:
             raise ValueDomainError("origin review changed the provenance identity")
-        updated = replace(value, revision=value.revision + 1, origin=reviewed_origin)
+        updated = replace(
+            value, revision=_next_revision(value.revision), origin=reviewed_origin
+        )
         record = self._record(
             value,
             updated,
@@ -1975,6 +2094,18 @@ class ValueSystem:
                     if not set(record.evidence_refs) <= set(ledger):
                         raise ValueDomainError(
                             "retained revision evidence is missing from its ledger"
+                        )
+                    if not set(record.after_state_projection.evidence_refs) <= set(
+                        ledger
+                    ):
+                        raise ValueDomainError(
+                            "retained Value state evidence is missing from its ledger"
+                        )
+                    if not set(record.after_state_projection.evidence_refs) <= set(
+                        ledger
+                    ):
+                        raise ValueDomainError(
+                            "retained Value state evidence is missing from its ledger"
                         )
             elif value.revision != 0:
                 raise ValueDomainError("a Value with no history must be at revision zero")
