@@ -236,6 +236,10 @@ def _max_revision(
                         "created_at": _R13_MAX_DATETIME_VALUE,
                         "event_id": "e" * R13_MAX_REF,
                         "event_sequence": R13_MAX_EVENT_SEQUENCE,
+                        # The generic U1 revision contract accepts bounded
+                        # identifiers up to R13_MAX_REF. U2 MotivationSystem
+                        # writes fixed 64-character typed-reference digests,
+                        # so this wider U1 witness shape remains conservative.
                         "evidence_refs": tuple(
                             _max_ids(R13_MAX_REVISION_WITNESSES)
                         ),
@@ -292,6 +296,9 @@ def _max_anchor(
                 "through_event_sequence": (
                     R13_MAX_EVENT_SEQUENCE - R13_MAX_REVISION_HISTORY
                 ),
+                # Preserve the U1 generic identifier maximum. Motivation U2
+                # anchor witnesses are fixed-size typed-reference digests,
+                # which fit below this conservative bound.
                 "through_evidence_refs": _max_ids(R13_MAX_REVISION_WITNESSES),
                 "through_operation": operation,
                 "through_previous_revision_digest": _max_digest(),

@@ -287,24 +287,53 @@ def test_same_opaque_id_under_different_source_kinds_remains_distinct() -> None:
     assert len(system.snapshot().evidence_ledger) == 2
 
 
-def test_same_motive_typed_reference_collision_fails_closed_under_u1_reference_bound() -> None:
+def test_same_motive_keeps_same_text_different_kinds_in_typed_revision_witnesses() -> None:
     system = MotivationSystem()
     target = ref(R13ReferenceKind.VALUE, "value:shared-target")
     experience = make_evidence(
         ref(R13ReferenceKind.EXPERIENCE, "source:shared"),
         target=target,
     )
-    system.apply_evidence(experience, source_event(experience, 1))
-    before = system.snapshot()
+    record = system.apply_evidence(experience, source_event(experience, 1))
     belief = make_evidence(
         ref(R13ReferenceKind.BELIEF, "source:shared"),
         target=target,
     )
+    record = system.apply_evidence(belief, source_event(belief, 2))
+    typed_refs = tuple(
+        sorted(
+            (experience.source_ref, belief.source_ref),
+            key=lambda item: (item.reference, item.kind.value),
+        )
+    )
+    typed_witnesses = tuple(
+        sorted(
+            motivation_system_module.motivation_evidence_witness(item)
+            for item in typed_refs
+        )
+    )
 
-    with pytest.raises(ValueError, match="references must be unique"):
-        system.apply_evidence(belief, source_event(belief, 2))
-    assert system.snapshot().authority_digest == before.authority_digest
-    assert len(system.snapshot().evidence_ledger) == 1
+    assert experience.motivation_id == belief.motivation_id == record.motivation_id
+    assert record.evidence_refs[:2] == typed_refs
+    assert len(typed_witnesses) == 2
+    assert typed_witnesses[0] != typed_witnesses[1]
+    assert record.revision_history[-1].evidence_refs == typed_witnesses
+    assert len(system.snapshot().evidence_ledger) == 2
+
+    for sequence in range(3, 11):
+        additional = make_evidence(
+            ref(R13ReferenceKind.EXPERIENCE, f"source:extra-{sequence:02d}"),
+            target=target,
+        )
+        record = system.apply_evidence(additional, source_event(additional, sequence))
+    assert record.history_anchor is not None
+    assert record.history_anchor.through_evidence_refs == typed_witnesses
+    assert set(record.evidence_refs) >= set(typed_refs)
+
+    before_replay = system.snapshot()
+    assert system.apply_evidence(experience, source_event(experience, 11)) == record
+    assert system.apply_evidence(belief, source_event(belief, 12)) == record
+    assert system.snapshot().authority_digest == before_replay.authority_digest
 
 
 def test_source_and_origin_with_same_text_but_different_kind_remain_distinct() -> None:
@@ -317,26 +346,6 @@ def test_source_and_origin_with_same_text_but_different_kind_remain_distinct() -
     accepted = system.snapshot().evidence_ledger[0].evidence
     assert accepted.source_ref == source
     assert accepted.origin_refs == (origin,)
-
-
-def test_same_motive_typed_reference_collision_fails_closed_under_u1_bound() -> None:
-    system = MotivationSystem()
-    target = ref(R13ReferenceKind.VALUE, "value:shared-target")
-    experience = make_evidence(
-        ref(R13ReferenceKind.EXPERIENCE, "source:shared"),
-        target=target,
-    )
-    system.apply_evidence(experience, source_event(experience, 1))
-    before = system.snapshot()
-
-    belief = make_evidence(
-        ref(R13ReferenceKind.BELIEF, "source:shared"),
-        target=target,
-    )
-    with pytest.raises(ValueError, match="references must be unique"):
-        system.apply_evidence(belief, source_event(belief, 2))
-    assert system.snapshot().authority_digest == before.authority_digest
-    assert len(system.snapshot().evidence_ledger) == 1
 
 
 def test_active_value_factory_preserves_origin_and_rejects_pending_value() -> None:

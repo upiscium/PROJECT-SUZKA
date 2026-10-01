@@ -2,6 +2,7 @@
 
 from dataclasses import fields
 from enum import Enum
+import hashlib
 import math
 import subprocess
 import sys
@@ -9,9 +10,12 @@ import sys
 import pytest
 
 from suzka.motivation import (
+    R13Reference,
     R13_SCHEMA_SIZE_BUDGET,
+    MOTIVATION_TYPED_EVIDENCE_WITNESS_DOMAIN,
     canonical_r13_schema_size_budget,
     derive_r13_schema_size_budget,
+    motivation_evidence_witness,
     validate_r13_schema_size_budget,
 )
 from suzka.runtime.agent_state import (
@@ -111,6 +115,35 @@ def test_schema_budget_is_reproducible_and_preserves_the_v8_future_reserve() -> 
     assert budget.remaining_after_reserve_bytes == 12_854_927
     assert budget.remaining_after_reserve_bytes >= 0
     assert canonical_r13_schema_size_budget() == canonical_r13_schema_size_budget()
+
+
+def test_typed_motivation_witness_is_fixed_and_u1_size_bound_remains_conservative() -> None:
+    experience = R13Reference(R13ReferenceKind.EXPERIENCE, "source:shared")
+    belief = R13Reference(R13ReferenceKind.BELIEF, "source:shared")
+    experience_witness = motivation_evidence_witness(experience)
+    belief_witness = motivation_evidence_witness(belief)
+
+    assert len(experience_witness) == len(belief_witness) == 64
+    assert experience_witness != belief_witness
+    assert experience_witness == hashlib.sha256(
+        MOTIVATION_TYPED_EVIDENCE_WITNESS_DOMAIN
+        + canonical_json(experience.canonical_value())
+    ).hexdigest()
+    assert belief_witness == hashlib.sha256(
+        MOTIVATION_TYPED_EVIDENCE_WITNESS_DOMAIN
+        + canonical_json(belief.canonical_value())
+    ).hexdigest()
+    budget = derive_r13_schema_size_budget()
+    assert budget == R13_SCHEMA_SIZE_BUDGET
+    max_record = max_motivation_record_shape()
+    history = max_record["revision_history"]
+    assert isinstance(history, list) and history
+    first_revision = history[0]
+    assert isinstance(first_revision, dict)
+    revision_witnesses = first_revision["evidence_refs"]
+    assert isinstance(revision_witnesses, list)
+    assert max(map(len, revision_witnesses)) == R13_MAX_REF
+    assert R13_MAX_REF >= len(experience_witness)
 
 
 def test_importing_pure_r13_contracts_does_not_import_runtime_or_models() -> None:

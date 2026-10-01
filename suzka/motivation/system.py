@@ -32,7 +32,7 @@ from suzka.motivation.common import (
     canonical_datetime,
     canonical_event,
     canonical_json,
-    canonical_references,
+    canonical_revision_witnesses,
     digest_payload,
     utc_datetime,
     validate_digest,
@@ -72,6 +72,9 @@ MOTIVATION_SYSTEM_SCHEMA_VERSION: Final = 1
 MOTIVATION_SYSTEM_DOMAIN: Final = b"PROJECT-SUZKA:R13:MOTIVATION-SYSTEM:V1\0"
 MOTIVATION_EVIDENCE_DOMAIN: Final = b"PROJECT-SUZKA:R13:MOTIVATION-EVIDENCE:V1\0"
 MOTIVATION_EVENT_DOMAIN: Final = b"PROJECT-SUZKA:R13:MOTIVATION-EVENT:V1\0"
+MOTIVATION_TYPED_EVIDENCE_WITNESS_DOMAIN: Final = (
+    b"PROJECT-SUZKA:R13:MOTIVATION-TYPED-EVIDENCE-WITNESS:V1\0"
+)
 MOTIVATION_MAX_RECORDS: Final = R13_MAX_RECORDS_PER_DOMAIN
 MOTIVATION_MAX_EVIDENCE_PER_RECORD: Final = R13_MAX_EVIDENCE_REFS
 MOTIVATION_MAX_EVIDENCE_LEDGER: Final = (
@@ -223,12 +226,46 @@ def _canonical_identity_refs(
     maximum: int,
     allowed_kinds: frozenset[R13ReferenceKind],
 ) -> tuple[R13Reference, ...]:
-    return canonical_references(
-        refs,
-        name,
-        maximum=maximum,
-        allow_empty=False,
-        allowed_kinds=allowed_kinds,
+    if type(refs) is not tuple:
+        raise TypeError(f"{name} must be a tuple")
+    if not refs:
+        raise ValueError(f"{name} must be non-empty")
+    if len(refs) > maximum:
+        raise ValueError(f"{name} exceeds its bound")
+    references: list[R13Reference] = []
+    for item in refs:
+        if not isinstance(item, R13Reference):
+            raise TypeError(f"{name} must contain R13Reference values")
+        if item.kind not in allowed_kinds:
+            raise ValueError(f"{name} contains an unauthorized reference kind")
+        references.append(item)
+    typed_identities = tuple((item.kind.value, item.reference) for item in references)
+    if len(set(typed_identities)) != len(typed_identities):
+        raise ValueError(f"{name} typed references must be unique")
+    ordered = tuple(
+        sorted(references, key=lambda item: (item.reference, item.kind.value))
+    )
+    if tuple(references) != ordered:
+        raise ValueError(f"{name} must be canonically ordered")
+    return ordered
+
+
+def motivation_evidence_witness(reference: R13Reference) -> str:
+    """Return a fixed-size revision witness for an exact typed source ref."""
+
+    checked = _source_reference(reference)
+    return digest_payload(
+        MOTIVATION_TYPED_EVIDENCE_WITNESS_DOMAIN,
+        checked.canonical_value(),
+    )
+
+
+def _motivation_revision_witnesses(
+    references: tuple[R13Reference, ...],
+) -> tuple[str, ...]:
+    return canonical_revision_witnesses(
+        tuple(sorted(motivation_evidence_witness(item) for item in references)),
+        "evidence_refs",
     )
 
 
@@ -690,11 +727,10 @@ class MotivationEventReceipt:
         ids = tuple(validate_identifier(item) for item in self.motivation_ids)
         if ids != tuple(sorted(set(ids))):
             raise ValueError("motivation_ids must be sorted and unique")
-        refs = canonical_references(
+        refs = _canonical_identity_refs(
             self.evidence_refs,
             "evidence_refs",
             maximum=R13_MAX_EVIDENCE_REFS,
-            allow_empty=False,
             allowed_kinds=MOTIVATION_SOURCE_KINDS,
         )
         for name in ("evidence_digest", "candidate_digest"):
@@ -1184,8 +1220,8 @@ class MotivationSystemSnapshot:
             )
             if refs != record.evidence_refs:
                 raise ValueError("Motivation record evidence differs from its exact ledger")
-            if record.revision_history[-1].evidence_refs != tuple(
-                sorted(item.reference for item in record.evidence_refs)
+            if record.revision_history[-1].evidence_refs != _motivation_revision_witnesses(
+                record.evidence_refs
             ):
                 raise ValueError("latest Motivation revision does not bind current evidence")
 
@@ -1232,10 +1268,12 @@ class MotivationSystemSnapshot:
                 ):
                     raise ValueError("Motivation revision lacks its exact event receipt")
                 revision_source_refs = tuple(
-                    sorted(
-                        item.evidence.source_ref.reference
-                        for item in record_entries
-                        if item.event_sequence <= event_sequence
+                    _motivation_revision_witnesses(
+                        tuple(
+                            item.evidence.source_ref
+                            for item in record_entries
+                            if item.event_sequence <= event_sequence
+                        )
                     )
                 )
                 if event_refs != revision_source_refs:
@@ -1594,7 +1632,7 @@ class MotivationSystem:
                 state_digest=state_digest,
                 event_id=event.event_id,
                 event_sequence=event.event_sequence,
-                evidence_refs=(evidence.source_ref.reference,),
+                evidence_refs=_motivation_revision_witnesses((evidence.source_ref,)),
             )
             updated = MotivationRecord(
                 motivation_id=motivation_id,
@@ -1997,7 +2035,7 @@ class MotivationSystem:
             previous_revision_digest=current.revision_history[-1].record_digest,
             event_id=event.event_id,
             event_sequence=event.event_sequence,
-            evidence_refs=tuple(sorted(item.reference for item in evidence_refs)),
+            evidence_refs=_motivation_revision_witnesses(evidence_refs),
         )
         history, anchor = _append_revision(current, revision)
         return replace(
@@ -2193,6 +2231,7 @@ __all__ = [
     "MOTIVATION_SYSTEM_DOMAIN",
     "MOTIVATION_SYSTEM_MAX_SERIALIZED_BYTES",
     "MOTIVATION_SYSTEM_SCHEMA_VERSION",
+    "MOTIVATION_TYPED_EVIDENCE_WITNESS_DOMAIN",
     "MotivationCapacityExceeded",
     "MotivationDomainError",
     "MotivationEventOperation",
@@ -2205,4 +2244,5 @@ __all__ = [
     "MotivationMutationEvidence",
     "MotivationSystem",
     "MotivationSystemSnapshot",
+    "motivation_evidence_witness",
 ]

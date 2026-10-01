@@ -28,7 +28,6 @@ from suzka.motivation.common import (
     canonical_datetime,
     canonical_event,
     canonical_json,
-    canonical_references,
     canonical_revision_witnesses,
     digest_payload,
     utc_datetime,
@@ -152,13 +151,28 @@ def _typed_refs(
     *,
     allow_empty: bool = True,
 ) -> tuple[R13Reference, ...]:
-    return canonical_references(
-        value,
-        name,
-        maximum=maximum,
-        allow_empty=allow_empty,
-        allowed_kinds=allowed_kinds,
+    if type(value) is not tuple:
+        raise TypeError(f"{name} must be a tuple")
+    if not allow_empty and not value:
+        raise ValueError(f"{name} must be non-empty")
+    if len(value) > maximum:
+        raise ValueError(f"{name} exceeds its bound")
+    references: list[R13Reference] = []
+    for item in value:
+        if not isinstance(item, R13Reference):
+            raise TypeError(f"{name} must contain R13Reference values")
+        if item.kind not in allowed_kinds:
+            raise ValueError(f"{name} contains an unauthorized reference kind")
+        references.append(item)
+    typed_identities = tuple((item.kind.value, item.reference) for item in references)
+    if len(set(typed_identities)) != len(typed_identities):
+        raise ValueError(f"{name} typed references must be unique")
+    ordered = tuple(
+        sorted(references, key=lambda item: (item.reference, item.kind.value))
     )
+    if tuple(references) != ordered:
+        raise ValueError(f"{name} must be canonically ordered")
+    return ordered
 
 
 def motivation_id_for_target(kind: MotivationKind, target: R13Reference) -> str:

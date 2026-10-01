@@ -126,6 +126,7 @@ from suzka.motivation.system import (
     MOTIVATION_SATIATION_STEP,
     MOTIVATION_SYSTEM_MAX_SERIALIZED_BYTES,
     MOTIVATION_SYSTEM_SCHEMA_VERSION,
+    MOTIVATION_TYPED_EVIDENCE_WITNESS_DOMAIN,
     MotivationCapacityExceeded,
     MotivationDomainError,
     MotivationEventOperation,
@@ -138,6 +139,7 @@ from suzka.motivation.system import (
     MotivationMutationEvidence,
     MotivationSystem,
     MotivationSystemSnapshot,
+    motivation_evidence_witness,
 )
 
 __all__ = [
@@ -182,6 +184,7 @@ __all__ = [
     "MOTIVATION_SATIATION_STEP",
     "MOTIVATION_SYSTEM_MAX_SERIALIZED_BYTES",
     "MOTIVATION_SYSTEM_SCHEMA_VERSION",
+    "MOTIVATION_TYPED_EVIDENCE_WITNESS_DOMAIN",
     "MotivationCapacityExceeded",
     "MotivationCandidate",
     "MotivationCandidateClassification",
@@ -265,6 +268,7 @@ __all__ = [
     "motivation_record_digest",
     "motivation_revision_digest",
     "motivation_state_digest",
+    "motivation_evidence_witness",
     "validate_goal_reference_graph",
     "validate_model_key",
     "validate_r13_schema_size_budget",
