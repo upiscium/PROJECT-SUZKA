@@ -91,6 +91,9 @@ MOTIVATION_REVIEW_STEP: Final = 0.25
 MOTIVATION_GOAL_PROPOSAL_MIN_STRENGTH: Final = 0.2
 MOTIVATION_MAX_GOALS_PER_EVENT: Final = 1
 MOTIVATION_MAX_GOALS_PER_MOTIVATION: Final = 1
+MOTIVATION_MAX_GOAL_PROPOSAL_WITNESSES: Final = (
+    MOTIVATION_MAX_RECORDS * MOTIVATION_MAX_GOALS_PER_MOTIVATION
+)
 
 _SOURCE_WEIGHTS: Final[dict[R13ReferenceKind, float]] = {
     R13ReferenceKind.EXPERIENCE: 0.30,
@@ -118,6 +121,7 @@ class MotivationEvidenceConflict(MotivationDomainError):
 
 class MotivationEventOperation(str, Enum):
     EVIDENCE = "evidence"
+    CANDIDATE = "candidate"
     DECAY = "decay"
     SATIATION = "satiation"
     REVIEW = "review"
@@ -183,6 +187,10 @@ class MotivationExperienceEvidence:
 def _exact_enum(value: object, enum_type: type[Enum], name: str) -> None:
     if type(value) is not enum_type:
         raise TypeError(f"{name} must be a {enum_type.__name__}")
+
+
+def _goal_description(motivation_id: str, kind: MotivationKind) -> str:
+    return f"consider {kind.value} motivation {motivation_id}"
 
 
 def _source_reference(value: object) -> R13Reference:
@@ -262,7 +270,7 @@ class MotivationEvidence:
             maximum=MOTIVATION_MAX_ORIGIN_REFS,
             allowed_kinds=_ORIGIN_KINDS,
         )
-        if source.reference in {item.reference for item in origins}:
+        if source in origins:
             raise ValueError("source_ref cannot be repeated as an origin reference")
         event_id, event_sequence, observed_at = _source_time(
             self.source_event_id,
@@ -664,6 +672,7 @@ class MotivationEventReceipt:
     evidence_digest: str | None = None
     candidate_digest: str | None = None
     elapsed_seconds: float | None = None
+    goal_proposal_digest: str | None = None
     receipt_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -692,14 +701,29 @@ class MotivationEventReceipt:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, validate_digest(value, name))
+        if self.goal_proposal_digest is not None:
+            object.__setattr__(
+                self,
+                "goal_proposal_digest",
+                validate_digest(self.goal_proposal_digest, "goal_proposal_digest"),
+            )
         if self.operation is MotivationEventOperation.EVIDENCE:
             if self.evidence_digest is None or self.elapsed_seconds is not None:
                 raise ValueError("evidence receipt requires its exact evidence digest")
+        elif self.operation is MotivationEventOperation.CANDIDATE:
+            if (
+                self.evidence_digest is not None
+                or self.candidate_digest is None
+                or self.elapsed_seconds is not None
+                or self.goal_proposal_digest is not None
+            ):
+                raise ValueError("candidate receipt requires its exact candidate digest")
         elif self.operation is MotivationEventOperation.DECAY:
             if (
                 self.evidence_digest is not None
                 or self.candidate_digest is not None
                 or self.elapsed_seconds is None
+                or self.goal_proposal_digest is not None
             ):
                 raise ValueError("decay receipt requires its exact elapsed-time input")
             object.__setattr__(self, "elapsed_seconds", _bounded_elapsed(self.elapsed_seconds))
@@ -707,6 +731,7 @@ class MotivationEventReceipt:
             self.evidence_digest is not None
             or self.candidate_digest is not None
             or self.elapsed_seconds is not None
+            or self.goal_proposal_digest is not None
         ):
             raise ValueError("unexpected operation-specific event receipt input")
         object.__setattr__(self, "motivation_ids", ids)
@@ -726,10 +751,119 @@ class MotivationEventReceipt:
             ),
             "input_digest": self.input_digest,
             "candidate_digest": self.candidate_digest,
+            "goal_proposal_digest": self.goal_proposal_digest,
             "motivation_ids": list(self.motivation_ids),
             "operation": self.operation.value,
             "recorded_at": canonical_datetime(self.recorded_at),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class MotivationGoalProposalWitness:
+    """First exact event at which one Motive became Goal-proposal eligible."""
+
+    motivation_id: str
+    kind: MotivationKind
+    event_id: str
+    event_sequence: int
+    recorded_at: datetime
+    evidence_ref: R13Reference
+    eligible_strength: float
+    motivation_revision: int
+    motivation_revision_digest: str
+    motivation_state_digest: str
+    goal_id: str = field(init=False)
+    proposal_digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "motivation_id", validate_identifier(self.motivation_id))
+        _exact_enum(self.kind, MotivationKind, "kind")
+        object.__setattr__(self, "event_id", validate_identifier(self.event_id))
+        if type(self.event_sequence) is not int or not 1 <= self.event_sequence <= R13_MAX_EVENT_SEQUENCE:
+            raise ValueError("event_sequence must be a positive bounded integer")
+        object.__setattr__(self, "recorded_at", utc_datetime(self.recorded_at, "recorded_at"))
+        evidence_ref = _source_reference(self.evidence_ref)
+        strength = bounded_fraction(self.eligible_strength, "eligible_strength")
+        if strength < MOTIVATION_GOAL_PROPOSAL_MIN_STRENGTH:
+            raise ValueError("eligible_strength does not meet the Goal proposal threshold")
+        if (
+            type(self.motivation_revision) is not int
+            or not 0 <= self.motivation_revision <= R13_MAX_REVISION
+        ):
+            raise ValueError("motivation_revision must be a bounded exact integer")
+        revision_digest = validate_digest(
+            self.motivation_revision_digest,
+            "motivation_revision_digest",
+        )
+        state_digest = validate_digest(
+            self.motivation_state_digest,
+            "motivation_state_digest",
+        )
+        object.__setattr__(self, "evidence_ref", evidence_ref)
+        object.__setattr__(self, "eligible_strength", strength)
+        object.__setattr__(self, "motivation_revision_digest", revision_digest)
+        object.__setattr__(self, "motivation_state_digest", state_digest)
+        motivation_ref = R13Reference(R13ReferenceKind.MOTIVATION, self.motivation_id)
+        goal_id = goal_id_for_target(motivation_ref)
+        proposal_digest = goal_proposal_digest(
+            motivation_ref,
+            _goal_description(self.motivation_id, self.kind),
+            origin_refs=(motivation_ref,),
+            evidence_refs=tuple(
+                sorted(
+                    (motivation_ref, evidence_ref),
+                    key=lambda item: (item.reference, item.kind.value),
+                )
+            ),
+        )
+        object.__setattr__(self, "goal_id", goal_id)
+        object.__setattr__(self, "proposal_digest", proposal_digest)
+
+    def canonical_value(self) -> dict[str, object]:
+        return {
+            "eligible_strength": self.eligible_strength.hex(),
+            "event_id": self.event_id,
+            "event_sequence": self.event_sequence,
+            "evidence_ref": self.evidence_ref.canonical_value(),
+            "goal_id": self.goal_id,
+            "kind": self.kind.value,
+            "motivation_id": self.motivation_id,
+            "motivation_revision": self.motivation_revision,
+            "motivation_revision_digest": self.motivation_revision_digest,
+            "motivation_state_digest": self.motivation_state_digest,
+            "proposal_digest": self.proposal_digest,
+            "recorded_at": canonical_datetime(self.recorded_at),
+        }
+
+    def to_goal_record(self) -> GoalRecord:
+        motivation_ref = R13Reference(R13ReferenceKind.MOTIVATION, self.motivation_id)
+        evidence_refs = tuple(
+            sorted(
+                (motivation_ref, self.evidence_ref),
+                key=lambda item: (item.reference, item.kind.value),
+            )
+        )
+        revision = GoalRevisionRecord(
+            goal_id=self.goal_id,
+            revision=0,
+            operation=GoalRevisionOperation.CREATE,
+            reason=GoalRevisionReason.CREATION,
+            created_at=self.recorded_at,
+            previous_lifecycle_state=None,
+            proposal_digest=self.proposal_digest,
+            event_id=self.event_id,
+            event_sequence=self.event_sequence,
+            evidence_refs=tuple(sorted(item.reference for item in evidence_refs)),
+        )
+        return GoalRecord(
+            goal_id=self.goal_id,
+            target=motivation_ref,
+            description=_goal_description(self.motivation_id, self.kind),
+            lifecycle=GoalLifecycle.PROPOSED,
+            origin_refs=(motivation_ref,),
+            evidence_refs=evidence_refs,
+            revision_history=(revision,),
+        )
 
 
 def _record_value(record: MotivationRecord) -> dict[str, object]:
@@ -760,6 +894,7 @@ class MotivationSystemSnapshot:
     evidence_ledger: tuple[MotivationEvidenceLedgerEntry, ...]
     candidates: tuple[MotivationInterpretationCandidate, ...]
     event_receipts: tuple[MotivationEventReceipt, ...]
+    goal_proposal_witnesses: tuple[MotivationGoalProposalWitness, ...] = ()
     schema_version: int = MOTIVATION_SYSTEM_SCHEMA_VERSION
     authority_digest: str = field(init=False)
     serialized_bytes: int = field(init=False)
@@ -772,6 +907,12 @@ class MotivationSystemSnapshot:
             ("evidence_ledger", self.evidence_ledger, MOTIVATION_MAX_EVIDENCE_LEDGER, MotivationEvidenceLedgerEntry),
             ("candidates", self.candidates, MOTIVATION_MAX_CANDIDATES, MotivationInterpretationCandidate),
             ("event_receipts", self.event_receipts, MOTIVATION_MAX_EVENT_RECEIPTS, MotivationEventReceipt),
+            (
+                "goal_proposal_witnesses",
+                self.goal_proposal_witnesses,
+                MOTIVATION_MAX_GOAL_PROPOSAL_WITNESSES,
+                MotivationGoalProposalWitness,
+            ),
         ):
             if type(values) is not tuple:
                 raise TypeError(f"{name} must be a tuple")
@@ -782,12 +923,22 @@ class MotivationSystemSnapshot:
         record_ids = tuple(item.motivation_id for item in self.records)
         if record_ids != tuple(sorted(set(record_ids))):
             raise ValueError("Motivation records must be sorted and unique")
-        evidence_ids = tuple(item.evidence.source_ref.reference for item in self.evidence_ledger)
+        evidence_ids = tuple(
+            (item.evidence.source_ref.kind.value, item.evidence.source_ref.reference)
+            for item in self.evidence_ledger
+        )
         if evidence_ids != tuple(sorted(set(evidence_ids))):
             raise ValueError("Motivation evidence ledger must be sorted and unique")
         candidate_ids = tuple(item.candidate_digest for item in self.candidates)
         if candidate_ids != tuple(sorted(set(candidate_ids))):
             raise ValueError("Motivation candidates must be sorted and unique")
+        proposal_ids = tuple(item.motivation_id for item in self.goal_proposal_witnesses)
+        if proposal_ids != tuple(sorted(set(proposal_ids))):
+            raise ValueError("Goal proposal witnesses must be sorted and unique")
+        if len({item.event_id for item in self.goal_proposal_witnesses}) != len(
+            self.goal_proposal_witnesses
+        ):
+            raise ValueError("one event cannot exceed the Goal proposal budget")
         event_sequences = tuple(item.event_sequence for item in self.event_receipts)
         if event_sequences != tuple(sorted(set(event_sequences))):
             raise ValueError("Motivation event receipts must be sequence ordered")
@@ -810,6 +961,9 @@ class MotivationSystemSnapshot:
             if receipt.operation is MotivationEventOperation.EVIDENCE:
                 if len(receipt.motivation_ids) != 1 or len(receipt.evidence_refs) != 1:
                     raise ValueError("evidence receipt must bind one Motive and one source")
+            elif receipt.operation is MotivationEventOperation.CANDIDATE:
+                if receipt.motivation_ids or receipt.candidate_digest is None:
+                    raise ValueError("candidate receipt cannot carry Motivation authority")
             elif receipt.operation is MotivationEventOperation.DECAY:
                 if receipt.evidence_refs != expected_motivation_refs:
                     raise ValueError("decay receipt must bind its exact Motive set")
@@ -817,6 +971,14 @@ class MotivationSystemSnapshot:
                 raise ValueError("review/retire receipt must bind one exact Motive")
             expected_digest: str
             if receipt.operation is MotivationEventOperation.EVIDENCE:
+                continue
+            if receipt.operation is MotivationEventOperation.CANDIDATE:
+                expected_digest = _event_input_digest(
+                    receipt.operation,
+                    {"candidate_digest": receipt.candidate_digest},
+                )
+                if receipt.input_digest != expected_digest:
+                    raise ValueError("candidate event receipt input digest is inconsistent")
                 continue
             if receipt.operation is MotivationEventOperation.DECAY:
                 if receipt.elapsed_seconds is None:
@@ -889,6 +1051,106 @@ class MotivationSystemSnapshot:
             evidence_by_motivation.setdefault(entry.motivation_id, []).append(
                 entry.evidence.source_ref
             )
+        for candidate in self.candidates:
+            candidate_receipt = receipt_map.get(candidate.event_id)
+            if (
+                candidate_receipt is None
+                or candidate_receipt.event_sequence != candidate.event_sequence
+                or candidate_receipt.candidate_digest != candidate.candidate_digest
+                or candidate_receipt.evidence_refs != candidate.source_evidence_refs
+                or candidate_receipt.operation
+                not in {
+                    MotivationEventOperation.CANDIDATE,
+                    MotivationEventOperation.EVIDENCE,
+                }
+            ):
+                raise ValueError("Motivation candidate lacks its exact event receipt")
+        for receipt in self.event_receipts:
+            if receipt.operation is MotivationEventOperation.CANDIDATE and not any(
+                item.candidate_digest == receipt.candidate_digest
+                and item.event_id == receipt.event_id
+                and item.event_sequence == receipt.event_sequence
+                and item.source_evidence_refs == receipt.evidence_refs
+                for item in self.candidates
+            ):
+                raise ValueError("candidate receipt lacks its exact candidate value")
+        proposal_by_id = {
+            item.motivation_id: item for item in self.goal_proposal_witnesses
+        }
+        for witness in self.goal_proposal_witnesses:
+            record = record_map.get(witness.motivation_id)
+            witness_receipt = receipt_map.get(witness.event_id)
+            if record is None or record.kind is not witness.kind:
+                raise ValueError("Goal proposal witness references a missing Motive")
+            if witness.evidence_ref not in record.evidence_refs:
+                raise ValueError("Goal proposal witness source is absent from its Motive")
+            if (
+                witness_receipt is None
+                or witness_receipt.operation is not MotivationEventOperation.EVIDENCE
+                or witness_receipt.event_sequence != witness.event_sequence
+                or witness_receipt.recorded_at != witness.recorded_at
+                or witness_receipt.motivation_ids != (witness.motivation_id,)
+                or witness_receipt.evidence_refs != (witness.evidence_ref,)
+                or witness_receipt.goal_proposal_digest != witness.proposal_digest
+            ):
+                raise ValueError("Goal proposal witness lacks its exact eligibility event")
+            if not any(
+                item.motivation_id == witness.motivation_id
+                and item.event_id == witness.event_id
+                and item.event_sequence == witness.event_sequence
+                and item.evidence.source_ref == witness.evidence_ref
+                for item in self.evidence_ledger
+            ):
+                raise ValueError("Goal proposal witness lacks its accepted source evidence")
+            retained_revision = next(
+                (
+                    item
+                    for item in record.revision_history
+                    if item.event_id == witness.event_id
+                    and item.event_sequence == witness.event_sequence
+                ),
+                None,
+            )
+            if retained_revision is not None:
+                if (
+                    retained_revision.revision != witness.motivation_revision
+                    or retained_revision.record_digest != witness.motivation_revision_digest
+                    or retained_revision.state_digest != witness.motivation_state_digest
+                ):
+                    raise ValueError("Goal proposal witness differs from its Motivation revision")
+            elif record.history_anchor is not None:
+                anchor = record.history_anchor
+                if (
+                    anchor.through_event_id == witness.event_id
+                    and anchor.through_event_sequence == witness.event_sequence
+                ):
+                    if (
+                        anchor.through_revision != witness.motivation_revision
+                        or anchor.through_digest != witness.motivation_revision_digest
+                        or anchor.through_state_digest != witness.motivation_state_digest
+                    ):
+                        raise ValueError("Goal proposal witness differs from its compaction anchor")
+                elif (
+                    witness.motivation_revision >= anchor.retained_from_revision
+                    or witness.event_sequence > anchor.through_event_sequence
+                ):
+                    raise ValueError("Goal proposal witness revision is absent from its Motive history")
+            else:
+                raise ValueError("Goal proposal witness revision is absent from its Motive history")
+        for record in self.records:
+            if (
+                record.lifecycle is MotivationLifecycle.ACTIVE
+                and record.strength >= MOTIVATION_GOAL_PROPOSAL_MIN_STRENGTH
+                and record.motivation_id not in proposal_by_id
+            ):
+                raise ValueError("eligible Motivation is missing its first Goal proposal witness")
+        for receipt in self.event_receipts:
+            if receipt.goal_proposal_digest is not None and not any(
+                item.event_id == receipt.event_id
+                and item.proposal_digest == receipt.goal_proposal_digest
+                for item in self.goal_proposal_witnesses
+            ):
+                raise ValueError("event receipt references a missing Goal proposal witness")
         for receipt in self.event_receipts:
             if receipt.operation is MotivationEventOperation.EVIDENCE:
                 matches = tuple(
@@ -1013,6 +1275,9 @@ class MotivationSystemSnapshot:
             "candidates": [_candidate_value(item) for item in self.candidates],
             "event_receipts": [item.canonical_value() for item in self.event_receipts],
             "evidence_ledger": [item.canonical_value() for item in self.evidence_ledger],
+            "goal_proposal_witnesses": [
+                item.canonical_value() for item in self.goal_proposal_witnesses
+            ],
             "records": [_record_value(item) for item in self.records],
             "schema_version": self.schema_version,
         }
@@ -1117,6 +1382,7 @@ class MotivationSystem:
         self._evidence_ledger: tuple[MotivationEvidenceLedgerEntry, ...] = ()
         self._candidates: tuple[MotivationInterpretationCandidate, ...] = ()
         self._event_receipts: tuple[MotivationEventReceipt, ...] = ()
+        self._goal_proposal_witnesses: tuple[MotivationGoalProposalWitness, ...] = ()
 
     @property
     def records(self) -> tuple[MotivationRecord, ...]:
@@ -1135,6 +1401,7 @@ class MotivationSystem:
             evidence_ledger=self._evidence_ledger,
             candidates=self._candidates,
             event_receipts=self._event_receipts,
+            goal_proposal_witnesses=self._goal_proposal_witnesses,
         )
 
     export = snapshot
@@ -1163,14 +1430,53 @@ class MotivationSystem:
             (item for item in self._candidates if item.candidate_digest == candidate.candidate_digest),
             None,
         )
+        input_digest = _event_input_digest(
+            MotivationEventOperation.CANDIDATE,
+            {"candidate_digest": candidate.candidate_digest},
+        )
+        existing_receipt = next(
+            (item for item in self._event_receipts if item.event_id == event.event_id),
+            None,
+        )
+        if existing_receipt is not None:
+            if (
+                existing_receipt.event_sequence == event.event_sequence
+                and existing_receipt.recorded_at == event.recorded_at
+                and existing_receipt.operation is MotivationEventOperation.EVIDENCE
+                and existing_receipt.candidate_digest == candidate.candidate_digest
+                and existing_receipt.evidence_refs == event.evidence_refs
+            ):
+                if existing is None:
+                    raise MotivationDomainError("evidence receipt lost its accepted candidate")
+                return existing
+            prior = self._matching_event(
+                event,
+                MotivationEventOperation.CANDIDATE,
+                input_digest,
+            )
+            if prior is not None:
+                if existing is None:
+                    raise MotivationDomainError("candidate receipt lost its candidate value")
+                return existing
         if existing is not None:
-            return existing
+            raise MotivationDomainError("candidate ledger value lacks its event receipt")
         if len(self._candidates) >= MOTIVATION_MAX_CANDIDATES:
             raise MotivationCapacityExceeded("Motivation candidate ledger is full")
+        self._check_new_event_capacity(event)
         candidates = tuple(
             sorted((*self._candidates, candidate), key=lambda item: item.candidate_digest)
         )
-        self._replace_state(candidates=candidates)
+        receipt = self._make_receipt(
+            event,
+            MotivationEventOperation.CANDIDATE,
+            input_digest,
+            (),
+            candidate_digest=candidate.candidate_digest,
+        )
+        self._replace_state(
+            candidates=candidates,
+            event_receipts=(*self._event_receipts, receipt),
+        )
         return candidate
 
     def apply_evidence(
@@ -1219,7 +1525,7 @@ class MotivationSystem:
             (
                 item
                 for item in self._evidence_ledger
-                if item.evidence.source_ref.reference == evidence.source_ref.reference
+                if item.evidence.source_ref == evidence.source_ref
             ),
             None,
         )
@@ -1254,7 +1560,10 @@ class MotivationSystem:
         gain = _SOURCE_WEIGHTS[evidence.source_ref.kind] * evidence.salience * evidence.confidence
         gain = min(0.35, max(0.0, gain))
         if current is None:
-            if evidence.source_ref.reference == motivation_id:
+            if (
+                evidence.source_ref.kind is R13ReferenceKind.MOTIVATION
+                and evidence.source_ref.reference == motivation_id
+            ):
                 raise MotivationDomainError("a Motivation cannot use itself as source evidence")
             lifecycle = MotivationLifecycle.ACTIVE
             strength = gain
@@ -1327,6 +1636,53 @@ class MotivationSystem:
                 evidence_refs=evidence_refs,
             )
 
+        proposal_witnesses = self._goal_proposal_witnesses
+        proposal_count_for_motivation = sum(
+            item.motivation_id == motivation_id for item in proposal_witnesses
+        )
+        has_proposal = proposal_count_for_motivation > 0
+        was_eligible = (
+            current is not None
+            and current.lifecycle is MotivationLifecycle.ACTIVE
+            and current.strength >= MOTIVATION_GOAL_PROPOSAL_MIN_STRENGTH
+        )
+        if was_eligible and not has_proposal:
+            raise MotivationDomainError(
+                "eligible Motivation is missing its first Goal proposal witness"
+            )
+        creates_proposal = (
+            not has_proposal
+            and not was_eligible
+            and updated.lifecycle is MotivationLifecycle.ACTIVE
+            and updated.strength >= MOTIVATION_GOAL_PROPOSAL_MIN_STRENGTH
+        )
+        proposal_witness: MotivationGoalProposalWitness | None = None
+        if creates_proposal:
+            if proposal_count_for_motivation >= MOTIVATION_MAX_GOALS_PER_MOTIVATION:
+                raise MotivationCapacityExceeded("Motivation Goal proposal budget is exhausted")
+            if len(proposal_witnesses) >= MOTIVATION_MAX_GOAL_PROPOSAL_WITNESSES:
+                raise MotivationCapacityExceeded("Motivation Goal proposal ledger is full")
+            if sum(item.event_id == event.event_id for item in proposal_witnesses) >= MOTIVATION_MAX_GOALS_PER_EVENT:
+                raise MotivationCapacityExceeded("Motivation event Goal proposal budget is exhausted")
+            proposal_witness = MotivationGoalProposalWitness(
+                motivation_id=motivation_id,
+                kind=evidence.kind,
+                event_id=event.event_id,
+                event_sequence=event.event_sequence,
+                recorded_at=event.recorded_at,
+                evidence_ref=evidence.source_ref,
+                eligible_strength=updated.strength,
+                motivation_revision=updated.revision_history[-1].revision,
+                motivation_revision_digest=updated.revision_history[-1].record_digest,
+                motivation_state_digest=updated.revision_history[-1].state_digest,
+            )
+            proposal_witnesses = tuple(
+                sorted(
+                    (*proposal_witnesses, proposal_witness),
+                    key=lambda item: item.motivation_id,
+                )
+            )
+
         ledger_entry = MotivationEvidenceLedgerEntry(
             evidence=evidence,
             motivation_id=motivation_id,
@@ -1336,7 +1692,10 @@ class MotivationSystem:
         evidence_ledger = tuple(
             sorted(
                 (*self._evidence_ledger, ledger_entry),
-                key=lambda item: item.evidence.source_ref.reference,
+                key=lambda item: (
+                    item.evidence.source_ref.kind.value,
+                    item.evidence.source_ref.reference,
+                ),
             )
         )
         candidates = self._candidates
@@ -1355,6 +1714,9 @@ class MotivationSystem:
             (motivation_id,),
             evidence_digest=evidence.evidence_digest,
             candidate_digest=None if candidate is None else candidate.candidate_digest,
+            goal_proposal_digest=(
+                None if proposal_witness is None else proposal_witness.proposal_digest
+            ),
         )
         records = tuple(
             sorted(
@@ -1372,6 +1734,7 @@ class MotivationSystem:
             evidence_ledger=evidence_ledger,
             candidates=candidates,
             event_receipts=(*self._event_receipts, receipt),
+            goal_proposal_witnesses=proposal_witnesses,
         )
         return updated
 
@@ -1532,82 +1895,22 @@ class MotivationSystem:
         return updated
 
     def propose_goal(self, motivation_id: str) -> GoalRecord | None:
-        """Return at most one deterministic PROPOSED Goal for one Motivation.
+        """Return the exact first-eligibility proposal, if one was produced.
 
-        The proposal is tied to the Motivation's genesis evidence and event, so
-        repeated calls are byte-for-byte idempotent even after later updates.
-        No Goal store, admission proof, priority score, or winner selection is
-        created here.
+        The eligibility witness is created atomically with the event that first
+        raises an active Motivation to the fixed threshold. Later updates do
+        not rewrite its identity, evidence, or CREATE event.
         """
-
         current = self._require_record(motivation_id)
-        if (
-            current.lifecycle is not MotivationLifecycle.ACTIVE
-            or current.strength < MOTIVATION_GOAL_PROPOSAL_MIN_STRENGTH
-        ):
-            return None
-        if MOTIVATION_MAX_GOALS_PER_MOTIVATION != 1 or MOTIVATION_MAX_GOALS_PER_EVENT != 1:
-            raise MotivationDomainError("unsupported Goal proposal policy bounds")
-        evidence_entry = next(
+        witness = next(
             (
                 item
-                for item in self._evidence_ledger
-                if item.evidence.source_ref == current.source_evidence
+                for item in self._goal_proposal_witnesses
+                if item.motivation_id == current.motivation_id
             ),
             None,
         )
-        if evidence_entry is None:
-            raise MotivationDomainError("Motivation source provenance is unavailable")
-        genesis_receipt = next(
-            (
-                item
-                for item in self._event_receipts
-                if item.event_id == evidence_entry.event_id
-                and item.event_sequence == evidence_entry.event_sequence
-                and item.operation is MotivationEventOperation.EVIDENCE
-                and current.motivation_id in item.motivation_ids
-            ),
-            None,
-        )
-        if genesis_receipt is None:
-            raise MotivationDomainError("Motivation genesis event receipt is unavailable")
-        motivation_ref = R13Reference(R13ReferenceKind.MOTIVATION, current.motivation_id)
-        evidence_refs = tuple(
-            sorted(
-                (motivation_ref, current.source_evidence),
-                key=lambda item: (item.reference, item.kind.value),
-            )
-        )
-        origin_refs = (motivation_ref,)
-        goal_id = goal_id_for_target(motivation_ref)
-        description = f"consider {current.kind.value} motivation {current.motivation_id}"
-        proposal_digest = goal_proposal_digest(
-            motivation_ref,
-            description,
-            origin_refs=origin_refs,
-            evidence_refs=evidence_refs,
-        )
-        revision = GoalRevisionRecord(
-            goal_id=goal_id,
-            revision=0,
-            operation=GoalRevisionOperation.CREATE,
-            reason=GoalRevisionReason.CREATION,
-            created_at=genesis_receipt.recorded_at,
-            previous_lifecycle_state=None,
-            proposal_digest=proposal_digest,
-            event_id=genesis_receipt.event_id,
-            event_sequence=genesis_receipt.event_sequence,
-            evidence_refs=tuple(sorted(item.reference for item in evidence_refs)),
-        )
-        return GoalRecord(
-            goal_id=goal_id,
-            target=motivation_ref,
-            description=description,
-            lifecycle=GoalLifecycle.PROPOSED,
-            origin_refs=origin_refs,
-            evidence_refs=evidence_refs,
-            revision_history=(revision,),
-        )
+        return None if witness is None else witness.to_goal_record()
 
     def _review_transition(
         self,
@@ -1798,6 +2101,7 @@ class MotivationSystem:
         evidence_digest: str | None = None,
         candidate_digest: str | None = None,
         elapsed_seconds: float | None = None,
+        goal_proposal_digest: str | None = None,
     ) -> MotivationEventReceipt:
         return MotivationEventReceipt(
             event_id=event.event_id,
@@ -1810,6 +2114,7 @@ class MotivationSystem:
             evidence_digest=evidence_digest,
             candidate_digest=candidate_digest,
             elapsed_seconds=elapsed_seconds,
+            goal_proposal_digest=goal_proposal_digest,
         )
 
     def _replace_one(
@@ -1834,6 +2139,7 @@ class MotivationSystem:
         evidence_ledger: tuple[MotivationEvidenceLedgerEntry, ...] | None = None,
         candidates: tuple[MotivationInterpretationCandidate, ...] | None = None,
         event_receipts: tuple[MotivationEventReceipt, ...] | None = None,
+        goal_proposal_witnesses: tuple[MotivationGoalProposalWitness, ...] | None = None,
     ) -> None:
         proposed = MotivationSystemSnapshot(
             records=self._records if records is None else records,
@@ -1844,11 +2150,17 @@ class MotivationSystem:
             event_receipts=(
                 self._event_receipts if event_receipts is None else event_receipts
             ),
+            goal_proposal_witnesses=(
+                self._goal_proposal_witnesses
+                if goal_proposal_witnesses is None
+                else goal_proposal_witnesses
+            ),
         )
         self._records = proposed.records
         self._evidence_ledger = proposed.evidence_ledger
         self._candidates = proposed.candidates
         self._event_receipts = proposed.event_receipts
+        self._goal_proposal_witnesses = proposed.goal_proposal_witnesses
 
 
 def _bounded_elapsed(value: object) -> float:
@@ -1869,6 +2181,7 @@ __all__ = [
     "MOTIVATION_MAX_EVIDENCE_PER_EVENT",
     "MOTIVATION_MAX_EVIDENCE_PER_RECORD",
     "MOTIVATION_MAX_EVENT_RECEIPTS",
+    "MOTIVATION_MAX_GOAL_PROPOSAL_WITNESSES",
     "MOTIVATION_MAX_GOALS_PER_EVENT",
     "MOTIVATION_MAX_GOALS_PER_MOTIVATION",
     "MOTIVATION_MAX_ORIGIN_REFS",
@@ -1888,6 +2201,7 @@ __all__ = [
     "MotivationEvidenceConflict",
     "MotivationEvidenceLedgerEntry",
     "MotivationExperienceEvidence",
+    "MotivationGoalProposalWitness",
     "MotivationMutationEvidence",
     "MotivationSystem",
     "MotivationSystemSnapshot",

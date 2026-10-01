@@ -264,6 +264,81 @@ def test_untrusted_request_and_out_of_scope_source_kinds_cannot_create_motivatio
         make_evidence(source=ref(R13ReferenceKind.EXTERNAL_PARTY, "party:one"))
 
 
+def test_same_opaque_id_under_different_source_kinds_remains_distinct() -> None:
+    system = MotivationSystem()
+    experience = make_evidence(
+        ref(R13ReferenceKind.EXPERIENCE, "source:shared"),
+        target=ref(R13ReferenceKind.VALUE, "value:experience-target"),
+        origin_refs=(ref(R13ReferenceKind.USER_REQUEST, "request:experience"),),
+    )
+    belief = make_evidence(
+        ref(R13ReferenceKind.BELIEF, "source:shared"),
+        target=ref(R13ReferenceKind.VALUE, "value:belief-target"),
+        kind=MotivationKind.INTEREST,
+        origin_refs=(ref(R13ReferenceKind.EXTERNAL_REQUEST, "request:belief"),),
+    )
+
+    experience_record = system.apply_evidence(experience, source_event(experience, 1))
+    belief_record = system.apply_evidence(belief, source_event(belief, 2))
+    ledger_refs = tuple(item.evidence.source_ref for item in system.snapshot().evidence_ledger)
+
+    assert experience_record.motivation_id != belief_record.motivation_id
+    assert set(ledger_refs) == {experience.source_ref, belief.source_ref}
+    assert len(system.snapshot().evidence_ledger) == 2
+
+
+def test_same_motive_typed_reference_collision_fails_closed_under_u1_reference_bound() -> None:
+    system = MotivationSystem()
+    target = ref(R13ReferenceKind.VALUE, "value:shared-target")
+    experience = make_evidence(
+        ref(R13ReferenceKind.EXPERIENCE, "source:shared"),
+        target=target,
+    )
+    system.apply_evidence(experience, source_event(experience, 1))
+    before = system.snapshot()
+    belief = make_evidence(
+        ref(R13ReferenceKind.BELIEF, "source:shared"),
+        target=target,
+    )
+
+    with pytest.raises(ValueError, match="references must be unique"):
+        system.apply_evidence(belief, source_event(belief, 2))
+    assert system.snapshot().authority_digest == before.authority_digest
+    assert len(system.snapshot().evidence_ledger) == 1
+
+
+def test_source_and_origin_with_same_text_but_different_kind_remain_distinct() -> None:
+    source = ref(R13ReferenceKind.EXPERIENCE, "origin:shared")
+    origin = ref(R13ReferenceKind.USER_REQUEST, "origin:shared")
+    evidence = make_evidence(source, origin_refs=(origin,))
+    system = MotivationSystem()
+
+    system.apply_evidence(evidence, source_event(evidence, 1))
+    accepted = system.snapshot().evidence_ledger[0].evidence
+    assert accepted.source_ref == source
+    assert accepted.origin_refs == (origin,)
+
+
+def test_same_motive_typed_reference_collision_fails_closed_under_u1_bound() -> None:
+    system = MotivationSystem()
+    target = ref(R13ReferenceKind.VALUE, "value:shared-target")
+    experience = make_evidence(
+        ref(R13ReferenceKind.EXPERIENCE, "source:shared"),
+        target=target,
+    )
+    system.apply_evidence(experience, source_event(experience, 1))
+    before = system.snapshot()
+
+    belief = make_evidence(
+        ref(R13ReferenceKind.BELIEF, "source:shared"),
+        target=target,
+    )
+    with pytest.raises(ValueError, match="references must be unique"):
+        system.apply_evidence(belief, source_event(belief, 2))
+    assert system.snapshot().authority_digest == before.authority_digest
+    assert len(system.snapshot().evidence_ledger) == 1
+
+
 def test_active_value_factory_preserves_origin_and_rejects_pending_value() -> None:
     evidence = MotivationEvidence.from_value(make_value())
     assert evidence.source_ref == ref(R13ReferenceKind.VALUE, "value:exercise")
@@ -376,7 +451,51 @@ def test_candidate_alone_has_no_motivation_authority() -> None:
     snapshot = system.snapshot()
     assert snapshot.candidates == (candidate,)
     assert snapshot.evidence_ledger == ()
-    assert snapshot.event_receipts == ()
+    assert len(snapshot.event_receipts) == 1
+    assert snapshot.event_receipts[0].operation.value == "candidate"
+    assert snapshot.event_receipts[0].motivation_ids == ()
+
+
+def test_candidate_only_ingestion_consumes_event_order_and_event_identity() -> None:
+    system = MotivationSystem()
+    evidence = make_evidence()
+    candidate_event = source_event(evidence, 100)
+    candidate = make_candidate(evidence, candidate_event)
+    system.ingest_candidate(candidate, candidate_event)
+    before = system.snapshot()
+
+    lower_evidence = make_evidence(ref(R13ReferenceKind.EXPERIENCE, "experience:lower"))
+    with pytest.raises(MotivationDomainError, match="sequence regressed"):
+        system.apply_evidence(lower_evidence, source_event(lower_evidence, 2))
+    assert system.snapshot().authority_digest == before.authority_digest
+
+    same_event_evidence = make_evidence(evidence.source_ref)
+    with pytest.raises(MotivationEvidenceConflict, match="event identity was reused"):
+        system.apply_evidence(same_event_evidence, candidate_event)
+    assert system.snapshot().authority_digest == before.authority_digest
+
+
+def test_candidate_event_replay_is_idempotent_and_conflicting_replay_fails() -> None:
+    system = MotivationSystem()
+    evidence = make_evidence()
+    event = source_event(evidence, 1)
+    candidate = make_candidate(evidence, event)
+    system.ingest_candidate(candidate, event)
+    before = system.snapshot()
+
+    assert system.ingest_candidate(candidate, event) == candidate
+    assert system.snapshot().authority_digest == before.authority_digest
+
+    conflicting = make_candidate(
+        evidence,
+        event,
+        kind=MotivationKind.DESIRE,
+        target=ref(R13ReferenceKind.VALUE, "value:conflicting-model-choice"),
+        strength=0.1,
+    )
+    with pytest.raises(MotivationEvidenceConflict, match="event identity was reused"):
+        system.ingest_candidate(conflicting, event)
+    assert system.snapshot().authority_digest == before.authority_digest
 
 
 def test_candidate_suggestions_cannot_override_authoritative_evidence_policy() -> None:
@@ -663,6 +782,56 @@ def test_goal_proposal_is_bounded_deterministic_proposed_and_admission_free() ->
     assert system.propose_goal(record.motivation_id) == proposal
 
 
+def test_goal_proposal_uses_the_exact_first_threshold_eligibility_event() -> None:
+    system = MotivationSystem()
+    target = ref(R13ReferenceKind.VALUE, "value:slow-build")
+    initial_evidence = make_evidence(
+        ref(R13ReferenceKind.EXPERIENCE, "experience:initial"),
+        target=target,
+        salience=0.5,
+        confidence=0.9,
+    )
+    initial_event = source_event(initial_evidence, 1)
+    below_threshold = system.apply_evidence(initial_evidence, initial_event)
+    assert below_threshold.strength < motivation_system_module.MOTIVATION_GOAL_PROPOSAL_MIN_STRENGTH
+    assert system.propose_goal(below_threshold.motivation_id) is None
+
+    crossing_evidence = make_evidence(
+        ref(R13ReferenceKind.EXPERIENCE, "experience:crossing"),
+        target=target,
+        salience=1.0,
+        confidence=1.0,
+    )
+    crossing_event = source_event(crossing_evidence, 2)
+    eligible = system.apply_evidence(crossing_evidence, crossing_event)
+    assert eligible.strength >= motivation_system_module.MOTIVATION_GOAL_PROPOSAL_MIN_STRENGTH
+    proposal = system.propose_goal(eligible.motivation_id)
+    assert proposal is not None
+    assert proposal.revision_history[0].event_id == crossing_event.event_id
+    assert proposal.revision_history[0].event_sequence == crossing_event.event_sequence
+    assert proposal.evidence_refs == tuple(
+        sorted(
+            (
+                ref(R13ReferenceKind.MOTIVATION, eligible.motivation_id),
+                crossing_evidence.source_ref,
+            ),
+            key=lambda item: (item.reference, item.kind.value),
+        )
+    )
+    witness = system.snapshot().goal_proposal_witnesses[0]
+    assert witness.evidence_ref == crossing_evidence.source_ref
+    assert witness.eligible_strength == eligible.strength
+
+    later_evidence = make_evidence(
+        ref(R13ReferenceKind.EXPERIENCE, "experience:later"),
+        target=target,
+        salience=1.0,
+        confidence=1.0,
+    )
+    system.apply_evidence(later_evidence, source_event(later_evidence, 3))
+    assert system.propose_goal(eligible.motivation_id) == proposal
+
+
 def test_high_salience_evidence_stays_within_per_event_record_and_goal_budgets() -> None:
     system = MotivationSystem()
     evidence = make_evidence(salience=1.0, confidence=1.0, persistence=1.0)
@@ -713,6 +882,7 @@ def test_snapshot_rejects_evidence_provenance_not_bound_by_its_receipt() -> None
             evidence_ledger=(altered,),
             candidates=snapshot.candidates,
             event_receipts=snapshot.event_receipts,
+            goal_proposal_witnesses=snapshot.goal_proposal_witnesses,
         )
 
     receipt = snapshot.event_receipts[0]
@@ -722,6 +892,7 @@ def test_snapshot_rejects_evidence_provenance_not_bound_by_its_receipt() -> None
             evidence_ledger=snapshot.evidence_ledger,
             candidates=snapshot.candidates,
             event_receipts=(replace(receipt, input_digest="0" * 64),),
+            goal_proposal_witnesses=snapshot.goal_proposal_witnesses,
         )
 
 
@@ -737,6 +908,7 @@ def test_snapshot_rejects_orphan_evidence_receipts_and_time_mismatch() -> None:
         event_id="event:orphan",
         event_sequence=2,
         recorded_at=receipt.recorded_at + timedelta(seconds=1),
+        goal_proposal_digest=None,
     )
     with pytest.raises(ValueError, match="one exact accepted input"):
         type(snapshot)(
@@ -744,18 +916,20 @@ def test_snapshot_rejects_orphan_evidence_receipts_and_time_mismatch() -> None:
             evidence_ledger=snapshot.evidence_ledger,
             candidates=snapshot.candidates,
             event_receipts=(receipt, orphan),
+            goal_proposal_witnesses=snapshot.goal_proposal_witnesses,
         )
 
     time_tampered = replace(
         receipt,
         recorded_at=receipt.recorded_at + timedelta(seconds=1),
     )
-    with pytest.raises(ValueError, match="exact event receipt"):
+    with pytest.raises(ValueError, match="exact eligibility event"):
         type(snapshot)(
             records=snapshot.records,
             evidence_ledger=snapshot.evidence_ledger,
             candidates=snapshot.candidates,
             event_receipts=(time_tampered,),
+            goal_proposal_witnesses=snapshot.goal_proposal_witnesses,
         )
 
 
