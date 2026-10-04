@@ -612,6 +612,15 @@ class GoalSystemSnapshot:
                 for item in goal_receipts
                 if item.operation is not GoalSystemEventOperation.INGEST_PROPOSAL
             )
+            # Genesis may precede ingestion, but subject mutation cannot precede
+            # the first GoalSystem ingestion, even after revision compaction.
+            first_ingestion = ingestions[0]
+            if goal_receipts[0].operation is not GoalSystemEventOperation.INGEST_PROPOSAL or any(
+                item.event_sequence <= first_ingestion.event_sequence
+                or item.recorded_at < first_ingestion.recorded_at
+                for item in mutation_receipts
+            ):
+                raise ValueError("Goal subject mutation precedes first proposal ingestion")
             if len(mutation_receipts) != record.revision:
                 raise ValueError("Goal revision count differs from its retained mutation receipts")
             if any(item.revision_witness is None for item in mutation_receipts):

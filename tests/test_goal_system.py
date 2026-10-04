@@ -666,6 +666,55 @@ def test_snapshot_binds_ingestion_receipt_to_retained_genesis_record() -> None:
         )
 
 
+def test_snapshot_rejects_adoption_before_first_proposal_ingestion() -> None:
+    system, _ = adopted_system()
+    snapshot = system.snapshot()
+    ingestion, adoption = snapshot.event_receipts
+    assert ingestion.operation is GoalSystemEventOperation.INGEST_PROPOSAL
+    assert adoption.operation is GoalSystemEventOperation.ADOPT
+
+    late_ingestion = replace(
+        ingestion,
+        event_id="event:late-ingestion",
+        event_sequence=3,
+        recorded_at=BASE_TIME + timedelta(seconds=3),
+    )
+    with pytest.raises(ValueError, match="first proposal ingestion"):
+        GoalSystemSnapshot(
+            records=snapshot.records,
+            event_receipts=(adoption, late_ingestion),
+        )
+
+    assert system.snapshot() == snapshot
+
+
+def test_delayed_initial_ingestion_and_post_adoption_repeat_remain_valid() -> None:
+    system = GoalSystem()
+    proposal = make_proposal()
+    ingest(system, proposal, 2, event_id="event:delayed-ingestion")
+    admission, event = admission_for(proposal, 3)
+    adopted = system.adopt(proposal.goal_id, admission, event)
+
+    repeat_event = make_event(
+        4,
+        proposal.evidence_refs,
+        event_id="event:post-adoption-repeat",
+    )
+    repeated = system.ingest_proposal(proposal, repeat_event)
+    snapshot = system.snapshot()
+
+    assert adopted.lifecycle is GoalLifecycle.ADOPTED
+    assert repeated is adopted
+    assert tuple(item.operation for item in snapshot.event_receipts) == (
+        GoalSystemEventOperation.INGEST_PROPOSAL,
+        GoalSystemEventOperation.ADOPT,
+        GoalSystemEventOperation.INGEST_PROPOSAL,
+    )
+    assert system.ingest_proposal(proposal, repeat_event) is adopted
+    assert system.adopt(proposal.goal_id, admission, event) is adopted
+    assert system.snapshot() == snapshot
+
+
 def test_subject_proofs_and_receipts_survive_bounded_revision_compaction() -> None:
     system, record = adopted_system()
     for sequence in range(3, 13):
@@ -692,6 +741,21 @@ def test_subject_proofs_and_receipts_survive_bounded_revision_compaction() -> No
     assert len(record.revision_history) <= goal_system_module.R13_MAX_REVISION_HISTORY
     assert len(snapshot.event_receipts) == record.revision + 1
     assert snapshot == system.export()
+
+    ingestion = snapshot.event_receipts[0]
+    assert ingestion.operation is GoalSystemEventOperation.INGEST_PROPOSAL
+    late_ingestion = replace(
+        ingestion,
+        event_id="event:late-ingestion:compacted",
+        event_sequence=13,
+        recorded_at=BASE_TIME + timedelta(seconds=13),
+    )
+    with pytest.raises(ValueError, match="first proposal ingestion"):
+        GoalSystemSnapshot(
+            records=snapshot.records,
+            event_receipts=(*snapshot.event_receipts[1:], late_ingestion),
+        )
+    assert system.snapshot() == snapshot
 
     compacted_receipt = next(
         item
