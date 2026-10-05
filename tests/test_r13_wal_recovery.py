@@ -19,8 +19,8 @@ from suzka.runtime.agent_state import (
     AgentStateStore,
 )
 from suzka.runtime.event_journal import EventJournal
-from suzka.runtime.state_recovery import StateRecoveryCoordinator
-from suzka.runtime.state_wal import StateWAL, StateWALError
+from suzka.runtime.state_recovery import StateRecoveryCoordinator, StateRecoveryError
+from suzka.runtime.state_wal import StateWAL, StateWALError, StateWALConflictError
 from test_agent_state_v8 import (
     NOW,
     _Loop,
@@ -177,6 +177,53 @@ def test_first_normal_v8_commit_after_v7_is_lazy_and_preserves_v7_lineage(
     assert isinstance(store.load(), AgentStateSnapshotV8)
     assert store.load() == candidate
     assert store.path.read_bytes() != retained_bytes
+
+
+@pytest.mark.parametrize("populated", [False, True])
+def test_ordinary_v8_to_v7_wal_transition_is_rejected(tmp_path: Path, populated: bool) -> None:
+    store = _store(tmp_path / "agent_state.json")
+    prior, _ = _capture_v8(store, populated=populated)
+    candidate = store.capture(_Loop(), sequence=21)
+    assert isinstance(candidate, AgentStateSnapshotV7)
+    store.save(prior)
+    wal = StateWAL(tmp_path / "wal")
+    manifest = wal.bootstrap(prior, 20)
+    generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    before = wal.inspect()
+    before_generation = generation.read_bytes()
+    before_canonical = store.path.read_bytes()
+
+    with pytest.raises(StateWALConflictError, match="v8.*downgrade"):
+        wal.append_transition(
+            event_id=uuid5(NAMESPACE_URL, "ordinary-v8-v7-downgrade"),
+            event_type="state.transition", event_source="test",
+            processing_sequence=21, prior_snapshot=prior, candidate_snapshot=candidate,
+        )
+
+    assert wal.inspect() == before
+    assert generation.read_bytes() == before_generation
+    assert store.path.read_bytes() == before_canonical
+
+
+@pytest.mark.parametrize("populated", [False, True])
+def test_internal_commit_rejects_v8_to_v7_before_prepare(tmp_path: Path, populated: bool) -> None:
+    store = _store(tmp_path / "agent_state.json")
+    prior, _ = _capture_v8(store, populated=populated)
+    candidate = store.capture(_Loop(), sequence=21)
+    assert isinstance(candidate, AgentStateSnapshotV7)
+    recovery, journal, wal = _boot_from_snapshot(tmp_path, store, prior)
+    event = _event("ordinary-internal-v8-v7-downgrade", 21)
+    _start_event(journal, event)
+    before_wal = wal.inspect()
+    before_journal = journal.path.read_bytes()
+    before_canonical = store.path.read_bytes()
+
+    with pytest.raises(StateRecoveryError, match="v8.*downgrade"):
+        recovery.commit_internal_candidate(event, prior, candidate)
+
+    assert wal.inspect() == before_wal
+    assert journal.path.read_bytes() == before_journal
+    assert store.path.read_bytes() == before_canonical
 
 
 def test_failed_first_v8_publication_keeps_canonical_v7_bytes(tmp_path: Path) -> None:

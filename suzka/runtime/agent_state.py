@@ -3601,12 +3601,11 @@ class AgentStateStore:
             restored_motivation, restored_goal, restored_commitment = (
                 _r13_domain_snapshots(r13_state)
             )
-            r13_is_nonempty = r13_state != R13StateSnapshot.empty()
             r13_ports_complete = all(
                 port is not None
                 for port in (motivation_port, goal_port, commitment_port)
             )
-            if isinstance(validated, AgentStateSnapshotV8) and r13_is_nonempty:
+            if isinstance(validated, AgentStateSnapshotV8):
                 if not r13_ports_complete:
                     raise AgentStateLoadError(
                         "AgentState restore requires all R13 state ports"

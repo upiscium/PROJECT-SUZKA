@@ -327,17 +327,50 @@ def test_v8_events_must_precede_root_sequence_and_saved_time(tmp_path: Path) -> 
         AgentStateSnapshotV8.model_validate(raw)
 
 
-def test_empty_v8_without_r13_ports_retains_legacy_capture_path(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "available_ports", [None, (False, False, False), (True, False, False),
+                        (True, True, False), (True, False, True)],
+)
+def test_empty_v8_restore_requires_all_ports_before_mutation(
+    tmp_path: Path, available_ports: tuple[bool, bool, bool] | None
+) -> None:
     store = _store(tmp_path / "agent_state.json")
     snapshot, _ = _capture_v8(store, populated=False)
     target = _Loop()
+    target.emotion_engine.state = EmotionState(valence=0.4, arousal=0.5, optimal_loss=1.5)
+    owner = _R13Loop(_domains(populated=True))
+    if available_ports is not None:
+        target.agent_state_ports = SimpleNamespace(
+            motivation_state_port=owner if available_ports[0] else None,
+            goal_state_port=owner if available_ports[1] else None,
+            commitment_state_port=owner if available_ports[2] else None,
+        )
+    before_emotion = target.emotion_engine.state
+    before_value = target.value_system
+    before_belief = target.export_belief_state()
+    before_r13 = owner.r13_state()
+
+    with pytest.raises(AgentStateLoadError, match="all R13 state ports"):
+        store.restore_into(target, snapshot)
+
+    assert target.emotion_engine.state == before_emotion
+    assert target.value_system is before_value
+    assert target.export_belief_state() == before_belief
+    assert owner.r13_state() == before_r13
+    assert owner.restore_calls == []
+
+
+def test_empty_v8_restore_with_complete_ports_keeps_capture_v8(tmp_path: Path) -> None:
+    store = _store(tmp_path / "agent_state.json")
+    snapshot, _ = _capture_v8(store, populated=False)
+    target = _R13Loop(_domains(populated=True))
+
     store.restore_into(target, snapshot)
     captured = store.capture(target, sequence=21)
-    assert isinstance(captured, AgentStateSnapshotV7)
-    target.agent_state_ports = type("EmptyPorts", (), {
-        "motivation_state_port": None, "goal_state_port": None, "commitment_state_port": None,
-    })()
-    assert isinstance(store.capture(target, sequence=21), AgentStateSnapshotV7)
+
+    assert isinstance(captured, AgentStateSnapshotV8)
+    assert target.r13_state() == _domains(populated=False)
+    assert captured.r13_state == snapshot.r13_state
 
 
 def test_v8_nonempty_state_without_all_ports_is_rejected_before_mutation(

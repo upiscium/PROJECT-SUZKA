@@ -1049,6 +1049,10 @@ class StateRecoveryCoordinator:
             raise StateRecoveryError("Authoritative mutation is recovery-gated")
         before_hash = self.state_store.snapshot_hash(prior_snapshot)
         after_hash = self.state_store.snapshot_hash(candidate_snapshot)
+        # Reject before Journal prepare/WAL publication; this is not the
+        # explicitly classified true-rollback generation path.
+        if prior_snapshot.schema_version == 8 and candidate_snapshot.schema_version != 8:
+            raise StateRecoveryError("ordinary v8 internal commit cannot downgrade schema")
         generation_id = str(manifest.active_generation_id)
         self.journal.append_prepared(
             event,
