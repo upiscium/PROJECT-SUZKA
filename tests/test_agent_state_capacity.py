@@ -1,4 +1,4 @@
-"""Focused AgentState v7 capacity and compatibility checks."""
+"""Focused AgentState v7/v8 capacity and compatibility checks."""
 
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,10 +29,14 @@ from suzka.runtime import (
     default_agent_state_snapshot,
     project_agent_state_schema_max_bytes,
 )
+from suzka.runtime.agent_state import (
+    AGENT_STATE_V8_BASE_MAX_SERIALIZED_BYTES,
+    AGENT_STATE_V8_SCHEMA_FIELD_MAX_BYTES,
+    AGENT_STATE_V8_SCHEMA_MAX_SERIALIZED_BYTES,
+)
 
 
 NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
-R13_U1_REVIEWED_MAX_FIELD_BYTES = 18_759_305
 
 
 def _empty_v6_snapshot() -> AgentStateSnapshotV6:
@@ -101,31 +105,48 @@ def test_v7_default_and_capacity_projection_fit_the_hard_bound() -> None:
     assert AGENT_STATE_V7_SCHEMA_MAX_SERIALIZED_BYTES <= (
         AGENT_STATE_MAX_SERIALIZED_BYTES
     )
-    assert project_agent_state_schema_max_bytes() == (
+    assert project_agent_state_schema_max_bytes(schema_version=7, base_schema_version=7) == (
         AGENT_STATE_V7_SCHEMA_MAX_SERIALIZED_BYTES
     )
 
 
-def test_r13_v8_projection_keeps_the_r14_future_reserve() -> None:
-    assert R13_U1_REVIEWED_MAX_FIELD_BYTES == 18_759_305
+def test_v8_schema_maxima_cover_all_r13_domains_and_keep_future_reserve() -> None:
+    r13_max_bytes = agent_state_module.r13_codec_schema_maxima()["total"]
+    assert r13_max_bytes == 23_747_415
     v6_max = agent_state_module.AGENT_STATE_V6_SCHEMA_MAX_SERIALIZED_BYTES
     assert v6_max == 151_284_436
     assert v6_max > AGENT_STATE_MAX_SERIALIZED_BYTES
     projected = project_agent_state_schema_max_bytes(
         schema_version=8,
+        base_schema_version=7,
         added_field_maxima={
-            "motivation_state": R13_U1_REVIEWED_MAX_FIELD_BYTES,
+            "r13_state": r13_max_bytes,
         },
     )
 
-    assert projected == 121_362_801
+    assert AGENT_STATE_V8_SCHEMA_FIELD_MAX_BYTES["r13_state"] == r13_max_bytes
+    assert set(AGENT_STATE_V8_SCHEMA_FIELD_MAX_BYTES) == set(
+        agent_state_module.AgentStateSnapshotV8.model_fields
+    )
+    assert sum(AGENT_STATE_V8_SCHEMA_FIELD_MAX_BYTES.values()) == 109_573_509
+    assert AGENT_STATE_V8_BASE_MAX_SERIALIZED_BYTES == 109_573_688
+    assert AGENT_STATE_V8_SCHEMA_MAX_SERIALIZED_BYTES == 126_350_904
+    assert (
+        AGENT_STATE_V8_BASE_MAX_SERIALIZED_BYTES
+        + AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
+        == AGENT_STATE_V8_SCHEMA_MAX_SERIALIZED_BYTES
+    )
+    assert projected == AGENT_STATE_V8_SCHEMA_MAX_SERIALIZED_BYTES
     projected_without_reserve = projected - AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
-    assert projected_without_reserve == 104_585_585
+    assert projected_without_reserve == AGENT_STATE_V8_BASE_MAX_SERIALIZED_BYTES
     assert projected <= AGENT_STATE_MAX_SERIALIZED_BYTES
     assert AGENT_STATE_MAX_SERIALIZED_BYTES - projected_without_reserve >= (
         AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
     )
-    assert AGENT_STATE_MAX_SERIALIZED_BYTES - projected == 12_854_927
+    assert project_agent_state_schema_max_bytes() == (
+        AGENT_STATE_V8_SCHEMA_MAX_SERIALIZED_BYTES
+    )
+    assert AGENT_STATE_MAX_SERIALIZED_BYTES - projected == 7_866_824
 
 
 def test_v6_load_is_byte_preserving_and_does_not_eagerly_migrate(

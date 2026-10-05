@@ -766,6 +766,17 @@ class GoalSystem:
             return GoalSystemSnapshot(self._records, self._event_receipts)
 
     export = snapshot
+    export_goal_state = snapshot
+
+    def restore_goal_state(self, snapshot: GoalSystemSnapshot) -> None:
+        """Replace Goal authority only after revalidating its exact snapshot."""
+
+        if type(snapshot) is not GoalSystemSnapshot:
+            raise TypeError("snapshot must be GoalSystemSnapshot")
+        validated = replace(snapshot)
+        with self._lock:
+            self._records = validated.records
+            self._event_receipts = validated.event_receipts
 
     def validate(self) -> None:
         self.snapshot()

@@ -1067,6 +1067,16 @@ class MotivationSystemSnapshot:
                 raise ValueError("Motivation evidence ledger lacks its exact event receipt")
             if entry_receipt.evidence_digest != entry.evidence.evidence_digest:
                 raise ValueError("Motivation receipt does not bind exact evidence provenance")
+            if (
+                entry.evidence.observed_at is not None
+                and entry.evidence.observed_at > entry_receipt.recorded_at
+            ):
+                raise ValueError("Motivation source observation is in the future of its receipt")
+            if (
+                entry.evidence.source_event_sequence == entry.event_sequence
+                and entry.evidence.source_event_id != entry.event_id
+            ):
+                raise ValueError("same-sequence Motivation source event ID differs from its receipt")
             expected_input_digest = _event_input_digest(
                 MotivationEventOperation.EVIDENCE,
                 {
@@ -1443,6 +1453,24 @@ class MotivationSystem:
         )
 
     export = snapshot
+    export_motivation_state = snapshot
+
+    def restore_motivation_state(self, snapshot: MotivationSystemSnapshot) -> None:
+        """Replace all retained Motivation authority from one validated snapshot.
+
+        MotivationSystem is serialized by its caller and has no internal lock.
+        Reconstructing the frozen value reruns its complete validator before
+        publishing any of its tuple fields.
+        """
+
+        if type(snapshot) is not MotivationSystemSnapshot:
+            raise TypeError("snapshot must be MotivationSystemSnapshot")
+        validated = replace(snapshot)
+        self._records = validated.records
+        self._evidence_ledger = validated.evidence_ledger
+        self._candidates = validated.candidates
+        self._event_receipts = validated.event_receipts
+        self._goal_proposal_witnesses = validated.goal_proposal_witnesses
 
     def validate(self) -> None:
         self.snapshot()

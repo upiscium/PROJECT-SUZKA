@@ -527,6 +527,23 @@ def test_v7_round_trip_preserves_compacted_belief_history_without_replay(
     )
 
 
+def test_v7_load_is_byte_preserving_and_does_not_eagerly_migrate(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "agent_state.json"
+    store = make_store(path)
+    snapshot = store.capture(BeliefLoopStub(BeliefSystem()), sequence=4)
+    assert isinstance(snapshot, AgentStateSnapshotV7)
+    store.save(snapshot)
+    original = path.read_bytes()
+
+    loaded = store.load()
+
+    assert isinstance(loaded, AgentStateSnapshotV7)
+    assert loaded.schema_version == 7
+    assert path.read_bytes() == original
+
+
 def test_legacy_v6_value_history_migrates_lazily_to_lossless_v7(
     tmp_path: Path,
 ) -> None:

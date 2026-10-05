@@ -104,6 +104,7 @@ def test_schema_budget_is_reproducible_and_preserves_the_v8_future_reserve() -> 
     assert budget.projected_agent_state_v8_with_reserve_bytes == (
         project_agent_state_schema_max_bytes(
             schema_version=8,
+            base_schema_version=7,
             added_field_maxima={"motivation_state": budget.aggregate_r13_bytes},
         )
     )

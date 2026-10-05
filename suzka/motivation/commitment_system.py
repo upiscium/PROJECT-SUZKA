@@ -845,6 +845,20 @@ class CommitmentSystem:
             return CommitmentSystemSnapshot(self._records, self._event_receipts)
 
     export = snapshot
+    export_commitment_state = snapshot
+
+    def restore_commitment_state(
+        self,
+        snapshot: CommitmentSystemSnapshot,
+    ) -> None:
+        """Replace Commitment authority after canonical snapshot validation."""
+
+        if type(snapshot) is not CommitmentSystemSnapshot:
+            raise TypeError("snapshot must be CommitmentSystemSnapshot")
+        validated = replace(snapshot)
+        with self._lock:
+            self._records = validated.records
+            self._event_receipts = validated.event_receipts
 
     def validate(self) -> None:
         self.snapshot()
