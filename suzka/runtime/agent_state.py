@@ -105,6 +105,9 @@ from suzka.identity.value_system import (
 )
 from suzka.privacy import normalize_private_key
 from suzka.identifiers import MAX_IDENTIFIER_CODEPOINTS
+from suzka.motivation.commitment_system import CommitmentSystemSnapshot
+from suzka.motivation.goal_system import GoalSystemSnapshot
+from suzka.motivation.system import MotivationSystemSnapshot
 from suzka.runtime.context import (
     ContextFrame,
     ContextRegistry,
@@ -126,6 +129,12 @@ from suzka.runtime.working_memory import (
     WorkingMemoryRetentionReason,
     WorkingMemorySourceKind,
     working_memory_item_id,
+)
+from suzka.runtime.r13_codec import (
+    R13_CODEC_SCHEMA_VERSION,
+    R13GraphSnapshot,
+    R13StateSnapshot,
+    r13_codec_schema_maxima,
 )
 
 if TYPE_CHECKING:
@@ -154,7 +163,43 @@ class BeliefStatePort(Protocol):
     def restore_belief_state(self, snapshot: BeliefSystemSnapshot) -> None: ...
 
 
-CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[7] = 7
+@runtime_checkable
+class MotivationStatePort(Protocol):
+    """Runtime-owned persistence port for immutable Motivation authority."""
+
+    def export_motivation_state(self) -> MotivationSystemSnapshot: ...
+
+    def restore_motivation_state(self, snapshot: MotivationSystemSnapshot) -> None: ...
+
+
+@runtime_checkable
+class GoalStatePort(Protocol):
+    """Runtime-owned persistence port for immutable Goal authority."""
+
+    def export_goal_state(self) -> GoalSystemSnapshot: ...
+
+    def restore_goal_state(self, snapshot: GoalSystemSnapshot) -> None: ...
+
+
+@runtime_checkable
+class CommitmentStatePort(Protocol):
+    """Runtime-owned persistence port for immutable Commitment authority."""
+
+    def export_commitment_state(self) -> CommitmentSystemSnapshot: ...
+
+    def restore_commitment_state(self, snapshot: CommitmentSystemSnapshot) -> None: ...
+
+
+class AgentStatePorts(Protocol):
+    """Optional domain state-port dependencies exposed by a runtime owner."""
+
+    motivation_state_port: MotivationStatePort | None
+    goal_state_port: GoalStatePort | None
+    commitment_state_port: CommitmentStatePort | None
+
+
+AGENT_STATE_V7_SCHEMA_VERSION: Literal[7] = 7
+CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[8] = 8
 
 
 class _StateModel(BaseModel):
@@ -1362,9 +1407,9 @@ class AgentStateSnapshotV6(_AgentStateSnapshotBase):
 
 
 class AgentStateSnapshotV7(_AgentStateSnapshotBase):
-    """Current AgentState schema with normalized Value history storage."""
+    """Retained AgentState v7 schema with normalized Value history storage."""
 
-    schema_version: Literal[7] = CURRENT_AGENT_STATE_SCHEMA_VERSION
+    schema_version: Literal[7] = AGENT_STATE_V7_SCHEMA_VERSION
     working_memory: WorkingMemorySnapshot
     context_state: ContextStateSnapshot
     appraisal_state: AppraisalStateSnapshot
@@ -1379,9 +1424,48 @@ class AgentStateSnapshotV7(_AgentStateSnapshotBase):
         return value.astimezone(timezone.utc)
 
 
+def _validated_r13_state_snapshot(value: R13StateSnapshot) -> R13StateSnapshot:
+    """Revalidate the complete nested R13 JSON table, including mutable rows."""
+
+    return R13StateSnapshot.model_validate(value.model_dump(mode="python"))
+
+
+class AgentStateSnapshotV8(_AgentStateSnapshotBase):
+    """Current snapshot with complete R13 Motivation, Goal, and Commitment state."""
+
+    schema_version: Literal[8] = 8
+    working_memory: WorkingMemorySnapshot
+    context_state: ContextStateSnapshot
+    appraisal_state: AppraisalStateSnapshot
+    value_state: ValueSystemStateSnapshotV7
+    belief_state: BeliefSystemStateSnapshot
+    r13_state: R13StateSnapshot
+
+    @field_validator("saved_at")
+    @classmethod
+    def require_canonical_saved_at(cls, value: datetime) -> datetime:
+        if value.utcoffset() != timedelta(0):
+            raise ValueError("saved_at must be canonical UTC")
+        return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def require_valid_r13_state(self) -> AgentStateSnapshotV8:
+        validated = _validated_r13_state_snapshot(self.r13_state)
+        for graph in (validated.motivation, validated.goal, validated.commitment):
+            domain = graph.restore()
+            receipts = getattr(domain, "event_receipts")
+            if any(
+                item.event_sequence > self.last_processed_event_sequence
+                or item.recorded_at > self.saved_at
+                for item in receipts
+            ):
+                raise ValueError("R13 authority event is in the future of its AgentState")
+        return self
+
+
 # The unqualified name denotes the current schema; retained callers should use
-# AgentStateSnapshotV4 when they intentionally construct the exact v4 shape.
-AgentStateSnapshot = AgentStateSnapshotV7
+# the versioned shape when they intentionally construct an older schema.
+AgentStateSnapshot = AgentStateSnapshotV8
 
 
 CompatibleAgentStateSnapshot = Annotated[
@@ -1391,7 +1475,8 @@ CompatibleAgentStateSnapshot = Annotated[
     | AgentStateSnapshotV4
     | AgentStateSnapshotV5
     | AgentStateSnapshotV6
-    | AgentStateSnapshotV7,
+    | AgentStateSnapshotV7
+    | AgentStateSnapshotV8,
     Field(discriminator="schema_version"),
 ]
 _COMPATIBLE_SNAPSHOT_ADAPTER: TypeAdapter[CompatibleAgentStateSnapshot] = (
@@ -1404,7 +1489,15 @@ def validate_compatible_agent_state_snapshot(
 ) -> CompatibleAgentStateSnapshot:
     """Validate a compatible snapshot without changing its schema version."""
 
-    return _COMPATIBLE_SNAPSHOT_ADAPTER.validate_python(value)
+    raw = (
+        value.model_dump(mode="python")
+        if isinstance(value, AgentStateSnapshotV8)
+        else value
+    )
+    validated = _COMPATIBLE_SNAPSHOT_ADAPTER.validate_python(raw)
+    if isinstance(validated, AgentStateSnapshotV8):
+        _validated_r13_state_snapshot(validated.r13_state)
+    return validated
 
 
 AGENT_STATE_V7_SCHEMA_MAX_FLOAT_JSON_BYTES: Final[int] = 25
@@ -1742,7 +1835,7 @@ def _schema_max_field_bytes() -> dict[str, int]:
             MAX_PERSISTED_EVENT_SEQUENCE
         ),
         "saved_at": _schema_max_json_bytes(_SCHEMA_MAX_DATETIME),
-        "schema_version": _schema_max_json_bytes(CURRENT_AGENT_STATE_SCHEMA_VERSION),
+        "schema_version": _schema_max_json_bytes(AGENT_STATE_V7_SCHEMA_VERSION),
         "value_state": _schema_max_json_bytes(_schema_max_value_state_v7()),
         "working_memory": _schema_max_json_bytes(_schema_max_working_memory()),
     }
@@ -1795,6 +1888,33 @@ AGENT_STATE_V7_SCHEMA_MAX_SERIALIZED_BYTES: Final[int] = (
 if AGENT_STATE_V7_SCHEMA_MAX_SERIALIZED_BYTES > AGENT_STATE_MAX_SERIALIZED_BYTES:
     raise RuntimeError("AgentState V7 capacity exceeds the hard serialized byte bound")
 
+
+def _schema_max_field_bytes_v8() -> dict[str, int]:
+    """Return maxima for every current V8 top-level field exactly once."""
+
+    maxima = dict(AGENT_STATE_V7_SCHEMA_FIELD_MAX_BYTES)
+    maxima["schema_version"] = _schema_max_json_bytes(
+        CURRENT_AGENT_STATE_SCHEMA_VERSION
+    )
+    maxima["r13_state"] = r13_codec_schema_maxima()["total"]
+    if set(maxima) != set(AgentStateSnapshotV8.model_fields):
+        raise RuntimeError("AgentState V8 schema maxima are out of sync")
+    return maxima
+
+
+AGENT_STATE_V8_SCHEMA_FIELD_MAX_BYTES: Final[dict[str, int]] = (
+    _schema_max_field_bytes_v8()
+)
+AGENT_STATE_V8_BASE_MAX_SERIALIZED_BYTES: Final[int] = _schema_envelope_size(
+    AGENT_STATE_V8_SCHEMA_FIELD_MAX_BYTES
+)
+AGENT_STATE_V8_SCHEMA_MAX_SERIALIZED_BYTES: Final[int] = (
+    AGENT_STATE_V8_BASE_MAX_SERIALIZED_BYTES
+    + AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
+)
+if AGENT_STATE_V8_SCHEMA_MAX_SERIALIZED_BYTES > AGENT_STATE_MAX_SERIALIZED_BYTES:
+    raise RuntimeError("AgentState V8 capacity exceeds the hard serialized byte bound")
+
 # Keep the retained V6 projection available for compatibility accounting.  It
 # is not used for new writes, because V7 is the normalized current schema.
 AGENT_STATE_V6_SCHEMA_FIELD_MAX_BYTES: Final[dict[str, int]] = (
@@ -1808,6 +1928,8 @@ AGENT_STATE_V6_SCHEMA_MAX_SERIALIZED_BYTES: Final[int] = (
 def project_agent_state_schema_max_bytes(
     schema_version: int = CURRENT_AGENT_STATE_SCHEMA_VERSION,
     added_field_maxima: Mapping[str, int] | None = None,
+    *,
+    base_schema_version: int = CURRENT_AGENT_STATE_SCHEMA_VERSION,
 ) -> int:
     """Project a future root schema without silently clipping the hard cap.
 
@@ -1829,7 +1951,12 @@ def project_agent_state_schema_max_bytes(
     else:
         additions = added_field_maxima
 
-    projected = dict(AGENT_STATE_V7_SCHEMA_FIELD_MAX_BYTES)
+    if base_schema_version == AGENT_STATE_V7_SCHEMA_VERSION:
+        projected = dict(AGENT_STATE_V7_SCHEMA_FIELD_MAX_BYTES)
+    elif base_schema_version == CURRENT_AGENT_STATE_SCHEMA_VERSION:
+        projected = dict(AGENT_STATE_V8_SCHEMA_FIELD_MAX_BYTES)
+    else:
+        raise ValueError("unsupported AgentState capacity projection baseline")
     projected["schema_version"] = len(_canonical_json_bytes(schema_version))
     for field_name, maximum in additions.items():
         if type(field_name) is not str or not field_name:
@@ -2584,6 +2711,8 @@ def _upgrade_value_state_to_v7(
 def _upgrade_snapshot_to_v7(
     snapshot: CompatibleAgentStateSnapshot,
 ) -> AgentStateSnapshotV7:
+    if isinstance(snapshot, AgentStateSnapshotV8):
+        raise AgentStateLoadError("V8 snapshots are not upgraded to V7")
     if isinstance(snapshot, AgentStateSnapshotV7):
         _domain_value_system(snapshot.value_state)
         _domain_belief_system(snapshot.belief_state)
@@ -2672,6 +2801,120 @@ def _belief_state_port(main_loop: SuzkaMainLoop) -> BeliefStatePort | None:
     """Return the explicit runtime-owned Belief state port, if implemented."""
 
     return main_loop if isinstance(main_loop, BeliefStatePort) else None
+
+
+def _r13_state_ports(
+    main_loop: SuzkaMainLoop,
+    *,
+    require_complete_topology: bool,
+) -> tuple[
+    MotivationStatePort | None,
+    GoalStatePort | None,
+    CommitmentStatePort | None,
+]:
+    """Resolve optional per-domain ports without hiding partial topologies."""
+
+    ports_owner = getattr(main_loop, "agent_state_ports", None)
+    if ports_owner is None:
+        ports_owner = main_loop
+    field_names = (
+        "motivation_state_port",
+        "goal_state_port",
+        "commitment_state_port",
+    )
+    field_presence = tuple(hasattr(ports_owner, name) for name in field_names)
+    if any(field_presence):
+        if not all(field_presence):
+            raise ValueError("R13 state port fields are incomplete")
+        motivation, goal, commitment = (
+            getattr(ports_owner, name) for name in field_names
+        )
+        candidates = (motivation, goal, commitment)
+        groups = (
+            ("export_motivation_state", "restore_motivation_state"),
+            ("export_goal_state", "restore_goal_state"),
+            ("export_commitment_state", "restore_commitment_state"),
+        )
+        container_availability: list[bool] = []
+        for candidate, (export_name, restore_name) in zip(
+            candidates, groups, strict=True
+        ):
+            if candidate is None:
+                container_availability.append(False)
+                continue
+            export_port = callable(getattr(candidate, export_name, None))
+            restore_port = callable(getattr(candidate, restore_name, None))
+            if not export_port or not restore_port:
+                raise ValueError("R13 state port is incomplete")
+            container_availability.append(True)
+        if (
+            require_complete_topology
+            and any(container_availability)
+            and not all(container_availability)
+        ):
+            raise ValueError("R13 state port topology is partial")
+        return (
+            cast(MotivationStatePort | None, motivation),
+            cast(GoalStatePort | None, goal),
+            cast(CommitmentStatePort | None, commitment),
+        )
+
+    groups = (
+        ("export_motivation_state", "restore_motivation_state"),
+        ("export_goal_state", "restore_goal_state"),
+        ("export_commitment_state", "restore_commitment_state"),
+    )
+    direct_availability: list[bool] = []
+    for export_name, restore_name in groups:
+        export_port = callable(getattr(main_loop, export_name, None))
+        restore_port = callable(getattr(main_loop, restore_name, None))
+        if export_port != restore_port:
+            raise ValueError("R13 state port is incomplete")
+        direct_availability.append(export_port)
+    if (
+        require_complete_topology
+        and any(direct_availability)
+        and not all(direct_availability)
+    ):
+        raise ValueError("R13 state port topology is partial")
+    return (
+        cast(MotivationStatePort, main_loop) if direct_availability[0] else None,
+        cast(GoalStatePort, main_loop) if direct_availability[1] else None,
+        cast(CommitmentStatePort, main_loop) if direct_availability[2] else None,
+    )
+
+
+def _r13_state_snapshot(
+    motivation: MotivationSystemSnapshot,
+    goal: GoalSystemSnapshot,
+    commitment: CommitmentSystemSnapshot,
+) -> R13StateSnapshot:
+    return R13StateSnapshot(
+        schema_version=R13_CODEC_SCHEMA_VERSION,
+        motivation=R13GraphSnapshot.capture(motivation),
+        goal=R13GraphSnapshot.capture(goal),
+        commitment=R13GraphSnapshot.capture(commitment),
+    )
+
+
+def _r13_domain_snapshots(
+    snapshot: R13StateSnapshot,
+) -> tuple[
+    MotivationSystemSnapshot,
+    GoalSystemSnapshot,
+    CommitmentSystemSnapshot,
+]:
+    validated = _validated_r13_state_snapshot(snapshot)
+    motivation = validated.motivation.restore()
+    goal = validated.goal.restore()
+    commitment = validated.commitment.restore()
+    if (
+        type(motivation) is not MotivationSystemSnapshot
+        or type(goal) is not GoalSystemSnapshot
+        or type(commitment) is not CommitmentSystemSnapshot
+    ):
+        raise ValueError("R13 graph root has an invalid domain snapshot type")
+    return motivation, goal, commitment
 
 
 class AgentStateStore:
@@ -2887,7 +3130,7 @@ class AgentStateStore:
                     "AgentState snapshot schema is invalid"
                 )
             raise schema_failure
-        if version == CURRENT_AGENT_STATE_SCHEMA_VERSION:
+        if version == AGENT_STATE_V7_SCHEMA_VERSION:
             schema_failure = None
             try:
                 loaded_v7 = AgentStateSnapshotV7.model_validate(raw)
@@ -2895,6 +3138,25 @@ class AgentStateStore:
                 _domain_value_system(loaded_v7.value_state)
                 _domain_belief_system(loaded_v7.belief_state)
                 return loaded_v7
+            except ValidationError:
+                schema_failure = AgentStateLoadError(
+                    "AgentState snapshot schema is invalid"
+                )
+            except AgentStateLoadError:
+                raise
+            except Exception:
+                schema_failure = AgentStateLoadError(
+                    "AgentState snapshot schema is invalid"
+                )
+            raise schema_failure
+        if version == CURRENT_AGENT_STATE_SCHEMA_VERSION:
+            schema_failure = None
+            try:
+                loaded_v8 = AgentStateSnapshotV8.model_validate(raw)
+                self._validate_value_configuration(loaded_v8)
+                _domain_value_system(loaded_v8.value_state)
+                _domain_belief_system(loaded_v8.belief_state)
+                return loaded_v8
             except ValidationError:
                 schema_failure = AgentStateLoadError(
                     "AgentState snapshot schema is invalid"
@@ -2918,7 +3180,8 @@ class AgentStateStore:
         self,
         snapshot: AgentStateSnapshotV5
         | AgentStateSnapshotV6
-        | AgentStateSnapshotV7,
+        | AgentStateSnapshotV7
+        | AgentStateSnapshotV8,
     ) -> None:
         """Check configuration as compatibility evidence, never as overwrite authority."""
 
@@ -3007,11 +3270,19 @@ class AgentStateStore:
             validated = validate_compatible_agent_state_snapshot(raw)
             if isinstance(
                 validated,
-                (AgentStateSnapshotV5, AgentStateSnapshotV6, AgentStateSnapshotV7),
+                (
+                    AgentStateSnapshotV5,
+                    AgentStateSnapshotV6,
+                    AgentStateSnapshotV7,
+                    AgentStateSnapshotV8,
+                ),
             ):
                 self._validate_value_configuration(validated)
                 _domain_value_system(validated.value_state)
-            if isinstance(validated, (AgentStateSnapshotV6, AgentStateSnapshotV7)):
+            if isinstance(
+                validated,
+                (AgentStateSnapshotV6, AgentStateSnapshotV7, AgentStateSnapshotV8),
+            ):
                 _domain_belief_system(validated.belief_state)
             payload = self._canonical_bytes(validated)
             if len(payload) > AGENT_STATE_MAX_SERIALIZED_BYTES:
@@ -3106,7 +3377,7 @@ class AgentStateStore:
 
     def capture(
         self, main_loop: SuzkaMainLoop, sequence: int
-    ) -> AgentStateSnapshotV5 | AgentStateSnapshotV7:
+    ) -> AgentStateSnapshotV5 | AgentStateSnapshotV7 | AgentStateSnapshotV8:
         capture_failure: AgentStateSaveError | None = None
         try:
             emotion_engine = getattr(main_loop, "emotion_engine", None)
@@ -3152,6 +3423,15 @@ class AgentStateStore:
                 belief_snapshot, BeliefSystemSnapshot
             ):
                 raise ValueError("Belief state port returned an invalid snapshot")
+            motivation_port, goal_port, commitment_port = _r13_state_ports(
+                main_loop, require_complete_topology=True
+            )
+            has_r13_ports = all(
+                port is not None
+                for port in (motivation_port, goal_port, commitment_port)
+            )
+            if has_r13_ports and belief_snapshot is None:
+                raise ValueError("R13 capture requires the Belief state port")
             common: dict[str, Any] = dict(
                 saved_at=self._now(),
                 last_processed_event_sequence=sequence,
@@ -3227,6 +3507,21 @@ class AgentStateStore:
                     value_state=_value_state_snapshot(value_system),
                 )
             value_state = _value_state_snapshot_v7(value_system)
+            if has_r13_ports:
+                assert motivation_port is not None
+                assert goal_port is not None
+                assert commitment_port is not None
+                r13_state = _r13_state_snapshot(
+                    motivation_port.export_motivation_state(),
+                    goal_port.export_goal_state(),
+                    commitment_port.export_commitment_state(),
+                )
+                return AgentStateSnapshotV8(
+                    **common,
+                    value_state=value_state,
+                    belief_state=_belief_state_snapshot(belief_snapshot),
+                    r13_state=r13_state,
+                )
             return AgentStateSnapshotV7(
                 **common,
                 value_state=value_state,
@@ -3252,8 +3547,21 @@ class AgentStateStore:
         previous_temporal: EmotionTemporalState | None = None
         previous_value_system: ValueSystem | None = None
         previous_belief_snapshot: BeliefSystemSnapshot | None = None
+        previous_motivation_snapshot: MotivationSystemSnapshot | None = None
+        previous_goal_snapshot: GoalSystemSnapshot | None = None
+        previous_commitment_snapshot: CommitmentSystemSnapshot | None = None
         value_system_authority: ValueSystem | None = None
         belief_port: BeliefStatePort | None = None
+        motivation_port: MotivationStatePort | None = None
+        goal_port: GoalStatePort | None = None
+        commitment_port: CommitmentStatePort | None = None
+        prepared_read_views: object | None = None
+        publish_read_views: Callable[[object], object] | None = None
+        read_views_prepared = False
+        prepared_r13_bundle: object | None = None
+        publish_r13_bundle: Callable[[object], object] | None = None
+        r13_bundle_prepared = False
+        attempted_r13_restores: list[tuple[str, object, object]] = []
         value_system_was_present = False
         belief_port_was_present = False
         emotion_engine: EmotionEngineAllostasis | None = None
@@ -3265,7 +3573,12 @@ class AgentStateStore:
             )
             if isinstance(
                 validated,
-                (AgentStateSnapshotV5, AgentStateSnapshotV6, AgentStateSnapshotV7),
+                (
+                    AgentStateSnapshotV5,
+                    AgentStateSnapshotV6,
+                    AgentStateSnapshotV7,
+                    AgentStateSnapshotV8,
+                ),
             ):
                 self._validate_value_configuration(validated)
                 restored_value_system = _domain_value_system(validated.value_state)
@@ -3273,9 +3586,36 @@ class AgentStateStore:
                 restored_value_system = self.configured_value_system
             restored_belief_system = (
                 _domain_belief_system(validated.belief_state)
-                if isinstance(validated, (AgentStateSnapshotV6, AgentStateSnapshotV7))
+                if isinstance(
+                    validated,
+                    (
+                        AgentStateSnapshotV6,
+                        AgentStateSnapshotV7,
+                        AgentStateSnapshotV8,
+                    ),
+                )
                 else BeliefSystem()
             )
+            motivation_port, goal_port, commitment_port = _r13_state_ports(
+                main_loop, require_complete_topology=False
+            )
+            r13_state = (
+                validated.r13_state
+                if isinstance(validated, AgentStateSnapshotV8)
+                else R13StateSnapshot.empty()
+            )
+            restored_motivation, restored_goal, restored_commitment = (
+                _r13_domain_snapshots(r13_state)
+            )
+            r13_ports_complete = all(
+                port is not None
+                for port in (motivation_port, goal_port, commitment_port)
+            )
+            if isinstance(validated, AgentStateSnapshotV8):
+                if not r13_ports_complete:
+                    raise AgentStateLoadError(
+                        "AgentState restore requires all R13 state ports"
+                    )
             emotion_engine = getattr(main_loop, "emotion_engine", None)
             if not isinstance(emotion_engine, EmotionEngineAllostasis):
                 raise AgentStateLoadError("AgentState restore requires EmotionEngine")
@@ -3294,6 +3634,7 @@ class AgentStateStore:
                         AgentStateSnapshotV5,
                         AgentStateSnapshotV6,
                         AgentStateSnapshotV7,
+                        AgentStateSnapshotV8,
                     ),
                 )
                 else WorkingMemorySnapshot(revision=0, items=())
@@ -3313,6 +3654,7 @@ class AgentStateStore:
                         AgentStateSnapshotV5,
                         AgentStateSnapshotV6,
                         AgentStateSnapshotV7,
+                        AgentStateSnapshotV8,
                     ),
                 )
                 else ContextRegistryState(0, None, (), ())
@@ -3330,6 +3672,7 @@ class AgentStateStore:
                         AgentStateSnapshotV5,
                         AgentStateSnapshotV6,
                         AgentStateSnapshotV7,
+                        AgentStateSnapshotV8,
                     ),
                 )
                 else AppraisalStateSnapshot(
@@ -3369,6 +3712,7 @@ class AgentStateStore:
                         AgentStateSnapshotV5,
                         AgentStateSnapshotV6,
                         AgentStateSnapshotV7,
+                        AgentStateSnapshotV8,
                     ),
                 )
                 and context_registry is None
@@ -3378,7 +3722,12 @@ class AgentStateStore:
             current_value_system = _value_system_authority(main_loop)
             if isinstance(
                 validated,
-                (AgentStateSnapshotV5, AgentStateSnapshotV6, AgentStateSnapshotV7),
+                (
+                    AgentStateSnapshotV5,
+                    AgentStateSnapshotV6,
+                    AgentStateSnapshotV7,
+                    AgentStateSnapshotV8,
+                ),
             ):
                 if not isinstance(current_value_system, ValueSystem):
                     raise AgentStateLoadError(
@@ -3394,7 +3743,7 @@ class AgentStateStore:
 
             belief_port = _belief_state_port(main_loop)
             if isinstance(validated, AgentStateSnapshotV6) or (
-                isinstance(validated, AgentStateSnapshotV7)
+                isinstance(validated, (AgentStateSnapshotV7, AgentStateSnapshotV8))
                 and bool(validated.belief_state.records)
             ):
                 if belief_port is None:
@@ -3406,6 +3755,86 @@ class AgentStateStore:
                 if not isinstance(previous_belief_snapshot, BeliefSystemSnapshot):
                     raise AgentStateLoadError("Belief state port returned an invalid snapshot")
                 belief_port_was_present = True
+
+            if motivation_port is not None:
+                previous_motivation_snapshot = (
+                    motivation_port.export_motivation_state()
+                )
+                if (
+                    R13GraphSnapshot.capture(previous_motivation_snapshot).domain
+                    != "motivation"
+                ):
+                    raise AgentStateLoadError(
+                        "Motivation state port returned an invalid snapshot"
+                    )
+            if goal_port is not None:
+                previous_goal_snapshot = goal_port.export_goal_state()
+                if R13GraphSnapshot.capture(previous_goal_snapshot).domain != "goal":
+                    raise AgentStateLoadError(
+                        "Goal state port returned an invalid snapshot"
+                    )
+            if commitment_port is not None:
+                previous_commitment_snapshot = (
+                    commitment_port.export_commitment_state()
+                )
+                if (
+                    R13GraphSnapshot.capture(previous_commitment_snapshot).domain
+                    != "commitment"
+                ):
+                    raise AgentStateLoadError(
+                        "Commitment state port returned an invalid snapshot"
+                    )
+            if r13_ports_complete:
+                assert previous_motivation_snapshot is not None
+                assert previous_goal_snapshot is not None
+                assert previous_commitment_snapshot is not None
+                _r13_state_snapshot(
+                    previous_motivation_snapshot,
+                    previous_goal_snapshot,
+                    previous_commitment_snapshot,
+                )
+
+            prepare_read_view_bundle = getattr(
+                main_loop, "_prepare_committed_read_views", None
+            )
+            publish_read_view_bundle = getattr(
+                main_loop, "_publish_committed_read_views", None
+            )
+            if callable(prepare_read_view_bundle) != callable(
+                publish_read_view_bundle
+            ):
+                raise AgentStateLoadError(
+                    "AgentState restore committed-read-view hooks are incomplete"
+                )
+            if callable(prepare_read_view_bundle) and callable(
+                publish_read_view_bundle
+            ):
+                prepared_read_views = prepare_read_view_bundle(
+                    restored_value_system.snapshot(),
+                    restored_belief_system.snapshot(),
+                    r13_state,
+                )
+                publish_read_views = cast(
+                    Callable[[object], object], publish_read_view_bundle
+                )
+                read_views_prepared = True
+            else:
+                prepare_r13_view = getattr(
+                    main_loop, "_prepare_committed_r13_view", None
+                )
+                publish_r13_view = getattr(
+                    main_loop, "_publish_committed_r13_view", None
+                )
+                if callable(prepare_r13_view) != callable(publish_r13_view):
+                    raise AgentStateLoadError(
+                        "AgentState restore R13 committed-view hooks are incomplete"
+                    )
+                if callable(prepare_r13_view) and callable(publish_r13_view):
+                    prepared_r13_bundle = prepare_r13_view(r13_state)
+                    publish_r13_bundle = cast(
+                        Callable[[object], object], publish_r13_view
+                    )
+                    r13_bundle_prepared = True
 
             previous_emotion = emotion_engine.state
             previous_working_memory_revision = working_memory_authority.revision
@@ -3427,17 +3856,59 @@ class AgentStateStore:
                 _replace_value_system_authority(main_loop, restored_value_system)
             if belief_port is not None:
                 belief_port.restore_belief_state(restored_belief_system.snapshot())
+            if motivation_port is not None:
+                assert previous_motivation_snapshot is not None
+                attempted_r13_restores.append(
+                    ("motivation", motivation_port, previous_motivation_snapshot)
+                )
+                motivation_port.restore_motivation_state(restored_motivation)
+            if goal_port is not None:
+                assert previous_goal_snapshot is not None
+                attempted_r13_restores.append(
+                    ("goal", goal_port, previous_goal_snapshot)
+                )
+                goal_port.restore_goal_state(restored_goal)
+            if commitment_port is not None:
+                assert previous_commitment_snapshot is not None
+                attempted_r13_restores.append(
+                    ("commitment", commitment_port, previous_commitment_snapshot)
+                )
+                commitment_port.restore_commitment_state(restored_commitment)
             emotion_engine.state = EmotionState(
                 valence=emotion.valence,
                 arousal=emotion.arousal,
                 optimal_loss=emotion.optimal_loss,
             )
             emotion_engine.temporal_state = restored_temporal
-        except AgentStateConfigurationDrift:
-            raise
+            if read_views_prepared:
+                assert publish_read_views is not None
+                publish_read_views(prepared_read_views)
+            elif r13_bundle_prepared:
+                assert publish_r13_bundle is not None
+                publish_r13_bundle(prepared_r13_bundle)
         except Exception as error:
+            if isinstance(
+                error, AgentStateConfigurationDrift
+            ) and not state_mutation_started:
+                raise
             if isinstance(error, AgentStateLoadError) and not state_mutation_started:
                 raise
+            for domain, port, previous_snapshot in reversed(attempted_r13_restores):
+                try:
+                    if domain == "motivation":
+                        cast(MotivationStatePort, port).restore_motivation_state(
+                            cast(MotivationSystemSnapshot, previous_snapshot)
+                        )
+                    elif domain == "goal":
+                        cast(GoalStatePort, port).restore_goal_state(
+                            cast(GoalSystemSnapshot, previous_snapshot)
+                        )
+                    else:
+                        cast(CommitmentStatePort, port).restore_commitment_state(
+                            cast(CommitmentSystemSnapshot, previous_snapshot)
+                        )
+                except Exception:
+                    pass
             if (
                 previous_working_memory_revision is not None
                 and previous_working_memory_items is not None
@@ -3521,11 +3992,21 @@ class AgentStateStore:
     def _canonical_bytes(snapshot: CompatibleAgentStateSnapshot) -> bytes:
         if isinstance(
             snapshot,
-            (AgentStateSnapshotV5, AgentStateSnapshotV6, AgentStateSnapshotV7),
+            (
+                AgentStateSnapshotV5,
+                AgentStateSnapshotV6,
+                AgentStateSnapshotV7,
+                AgentStateSnapshotV8,
+            ),
         ):
             _domain_value_system(snapshot.value_state)
-        if isinstance(snapshot, (AgentStateSnapshotV6, AgentStateSnapshotV7)):
+        if isinstance(
+            snapshot,
+            (AgentStateSnapshotV6, AgentStateSnapshotV7, AgentStateSnapshotV8),
+        ):
             _domain_belief_system(snapshot.belief_state)
+        if isinstance(snapshot, AgentStateSnapshotV8):
+            _validated_r13_state_snapshot(snapshot.r13_state)
         payload = json.dumps(
             snapshot.model_dump(mode="json"),
             ensure_ascii=False,

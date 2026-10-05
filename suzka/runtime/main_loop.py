@@ -51,6 +51,13 @@ from suzka.experience import (
 )
 from suzka.memory.experience_store import ExperienceStore
 from suzka.models import ModelProvider
+from suzka.motivation.commitment_system import (
+    CommitmentSystem,
+    CommitmentSystemSnapshot,
+)
+from suzka.motivation.goal_system import GoalSystem, GoalSystemSnapshot
+from suzka.motivation.projection import R13PromptView
+from suzka.motivation.system import MotivationSystem, MotivationSystemSnapshot
 from suzka.persona import (
     ConsciousAgent,
     ContextPromptView,
@@ -81,6 +88,11 @@ from suzka.runtime.working_memory import (
     WorkingMemory,
     WorkingMemorySourceKind,
     WorkingMemoryView,
+)
+from suzka.runtime.r13_codec import (
+    R13_CODEC_SCHEMA_VERSION,
+    R13GraphSnapshot,
+    R13StateSnapshot,
 )
 
 if TYPE_CHECKING:
@@ -137,6 +149,25 @@ class _ComputedChat:
     session_participant: SessionTurnParticipant
 
 
+@dataclass(frozen=True, slots=True)
+class _CommittedR13Bundle:
+    """One atomically published, detached R13 view and its source states."""
+
+    motivation_state: MotivationSystemSnapshot
+    goal_state: GoalSystemSnapshot
+    commitment_state: CommitmentSystemSnapshot
+    view: R13PromptView
+
+
+@dataclass(frozen=True, slots=True)
+class _CommittedReadViews:
+    """Atomically published ordinary read views across all owned domains."""
+
+    value_snapshot: ValueSystemSnapshot
+    belief_snapshot: BeliefSystemSnapshot
+    r13_bundle: _CommittedR13Bundle
+
+
 class SuzkaMainLoop:
     """Connect prediction error, emotion, memory, generation, and storage."""
 
@@ -158,6 +189,9 @@ class SuzkaMainLoop:
         value_system: ValueSystem | None = None,
         belief_system: BeliefSystem | None = None,
         experience_store: ExperienceStore | None = None,
+        motivation_system: MotivationSystem | None = None,
+        goal_system: GoalSystem | None = None,
+        commitment_system: CommitmentSystem | None = None,
     ) -> None:
         from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 
@@ -239,7 +273,6 @@ class SuzkaMainLoop:
                 raise TypeError("value_system must be ValueSystem")
             authority = ValueSystem.restore_snapshot(value_system.snapshot())
         self._value_system = authority
-        self._committed_value_snapshot: ValueSystemSnapshot = authority.snapshot()
         if belief_system is None:
             belief_authority = BeliefSystem(event_provider=self._current_belief_event)
         else:
@@ -249,15 +282,75 @@ class SuzkaMainLoop:
                 belief_system.snapshot(), event_provider=self._current_belief_event
             )
         self._belief_system = belief_authority
-        self._committed_belief_snapshot: BeliefSystemSnapshot = (
-            belief_authority.snapshot()
+        if motivation_system is None:
+            motivation_authority = MotivationSystem()
+        else:
+            if not isinstance(motivation_system, MotivationSystem):
+                raise TypeError("motivation_system must be MotivationSystem")
+            motivation_authority = MotivationSystem()
+            motivation_authority.restore_motivation_state(
+                motivation_system.snapshot()
+            )
+        self._motivation_system = motivation_authority
+        if goal_system is None:
+            goal_authority = GoalSystem()
+        else:
+            if not isinstance(goal_system, GoalSystem):
+                raise TypeError("goal_system must be GoalSystem")
+            goal_authority = GoalSystem()
+            goal_authority.restore_goal_state(goal_system.snapshot())
+        self._goal_system = goal_authority
+        if commitment_system is None:
+            commitment_authority = CommitmentSystem()
+        else:
+            if not isinstance(commitment_system, CommitmentSystem):
+                raise TypeError("commitment_system must be CommitmentSystem")
+            commitment_authority = CommitmentSystem()
+            commitment_authority.restore_commitment_state(
+                commitment_system.snapshot()
+            )
+        self._commitment_system = commitment_authority
+        initial_r13_state = R13StateSnapshot(
+            schema_version=R13_CODEC_SCHEMA_VERSION,
+            motivation=R13GraphSnapshot.capture(
+                self._motivation_system.snapshot()
+            ),
+            goal=R13GraphSnapshot.capture(self._goal_system.snapshot()),
+            commitment=R13GraphSnapshot.capture(
+                self._commitment_system.snapshot()
+            ),
+        )
+        self._committed_read_views = self._prepare_committed_read_views(
+            authority.snapshot(),
+            belief_authority.snapshot(),
+            initial_r13_state,
         )
 
     @property
     def value_system(self) -> ValueSystem:
         """Return a detached read-only-by-convention Value projection."""
 
-        return ValueSystem.restore_snapshot(self._committed_value_snapshot)
+        return ValueSystem.restore_snapshot(
+            self._committed_read_views.value_snapshot
+        )
+
+    @property
+    def _committed_value_snapshot(self) -> ValueSystemSnapshot:
+        """Compatibility read for event validation from the shared bundle."""
+
+        return self._committed_read_views.value_snapshot
+
+    @property
+    def _committed_belief_snapshot(self) -> BeliefSystemSnapshot:
+        """Compatibility read for event validation from the shared bundle."""
+
+        return self._committed_read_views.belief_snapshot
+
+    @property
+    def _committed_r13_bundle(self) -> _CommittedR13Bundle:
+        """Compatibility read from the shared ordinary-view bundle."""
+
+        return self._committed_read_views.r13_bundle
 
     def _value_system_for_state(self) -> ValueSystem:
         """Return the internal Value authority to AgentState only."""
@@ -268,18 +361,23 @@ class SuzkaMainLoop:
         if not isinstance(value_system, ValueSystem):
             raise TypeError("value_system must be ValueSystem")
         self._value_system = value_system
-        self._committed_value_snapshot = value_system.snapshot()
 
     def _publish_committed_value_view(self) -> None:
         """Publish the Value state after the runtime commit protocol succeeds."""
 
-        self._committed_value_snapshot = self._value_system.snapshot()
+        snapshot = self._value_system.snapshot()
+        current = self._committed_read_views
+        self._committed_read_views = _CommittedReadViews(
+            snapshot, current.belief_snapshot, current.r13_bundle
+        )
 
     @property
     def belief_system(self) -> BeliefSystem:
         """Return a detached read-only-by-convention Belief projection."""
 
-        return BeliefSystem.restore_snapshot(self._committed_belief_snapshot)
+        return BeliefSystem.restore_snapshot(
+            self._committed_read_views.belief_snapshot
+        )
 
     def export_belief_state(self) -> BeliefSystemSnapshot:
         """Export an immutable Belief snapshot for AgentState capture."""
@@ -295,7 +393,6 @@ class SuzkaMainLoop:
             snapshot, event_provider=self._current_belief_event
         )
         self._belief_system = restored
-        self._committed_belief_snapshot = restored.snapshot()
 
     def _current_belief_event(self) -> object | None:
         runtime = self._runtime
@@ -306,7 +403,127 @@ class SuzkaMainLoop:
     def _publish_committed_belief_view(self) -> None:
         """Publish Belief state after the runtime commit protocol succeeds."""
 
-        self._committed_belief_snapshot = self._belief_system.snapshot()
+        snapshot = self._belief_system.snapshot()
+        current = self._committed_read_views
+        self._committed_read_views = _CommittedReadViews(
+            current.value_snapshot, snapshot, current.r13_bundle
+        )
+
+    def export_motivation_state(self) -> MotivationSystemSnapshot:
+        """Export a complete immutable Motivation snapshot for AgentState."""
+
+        return self._motivation_system.snapshot()
+
+    def restore_motivation_state(self, snapshot: MotivationSystemSnapshot) -> None:
+        """Replace only Motivation authority through the AgentState port."""
+
+        self._motivation_system.restore_motivation_state(snapshot)
+
+    def export_goal_state(self) -> GoalSystemSnapshot:
+        """Export a complete immutable Goal snapshot for AgentState."""
+
+        return self._goal_system.snapshot()
+
+    def restore_goal_state(self, snapshot: GoalSystemSnapshot) -> None:
+        """Replace only Goal authority through the AgentState port."""
+
+        self._goal_system.restore_goal_state(snapshot)
+
+    def export_commitment_state(self) -> CommitmentSystemSnapshot:
+        """Export a complete immutable Commitment snapshot for AgentState."""
+
+        return self._commitment_system.snapshot()
+
+    def restore_commitment_state(
+        self, snapshot: CommitmentSystemSnapshot
+    ) -> None:
+        """Replace only Commitment authority through the AgentState port."""
+
+        self._commitment_system.restore_commitment_state(snapshot)
+
+    def r13_view(self) -> R13PromptView:
+        """Return the one atomically committed immutable R13 prompt view."""
+
+        return self._committed_read_views.r13_bundle.view
+
+    @staticmethod
+    def _prepare_committed_r13_view(
+        r13_state: R13StateSnapshot,
+    ) -> _CommittedR13Bundle:
+        """Decode, validate, and project R13 without changing runtime state."""
+
+        if type(r13_state) is not R13StateSnapshot:
+            raise TypeError("r13_state must be an exact R13StateSnapshot")
+        validated = R13StateSnapshot(
+            schema_version=r13_state.schema_version,
+            motivation=R13GraphSnapshot.model_validate(
+                r13_state.motivation.model_dump(mode="python")
+            ),
+            goal=R13GraphSnapshot.model_validate(
+                r13_state.goal.model_dump(mode="python")
+            ),
+            commitment=R13GraphSnapshot.model_validate(
+                r13_state.commitment.model_dump(mode="python")
+            ),
+        )
+        motivation_state = validated.motivation.restore()
+        goal_state = validated.goal.restore()
+        commitment_state = validated.commitment.restore()
+        if type(motivation_state) is not MotivationSystemSnapshot:
+            raise ValueError("R13 motivation graph has an invalid root type")
+        if type(goal_state) is not GoalSystemSnapshot:
+            raise ValueError("R13 goal graph has an invalid root type")
+        if type(commitment_state) is not CommitmentSystemSnapshot:
+            raise ValueError("R13 commitment graph has an invalid root type")
+        view = R13PromptView.from_snapshots(
+            motivation_state, goal_state, commitment_state
+        )
+        return _CommittedR13Bundle(
+            motivation_state,
+            goal_state,
+            commitment_state,
+            view,
+        )
+
+    def _publish_committed_r13_view(
+        self, bundle: _CommittedR13Bundle
+    ) -> None:
+        """Publish R13 while preserving Value/Belief views for compatibility."""
+
+        current = self._committed_read_views
+        self._committed_read_views = _CommittedReadViews(
+            current.value_snapshot, current.belief_snapshot, bundle
+        )
+
+    def _prepare_committed_read_views(
+        self,
+        value_snapshot: ValueSystemSnapshot,
+        belief_snapshot: BeliefSystemSnapshot,
+        r13_state: R13StateSnapshot,
+    ) -> _CommittedReadViews:
+        """Validate every ordinary read projection before atomic publication."""
+
+        if type(value_snapshot) is not ValueSystemSnapshot:
+            raise TypeError("value_snapshot must be an exact ValueSystemSnapshot")
+        if type(belief_snapshot) is not BeliefSystemSnapshot:
+            raise TypeError("belief_snapshot must be an exact BeliefSystemSnapshot")
+        validated_value_snapshot = ValueSystem.restore_snapshot(
+            value_snapshot
+        ).snapshot()
+        validated_belief_snapshot = BeliefSystem.restore_snapshot(
+            belief_snapshot
+        ).snapshot()
+        r13_bundle = self._prepare_committed_r13_view(r13_state)
+        return _CommittedReadViews(
+            validated_value_snapshot,
+            validated_belief_snapshot,
+            r13_bundle,
+        )
+
+    def _publish_committed_read_views(self, bundle: _CommittedReadViews) -> None:
+        """Publish all ordinary domain reads with one non-fallible ref swap."""
+
+        self._committed_read_views = bundle
 
     def _validate_belief_event_commit(self, event: AgentEvent) -> None:
         """Require every newly published Belief revision to bind this event."""
@@ -874,10 +1091,13 @@ class SuzkaMainLoop:
             parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
         )
         keyword_arguments: dict[str, object] = {}
+        r13_view = self.r13_view()
         if accepts_kwargs or "context_view" in keyword_names:
             keyword_arguments["context_view"] = context_view
         if accepts_kwargs or "value_view" in keyword_names:
             keyword_arguments["value_view"] = value_view
+        if accepts_kwargs or "r13_view" in keyword_names:
+            keyword_arguments["r13_view"] = r13_view
         return build(
             user_input,
             emotion_state,

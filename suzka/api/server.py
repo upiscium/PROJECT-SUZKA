@@ -23,6 +23,7 @@ from suzka.runtime import (
     AgentRuntime,
     AgentRuntimeStatus,
     AgentStateStore,
+    AgentStateSnapshotV8,
     CompatibleAgentStateSnapshot,
     EventJournal,
     EventJournalError,
@@ -36,6 +37,10 @@ from suzka.runtime import (
     StateWAL,
     TransactionCoordinator,
     WorkingMemory,
+)
+from suzka.runtime.agent_state import (
+    _domain_belief_system,
+    _domain_value_system,
 )
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
 from suzka.runtime.semantic_receipt_retention import (
@@ -275,15 +280,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.main_loop, sequence
             )
             candidate_hash = app.state.agent_state_store.snapshot_hash(candidate)
+            prepared_read_views = None
+            if isinstance(app.state.main_loop, SuzkaMainLoop):
+                assert isinstance(candidate, AgentStateSnapshotV8)
+                value_snapshot = _domain_value_system(
+                    candidate.value_state
+                ).snapshot()
+                belief_snapshot = _domain_belief_system(
+                    candidate.belief_state
+                ).snapshot()
+                prepared_read_views = (
+                    app.state.main_loop._prepare_committed_read_views(
+                        value_snapshot,
+                        belief_snapshot,
+                        candidate.r13_state,
+                    )
+                )
+                if prepared_read_views is None:
+                    raise StateRecoveryError(
+                        "Committed read views were not prepared"
+                    )
             evidence = app.state.state_recovery.commit_internal_candidate(
                 event, committed_snapshot, candidate
             )
-            app.state.main_loop._publish_committed_value_view()
-            publish_belief_view = getattr(
-                app.state.main_loop, "_publish_committed_belief_view", None
-            )
-            if callable(publish_belief_view):
-                publish_belief_view()
+            if prepared_read_views is not None:
+                app.state.main_loop._publish_committed_read_views(
+                    prepared_read_views
+                )
             committed_snapshot = candidate
             committed_snapshot_hash = candidate_hash
             return evidence

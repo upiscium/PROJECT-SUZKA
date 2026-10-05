@@ -1088,6 +1088,10 @@ class StateWAL:
             raise StateWALConflictError("event identifier is already retained in WAL")
         prior_hash = self._snapshot_hash_value(prior_snapshot)
         candidate_hash = self._snapshot_hash_value(candidate_snapshot)
+        # Ordinary transitions preserve the v8 authority contract even when
+        # R13 is empty. Explicit true rollback uses a new generation instead.
+        if prior_snapshot.schema_version == 8 and candidate_snapshot.schema_version != 8:
+            raise StateWALConflictError("ordinary v8 state transition cannot downgrade schema")
         if (
             inspection.latest_snapshot_sequence
             != prior_snapshot.last_processed_event_sequence
