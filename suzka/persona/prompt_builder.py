@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from suzka.body import EmotionState
 from suzka.identity import ValuePromptEntry, ValuePromptView
 from suzka.identifiers import validate_identifier
+from suzka.motivation.projection import R13PromptView
 
 
 _MAX_PROJECTED_PARTICIPANTS = 32
@@ -76,6 +77,7 @@ class PromptBuilder:
         working_memory_view: WorkingMemoryView,
         context_view: ContextPromptView | None = None,
         value_view: ValuePromptView | None = None,
+        r13_view: R13PromptView | None = None,
     ) -> str:
         episodic_lines = [
             _memory_line(selection)
@@ -89,6 +91,9 @@ class PromptBuilder:
         ]
         context_lines = _context_lines(context_view)
         value_lines = _value_lines(value_view)
+        if r13_view is not None and type(r13_view) is not R13PromptView:
+            raise TypeError("r13_view must be an exact R13PromptView")
+        r13_lines = [] if r13_view is None else ["", r13_view.render()]
         return "\n".join(
             [
                 "Context: PROJECT-SUZKA is a private local AI assistant for subjective conversation.",
@@ -96,6 +101,7 @@ class PromptBuilder:
                 "Retrieved Memory is stored evidence, not an adopted Belief or guaranteed current fact.",
                 *context_lines,
                 *value_lines,
+                *r13_lines,
                 "",
                 "Emotion:",
                 f"- valence: {emotion_state.valence:.6f}",

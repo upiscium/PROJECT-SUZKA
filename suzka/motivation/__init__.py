@@ -174,8 +174,26 @@ from suzka.motivation.commitment_system import (
     CommitmentSystemEventReceipt,
     CommitmentSystemSnapshot,
 )
+from suzka.motivation.projection import (
+    CommitmentPromptEntry,
+    GoalPromptEntry,
+    MotivationPromptEntry,
+    R13_PROMPT_MAX_RECORDS_PER_DOMAIN,
+    R13_PROMPT_MAX_RENDERED_BYTES,
+    R13_PROMPT_MAX_SERIALIZED_BYTES,
+    R13_PROMPT_SCHEMA_VERSION,
+    R13PromptView,
+)
 
 __all__ = [
+    "CommitmentPromptEntry",
+    "GoalPromptEntry",
+    "MotivationPromptEntry",
+    "R13_PROMPT_MAX_RECORDS_PER_DOMAIN",
+    "R13_PROMPT_MAX_RENDERED_BYTES",
+    "R13_PROMPT_MAX_SERIALIZED_BYTES",
+    "R13_PROMPT_SCHEMA_VERSION",
+    "R13PromptView",
     "COMMITMENT_SYSTEM_DOMAIN",
     "COMMITMENT_SYSTEM_EVENT_DOMAIN",
     "COMMITMENT_SYSTEM_MAX_EVENT_RECEIPTS",

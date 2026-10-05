@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import fields
 from datetime import datetime, timezone
 import math
@@ -5,16 +6,17 @@ from pathlib import Path
 
 import pytest
 
-from suzka.body import EmotionEngineAllostasis, EmotionState
+from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
 from suzka.belief import (
     BeliefDomainError,
     BeliefEvidence,
     BeliefEvidenceType,
     BeliefMutationEvidence,
     BeliefProposition,
+    BeliefSystem,
 )
 from suzka.cognition import LossCalibration, LossInvalidReason, model_key
-from suzka.identity import ValuePromptView
+from suzka.identity import ValuePromptView, ValueSystem
 from suzka.config import Settings, load_settings
 from suzka.memory import (
     DualMemorySystem,
@@ -24,6 +26,13 @@ from suzka.memory import (
     SemanticMemoryReadError,
     SemanticMemoryRecord,
 )
+from suzka.motivation.commitment_system import (
+    CommitmentSystem,
+    CommitmentSystemSnapshot,
+)
+from suzka.motivation.goal_system import GoalSystem
+from suzka.motivation.projection import R13PromptView
+from suzka.motivation.system import MotivationSystem
 from suzka.runtime.context import ContextType
 from suzka.models import DummyProvider
 from suzka.persona import ContextPromptView, PromptBuilder
@@ -31,6 +40,9 @@ from suzka.runtime import (
     ChatContextSelectors,
     CoordinatedResult,
     ContextRegistry,
+    AgentStateLoadError,
+    AgentStateSnapshotV8,
+    AgentStateStore,
     SuzkaMainLoop,
     TransactionBinding,
     TransactionBoundValue,
@@ -47,6 +59,15 @@ from suzka.runtime.agent_runtime import (
     AgentEventSource,
     AgentEventType,
     AgentRuntime,
+)
+from suzka.runtime.r13_codec import (
+    R13_CODEC_SCHEMA_VERSION,
+    R13StateSnapshot,
+)
+from test_r13_codec import (
+    _commitment_snapshot,
+    _goal_snapshot,
+    _motivation_snapshot,
 )
 
 
@@ -168,6 +189,260 @@ def test_main_loop_passively_owns_configured_or_injected_working_memory(
         == settings.working_memory.projection_max_bytes
     )
     assert explicit.working_memory is injected
+
+
+def test_main_loop_clones_injected_r13_authorities_and_publishes_their_view(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    injected_motivation = MotivationSystem()
+    injected_goal = GoalSystem()
+    injected_commitment = CommitmentSystem()
+    snapshots = (
+        _motivation_snapshot(),
+        _goal_snapshot(),
+        _commitment_snapshot(),
+    )
+    injected_motivation.restore_motivation_state(snapshots[0])
+    injected_goal.restore_goal_state(snapshots[1])
+    injected_commitment.restore_commitment_state(snapshots[2])
+
+    loop = SuzkaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(settings),
+        motivation_system=injected_motivation,
+        goal_system=injected_goal,
+        commitment_system=injected_commitment,
+    )
+
+    assert loop._motivation_system is not injected_motivation
+    assert loop._goal_system is not injected_goal
+    assert loop._commitment_system is not injected_commitment
+    assert loop.export_motivation_state() == snapshots[0]
+    assert loop.export_goal_state() == snapshots[1]
+    assert loop.export_commitment_state() == snapshots[2]
+    assert loop.r13_view().motivations
+    assert loop.r13_view().goals
+    assert not hasattr(loop, "motivation_system")
+    assert not hasattr(loop, "goal_system")
+    assert not hasattr(loop, "commitment_system")
+
+    empty = R13StateSnapshot.empty()
+    injected_motivation.restore_motivation_state(empty.motivation.restore())
+    injected_goal.restore_goal_state(empty.goal.restore())
+    injected_commitment.restore_commitment_state(empty.commitment.restore())
+    assert loop.export_motivation_state() == snapshots[0]
+    assert loop.export_goal_state() == snapshots[1]
+    assert loop.export_commitment_state() == snapshots[2]
+
+
+@pytest.mark.parametrize(
+    ("port_name",),
+    (
+        ("motivation_system",),
+        ("goal_system",),
+        ("commitment_system",),
+    ),
+)
+def test_main_loop_rejects_invalid_injected_r13_authority(
+    tmp_path: Path, port_name: str
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    with pytest.raises(TypeError, match=port_name):
+        SuzkaMainLoop(
+            settings,
+            ThinkingDummyProvider(),
+            DualMemorySystem(settings),
+            **{port_name: object()},
+        )
+
+
+def test_main_loop_r13_view_changes_only_after_staged_publication(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    motivation = MotivationSystem()
+    motivation.restore_motivation_state(_motivation_snapshot())
+    loop = SuzkaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(settings),
+        motivation_system=motivation,
+    )
+    committed_before = loop.r13_view()
+    assert committed_before.motivations
+
+    empty = R13StateSnapshot.empty()
+    loop.restore_motivation_state(empty.motivation.restore())
+    assert not loop.export_motivation_state().records
+    assert loop.r13_view() is committed_before
+
+    prepared = loop._prepare_committed_r13_view(empty)
+    assert loop.r13_view() is committed_before
+    assert not prepared.view.motivations
+    loop._publish_committed_r13_view(prepared)
+    assert loop.r13_view() is prepared.view
+    assert loop.r13_view() != committed_before
+
+
+def test_main_loop_direct_r13_restore_ports_do_not_publish_prompt_view(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = SuzkaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(settings),
+        motivation_system=MotivationSystem(),
+        goal_system=GoalSystem(),
+        commitment_system=CommitmentSystem(),
+    )
+    before = loop.r13_view()
+    empty = R13StateSnapshot.empty()
+
+    loop.restore_motivation_state(empty.motivation.restore())
+    loop.restore_goal_state(empty.goal.restore())
+    loop.restore_commitment_state(empty.commitment.restore())
+
+    assert loop.r13_view() is before
+
+
+def test_production_main_loop_captures_complete_empty_r13_state_as_v8(
+    tmp_path: Path,
+) -> None:
+    settings = _settings_for_tmp_memory(tmp_path)
+    loop = SuzkaMainLoop(
+        settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(settings),
+    )
+    snapshot = AgentStateStore(
+        tmp_path / "agent-state.json", settings.emotion.baseline_surprisal
+    ).capture(loop, sequence=0)
+
+    assert isinstance(snapshot, AgentStateSnapshotV8)
+    assert snapshot.r13_state.schema_version == R13_CODEC_SCHEMA_VERSION
+    assert snapshot.r13_state.motivation.restore() == loop.export_motivation_state()
+    assert snapshot.r13_state.goal.restore() == loop.export_goal_state()
+    assert snapshot.r13_state.commitment.restore() == loop.export_commitment_state()
+
+
+@pytest.mark.parametrize("failure_phase", ["temporal", "commitment"])
+def test_failed_agent_state_restore_keeps_all_previous_committed_views(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+) -> None:
+    class FailingTemporalEngine(EmotionEngineAllostasis):
+        def __init__(self) -> None:
+            self.fail_next_temporal_restore = False
+            self.on_temporal_failure: Callable[[], None] | None = None
+            self._temporal_state = EmotionTemporalState()
+            super().__init__(EmotionState())
+
+        @property
+        def temporal_state(self) -> EmotionTemporalState:
+            return self._temporal_state
+
+        @temporal_state.setter
+        def temporal_state(self, value: EmotionTemporalState) -> None:
+            if self.fail_next_temporal_restore:
+                self.fail_next_temporal_restore = False
+                if self.on_temporal_failure is not None:
+                    self.on_temporal_failure()
+                raise RuntimeError("injected temporal restore failure")
+            self._temporal_state = value
+
+    source_settings = _settings_for_tmp_memory(tmp_path / "source")
+    source = SuzkaMainLoop(
+        source_settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(source_settings),
+        value_system=ValueSystem(),
+    )
+    store = AgentStateStore(
+        tmp_path / "agent-state.json", source_settings.emotion.baseline_surprisal
+    )
+    target_settings = _settings_for_tmp_memory(tmp_path / "target")
+    event_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    belief_event = AgentEvent(
+        "belief-initial-event",
+        AgentEventType.CHAT,
+        AgentEventSource.API_CHAT,
+        event_time,
+        processing_sequence=1,
+    )
+    belief = BeliefSystem(event_provider=lambda: belief_event)
+    belief.create_proposal(
+        BeliefProposition("A committed read projection"),
+        BeliefMutationEvidence(belief_event.event_id, 1, event_time),
+        evidence=(BeliefEvidence("belief-source", BeliefEvidenceType.EXTERNAL_CLAIM),),
+    )
+    motivation = MotivationSystem()
+    motivation_snapshot = _motivation_snapshot()
+    motivation.restore_motivation_state(motivation_snapshot)
+    emotion_engine = FailingTemporalEngine()
+    target = SuzkaMainLoop(
+        target_settings,
+        ThinkingDummyProvider(),
+        DualMemorySystem(target_settings),
+        emotion_engine=emotion_engine,
+        belief_system=belief,
+        motivation_system=motivation,
+    )
+    before_value = target.value_system.snapshot()
+    before_belief = target.belief_system.snapshot()
+    before_view = target.r13_view()
+    assert before_value.values
+    assert before_belief.records
+    assert before_view.motivations
+    persisted = store.capture(source, sequence=1)
+    assert isinstance(persisted, AgentStateSnapshotV8)
+    observed_views: list[tuple[object, object, object]] = []
+
+    def observe_views() -> None:
+        observed_views.append(
+            (
+                target.value_system.snapshot(),
+                target.belief_system.snapshot(),
+                target.r13_view(),
+            )
+        )
+
+    if failure_phase == "temporal":
+        emotion_engine.on_temporal_failure = observe_views
+        emotion_engine.fail_next_temporal_restore = True
+    else:
+        original_restore = target._commitment_system.restore_commitment_state
+        failed_once = False
+
+        def restore_then_fail(snapshot: CommitmentSystemSnapshot) -> None:
+            nonlocal failed_once
+            original_restore(snapshot)
+            if not failed_once:
+                failed_once = True
+                observe_views()
+                raise RuntimeError("injected Commitment restore failure")
+
+        monkeypatch.setattr(
+            target._commitment_system,
+            "restore_commitment_state",
+            restore_then_fail,
+        )
+
+    with pytest.raises(AgentStateLoadError, match="restore failed"):
+        store.restore_into(target, persisted)
+
+    assert len(observed_views) == 1
+    observed_value, observed_belief, observed_r13 = observed_views[0]
+    assert observed_value == before_value
+    assert observed_belief == before_belief
+    assert observed_r13 is before_view
+    assert target.value_system.snapshot() == before_value
+    assert target.belief_system.snapshot() == before_belief
+    assert target.r13_view() is before_view
+    assert target.export_motivation_state() == motivation_snapshot
 
 
 def test_emotion_tick_only_advances_emotion_temporal_state(tmp_path: Path) -> None:
@@ -470,11 +745,24 @@ def test_prompt_builder_projection_keywords_preserve_injected_builder_shapes(
             observed.append(None)
             return "legacy"
 
+    class R13Builder:
+        def build(
+            self,
+            _user_input,
+            _emotion_state,
+            _working_memory_view,
+            *,
+            r13_view: R13PromptView,
+        ):
+            observed.append(r13_view)
+            return "r13"
+
     for builder, expected in (
         (BothBuilder(), "both"),
         (KwargsBuilder(), "kwargs"),
         (ContextOnlyBuilder(), "context"),
         (LegacyBuilder(), "legacy"),
+        (R13Builder(), "r13"),
     ):
         loop.prompt_builder = builder  # type: ignore[assignment]
         assert (
@@ -492,9 +780,11 @@ def test_prompt_builder_projection_keywords_preserve_injected_builder_shapes(
     assert observed[1] == {
         "context_view": context_view,
         "value_view": value_view,
+        "r13_view": loop.r13_view(),
     }
     assert observed[2] is context_view
     assert observed[3] is None
+    assert observed[4] is loop.r13_view()
 
     class BodyTypeErrorBuilder:
         calls = 0

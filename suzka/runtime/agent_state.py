@@ -3555,6 +3555,12 @@ class AgentStateStore:
         motivation_port: MotivationStatePort | None = None
         goal_port: GoalStatePort | None = None
         commitment_port: CommitmentStatePort | None = None
+        prepared_read_views: object | None = None
+        publish_read_views: Callable[[object], object] | None = None
+        read_views_prepared = False
+        prepared_r13_bundle: object | None = None
+        publish_r13_bundle: Callable[[object], object] | None = None
+        r13_bundle_prepared = False
         attempted_r13_restores: list[tuple[str, object, object]] = []
         value_system_was_present = False
         belief_port_was_present = False
@@ -3788,6 +3794,48 @@ class AgentStateStore:
                     previous_commitment_snapshot,
                 )
 
+            prepare_read_view_bundle = getattr(
+                main_loop, "_prepare_committed_read_views", None
+            )
+            publish_read_view_bundle = getattr(
+                main_loop, "_publish_committed_read_views", None
+            )
+            if callable(prepare_read_view_bundle) != callable(
+                publish_read_view_bundle
+            ):
+                raise AgentStateLoadError(
+                    "AgentState restore committed-read-view hooks are incomplete"
+                )
+            if callable(prepare_read_view_bundle) and callable(
+                publish_read_view_bundle
+            ):
+                prepared_read_views = prepare_read_view_bundle(
+                    restored_value_system.snapshot(),
+                    restored_belief_system.snapshot(),
+                    r13_state,
+                )
+                publish_read_views = cast(
+                    Callable[[object], object], publish_read_view_bundle
+                )
+                read_views_prepared = True
+            else:
+                prepare_r13_view = getattr(
+                    main_loop, "_prepare_committed_r13_view", None
+                )
+                publish_r13_view = getattr(
+                    main_loop, "_publish_committed_r13_view", None
+                )
+                if callable(prepare_r13_view) != callable(publish_r13_view):
+                    raise AgentStateLoadError(
+                        "AgentState restore R13 committed-view hooks are incomplete"
+                    )
+                if callable(prepare_r13_view) and callable(publish_r13_view):
+                    prepared_r13_bundle = prepare_r13_view(r13_state)
+                    publish_r13_bundle = cast(
+                        Callable[[object], object], publish_r13_view
+                    )
+                    r13_bundle_prepared = True
+
             previous_emotion = emotion_engine.state
             previous_working_memory_revision = working_memory_authority.revision
             previous_working_memory_items = working_memory_authority.items
@@ -3832,6 +3880,12 @@ class AgentStateStore:
                 optimal_loss=emotion.optimal_loss,
             )
             emotion_engine.temporal_state = restored_temporal
+            if read_views_prepared:
+                assert publish_read_views is not None
+                publish_read_views(prepared_read_views)
+            elif r13_bundle_prepared:
+                assert publish_r13_bundle is not None
+                publish_r13_bundle(prepared_r13_bundle)
         except Exception as error:
             if isinstance(
                 error, AgentStateConfigurationDrift

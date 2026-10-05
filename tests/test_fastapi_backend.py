@@ -346,6 +346,35 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
         assert list(pending.glob("*.json")) == []
 
 
+def test_server_commit_does_not_call_legacy_view_publishers_after_durability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _client(tmp_path) as client:
+        main_loop = client.app.state.main_loop
+
+        def reject_legacy_publication(*_args: object, **_kwargs: object) -> None:
+            pytest.fail("server invoked a legacy per-domain view publisher")
+
+        monkeypatch.setattr(
+            main_loop, "_publish_committed_value_view", reject_legacy_publication
+        )
+        monkeypatch.setattr(
+            main_loop, "_publish_committed_belief_view", reject_legacy_publication
+        )
+        monkeypatch.setattr(
+            main_loop, "_publish_committed_r13_view", reject_legacy_publication
+        )
+
+        response = client.post(
+            "/api/chat", json={"message": "atomic read publication", "attachments": []}
+        )
+
+        assert response.status_code == 200
+        snapshot = client.app.state.agent_state_store.load()
+        assert snapshot.schema_version == 8
+        assert main_loop.r13_view().motivations == ()
+
+
 def test_repeated_real_memory_and_experience_reads_do_not_mutate_authority(
     tmp_path: Path,
 ) -> None:
@@ -980,7 +1009,7 @@ def test_retained_v4_lazy_upgrade_preserves_bytes_then_publishes_v7(
         assert response.status_code == 200
 
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 7
+        assert upgraded.schema_version == 8
         assert tuple(value.value_id for value in upgraded.value_state.values) == (
             "care",
             "honesty",
@@ -1034,7 +1063,7 @@ def test_retained_v2_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
         )
         assert response.status_code == 200
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 7
+        assert upgraded.schema_version == 8
         assert upgraded.context_state.current_context_id == "conversation.default"
         assert tuple(
             frame.context_id for frame in upgraded.context_state.frames
@@ -1118,7 +1147,7 @@ def test_retained_v3_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
         )
         assert response.status_code == 200
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 7
+        assert upgraded.schema_version == 8
         assert len(upgraded.appraisal_state.calibration_entries) == 1
         assert upgraded.appraisal_state.calibration_entries[0].count == 1
         assert (
@@ -3484,7 +3513,7 @@ def test_second_startup_cannot_touch_snapshot_before_journal_lease(
         assert settings.agent_state.path.read_bytes() == original
 
 
-def test_chat_commits_post_chat_working_memory_in_agent_state_v7(
+def test_chat_commits_post_chat_working_memory_in_agent_state_v8(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -3501,7 +3530,10 @@ def test_chat_commits_post_chat_working_memory_in_agent_state_v7(
         assert set(response.json()) == {"episode_id", "response", "emotion", "model"}
         snapshot = client.app.state.agent_state_store.load()
         authoritative_items = client.app.state.main_loop.working_memory.items
-        assert snapshot.schema_version == 7
+        assert snapshot.schema_version == 8
+        assert not snapshot.r13_state.motivation.restore().records
+        assert not snapshot.r13_state.goal.restore().records
+        assert not snapshot.r13_state.commitment.restore().records
         assert snapshot.working_memory.revision == (
             client.app.state.main_loop.working_memory.revision
         )
