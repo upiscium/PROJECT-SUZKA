@@ -54,8 +54,13 @@ def test_u1_documented_capacity_and_resources_match_executable_derivation() -> N
 
 
 def test_u1_modules_do_not_import_runtime_providers_or_later_authorities() -> None:
+    # Keep class/mutation exclusions scoped to U1 definitions. The shared
+    # package façade now re-exports authorized U2, but must remain free of
+    # production runtime/provider/later-authority dependencies.
     modules = (
-        *sorted((ROOT / "suzka" / "attention").glob("*.py")),
+        *(ROOT / "suzka" / "attention" / name for name in (
+            "__init__.py", "common.py", "contracts.py", "bounds.py", "adapters.py", "policy.py"
+        )),
         *sorted((ROOT / "suzka" / "metacognition").glob("*.py")),
         ROOT / "suzka" / "working_memory_contracts.py",
         ROOT / "suzka" / "context_contracts.py",

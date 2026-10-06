@@ -1,4 +1,4 @@
-"""Pure R14 Attention contracts; no process-local or runtime authority."""
+"""R14 Attention contracts and local authority, without production runtime wiring."""
 
 from suzka.attention.common import (
     ATTENTION_FIXED_POINT_SCALE,
@@ -57,6 +57,14 @@ from suzka.attention.policy import (
     next_streak_counts,
     select_attention_prompt,
 )
+from suzka.attention.system import (
+    AttentionRefreshResult,
+    AttentionReplayConflict,
+    AttentionSelectedView,
+    AttentionSourceConflict,
+    AttentionSystem,
+    AttentionSystemError,
+)
 
 __all__ = [
     "ATTENTION_FIXED_POINT_SCALE",
@@ -79,15 +87,21 @@ __all__ = [
     "AttentionPromptReason",
     "AttentionPromptSelection",
     "AttentionReceiptAnchor",
+    "AttentionRefreshResult",
+    "AttentionReplayConflict",
     "AttentionRevisionAnchor",
     "AttentionRevisionEvidence",
     "AttentionRevisionReason",
     "AttentionSchemaSizeBudget",
     "AttentionSignalVector",
+    "AttentionSelectedView",
+    "AttentionSourceConflict",
     "AttentionSourceKind",
     "AttentionSourceWitness",
     "AttentionTarget",
     "AttentionTargetKind",
+    "AttentionSystem",
+    "AttentionSystemError",
     "AttentionUnfinishedOverflowError",
     "CandidateAvailability",
     "GlobalEmotionProjection",

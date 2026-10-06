@@ -2,10 +2,12 @@
 
 This is implementation evidence for #281 / Draft PR #282, not a readiness or
 focused-review verdict. D1–D13=A and A1–A24 remain authoritative. Only U1 is
-implemented: immutable shapes, pure source adapters and competition functions,
-resource limits, and a future-v9 capacity **projection**. There is no
-AttentionSystem, Metacognition computation, MainLoop/PromptBuilder integration,
+implemented by that unit: immutable shapes, pure source adapters and competition
+functions, resource limits, and a future-v9 capacity **projection**. U1 introduced
+no AttentionSystem, Metacognition computation, MainLoop/PromptBuilder integration,
 AgentState v9 field, WAL/recovery change, route, scheduler or R15–R19 producer.
+The separate process-local U2 boundary is recorded in
+[r14-u2-attention-system.md](r14-u2-attention-system.md); it does not expand U1.
 
 ## Target and source boundary
 
@@ -211,4 +213,5 @@ unknown/zero/contradiction distinctions, policy math/ties/continuity, count and
 byte boundaries, proof/checksum tampering, parser resource limits, full schema
 capacity and compatibility re-exports. Final focused/full results and exact
 head-associated CI are reported in Draft PR #282, not inferred from this file.
-Stop after U1 publication for exact-head focused review; U2–U6 remain unauthorized.
+U1 was accepted at `cdced8c2148d4fd07b47ae92c6a538ac762618a6` (PR review comment
+6012724848). U2 is separately authorized; U3–U6 and Ready/Merge remain gated.
