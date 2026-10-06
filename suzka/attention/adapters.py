@@ -668,9 +668,11 @@ def _clone_goal(record: GoalRecord) -> GoalRecord:
     return current
 
 
-def _deadline_urgency(deadline: datetime | None, event: AttentionEvent) -> float | None:
+def _deadline_urgency(deadline: datetime | None, event: AttentionEvent) -> float:
+    """Map exact R13 deadline facts; explicit absence means measured no urgency."""
+
     if deadline is None:
-        return None
+        return 0.0
     if type(deadline) is not datetime:
         raise TypeError("deadline must be an exact datetime or None")
     remaining = deadline - event.occurred_at

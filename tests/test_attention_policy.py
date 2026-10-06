@@ -357,6 +357,27 @@ def test_unknown_and_observed_zero_have_distinct_scores_and_digests() -> None:
     assert unknown_result.decisions[0].missing_dimensions != zero_result.decisions[0].missing_dimensions
 
 
+def test_generic_unknown_urgency_still_uses_neutral_not_measured_zero() -> None:
+    # Policy-only inputs distinguish unavailable urgency from measured zero;
+    # the R13 no-deadline adapter must now produce the measured case instead.
+    event = _event()
+    unknown = _goal("a", event=event, signals=AttentionSignalVector(urgency=None))
+    measured_zero = _goal("a", event=event, signals=AttentionSignalVector(urgency=0.0))
+    prior = AttentionContinuity.bootstrap()
+    unknown_result = compete_attention((unknown,), prior, event)
+    zero_result = compete_attention((measured_zero,), prior, event)
+    unknown_decision = _decision(unknown_result, unknown)
+    zero_decision = _decision(zero_result, measured_zero)
+
+    assert unknown.signals.urgency is None
+    assert unknown_decision.base_score_units == 500_000
+    assert zero_decision.base_score_units == 400_000
+    assert AttentionSignalDimension.URGENCY in unknown_decision.missing_dimensions
+    assert AttentionSignalDimension.URGENCY not in zero_decision.missing_dimensions
+    assert unknown_result.input_digest != zero_result.input_digest
+    assert unknown_result.result_digest != zero_result.result_digest
+
+
 def test_target_kind_does_not_hard_override_fixed_numeric_competition() -> None:
     event = _event()
     weak_goal = _goal(

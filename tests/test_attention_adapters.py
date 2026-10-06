@@ -32,10 +32,12 @@ from suzka.attention.common import (
 )
 from suzka.attention.contracts import (
     AttentionCandidateProjection,
+    AttentionContinuity,
     AttentionEvent,
     AttentionSignalVector,
     AttentionTarget,
 )
+from suzka.attention.policy import AttentionSignalDimension, compete_attention
 from suzka.context_contracts import ContextRelation
 from suzka.emotion_contracts import EmotionState
 from suzka.motivation.common import Deadline
@@ -504,12 +506,39 @@ def test_goal_and_commitment_deadline_urgency_uses_event_time_fixed_point() -> N
         _, _, commitment_snapshot = _source_systems(commitment_deadline=deadline)
         return project_commitment(commitment_snapshot.records[0], event=EVENT)
 
-    assert goal_projection(Deadline()).signals.urgency is None
-    assert goal_projection(Deadline(NOW)).signals.urgency == 1.0
-    assert goal_projection(Deadline(NOW - timedelta(microseconds=1))).signals.urgency == 1.0
-    assert goal_projection(Deadline(NOW + timedelta(hours=24))).signals.urgency == 0.0
+    for project in (goal_projection, commitment_projection):
+        assert project(Deadline.without_deadline()).signals.urgency == 0.0
+        assert project(Deadline(NOW)).signals.urgency == 1.0
+        assert project(Deadline(NOW - timedelta(microseconds=1))).signals.urgency == 1.0
+        assert project(Deadline(NOW + timedelta(hours=24))).signals.urgency == 0.0
+        assert project(Deadline(NOW + timedelta(hours=48))).signals.urgency == 0.0
     assert goal_projection(Deadline(NOW + timedelta(hours=16))).signals.urgency == 0.333333
     assert commitment_projection(Deadline(NOW + timedelta(hours=12))).signals.urgency == 0.5
+
+
+@pytest.mark.parametrize("kind", (AttentionTargetKind.GOAL, AttentionTargetKind.COMMITMENT))
+def test_no_deadline_and_distant_deadline_have_equal_measured_urgency_contribution(
+    kind: AttentionTargetKind,
+) -> None:
+    def projection(deadline: Deadline) -> AttentionCandidateProjection:
+        _, goals, commitments = _source_systems(
+            goal_deadline=deadline, commitment_deadline=deadline
+        )
+        if kind is AttentionTargetKind.GOAL:
+            return project_goal(goals.records[0], event=EVENT)
+        return project_commitment(commitments.records[0], event=EVENT)
+
+    no_deadline = projection(Deadline.without_deadline())
+    distant = projection(Deadline(NOW + timedelta(hours=48)))
+    assert no_deadline.signals.urgency == distant.signals.urgency == 0.0
+
+    prior = AttentionContinuity.bootstrap()
+    no_deadline_decision = compete_attention((no_deadline,), prior, EVENT).decisions[0]
+    distant_decision = compete_attention((distant,), prior, EVENT).decisions[0]
+    assert no_deadline_decision.base_score_units == distant_decision.base_score_units == 400_000
+    assert no_deadline_decision.score_units == distant_decision.score_units
+    assert AttentionSignalDimension.URGENCY not in no_deadline_decision.missing_dimensions
+    assert no_deadline_decision.missing_dimensions == distant_decision.missing_dimensions
 
 
 def test_r13_adapters_reject_future_events_and_ineligible_lifecycles() -> None:

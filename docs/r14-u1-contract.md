@@ -88,11 +88,14 @@ lifetime totals; overflow rejects rather than clamps. Each candidate's streak
 is bounded by the event sequence independently; counts across candidates are
 not summed against one global event count. No helper mutates continuity.
 
-Deadline urgency has a fixed 86400-second horizon. No deadline means `None`;
-due/overdue means 1; a deadline at least one horizon ahead means measured 0.
+Deadline urgency has a fixed 86400-second horizon. An explicit R13 no-deadline
+fact means measured urgency `0.0`, not unknown; due/overdue means `1.0`; a
+deadline at least one horizon ahead also means measured `0.0`.
 Intermediate urgency uses explicit UTC timedelta microseconds and fixed-point
 integer flooring, then the common binary64 signal quantization. Source deadline
-and record digest are unchanged.
+and record digest are unchanged. Only genuinely unavailable signals remain
+`None` and receive the unchanged generic neutral fallback; no-deadline urgency
+does not appear in missing dimensions or outrank a distant deadline by urgency.
 
 Competition returns a proposal with decisions for every supplied candidate.
 It does not advance history, receipts or counters. Re-evaluating the same exact
