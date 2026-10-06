@@ -7,36 +7,7 @@ import math
 from typing import Callable
 
 from suzka.cognition.appraisal import AppraisalResult
-
-
-def _number(value: float, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{name} must be a number")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite")
-    return result
-
-
-def _bounded(value: float, name: str, lower: float, upper: float) -> float:
-    result = _number(value, name)
-    if not lower <= result <= upper:
-        raise ValueError(f"{name} must be in [{lower}, {upper}]")
-    return result
-
-
-@dataclass(frozen=True, slots=True)
-class EmotionState:
-    valence: float = 0.0
-    arousal: float = 0.0
-    optimal_loss: float = 1.0
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "valence", _bounded(self.valence, "valence", -1.0, 1.0))
-        object.__setattr__(self, "arousal", _bounded(self.arousal, "arousal", 0.0, 1.0))
-        # Keep the legacy scalar finite without imposing a new lower bound on
-        # the raw ``update()`` compatibility path.
-        object.__setattr__(self, "optimal_loss", _number(self.optimal_loss, "optimal_loss"))
+from suzka.emotion_contracts import EmotionState as EmotionState, _bounded, _number
 
 
 @dataclass(frozen=True, slots=True)
