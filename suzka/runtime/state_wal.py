@@ -24,6 +24,7 @@ from suzka.runtime.agent_state import (
     CompatibleAgentStateSnapshot,
     validate_compatible_agent_state_snapshot,
 )
+from suzka.runtime.attention_state_codec import preflight_attention_json
 
 
 class StateWALError(Exception):
@@ -717,6 +718,7 @@ class StateWAL:
                 raise ValueError
             if not lines[0].endswith(b"\n"):
                 raise ValueError
+            preflight_attention_json(lines[0])
             raw = json.loads(lines[0])
             baseline = BaselineRecord.model_validate_json(_canonical(raw))
             record_hash = _record_json(baseline, "suzka.state-wal.baseline")[1]
@@ -730,6 +732,10 @@ class StateWAL:
             ):
                 raise ValueError
             return baseline, record_hash
+        except RecursionError:
+            raise StateWALConflictError(
+                "existing generation cannot be resumed"
+            ) from None
         except Exception:
             raise StateWALConflictError(
                 "existing generation cannot be resumed"
@@ -989,6 +995,7 @@ class StateWAL:
             try:
                 if not line.endswith(b"\n"):
                     raise ValueError
+                preflight_attention_json(line)
                 raw = json.loads(line)
                 kind = raw.get("record_type")
                 model = (
@@ -1056,6 +1063,8 @@ class StateWAL:
                 ids.add(record.record_id)
                 records.append(record)
                 hashes.append(record.record_hash)
+            except RecursionError:
+                raise StateWALIntegrityError("WAL generation is invalid") from None
             except Exception:
                 raise StateWALIntegrityError("WAL generation is invalid") from None
         if (
@@ -1088,10 +1097,16 @@ class StateWAL:
             raise StateWALConflictError("event identifier is already retained in WAL")
         prior_hash = self._snapshot_hash_value(prior_snapshot)
         candidate_hash = self._snapshot_hash_value(candidate_snapshot)
-        # Ordinary transitions preserve the v8 authority contract even when
-        # R13 is empty. Explicit true rollback uses a new generation instead.
-        if prior_snapshot.schema_version == 8 and candidate_snapshot.schema_version != 8:
-            raise StateWALConflictError("ordinary v8 state transition cannot downgrade schema")
+        # Ordinary transitions can advance the current authority schema but
+        # cannot downgrade any v8+ authority. Explicit true rollback uses a
+        # new generation instead.
+        if (
+            prior_snapshot.schema_version >= 8
+            and candidate_snapshot.schema_version < prior_snapshot.schema_version
+        ):
+            raise StateWALConflictError(
+                "ordinary v8-or-newer state transition cannot downgrade schema"
+            )
         if (
             inspection.latest_snapshot_sequence
             != prior_snapshot.last_processed_event_sequence
@@ -1290,6 +1305,7 @@ class StateWAL:
             try:
                 if not line.endswith(b"\n"):
                     raise ValueError
+                preflight_attention_json(line)
                 raw = json.loads(line)
                 kind = raw.get("record_type")
                 model = (
@@ -1376,6 +1392,8 @@ class StateWAL:
                     ):
                         raise ValueError
                     return snapshot
+            except RecursionError:
+                raise StateWALIntegrityError("bound WAL prefix is invalid") from None
             except Exception:
                 raise StateWALIntegrityError("bound WAL prefix is invalid") from None
         raise StateWALConflictError("bound WAL record is not retained")
