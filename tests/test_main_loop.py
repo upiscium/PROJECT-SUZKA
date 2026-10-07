@@ -41,7 +41,7 @@ from suzka.runtime import (
     CoordinatedResult,
     ContextRegistry,
     AgentStateLoadError,
-    AgentStateSnapshotV8,
+    AgentStateSnapshotV9,
     AgentStateStore,
     SuzkaMainLoop,
     TransactionBinding,
@@ -64,11 +64,8 @@ from suzka.runtime.r13_codec import (
     R13_CODEC_SCHEMA_VERSION,
     R13StateSnapshot,
 )
-from test_r13_codec import (
-    _commitment_snapshot,
-    _goal_snapshot,
-    _motivation_snapshot,
-)
+from test_r13_codec import _motivation_snapshot
+from r14_attention_fixtures import coherent_r13_systems
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
@@ -198,10 +195,11 @@ def test_main_loop_clones_injected_r13_authorities_and_publishes_their_view(
     injected_motivation = MotivationSystem()
     injected_goal = GoalSystem()
     injected_commitment = CommitmentSystem()
+    source_motivation, source_goal, source_commitment = coherent_r13_systems()
     snapshots = (
-        _motivation_snapshot(),
-        _goal_snapshot(),
-        _commitment_snapshot(),
+        source_motivation.snapshot(),
+        source_goal.snapshot(),
+        source_commitment.snapshot(),
     )
     injected_motivation.restore_motivation_state(snapshots[0])
     injected_goal.restore_goal_state(snapshots[1])
@@ -308,7 +306,7 @@ def test_main_loop_direct_r13_restore_ports_do_not_publish_prompt_view(
     assert loop.r13_view() is before
 
 
-def test_production_main_loop_captures_complete_empty_r13_state_as_v8(
+def test_production_main_loop_captures_complete_empty_r13_state_as_v9(
     tmp_path: Path,
 ) -> None:
     settings = _settings_for_tmp_memory(tmp_path)
@@ -321,7 +319,7 @@ def test_production_main_loop_captures_complete_empty_r13_state_as_v8(
         tmp_path / "agent-state.json", settings.emotion.baseline_surprisal
     ).capture(loop, sequence=0)
 
-    assert isinstance(snapshot, AgentStateSnapshotV8)
+    assert isinstance(snapshot, AgentStateSnapshotV9)
     assert snapshot.r13_state.schema_version == R13_CODEC_SCHEMA_VERSION
     assert snapshot.r13_state.motivation.restore() == loop.export_motivation_state()
     assert snapshot.r13_state.goal.restore() == loop.export_goal_state()
@@ -394,12 +392,16 @@ def test_failed_agent_state_restore_keeps_all_previous_committed_views(
     before_value = target.value_system.snapshot()
     before_belief = target.belief_system.snapshot()
     before_view = target.r13_view()
+    before_attention = target.attention_view()
     assert before_value.values
     assert before_belief.records
     assert before_view.motivations
+    assert before_attention.event is None
+    assert before_attention.competition is None
+    assert before_attention.prompt is None
     persisted = store.capture(source, sequence=1)
-    assert isinstance(persisted, AgentStateSnapshotV8)
-    observed_views: list[tuple[object, object, object]] = []
+    assert isinstance(persisted, AgentStateSnapshotV9)
+    observed_views: list[tuple[object, object, object, object]] = []
 
     def observe_views() -> None:
         observed_views.append(
@@ -407,6 +409,7 @@ def test_failed_agent_state_restore_keeps_all_previous_committed_views(
                 target.value_system.snapshot(),
                 target.belief_system.snapshot(),
                 target.r13_view(),
+                target.attention_view(),
             )
         )
 
@@ -435,13 +438,15 @@ def test_failed_agent_state_restore_keeps_all_previous_committed_views(
         store.restore_into(target, persisted)
 
     assert len(observed_views) == 1
-    observed_value, observed_belief, observed_r13 = observed_views[0]
+    observed_value, observed_belief, observed_r13, observed_attention = observed_views[0]
     assert observed_value == before_value
     assert observed_belief == before_belief
     assert observed_r13 is before_view
+    assert observed_attention == before_attention
     assert target.value_system.snapshot() == before_value
     assert target.belief_system.snapshot() == before_belief
     assert target.r13_view() is before_view
+    assert target.attention_view() == before_attention
     assert target.export_motivation_state() == motivation_snapshot
 
 

@@ -4042,21 +4042,46 @@ class AgentStateStore:
                     previous_commitment_snapshot,
                 )
 
+            prepare_attention_read_views = getattr(
+                main_loop, "_prepare_committed_attention_read_views", None
+            )
             prepare_read_view_bundle = getattr(
                 main_loop, "_prepare_committed_read_views", None
             )
             publish_read_view_bundle = getattr(
                 main_loop, "_publish_committed_read_views", None
             )
-            if callable(prepare_read_view_bundle) != callable(
-                publish_read_view_bundle
+            if any(
+                hook is not None and not callable(hook)
+                for hook in (
+                    prepare_attention_read_views,
+                    prepare_read_view_bundle,
+                    publish_read_view_bundle,
+                )
             ):
                 raise AgentStateLoadError(
-                    "AgentState restore committed-read-view hooks are incomplete"
+                    "AgentState restore committed-read-view hooks are invalid"
                 )
-            if callable(prepare_read_view_bundle) and callable(
-                publish_read_view_bundle
-            ):
+            if callable(prepare_attention_read_views):
+                if not callable(publish_read_view_bundle):
+                    raise AgentStateLoadError(
+                        "AgentState restore committed-read-view hooks are incomplete"
+                    )
+                prepared_read_views = prepare_attention_read_views(
+                    restored_value_system.snapshot(),
+                    restored_belief_system.snapshot(),
+                    r13_state,
+                    restored_attention,
+                )
+                publish_read_views = cast(
+                    Callable[[object], object], publish_read_view_bundle
+                )
+                read_views_prepared = True
+            elif callable(prepare_read_view_bundle):
+                if not callable(publish_read_view_bundle):
+                    raise AgentStateLoadError(
+                        "AgentState restore committed-read-view hooks are incomplete"
+                    )
                 prepared_read_views = prepare_read_view_bundle(
                     restored_value_system.snapshot(),
                     restored_belief_system.snapshot(),
@@ -4066,6 +4091,10 @@ class AgentStateStore:
                     Callable[[object], object], publish_read_view_bundle
                 )
                 read_views_prepared = True
+            elif callable(publish_read_view_bundle):
+                raise AgentStateLoadError(
+                    "AgentState restore committed-read-view hooks are incomplete"
+                )
             else:
                 prepare_r13_view = getattr(
                     main_loop, "_prepare_committed_r13_view", None

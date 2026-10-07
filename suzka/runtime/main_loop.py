@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import inspect
 from typing import TYPE_CHECKING, Callable, cast
 
+from suzka.attention.adapters import (
+    project_attention_candidates,
+    project_global_emotion,
+)
+from suzka.attention.contracts import (
+    AttentionContinuity,
+    AttentionEvent,
+    AttentionTarget,
+)
+from suzka.attention.system import (
+    AttentionRefreshResult,
+    AttentionSelectedView,
+    AttentionSystem,
+)
 from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionUpdate
 from suzka.belief import BeliefDomainError, BeliefSystem, BeliefSystemSnapshot
 from suzka.cognition import (
@@ -64,6 +79,10 @@ from suzka.persona import (
     PromptBuilder,
     ResponsePostprocessor,
 )
+from suzka.persona.attention_prompt import (
+    AttentionPromptPayload,
+    build_attention_prompt_payload,
+)
 from suzka.runtime.chat_context import ChatContextSelectors, resolve_chat_context
 from suzka.runtime.agent_runtime import (
     AgentEvent,
@@ -76,7 +95,15 @@ from suzka.runtime.session_participant import (
     SessionTurnParticipant,
 )
 from suzka.runtime.session_state import SessionState
-from suzka.runtime.context import ContextRegistry
+from suzka.runtime.context import (
+    ContextFrame,
+    ContextRegistry,
+    ContextRegistryState,
+    ContextStatus,
+    validate_context_registry_state,
+)
+from suzka.runtime.attention_state_codec import validated_attention_continuity
+from suzka.runtime.attention_state_port import AttentionStatePort
 from suzka.runtime.transaction_coordinator import (
     CoordinatedResult,
     TransactionBoundValue,
@@ -98,6 +125,11 @@ from suzka.runtime.r13_codec import (
 if TYPE_CHECKING:
     from suzka.memory.episodic_participant import MemoryEpisodicParticipant
     from suzka.memory.experience_participant import MemoryExperienceParticipant
+    from suzka.runtime.agent_state import (
+        CommitmentStatePort,
+        GoalStatePort,
+        MotivationStatePort,
+    )
 
 
 @dataclass(frozen=True)
@@ -166,6 +198,92 @@ class _CommittedReadViews:
     value_snapshot: ValueSystemSnapshot
     belief_snapshot: BeliefSystemSnapshot
     r13_bundle: _CommittedR13Bundle
+    attention_view: AttentionSelectedView
+
+
+@dataclass(frozen=True, slots=True)
+class _AgentStatePorts:
+    """The existing state ports, plus this loop's concrete Attention owner."""
+
+    motivation_state_port: MotivationStatePort
+    goal_state_port: GoalStatePort
+    commitment_state_port: CommitmentStatePort
+    attention_state_port: AttentionStatePort
+
+
+def _validated_attention_view(value: object) -> AttentionSelectedView:
+    """Return a detached, revalidated copy of an Attention metadata view."""
+
+    if type(value) is not AttentionSelectedView:
+        raise TypeError("attention view must be an exact AttentionSelectedView")
+    value.__post_init__()
+    event = (
+        None
+        if value.event is None
+        else AttentionEvent.from_canonical_value(value.event.canonical_value())
+    )
+    focused_targets = tuple(
+        AttentionTarget.from_canonical_value(target.canonical_value())
+        for target in value.focused_targets
+    )
+    unfinished_targets = tuple(
+        AttentionTarget.from_canonical_value(target.canonical_value())
+        for target in value.unfinished_targets
+    )
+    competition = value.competition
+    if competition is not None:
+        competition_value = competition.canonical_value()
+        competition = copy.deepcopy(competition)
+        competition.__post_init__()
+        if competition.canonical_value() != competition_value:
+            raise ValueError("Attention competition changed while copying its view")
+    prompt = value.prompt
+    if prompt is not None:
+        prompt_value = prompt.canonical_value()
+        prompt = copy.deepcopy(prompt)
+        prompt.__post_init__()
+        if prompt.canonical_value() != prompt_value:
+            raise ValueError("Attention prompt changed while copying its view")
+    result = AttentionSelectedView(
+        revision=value.revision,
+        event=event,
+        state_digest=value.state_digest,
+        authority_digest=value.authority_digest,
+        focused_targets=focused_targets,
+        unfinished_targets=unfinished_targets,
+        competition=competition,
+        prompt=prompt,
+    )
+    result.__post_init__()
+    return result
+
+
+def _attention_view_matches_state(
+    view: AttentionSelectedView, snapshot: AttentionContinuity
+) -> bool:
+    """Check that the selection metadata is bound to an exact continuity root."""
+
+    target_by_id = {
+        item.candidate_id: item.target for item in snapshot.candidates
+    }
+    return (
+        view.revision == snapshot.revision
+        and view.event == snapshot.last_event
+        and view.state_digest == snapshot.state_digest
+        and view.authority_digest == snapshot.authority_digest
+        and tuple(target.candidate_id for target in view.focused_targets)
+        == snapshot.focused_ids
+        and all(
+            target_by_id.get(target.candidate_id) == target
+            for target in view.focused_targets
+        )
+        and tuple(target.candidate_id for target in view.unfinished_targets)
+        == snapshot.unfinished_ids
+        and all(
+            target_by_id.get(target.candidate_id) == target
+            for target in view.unfinished_targets
+        )
+    )
 
 
 class SuzkaMainLoop:
@@ -192,6 +310,7 @@ class SuzkaMainLoop:
         motivation_system: MotivationSystem | None = None,
         goal_system: GoalSystem | None = None,
         commitment_system: CommitmentSystem | None = None,
+        attention_system: AttentionSystem | None = None,
     ) -> None:
         from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 
@@ -310,6 +429,20 @@ class SuzkaMainLoop:
                 commitment_system.snapshot()
             )
         self._commitment_system = commitment_authority
+        if attention_system is None:
+            attention_authority = AttentionSystem()
+        else:
+            if type(attention_system) is not AttentionSystem:
+                raise TypeError("attention_system must be AttentionSystem")
+            attention_authority = AttentionSystem(attention_system.snapshot())
+        self._attention_system = attention_authority
+        self._attention_state_port = AttentionStatePort(attention_authority)
+        self._agent_state_ports = _AgentStatePorts(
+            self,
+            self,
+            self,
+            self._attention_state_port,
+        )
         initial_r13_state = R13StateSnapshot(
             schema_version=R13_CODEC_SCHEMA_VERSION,
             motivation=R13GraphSnapshot.capture(
@@ -320,11 +453,19 @@ class SuzkaMainLoop:
                 self._commitment_system.snapshot()
             ),
         )
-        self._committed_read_views = self._prepare_committed_read_views(
+        self._committed_read_views = self._prepare_committed_attention_read_views(
             authority.snapshot(),
             belief_authority.snapshot(),
             initial_r13_state,
+            attention_authority.snapshot(),
+            retain_selection=False,
         )
+
+    @property
+    def agent_state_ports(self) -> _AgentStatePorts:
+        """Expose the exact state-port topology consumed by AgentState only."""
+
+        return self._agent_state_ports
 
     @property
     def value_system(self) -> ValueSystem:
@@ -368,8 +509,16 @@ class SuzkaMainLoop:
         snapshot = self._value_system.snapshot()
         current = self._committed_read_views
         self._committed_read_views = _CommittedReadViews(
-            snapshot, current.belief_snapshot, current.r13_bundle
+            snapshot,
+            current.belief_snapshot,
+            current.r13_bundle,
+            current.attention_view,
         )
+
+    def _committed_read_view_checkpoint(self) -> _CommittedReadViews:
+        """Return the opaque last-published handle for trusted server recovery."""
+
+        return self._committed_read_views
 
     @property
     def belief_system(self) -> BeliefSystem:
@@ -406,7 +555,10 @@ class SuzkaMainLoop:
         snapshot = self._belief_system.snapshot()
         current = self._committed_read_views
         self._committed_read_views = _CommittedReadViews(
-            current.value_snapshot, snapshot, current.r13_bundle
+            current.value_snapshot,
+            snapshot,
+            current.r13_bundle,
+            current.attention_view,
         )
 
     def export_motivation_state(self) -> MotivationSystemSnapshot:
@@ -445,6 +597,13 @@ class SuzkaMainLoop:
         """Return the one atomically committed immutable R13 prompt view."""
 
         return self._committed_read_views.r13_bundle.view
+
+    def attention_view(self) -> AttentionSelectedView:
+        """Return a detached copy of only the last committed Attention metadata."""
+
+        return _validated_attention_view(
+            self._committed_read_views.attention_view
+        )
 
     @staticmethod
     def _prepare_committed_r13_view(
@@ -492,7 +651,10 @@ class SuzkaMainLoop:
 
         current = self._committed_read_views
         self._committed_read_views = _CommittedReadViews(
-            current.value_snapshot, current.belief_snapshot, bundle
+            current.value_snapshot,
+            current.belief_snapshot,
+            bundle,
+            current.attention_view,
         )
 
     def _prepare_committed_read_views(
@@ -502,6 +664,36 @@ class SuzkaMainLoop:
         r13_state: R13StateSnapshot,
     ) -> _CommittedReadViews:
         """Validate every ordinary read projection before atomic publication."""
+
+        (
+            validated_value_snapshot,
+            validated_belief_snapshot,
+            r13_bundle,
+        ) = self._prepare_committed_domain_read_views(
+            value_snapshot,
+            belief_snapshot,
+            r13_state,
+        )
+        current = getattr(self, "_committed_read_views", None)
+        attention_view = (
+            self._attention_system.selected_view()
+            if current is None
+            else current.attention_view
+        )
+        return _CommittedReadViews(
+            validated_value_snapshot,
+            validated_belief_snapshot,
+            r13_bundle,
+            _validated_attention_view(attention_view),
+        )
+
+    def _prepare_committed_domain_read_views(
+        self,
+        value_snapshot: ValueSystemSnapshot,
+        belief_snapshot: BeliefSystemSnapshot,
+        r13_state: R13StateSnapshot,
+    ) -> tuple[ValueSystemSnapshot, BeliefSystemSnapshot, _CommittedR13Bundle]:
+        """Stage the existing Value, Belief, and R13 roots without side reads."""
 
         if type(value_snapshot) is not ValueSystemSnapshot:
             raise TypeError("value_snapshot must be an exact ValueSystemSnapshot")
@@ -514,10 +706,50 @@ class SuzkaMainLoop:
             belief_snapshot
         ).snapshot()
         r13_bundle = self._prepare_committed_r13_view(r13_state)
+        return (
+            validated_value_snapshot,
+            validated_belief_snapshot,
+            r13_bundle,
+        )
+
+    def _prepare_committed_attention_read_views(
+        self,
+        value_snapshot: ValueSystemSnapshot,
+        belief_snapshot: BeliefSystemSnapshot,
+        r13_state: R13StateSnapshot,
+        attention_state: AttentionContinuity,
+        *,
+        retain_selection: bool = False,
+    ) -> _CommittedReadViews:
+        """Stage all committed read projections for one explicit Attention root."""
+
+        if type(retain_selection) is not bool:
+            raise TypeError("retain_selection must be an exact bool")
+        validated_attention = validated_attention_continuity(attention_state)
+        (
+            validated_value_snapshot,
+            validated_belief_snapshot,
+            r13_bundle,
+        ) = self._prepare_committed_domain_read_views(
+            value_snapshot,
+            belief_snapshot,
+            r13_state,
+        )
+        if retain_selection:
+            selected_view = self._attention_system.selected_view()
+            if not _attention_view_matches_state(selected_view, validated_attention):
+                raise ValueError(
+                    "live Attention selection does not match the committed root"
+                )
+        else:
+            # Restore/constructor staging must use the supplied target root, not
+            # speculative metadata belonging to the current live owner.
+            selected_view = AttentionSystem(validated_attention).selected_view()
         return _CommittedReadViews(
             validated_value_snapshot,
             validated_belief_snapshot,
             r13_bundle,
+            _validated_attention_view(selected_view),
         )
 
     def _publish_committed_read_views(self, bundle: _CommittedReadViews) -> None:
@@ -934,8 +1166,24 @@ class SuzkaMainLoop:
             context_registry,
             current_context.context_id,
         )
+        attention_payload = (
+            self._refresh_attention_prompt(
+                event,
+                current_context,
+                emotion_state,
+                working_memory_view,
+                working_memory,
+            )
+            if event is not None
+            else None
+        )
         prompt = self._build_prompt(
-            user_input, emotion_state, working_memory_view, context_view, value_view
+            user_input,
+            emotion_state,
+            working_memory_view,
+            context_view,
+            value_view,
+            attention_payload=attention_payload,
         )
         raw_response = self.agent.generate(prompt)
         processed_response = self.postprocessor.process(raw_response)
@@ -1069,6 +1317,116 @@ class SuzkaMainLoop:
             session_participant=session_participant,
         )
 
+    def _refresh_attention_prompt(
+        self,
+        event: AgentEvent,
+        current_context: ContextFrame,
+        emotion_state: EmotionState,
+        working_memory_view: WorkingMemoryView,
+        working_memory: WorkingMemory,
+    ) -> AttentionPromptPayload:
+        """Refresh Attention once from exact sources inside this active chat."""
+
+        runtime = self._runtime
+        if not isinstance(runtime, AgentRuntime):
+            raise RuntimeError(
+                "Attention refresh requires the exact bound handler event"
+            )
+        if runtime.current_event() is not event:
+            raise RuntimeError(
+                "Attention refresh requires the exact bound handler event"
+            )
+        if type(event) is not AgentEvent or (
+            type(event.processing_sequence) is not int
+            or event.processing_sequence <= 0
+        ):
+            raise RuntimeError("Attention refresh requires a validated runtime event")
+        if type(current_context) is not ContextFrame:
+            raise TypeError("Attention refresh requires the resolved Context frame")
+
+        context_state = self.context_registry.state
+        if type(context_state) is not ContextRegistryState:
+            raise RuntimeError("Context authority returned an invalid state")
+        validate_context_registry_state(context_state)
+        registered_context = next(
+            (
+                frame
+                for frame in context_state.frames
+                if frame.context_id == context_state.current_context_id
+            ),
+            None,
+        )
+        if (
+            context_state.current_context_id != current_context.context_id
+            or registered_context != current_context
+            or registered_context is None
+            or registered_context.status is not ContextStatus.ACTIVE
+            or self.context_registry.current_context != registered_context
+        ):
+            raise RuntimeError(
+                "Attention refresh Context does not match the current R09 authority"
+            )
+
+        attention_event = AttentionEvent(
+            event.event_id,
+            event.processing_sequence,
+            event.requested_at,
+        )
+        working_memory_revision = working_memory.revision
+        working_memory_items = working_memory.items
+        if (
+            type(working_memory_items) is not tuple
+            or working_memory_view.revision != working_memory_revision
+            or working_memory.revision != working_memory_revision
+            or working_memory.items != working_memory_items
+        ):
+            raise RuntimeError(
+                "Attention refresh requires one coherent complete Working Memory view"
+            )
+
+        belief_snapshot = self._belief_system.snapshot()
+        if type(belief_snapshot) is not BeliefSystemSnapshot:
+            raise RuntimeError("Belief authority returned an invalid current snapshot")
+        motivation_state = self._motivation_system.snapshot()
+        goal_state = self._goal_system.snapshot()
+        commitment_state = self._commitment_system.snapshot()
+        global_emotion = project_global_emotion(
+            emotion_state,
+            event=attention_event,
+        )
+        projections = project_attention_candidates(
+            working_memory_items=working_memory_items,
+            working_memory_revision=working_memory_revision,
+            working_memory_view=working_memory_view,
+            motivation_snapshot=motivation_state,
+            goal_snapshot=goal_state,
+            commitment_snapshot=commitment_state,
+            event=attention_event,
+        )
+        if (
+            runtime.current_event() is not event
+            or self.context_registry.state != context_state
+            or working_memory.revision != working_memory_revision
+            or working_memory.items != working_memory_items
+        ):
+            raise RuntimeError("Attention source capture changed before refresh")
+        refresh = self._attention_system.refresh(
+            projections,
+            attention_event,
+            global_emotion=global_emotion,
+        )
+        if type(refresh) is not AttentionRefreshResult:
+            raise RuntimeError("Attention owner returned an invalid refresh result")
+        return build_attention_prompt_payload(
+            refresh,
+            working_memory_items=working_memory_items,
+            working_memory_revision=working_memory_revision,
+            working_memory_view=working_memory_view,
+            motivation_state=motivation_state,
+            goal_state=goal_state,
+            commitment_state=commitment_state,
+        )
+
     def _build_prompt(
         self,
         user_input: str,
@@ -1076,10 +1434,29 @@ class SuzkaMainLoop:
         working_memory_view: WorkingMemoryView,
         context_view: ContextPromptView,
         value_view: ValuePromptView,
+        *,
+        attention_payload: AttentionPromptPayload | None = None,
     ) -> str:
         """Pass prompt projections while retaining older injected builders."""
 
         build = cast(Callable[..., str], self.prompt_builder.build)
+        if attention_payload is not None:
+            if type(attention_payload) is not AttentionPromptPayload:
+                raise TypeError(
+                    "attention_payload must be an exact AttentionPromptPayload"
+                )
+            if type(self.prompt_builder) is not PromptBuilder:
+                raise TypeError(
+                    "Attention prompt payload requires the exact PromptBuilder"
+                )
+            return build(
+                user_input,
+                emotion_state,
+                working_memory_view,
+                context_view=context_view,
+                value_view=value_view,
+                attention_payload=attention_payload,
+            )
         parameters = tuple(inspect.signature(build).parameters.values())
         keyword_names = {
             parameter.name
