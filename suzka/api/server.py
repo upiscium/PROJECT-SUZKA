@@ -1,7 +1,8 @@
 """FastAPI startup foundation for PROJECT-SUZKA."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from typing import cast
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -23,7 +24,7 @@ from suzka.runtime import (
     AgentRuntime,
     AgentRuntimeStatus,
     AgentStateStore,
-    AgentStateSnapshotV8,
+    AgentStateSnapshotV9,
     CompatibleAgentStateSnapshot,
     EventJournal,
     EventJournalError,
@@ -57,6 +58,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         existing_journal = getattr(app.state, "event_journal", None)
         journal_lease: EventJournalLease | None = None
+        initial_committed_read_views: object | None = None
+        committed_read_view_publisher: Callable[[object], None] | None = None
         try:
             if existing_journal is None:
                 journal_lease = EventJournalLease(app_settings.event_journal.path)
@@ -226,6 +229,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             app.state.working_memory = app.state.main_loop.working_memory
             app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
+            if isinstance(app.state.main_loop, SuzkaMainLoop):
+                checkpoint_read_views = getattr(
+                    app.state.main_loop,
+                    "_committed_read_view_checkpoint",
+                    None,
+                )
+                if not callable(checkpoint_read_views):
+                    raise StateRecoveryError(
+                        "Main loop committed read-view checkpoint is unavailable"
+                    )
+                publish_read_views = getattr(
+                    app.state.main_loop, "_publish_committed_read_views", None
+                )
+                if not callable(publish_read_views):
+                    raise StateRecoveryError(
+                        "Main loop committed read-view publisher is unavailable"
+                    )
+                committed_read_view_publisher = cast(
+                    Callable[[object], None], publish_read_views
+                )
+                initial_committed_read_views = checkpoint_read_views()
+                if initial_committed_read_views is None:
+                    raise StateRecoveryError(
+                        "Main loop committed read-view checkpoint is invalid"
+                    )
             app.state.sleep_cycle_manager = getattr(
                 app.state, "sleep_cycle_manager", None
             ) or SleepCycleManager(
@@ -243,6 +271,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise
         committed_snapshot: CompatibleAgentStateSnapshot = snapshot
         committed_snapshot_hash = snapshot_hash
+        committed_read_views = initial_committed_read_views
         app.state.transaction_coordinator = TransactionCoordinator(
             app.state.event_journal,
             app.state.state_recovery.verify_internal_commit,
@@ -268,6 +297,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         def internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
             nonlocal committed_snapshot, committed_snapshot_hash
+            nonlocal committed_read_views
             sequence = event.processing_sequence
             assert sequence is not None
             validate_belief_commit = getattr(
@@ -280,33 +310,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.main_loop, sequence
             )
             candidate_hash = app.state.agent_state_store.snapshot_hash(candidate)
-            prepared_read_views = None
+            prepared_read_views: tuple[
+                object, Callable[[object], None]
+            ] | None = None
             if isinstance(app.state.main_loop, SuzkaMainLoop):
-                assert isinstance(candidate, AgentStateSnapshotV8)
+                assert isinstance(candidate, AgentStateSnapshotV9)
                 value_snapshot = _domain_value_system(
                     candidate.value_state
                 ).snapshot()
                 belief_snapshot = _domain_belief_system(
                     candidate.belief_state
                 ).snapshot()
-                prepared_read_views = (
-                    app.state.main_loop._prepare_committed_read_views(
-                        value_snapshot,
-                        belief_snapshot,
-                        candidate.r13_state,
+                prepare_attention_read_views = getattr(
+                    app.state.main_loop,
+                    "_prepare_committed_attention_read_views",
+                    None,
+                )
+                if not callable(prepare_attention_read_views):
+                    raise StateRecoveryError(
+                        "Committed Attention read-view hooks are unavailable"
                     )
+                publisher = committed_read_view_publisher
+                if publisher is None:
+                    raise StateRecoveryError(
+                        "Committed Attention read-view publisher is unavailable"
+                    )
+                prepared_read_views = prepare_attention_read_views(
+                    value_snapshot,
+                    belief_snapshot,
+                    candidate.r13_state,
+                    candidate.attention_state,
+                    retain_selection=True,
                 )
                 if prepared_read_views is None:
                     raise StateRecoveryError(
                         "Committed read views were not prepared"
                     )
+                prepared_read_views = (prepared_read_views, publisher)
             evidence = app.state.state_recovery.commit_internal_candidate(
                 event, committed_snapshot, candidate
             )
             if prepared_read_views is not None:
-                app.state.main_loop._publish_committed_read_views(
-                    prepared_read_views
-                )
+                read_view_bundle, publish_read_views = prepared_read_views
+                publish_read_views(read_view_bundle)
+                committed_read_views = read_view_bundle
             committed_snapshot = candidate
             committed_snapshot_hash = candidate_hash
             return evidence
@@ -326,6 +373,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.agent_state_store.restore_into(
                 app.state.main_loop, committed_snapshot
             )
+            if (
+                committed_read_view_publisher is not None
+                and committed_read_views is not None
+            ):
+                committed_read_view_publisher(committed_read_views)
             app.state.event_journal.append_failed(
                 event,
                 committed_snapshot.last_processed_event_sequence,

@@ -8,6 +8,12 @@ from pathlib import Path
 
 import pytest
 
+from suzka.attention.common import AttentionTargetKind, canonical_json
+from suzka.attention.policy import (
+    ATTENTION_PROMPT_AUTHORITY_INTRO,
+    ATTENTION_PROMPT_SECTION_HEADERS,
+    AttentionPromptReason,
+)
 from suzka.config import Settings
 from suzka.memory import DualMemorySystem
 from suzka.motivation import (
@@ -20,11 +26,11 @@ from suzka.runtime import (
     AgentEventSource, AgentEventType, AgentRuntimeDurabilityError,
     AgentRuntimeExecutionError, AgentRuntimeStatus, AgentStateSaveError,
     AgentStateSaveStage, AgentStateSnapshotV7, AgentStateSnapshotV8,
+    AgentStateSnapshotV9,
     AgentStateStore, SuzkaMainLoop,
 )
-from test_commitment_system import active_system
 from test_fastapi_backend import _client, _settings, ThinkingProvider, admin_headers
-from test_r13_codec import _motivation_snapshot, _goal_snapshot
+from r14_attention_fixtures import coherent_r13_systems
 
 
 def _states(loop: SuzkaMainLoop) -> tuple:
@@ -33,10 +39,7 @@ def _states(loop: SuzkaMainLoop) -> tuple:
 
 
 def _seed_v8(settings: Settings) -> tuple:
-    motivation, goal = MotivationSystem(), GoalSystem()
-    motivation.restore_motivation_state(_motivation_snapshot())
-    goal.restore_goal_state(_goal_snapshot())
-    commitment, _ = active_system()
+    motivation, goal, commitment = coherent_r13_systems()
     loop = SuzkaMainLoop(
         settings, ThinkingProvider(), DualMemorySystem(settings),
         motivation_system=motivation, goal_system=goal, commitment_system=commitment,
@@ -45,7 +48,12 @@ def _seed_v8(settings: Settings) -> tuple:
     store.configure_value_contract(
         tuple(seed.to_declaration() for seed in settings.values.seeds), ()
     )
-    store.save(store.capture(loop, 20))
+    captured = store.capture(loop, 20)
+    assert isinstance(captured, AgentStateSnapshotV9)
+    retained_fields = captured.model_dump(mode="python")
+    retained_fields.pop("attention_state")
+    retained_fields["schema_version"] = 8
+    store.save(AgentStateSnapshotV8.model_validate(retained_fields))
     return _states(loop), loop.r13_view()
 
 
@@ -71,14 +79,14 @@ def test_production_ports_upgrade_retained_v7_on_first_commit_without_feedback(t
         loop = client.app.state.main_loop
         store = client.app.state.agent_state_store
         assert isinstance(store.load(), AgentStateSnapshotV7)
-        assert isinstance(store.capture(loop, 0), AgentStateSnapshotV8)
+        assert isinstance(store.capture(loop, 0), AgentStateSnapshotV9)
         before = _states(loop)
         for message in ("adopt this user request", "accept this responsibility", "repeat request"):
             response = client.post("/api/chat", json={"message": message, "attachments": []})
             assert response.status_code == 200
             assert _states(loop) == before
             assert loop.r13_view() == R13PromptView()
-            assert isinstance(store.load(), AgentStateSnapshotV8)
+            assert isinstance(store.load(), AgentStateSnapshotV9)
         debug = client.post(
             "/api/chat/debug", headers=admin_headers(),
             json={"message": "model thinks it wants more", "attachments": [], "debug": True},
@@ -127,11 +135,75 @@ def test_standard_prompt_renders_only_minimal_current_r13_authority(tmp_path: Pa
         )
         assert response.status_code == 200
         prompt = response.json()["prompt"]
-        assert expected_view.render() in prompt
-        assert "Current Motivations:" in prompt
-        assert "Adopted Goals:" in prompt
-        assert "Active Commitments:" in prompt
-        assert "accepted responsibility" in prompt
+        loop = client.app.state.main_loop
+        attention_view = loop.attention_view()
+        attention_snapshot = loop._attention_system.snapshot()
+        assert attention_view.prompt is not None
+        assert attention_view.revision == attention_snapshot.revision
+        assert attention_view.event == attention_snapshot.last_event
+        assert ATTENTION_PROMPT_AUTHORITY_INTRO in prompt
+        assert prompt.count(ATTENTION_PROMPT_AUTHORITY_INTRO) == 1
+        header_positions = tuple(
+            prompt.index(header) for _, header in ATTENTION_PROMPT_SECTION_HEADERS
+        )
+        assert header_positions == tuple(sorted(header_positions))
+        assert prompt.index(ATTENTION_PROMPT_AUTHORITY_INTRO) < header_positions[0]
+        assert all(
+            prompt.count(header) == 1
+            for _, header in ATTENTION_PROMPT_SECTION_HEADERS
+        )
+
+        candidates_by_id = {
+            candidate.candidate_id: candidate
+            for candidate in attention_snapshot.candidates
+        }
+        included_candidate_ids = set(attention_view.prompt.included_candidate_ids)
+        assert included_candidate_ids <= set(candidates_by_id)
+        assert included_candidate_ids
+        included_decision_ids = {
+            decision.candidate_id
+            for decision in attention_view.prompt.decisions
+            if decision.reason is AttentionPromptReason.INCLUDED
+        }
+        assert included_candidate_ids == included_decision_ids
+        expected_rows = expected_view.canonical_value()
+        row_ids_by_kind = {
+            AttentionTargetKind.MOTIVATION: ("motivations", "motivation_id"),
+            AttentionTargetKind.GOAL: ("goals", "goal_id"),
+            AttentionTargetKind.COMMITMENT: ("commitments", "commitment_id"),
+        }
+        source_rows_by_kind: dict[AttentionTargetKind, dict[str, str]] = {}
+        for kind, (section, identity_field) in row_ids_by_kind.items():
+            source_rows = expected_rows[section]
+            assert type(source_rows) is list
+            rows_by_reference: dict[str, str] = {}
+            for source_row in source_rows:
+                assert type(source_row) is dict
+                reference = source_row[identity_field]
+                assert type(reference) is str
+                rows_by_reference[reference] = canonical_json(source_row).decode(
+                    "ascii"
+                )
+            source_rows_by_kind[kind] = rows_by_reference
+        expected_render_order = [
+            source_rows_by_kind[kind][
+                candidates_by_id[candidate_id].target.reference
+            ]
+            for kind, _header in ATTENTION_PROMPT_SECTION_HEADERS
+            if kind in source_rows_by_kind
+            for candidate_id in attention_view.prompt.included_candidate_ids
+            if candidates_by_id[candidate_id].target.kind is kind
+        ]
+        known_rows = {
+            row
+            for rows in source_rows_by_kind.values()
+            for row in rows.values()
+        }
+        actual_render_order = [
+            line for line in prompt.splitlines() if line in known_rows
+        ]
+        assert actual_render_order == expected_render_order
+        assert loop.r13_view() == expected_view
         for snapshot in expected:
             for receipt in snapshot.event_receipts:
                 assert receipt.event_id not in prompt
@@ -266,7 +338,7 @@ def test_published_v8_failure_fail_stops_and_restart_recovers_exact_authority(
         assert store.path.read_bytes() != canonical
         expected = _states(loop)
         persisted = store.load()
-        assert isinstance(persisted, AgentStateSnapshotV8)
+        assert isinstance(persisted, AgentStateSnapshotV9)
         assert persisted.r13_state.motivation.restore() == expected[0]
         expected_view = R13PromptView.from_snapshots(*expected)
         assert expected_view != committed_view

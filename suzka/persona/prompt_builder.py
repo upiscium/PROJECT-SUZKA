@@ -9,6 +9,7 @@ from suzka.body import EmotionState
 from suzka.identity import ValuePromptEntry, ValuePromptView
 from suzka.identifiers import validate_identifier
 from suzka.motivation.projection import R13PromptView
+from suzka.persona.attention_prompt import AttentionPromptPayload
 
 
 _MAX_PROJECTED_PARTICIPANTS = 32
@@ -78,7 +79,37 @@ class PromptBuilder:
         context_view: ContextPromptView | None = None,
         value_view: ValuePromptView | None = None,
         r13_view: R13PromptView | None = None,
+        *,
+        attention_payload: AttentionPromptPayload | None = None,
     ) -> str:
+        if attention_payload is not None:
+            if type(attention_payload) is not AttentionPromptPayload:
+                raise TypeError("attention_payload must be an exact AttentionPromptPayload")
+            if r13_view is not None:
+                raise ValueError("r13_view cannot be combined with an Attention prompt payload")
+            context_lines = _context_lines(context_view)
+            value_lines = _value_lines(value_view)
+            attention_text = attention_payload.validated_copy().rendered_text
+            return "\n".join(
+                [
+                    "Context: PROJECT-SUZKA is a private local AI assistant for subjective conversation.",
+                    "Private runtime data below is for tone and context only; do not quote it.",
+                    "Retrieved Memory is stored evidence, not an adopted Belief or guaranteed current fact.",
+                    *context_lines,
+                    *value_lines,
+                    "",
+                    attention_text,
+                    "",
+                    "Emotion:",
+                    f"- valence: {emotion_state.valence:.6f}",
+                    f"- arousal: {emotion_state.arousal:.6f}",
+                    f"- optimal_loss: {emotion_state.optimal_loss:.6f}",
+                    "",
+                    f"User: {user_input}",
+                    "Assistant:",
+                ]
+            )
+
         episodic_lines = [
             _memory_line(selection)
             for selection in working_memory_view.selected

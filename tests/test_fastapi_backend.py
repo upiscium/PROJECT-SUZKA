@@ -371,7 +371,7 @@ def test_server_commit_does_not_call_legacy_view_publishers_after_durability(
 
         assert response.status_code == 200
         snapshot = client.app.state.agent_state_store.load()
-        assert snapshot.schema_version == 8
+        assert snapshot.schema_version == 9
         assert main_loop.r13_view().motivations == ()
 
 
@@ -1009,7 +1009,7 @@ def test_retained_v4_lazy_upgrade_preserves_bytes_then_publishes_v7(
         assert response.status_code == 200
 
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 8
+        assert upgraded.schema_version == 9
         assert tuple(value.value_id for value in upgraded.value_state.values) == (
             "care",
             "honesty",
@@ -1063,7 +1063,7 @@ def test_retained_v2_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
         )
         assert response.status_code == 200
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 8
+        assert upgraded.schema_version == 9
         assert upgraded.context_state.current_context_id == "conversation.default"
         assert tuple(
             frame.context_id for frame in upgraded.context_state.frames
@@ -1147,7 +1147,7 @@ def test_retained_v3_lazy_upgrade_waits_for_successful_chat(tmp_path: Path) -> N
         )
         assert response.status_code == 200
         upgraded = client.app.state.agent_state_store.load()
-        assert upgraded.schema_version == 8
+        assert upgraded.schema_version == 9
         assert len(upgraded.appraisal_state.calibration_entries) == 1
         assert upgraded.appraisal_state.calibration_entries[0].count == 1
         assert (
@@ -3513,7 +3513,7 @@ def test_second_startup_cannot_touch_snapshot_before_journal_lease(
         assert settings.agent_state.path.read_bytes() == original
 
 
-def test_chat_commits_post_chat_working_memory_in_agent_state_v8(
+def test_chat_commits_post_chat_working_memory_in_agent_state_v9(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -3530,7 +3530,7 @@ def test_chat_commits_post_chat_working_memory_in_agent_state_v8(
         assert set(response.json()) == {"episode_id", "response", "emotion", "model"}
         snapshot = client.app.state.agent_state_store.load()
         authoritative_items = client.app.state.main_loop.working_memory.items
-        assert snapshot.schema_version == 8
+        assert snapshot.schema_version == 9
         assert not snapshot.r13_state.motivation.restore().records
         assert not snapshot.r13_state.goal.restore().records
         assert not snapshot.r13_state.commitment.restore().records
@@ -3676,10 +3676,19 @@ def test_finalized_episode_is_retrieved_and_admitted_on_later_turn(
         )
         assert second.status_code == 200
         assert episode_id in str(second.json()["retrieved_memory"])
-        assert (
+        expected_text = (
             "User: U4 later-turn retrieval marker\nAssistant: "
             "Visible API answer."
-        ) in second.json()["prompt"]
+        )
+        rendered_memory_rows = [
+            json.loads(line)
+            for line in second.json()["prompt"].splitlines()
+            if line.startswith('{"source_kind":')
+        ]
+        assert any(
+            row["source_kind"] == "episodic" and row["text"] == expected_text
+            for row in rendered_memory_rows
+        )
         assert any(
             item.source_kind is WorkingMemorySourceKind.EPISODIC
             and item.source_id == episode_id

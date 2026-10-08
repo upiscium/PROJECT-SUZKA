@@ -29,10 +29,12 @@ from pydantic import (
     Field,
     TypeAdapter,
     ValidationError,
+    field_serializer,
     field_validator,
     model_validator,
 )
 
+from suzka.attention.contracts import AttentionContinuity
 from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
 from suzka.belief import (
     BELIEF_MAX_COMPONENT_CODEPOINTS,
@@ -108,6 +110,15 @@ from suzka.identifiers import MAX_IDENTIFIER_CODEPOINTS
 from suzka.motivation.commitment_system import CommitmentSystemSnapshot
 from suzka.motivation.goal_system import GoalSystemSnapshot
 from suzka.motivation.system import MotivationSystemSnapshot
+from suzka.runtime.attention_state_codec import (
+    AGENT_STATE_ATTENTION_MAX_SERIALIZED_BYTES,
+    preflight_attention_json,
+    validated_attention_continuity,
+)
+from suzka.runtime.attention_state_port import (
+    AttentionRestoreTransaction,
+    AttentionStatePort,
+)
 from suzka.runtime.context import (
     ContextFrame,
     ContextRegistry,
@@ -198,8 +209,15 @@ class AgentStatePorts(Protocol):
     commitment_state_port: CommitmentStatePort | None
 
 
+class AttentionAgentStatePorts(AgentStatePorts, Protocol):
+    """Optional extension for runtimes which attach an Attention owner port."""
+
+    attention_state_port: AttentionStatePort | None = None
+
+
 AGENT_STATE_V7_SCHEMA_VERSION: Literal[7] = 7
-CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[8] = 8
+AGENT_STATE_SCHEMA_VERSION_V8: Literal[8] = 8
+CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[9] = 9
 
 
 class _StateModel(BaseModel):
@@ -1430,6 +1448,27 @@ def _validated_r13_state_snapshot(value: R13StateSnapshot) -> R13StateSnapshot:
     return R13StateSnapshot.model_validate(value.model_dump(mode="python"))
 
 
+def _validate_r13_events_before_root(
+    value: R13StateSnapshot,
+    *,
+    last_processed_event_sequence: int,
+    saved_at: datetime,
+) -> R13StateSnapshot:
+    """Revalidate R13 authority and fence every retained event at the root."""
+
+    validated = _validated_r13_state_snapshot(value)
+    for graph in (validated.motivation, validated.goal, validated.commitment):
+        domain = graph.restore()
+        receipts = getattr(domain, "event_receipts")
+        if any(
+            item.event_sequence > last_processed_event_sequence
+            or item.recorded_at > saved_at
+            for item in receipts
+        ):
+            raise ValueError("R13 authority event is in the future of its AgentState")
+    return validated
+
+
 class AgentStateSnapshotV8(_AgentStateSnapshotBase):
     """Current snapshot with complete R13 Motivation, Goal, and Commitment state."""
 
@@ -1450,22 +1489,82 @@ class AgentStateSnapshotV8(_AgentStateSnapshotBase):
 
     @model_validator(mode="after")
     def require_valid_r13_state(self) -> AgentStateSnapshotV8:
-        validated = _validated_r13_state_snapshot(self.r13_state)
-        for graph in (validated.motivation, validated.goal, validated.commitment):
-            domain = graph.restore()
-            receipts = getattr(domain, "event_receipts")
-            if any(
-                item.event_sequence > self.last_processed_event_sequence
-                or item.recorded_at > self.saved_at
-                for item in receipts
+        _validate_r13_events_before_root(
+            self.r13_state,
+            last_processed_event_sequence=self.last_processed_event_sequence,
+            saved_at=self.saved_at,
+        )
+        return self
+
+
+class AgentStateSnapshotV9(_AgentStateSnapshotBase):
+    """Current snapshot with complete R13 and Attention continuity."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, arbitrary_types_allowed=True
+    )
+
+    schema_version: Literal[9] = CURRENT_AGENT_STATE_SCHEMA_VERSION
+    working_memory: WorkingMemorySnapshot
+    context_state: ContextStateSnapshot
+    appraisal_state: AppraisalStateSnapshot
+    value_state: ValueSystemStateSnapshotV7
+    belief_state: BeliefSystemStateSnapshot
+    r13_state: R13StateSnapshot
+    attention_state: AttentionContinuity
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_exact_schema_version(cls, value: object) -> object:
+        if isinstance(value, Mapping) and "schema_version" in value:
+            schema_version = value["schema_version"]
+            if (
+                type(schema_version) is not int
+                or schema_version != CURRENT_AGENT_STATE_SCHEMA_VERSION
             ):
-                raise ValueError("R13 authority event is in the future of its AgentState")
+                raise ValueError("schema_version must be the exact integer 9")
+        return value
+
+    @field_validator("saved_at")
+    @classmethod
+    def require_canonical_saved_at(cls, value: datetime) -> datetime:
+        if value.utcoffset() != timedelta(0):
+            raise ValueError("saved_at must be canonical UTC")
+        return value.astimezone(timezone.utc)
+
+    @field_validator("attention_state", mode="before")
+    @classmethod
+    def validate_attention_state(cls, value: object) -> AttentionContinuity:
+        return validated_attention_continuity(value)
+
+    @field_serializer("attention_state")
+    def serialize_attention_state(
+        self, value: AttentionContinuity
+    ) -> dict[str, object]:
+        # Typed domain values may contain tampered mutable descendants; serialize
+        # only a newly validated canonical projection, never a repaired digest.
+        return validated_attention_continuity(value).canonical_value()
+
+    @model_validator(mode="after")
+    def require_valid_domain_event_fences(self) -> AgentStateSnapshotV9:
+        _validate_r13_events_before_root(
+            self.r13_state,
+            last_processed_event_sequence=self.last_processed_event_sequence,
+            saved_at=self.saved_at,
+        )
+        attention = validated_attention_continuity(self.attention_state)
+        event = attention.last_event
+        if event is not None and (
+            event.event_sequence > self.last_processed_event_sequence
+            or event.occurred_at > self.saved_at
+        ):
+            raise ValueError("Attention event is in the future of its AgentState")
         return self
 
 
 # The unqualified name denotes the current schema; retained callers should use
 # the versioned shape when they intentionally construct an older schema.
-AgentStateSnapshot = AgentStateSnapshotV8
+AgentStateSnapshot = AgentStateSnapshotV9
 
 
 CompatibleAgentStateSnapshot = Annotated[
@@ -1476,7 +1575,8 @@ CompatibleAgentStateSnapshot = Annotated[
     | AgentStateSnapshotV5
     | AgentStateSnapshotV6
     | AgentStateSnapshotV7
-    | AgentStateSnapshotV8,
+    | AgentStateSnapshotV8
+    | AgentStateSnapshotV9,
     Field(discriminator="schema_version"),
 ]
 _COMPATIBLE_SNAPSHOT_ADAPTER: TypeAdapter[CompatibleAgentStateSnapshot] = (
@@ -1491,12 +1591,15 @@ def validate_compatible_agent_state_snapshot(
 
     raw = (
         value.model_dump(mode="python")
-        if isinstance(value, AgentStateSnapshotV8)
+        if isinstance(value, (AgentStateSnapshotV8, AgentStateSnapshotV9))
         else value
     )
     validated = _COMPATIBLE_SNAPSHOT_ADAPTER.validate_python(raw)
     if isinstance(validated, AgentStateSnapshotV8):
         _validated_r13_state_snapshot(validated.r13_state)
+    if isinstance(validated, AgentStateSnapshotV9):
+        _validated_r13_state_snapshot(validated.r13_state)
+        validated_attention_continuity(validated.attention_state)
     return validated
 
 
@@ -1893,9 +1996,7 @@ def _schema_max_field_bytes_v8() -> dict[str, int]:
     """Return maxima for every current V8 top-level field exactly once."""
 
     maxima = dict(AGENT_STATE_V7_SCHEMA_FIELD_MAX_BYTES)
-    maxima["schema_version"] = _schema_max_json_bytes(
-        CURRENT_AGENT_STATE_SCHEMA_VERSION
-    )
+    maxima["schema_version"] = _schema_max_json_bytes(AGENT_STATE_SCHEMA_VERSION_V8)
     maxima["r13_state"] = r13_codec_schema_maxima()["total"]
     if set(maxima) != set(AgentStateSnapshotV8.model_fields):
         raise RuntimeError("AgentState V8 schema maxima are out of sync")
@@ -1914,6 +2015,33 @@ AGENT_STATE_V8_SCHEMA_MAX_SERIALIZED_BYTES: Final[int] = (
 )
 if AGENT_STATE_V8_SCHEMA_MAX_SERIALIZED_BYTES > AGENT_STATE_MAX_SERIALIZED_BYTES:
     raise RuntimeError("AgentState V8 capacity exceeds the hard serialized byte bound")
+
+
+def _schema_max_field_bytes_v9() -> dict[str, int]:
+    """Derive V9 from the frozen V8 fields plus its one new authority field."""
+
+    maxima = _schema_max_field_bytes_v8()
+    maxima["schema_version"] = _schema_max_json_bytes(
+        CURRENT_AGENT_STATE_SCHEMA_VERSION
+    )
+    maxima["attention_state"] = AGENT_STATE_ATTENTION_MAX_SERIALIZED_BYTES
+    if set(maxima) != set(AgentStateSnapshotV9.model_fields):
+        raise RuntimeError("AgentState V9 schema maxima are out of sync")
+    return maxima
+
+
+AGENT_STATE_V9_SCHEMA_FIELD_MAX_BYTES: Final[dict[str, int]] = (
+    _schema_max_field_bytes_v9()
+)
+AGENT_STATE_V9_BASE_MAX_SERIALIZED_BYTES: Final[int] = _schema_envelope_size(
+    AGENT_STATE_V9_SCHEMA_FIELD_MAX_BYTES
+)
+AGENT_STATE_V9_SCHEMA_MAX_SERIALIZED_BYTES: Final[int] = (
+    AGENT_STATE_V9_BASE_MAX_SERIALIZED_BYTES
+    + AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
+)
+if AGENT_STATE_V9_SCHEMA_MAX_SERIALIZED_BYTES > AGENT_STATE_MAX_SERIALIZED_BYTES:
+    raise RuntimeError("AgentState V9 capacity exceeds the hard serialized byte bound")
 
 # Keep the retained V6 projection available for compatibility accounting.  It
 # is not used for new writes, because V7 is the normalized current schema.
@@ -1953,8 +2081,10 @@ def project_agent_state_schema_max_bytes(
 
     if base_schema_version == AGENT_STATE_V7_SCHEMA_VERSION:
         projected = dict(AGENT_STATE_V7_SCHEMA_FIELD_MAX_BYTES)
-    elif base_schema_version == CURRENT_AGENT_STATE_SCHEMA_VERSION:
+    elif base_schema_version == AGENT_STATE_SCHEMA_VERSION_V8:
         projected = dict(AGENT_STATE_V8_SCHEMA_FIELD_MAX_BYTES)
+    elif base_schema_version == CURRENT_AGENT_STATE_SCHEMA_VERSION:
+        projected = dict(AGENT_STATE_V9_SCHEMA_FIELD_MAX_BYTES)
     else:
         raise ValueError("unsupported AgentState capacity projection baseline")
     projected["schema_version"] = len(_canonical_json_bytes(schema_version))
@@ -2711,7 +2841,7 @@ def _upgrade_value_state_to_v7(
 def _upgrade_snapshot_to_v7(
     snapshot: CompatibleAgentStateSnapshot,
 ) -> AgentStateSnapshotV7:
-    if isinstance(snapshot, AgentStateSnapshotV8):
+    if isinstance(snapshot, (AgentStateSnapshotV8, AgentStateSnapshotV9)):
         raise AgentStateLoadError("V8 snapshots are not upgraded to V7")
     if isinstance(snapshot, AgentStateSnapshotV7):
         _domain_value_system(snapshot.value_state)
@@ -2884,6 +3014,23 @@ def _r13_state_ports(
     )
 
 
+def _attention_state_port(main_loop: SuzkaMainLoop) -> AttentionStatePort | None:
+    """Resolve only the explicitly attached concrete Attention owner port."""
+
+    ports_owner = getattr(main_loop, "agent_state_ports", None)
+    if ports_owner is not None and hasattr(ports_owner, "attention_state_port"):
+        port = getattr(ports_owner, "attention_state_port")
+    elif hasattr(main_loop, "attention_state_port"):
+        port = getattr(main_loop, "attention_state_port")
+    else:
+        return None
+    if port is None:
+        return None
+    if type(port) is not AttentionStatePort:
+        raise ValueError("Attention state port must be an exact AttentionStatePort")
+    return cast(AttentionStatePort, port)
+
+
 def _r13_state_snapshot(
     motivation: MotivationSystemSnapshot,
     goal: GoalSystemSnapshot,
@@ -3039,11 +3186,18 @@ class AgentStateStore:
             finally:
                 if descriptor >= 0:
                     os.close(descriptor)
+            preflight_attention_json(raw_bytes)
             raw = json.loads(
                 raw_bytes.decode("utf-8"),
                 parse_constant=self._reject_json_constant,
             )
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            ValueError,
+            RecursionError,
+        ):
             read_failure = AgentStateLoadError("AgentState snapshot is malformed")
         if read_failure is not None:
             raise read_failure
@@ -3053,6 +3207,8 @@ class AgentStateStore:
         privacy_failure: AgentStateLoadError | None = None
         try:
             _reject_private_keys(raw)
+        except RecursionError:
+            raise AgentStateLoadError("AgentState snapshot is malformed") from None
         except ValueError:
             privacy_failure = AgentStateLoadError(
                 "AgentState snapshot violates privacy"
@@ -3149,7 +3305,7 @@ class AgentStateStore:
                     "AgentState snapshot schema is invalid"
                 )
             raise schema_failure
-        if version == CURRENT_AGENT_STATE_SCHEMA_VERSION:
+        if version == AGENT_STATE_SCHEMA_VERSION_V8:
             schema_failure = None
             try:
                 loaded_v8 = AgentStateSnapshotV8.model_validate(raw)
@@ -3157,6 +3313,26 @@ class AgentStateStore:
                 _domain_value_system(loaded_v8.value_state)
                 _domain_belief_system(loaded_v8.belief_state)
                 return loaded_v8
+            except ValidationError:
+                schema_failure = AgentStateLoadError(
+                    "AgentState snapshot schema is invalid"
+                )
+            except AgentStateLoadError:
+                raise
+            except Exception:
+                schema_failure = AgentStateLoadError(
+                    "AgentState snapshot schema is invalid"
+                )
+            raise schema_failure
+        if version == CURRENT_AGENT_STATE_SCHEMA_VERSION:
+            schema_failure = None
+            try:
+                loaded_v9 = AgentStateSnapshotV9.model_validate(raw)
+                self._validate_value_configuration(loaded_v9)
+                _domain_value_system(loaded_v9.value_state)
+                _domain_belief_system(loaded_v9.belief_state)
+                validated_attention_continuity(loaded_v9.attention_state)
+                return loaded_v9
             except ValidationError:
                 schema_failure = AgentStateLoadError(
                     "AgentState snapshot schema is invalid"
@@ -3181,7 +3357,8 @@ class AgentStateStore:
         snapshot: AgentStateSnapshotV5
         | AgentStateSnapshotV6
         | AgentStateSnapshotV7
-        | AgentStateSnapshotV8,
+        | AgentStateSnapshotV8
+        | AgentStateSnapshotV9,
     ) -> None:
         """Check configuration as compatibility evidence, never as overwrite authority."""
 
@@ -3275,13 +3452,19 @@ class AgentStateStore:
                     AgentStateSnapshotV6,
                     AgentStateSnapshotV7,
                     AgentStateSnapshotV8,
+                    AgentStateSnapshotV9,
                 ),
             ):
                 self._validate_value_configuration(validated)
                 _domain_value_system(validated.value_state)
             if isinstance(
                 validated,
-                (AgentStateSnapshotV6, AgentStateSnapshotV7, AgentStateSnapshotV8),
+                (
+                    AgentStateSnapshotV6,
+                    AgentStateSnapshotV7,
+                    AgentStateSnapshotV8,
+                    AgentStateSnapshotV9,
+                ),
             ):
                 _domain_belief_system(validated.belief_state)
             payload = self._canonical_bytes(validated)
@@ -3304,31 +3487,19 @@ class AgentStateStore:
     def ensure_published(self, snapshot: CompatibleAgentStateSnapshot) -> None:
         """Publish bootstrap/migrated state while avoiding an identical rewrite."""
 
-        try:
-            preserve_legacy = (
-                isinstance(
-                    snapshot,
-                    (
-                        AgentStateSnapshotV1,
-                        AgentStateSnapshotV2,
-                        AgentStateSnapshotV3,
-                        AgentStateSnapshotV4,
-                        AgentStateSnapshotV5,
-                        AgentStateSnapshotV6,
-                    ),
-                )
-                and self.snapshot_exists()
-            )
-        except AgentStateLoadError:
-            preserve_legacy = False
-        if preserve_legacy:
-            try:
-                published_snapshot = self.load()
-            except AgentStateLoadError:
-                pass
-            else:
-                if published_snapshot == snapshot:
-                    return
+        preserve_legacy = isinstance(
+            snapshot,
+            (
+                AgentStateSnapshotV1,
+                AgentStateSnapshotV2,
+                AgentStateSnapshotV3,
+                AgentStateSnapshotV4,
+                AgentStateSnapshotV5,
+                AgentStateSnapshotV6,
+                AgentStateSnapshotV7,
+                AgentStateSnapshotV8,
+            ),
+        )
         payload = self.canonical_bytes(snapshot)
         inspection_failure: AgentStateSaveError | None = None
         descriptor: int | None = None
@@ -3369,6 +3540,34 @@ class AgentStateStore:
                     AgentStateSaveStage.TEMP_WRITE, published=False
                 )
             else:
+                if preserve_legacy:
+                    try:
+                        preflight_attention_json(published)
+                        published_raw = json.loads(
+                            published.decode("utf-8"),
+                            parse_constant=self._reject_json_constant,
+                        )
+                    except (
+                        UnicodeError,
+                        json.JSONDecodeError,
+                        ValueError,
+                        RecursionError,
+                    ):
+                        pass
+                    else:
+                        published_version = (
+                            published_raw.get("schema_version")
+                            if isinstance(published_raw, dict)
+                            else None
+                        )
+                        if published_version == snapshot.schema_version:
+                            try:
+                                published_snapshot = self.load()
+                            except AgentStateLoadError:
+                                pass
+                            else:
+                                if published_snapshot == snapshot:
+                                    return
                 if published == payload:
                     return
         if inspection_failure is not None:
@@ -3377,7 +3576,12 @@ class AgentStateStore:
 
     def capture(
         self, main_loop: SuzkaMainLoop, sequence: int
-    ) -> AgentStateSnapshotV5 | AgentStateSnapshotV7 | AgentStateSnapshotV8:
+    ) -> (
+        AgentStateSnapshotV5
+        | AgentStateSnapshotV7
+        | AgentStateSnapshotV8
+        | AgentStateSnapshotV9
+    ):
         capture_failure: AgentStateSaveError | None = None
         try:
             emotion_engine = getattr(main_loop, "emotion_engine", None)
@@ -3426,12 +3630,26 @@ class AgentStateStore:
             motivation_port, goal_port, commitment_port = _r13_state_ports(
                 main_loop, require_complete_topology=True
             )
+            attention_port = _attention_state_port(main_loop)
             has_r13_ports = all(
                 port is not None
                 for port in (motivation_port, goal_port, commitment_port)
             )
             if has_r13_ports and belief_snapshot is None:
                 raise ValueError("R13 capture requires the Belief state port")
+            attention_snapshot = (
+                validated_attention_continuity(
+                    attention_port.export_attention_state()
+                )
+                if attention_port is not None
+                else None
+            )
+            if attention_port is not None and (
+                not has_r13_ports or belief_snapshot is None
+            ):
+                raise ValueError(
+                    "Attention capture requires complete Belief and R13 state ports"
+                )
             common: dict[str, Any] = dict(
                 saved_at=self._now(),
                 last_processed_event_sequence=sequence,
@@ -3516,11 +3734,19 @@ class AgentStateStore:
                     goal_port.export_goal_state(),
                     commitment_port.export_commitment_state(),
                 )
-                return AgentStateSnapshotV8(
+                if attention_snapshot is None:
+                    return AgentStateSnapshotV8(
+                        **common,
+                        value_state=value_state,
+                        belief_state=_belief_state_snapshot(belief_snapshot),
+                        r13_state=r13_state,
+                    )
+                return AgentStateSnapshotV9(
                     **common,
                     value_state=value_state,
                     belief_state=_belief_state_snapshot(belief_snapshot),
                     r13_state=r13_state,
+                    attention_state=attention_snapshot,
                 )
             return AgentStateSnapshotV7(
                 **common,
@@ -3555,6 +3781,8 @@ class AgentStateStore:
         motivation_port: MotivationStatePort | None = None
         goal_port: GoalStatePort | None = None
         commitment_port: CommitmentStatePort | None = None
+        attention_port: AttentionStatePort | None = None
+        attention_restore_transaction: AttentionRestoreTransaction | None = None
         prepared_read_views: object | None = None
         publish_read_views: Callable[[object], object] | None = None
         read_views_prepared = False
@@ -3578,6 +3806,7 @@ class AgentStateStore:
                     AgentStateSnapshotV6,
                     AgentStateSnapshotV7,
                     AgentStateSnapshotV8,
+                    AgentStateSnapshotV9,
                 ),
             ):
                 self._validate_value_configuration(validated)
@@ -3592,6 +3821,7 @@ class AgentStateStore:
                         AgentStateSnapshotV6,
                         AgentStateSnapshotV7,
                         AgentStateSnapshotV8,
+                        AgentStateSnapshotV9,
                     ),
                 )
                 else BeliefSystem()
@@ -3599,9 +3829,10 @@ class AgentStateStore:
             motivation_port, goal_port, commitment_port = _r13_state_ports(
                 main_loop, require_complete_topology=False
             )
+            attention_port = _attention_state_port(main_loop)
             r13_state = (
                 validated.r13_state
-                if isinstance(validated, AgentStateSnapshotV8)
+                if isinstance(validated, (AgentStateSnapshotV8, AgentStateSnapshotV9))
                 else R13StateSnapshot.empty()
             )
             restored_motivation, restored_goal, restored_commitment = (
@@ -3611,11 +3842,20 @@ class AgentStateStore:
                 port is not None
                 for port in (motivation_port, goal_port, commitment_port)
             )
-            if isinstance(validated, AgentStateSnapshotV8):
+            if isinstance(validated, (AgentStateSnapshotV8, AgentStateSnapshotV9)):
                 if not r13_ports_complete:
                     raise AgentStateLoadError(
                         "AgentState restore requires all R13 state ports"
                     )
+            if isinstance(validated, AgentStateSnapshotV9) and attention_port is None:
+                raise AgentStateLoadError(
+                    "AgentState restore requires the Attention state port"
+                )
+            restored_attention = (
+                validated.attention_state
+                if isinstance(validated, AgentStateSnapshotV9)
+                else AttentionContinuity.bootstrap()
+            )
             emotion_engine = getattr(main_loop, "emotion_engine", None)
             if not isinstance(emotion_engine, EmotionEngineAllostasis):
                 raise AgentStateLoadError("AgentState restore requires EmotionEngine")
@@ -3635,6 +3875,7 @@ class AgentStateStore:
                         AgentStateSnapshotV6,
                         AgentStateSnapshotV7,
                         AgentStateSnapshotV8,
+                        AgentStateSnapshotV9,
                     ),
                 )
                 else WorkingMemorySnapshot(revision=0, items=())
@@ -3655,6 +3896,7 @@ class AgentStateStore:
                         AgentStateSnapshotV6,
                         AgentStateSnapshotV7,
                         AgentStateSnapshotV8,
+                        AgentStateSnapshotV9,
                     ),
                 )
                 else ContextRegistryState(0, None, (), ())
@@ -3673,6 +3915,7 @@ class AgentStateStore:
                         AgentStateSnapshotV6,
                         AgentStateSnapshotV7,
                         AgentStateSnapshotV8,
+                        AgentStateSnapshotV9,
                     ),
                 )
                 else AppraisalStateSnapshot(
@@ -3713,6 +3956,7 @@ class AgentStateStore:
                         AgentStateSnapshotV6,
                         AgentStateSnapshotV7,
                         AgentStateSnapshotV8,
+                        AgentStateSnapshotV9,
                     ),
                 )
                 and context_registry is None
@@ -3727,6 +3971,7 @@ class AgentStateStore:
                     AgentStateSnapshotV6,
                     AgentStateSnapshotV7,
                     AgentStateSnapshotV8,
+                    AgentStateSnapshotV9,
                 ),
             ):
                 if not isinstance(current_value_system, ValueSystem):
@@ -3742,8 +3987,11 @@ class AgentStateStore:
                 value_system_was_present = True
 
             belief_port = _belief_state_port(main_loop)
-            if isinstance(validated, AgentStateSnapshotV6) or (
-                isinstance(validated, (AgentStateSnapshotV7, AgentStateSnapshotV8))
+            if isinstance(validated, (AgentStateSnapshotV6, AgentStateSnapshotV9)) or (
+                isinstance(
+                    validated,
+                    (AgentStateSnapshotV7, AgentStateSnapshotV8),
+                )
                 and bool(validated.belief_state.records)
             ):
                 if belief_port is None:
@@ -3794,21 +4042,46 @@ class AgentStateStore:
                     previous_commitment_snapshot,
                 )
 
+            prepare_attention_read_views = getattr(
+                main_loop, "_prepare_committed_attention_read_views", None
+            )
             prepare_read_view_bundle = getattr(
                 main_loop, "_prepare_committed_read_views", None
             )
             publish_read_view_bundle = getattr(
                 main_loop, "_publish_committed_read_views", None
             )
-            if callable(prepare_read_view_bundle) != callable(
-                publish_read_view_bundle
+            if any(
+                hook is not None and not callable(hook)
+                for hook in (
+                    prepare_attention_read_views,
+                    prepare_read_view_bundle,
+                    publish_read_view_bundle,
+                )
             ):
                 raise AgentStateLoadError(
-                    "AgentState restore committed-read-view hooks are incomplete"
+                    "AgentState restore committed-read-view hooks are invalid"
                 )
-            if callable(prepare_read_view_bundle) and callable(
-                publish_read_view_bundle
-            ):
+            if callable(prepare_attention_read_views):
+                if not callable(publish_read_view_bundle):
+                    raise AgentStateLoadError(
+                        "AgentState restore committed-read-view hooks are incomplete"
+                    )
+                prepared_read_views = prepare_attention_read_views(
+                    restored_value_system.snapshot(),
+                    restored_belief_system.snapshot(),
+                    r13_state,
+                    restored_attention,
+                )
+                publish_read_views = cast(
+                    Callable[[object], object], publish_read_view_bundle
+                )
+                read_views_prepared = True
+            elif callable(prepare_read_view_bundle):
+                if not callable(publish_read_view_bundle):
+                    raise AgentStateLoadError(
+                        "AgentState restore committed-read-view hooks are incomplete"
+                    )
                 prepared_read_views = prepare_read_view_bundle(
                     restored_value_system.snapshot(),
                     restored_belief_system.snapshot(),
@@ -3818,6 +4091,10 @@ class AgentStateStore:
                     Callable[[object], object], publish_read_view_bundle
                 )
                 read_views_prepared = True
+            elif callable(publish_read_view_bundle):
+                raise AgentStateLoadError(
+                    "AgentState restore committed-read-view hooks are incomplete"
+                )
             else:
                 prepare_r13_view = getattr(
                     main_loop, "_prepare_committed_r13_view", None
@@ -3844,6 +4121,22 @@ class AgentStateStore:
             )
             previous_calibration = calibration.export()
             previous_temporal = current_temporal
+            if attention_port is not None:
+                try:
+                    attention_restore_transaction = (
+                        attention_port.prepare_attention_restore(restored_attention)
+                    )
+                except Exception:
+                    raise AgentStateLoadError(
+                        "AgentState Attention restore could not be prepared"
+                    ) from None
+                if (
+                    type(attention_restore_transaction)
+                    is not AttentionRestoreTransaction
+                ):
+                    raise AgentStateLoadError(
+                        "Attention state port returned an invalid restore transaction"
+                    )
             state_mutation_started = True
             working_memory_authority.restore_exact(
                 working_memory.revision,
@@ -3880,12 +4173,16 @@ class AgentStateStore:
                 optimal_loss=emotion.optimal_loss,
             )
             emotion_engine.temporal_state = restored_temporal
+            if attention_restore_transaction is not None:
+                attention_restore_transaction.publish()
             if read_views_prepared:
                 assert publish_read_views is not None
                 publish_read_views(prepared_read_views)
             elif r13_bundle_prepared:
                 assert publish_r13_bundle is not None
                 publish_r13_bundle(prepared_r13_bundle)
+            if attention_restore_transaction is not None:
+                attention_restore_transaction.complete()
         except Exception as error:
             if isinstance(
                 error, AgentStateConfigurationDrift
@@ -3953,6 +4250,9 @@ class AgentStateStore:
                 except Exception:
                     pass
             restore_failure = AgentStateLoadError("AgentState restore failed")
+        finally:
+            if attention_restore_transaction is not None:
+                attention_restore_transaction.close()
         if restore_failure is not None:
             raise restore_failure
 
@@ -3997,16 +4297,24 @@ class AgentStateStore:
                 AgentStateSnapshotV6,
                 AgentStateSnapshotV7,
                 AgentStateSnapshotV8,
+                AgentStateSnapshotV9,
             ),
         ):
             _domain_value_system(snapshot.value_state)
         if isinstance(
             snapshot,
-            (AgentStateSnapshotV6, AgentStateSnapshotV7, AgentStateSnapshotV8),
+            (
+                AgentStateSnapshotV6,
+                AgentStateSnapshotV7,
+                AgentStateSnapshotV8,
+                AgentStateSnapshotV9,
+            ),
         ):
             _domain_belief_system(snapshot.belief_state)
-        if isinstance(snapshot, AgentStateSnapshotV8):
+        if isinstance(snapshot, (AgentStateSnapshotV8, AgentStateSnapshotV9)):
             _validated_r13_state_snapshot(snapshot.r13_state)
+        if isinstance(snapshot, AgentStateSnapshotV9):
+            validated_attention_continuity(snapshot.attention_state)
         payload = json.dumps(
             snapshot.model_dump(mode="json"),
             ensure_ascii=False,

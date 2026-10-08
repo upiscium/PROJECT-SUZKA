@@ -143,7 +143,7 @@ def test_v8_schema_maxima_cover_all_r13_domains_and_keep_future_reserve() -> Non
     assert AGENT_STATE_MAX_SERIALIZED_BYTES - projected_without_reserve >= (
         AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
     )
-    assert project_agent_state_schema_max_bytes() == (
+    assert project_agent_state_schema_max_bytes(schema_version=8, base_schema_version=8) == (
         AGENT_STATE_V8_SCHEMA_MAX_SERIALIZED_BYTES
     )
     assert AGENT_STATE_MAX_SERIALIZED_BYTES - projected == 7_866_824
