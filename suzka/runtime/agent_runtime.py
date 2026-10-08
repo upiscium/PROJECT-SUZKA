@@ -186,6 +186,8 @@ class AgentRuntime:
         self._status = AgentRuntimeStatus.CREATED
         self._worker: Thread | None = None
         self._sequence = initial_sequence
+        self._last_admitted_at: datetime | None = None
+        self._admission_in_progress = False
         self._active: tuple[_PendingEvent, AgentEvent] | None = None
         self._handler_event: AgentEvent | None = None
         self._failed_phase: AgentRuntimeDurabilityPhase | None = None
@@ -295,49 +297,75 @@ class AgentRuntime:
             raise TypeError("event_type must be an AgentEventType")
         if not isinstance(source, AgentEventSource):
             raise TypeError("source must be an AgentEventSource")
-        event = AgentEvent(
-            event_id=str(uuid4()),
-            event_type=event_type,
-            source=source,
-            requested_at=datetime.now(timezone.utc),
-        )
-        future: Future[AgentEventOutcome[T]] = Future()
-        pending = _PendingEvent(
-            event,
-            cast(Callable[[], object], handler),
-            cast(Future[AgentEventOutcome[object]], future),
-        )
+        event_id = str(uuid4())
         with self._condition:
+            # Bind the shared event time at the same serialized boundary that
+            # orders acceptance and FIFO enqueue, not at producer entry.
+            event = AgentEvent(
+                event_id=event_id,
+                event_type=event_type,
+                source=source,
+                requested_at=datetime.now(timezone.utc),
+            )
+            future: Future[AgentEventOutcome[T]] = Future()
+            pending = _PendingEvent(
+                event,
+                cast(Callable[[], object], handler),
+                cast(Future[AgentEventOutcome[object]], future),
+            )
             if self._status is not AgentRuntimeStatus.ACCEPTING:
                 raise AgentRuntimeStopped(event)
             if len(self._pending) >= self._queue_capacity:
                 raise AgentRuntimeQueueFull(event)
             if self._sequence + len(self._pending) >= MAX_PERSISTED_EVENT_SEQUENCE:
                 raise AgentRuntimeAdmissionBlocked(event)
-            if self._pre_admission_guard is not None:
-                try:
-                    admitted = self._pre_admission_guard(event)
-                except Exception as error:
-                    guard_error = self._durability_error(
-                        event, AgentRuntimeDurabilityPhase.ADMISSION, error, False
-                    )
-                    self._fail_stop_locked(phase=AgentRuntimeDurabilityPhase.ADMISSION)
-                    raise guard_error
-                if admitted is False:
-                    raise AgentRuntimeAdmissionBlocked(event)
-            if self._admission_checkpoint is not None:
-                durability_error: AgentRuntimeDurabilityError | None = None
-                try:
-                    self._admission_checkpoint(event)
-                except Exception as error:
-                    durability_error = self._durability_error(
-                        event, AgentRuntimeDurabilityPhase.ADMISSION, error, False
-                    )
-                if durability_error is not None:
-                    self._fail_stop_locked(phase=AgentRuntimeDurabilityPhase.ADMISSION)
-                    raise durability_error
-            self._pending.append(pending)
-            self._condition.notify()
+            if (
+                self._last_admitted_at is not None
+                and event.requested_at < self._last_admitted_at
+            ):
+                # A backward wall clock is not new ordered event evidence.
+                # Refuse before any acceptance collaborator; never clamp time.
+                raise AgentRuntimeAdmissionBlocked(event)
+            if self._admission_in_progress:
+                raise AgentRuntimeAdmissionBlocked(event)
+            # The condition uses an RLock: prevent collaborators from recursively
+            # admitting an event ahead of the event whose acceptance they inspect.
+            self._admission_in_progress = True
+            try:
+                if self._pre_admission_guard is not None:
+                    try:
+                        admitted = self._pre_admission_guard(event)
+                    except Exception as error:
+                        guard_error = self._durability_error(
+                            event, AgentRuntimeDurabilityPhase.ADMISSION, error, False
+                        )
+                        self._fail_stop_locked(
+                            phase=AgentRuntimeDurabilityPhase.ADMISSION
+                        )
+                        raise guard_error
+                    if admitted is False:
+                        raise AgentRuntimeAdmissionBlocked(event)
+                if self._admission_checkpoint is not None:
+                    durability_error: AgentRuntimeDurabilityError | None = None
+                    try:
+                        self._admission_checkpoint(event)
+                    except Exception as error:
+                        durability_error = self._durability_error(
+                            event,
+                            AgentRuntimeDurabilityPhase.ADMISSION,
+                            error,
+                            False,
+                        )
+                    if durability_error is not None:
+                        self._fail_stop_locked(
+                            phase=AgentRuntimeDurabilityPhase.ADMISSION
+                        )
+                        raise durability_error
+                self._pending.append(pending)
+                self._last_admitted_at = event.requested_at
+                self._condition.notify()
+            finally:
+                self._admission_in_progress = False
         return future
 
     def shutdown(self) -> None:

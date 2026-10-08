@@ -5,6 +5,52 @@ U4 is accepted at `ee7e9f849e0b6f0f3ccbd455a7acae9800a8a056`,
 U5 implements production wiring only. Human U5 focused review is pending.
 U6, Ready, and Merge remain unauthorized; PR #282 remains Draft.
 
+## Narrow U5 HOLD correction — ordered runtime event time
+
+Human [HOLD 6048936189](https://github.com/upiscium/PROJECT-SUZKA/pull/282#issuecomment-6048936189)
+identified one concurrency blocker at `d86d172fe6ffa16f095f6780251193682352cebc`:
+the runtime sampled `requested_at` before the queue lock, so an older producer
+could enqueue after a newer producer and deliver a later sequence with an older
+time. All other U5 areas remain accepted and are not redesigned here.
+
+`AgentEvent.requested_at` is now bound under the existing runtime Condition at
+serialized admission, before guard/checkpoint/enqueue. It denotes runtime-owned
+admission UTC evidence, not a pre-lock producer-entry/client timestamp. UUID
+allocation may precede the lock; the complete immutable event passed to acceptance
+collaborators, the worker, same-event source authorities, and outcomes has one
+shared timestamp. The consumer still adds only `processing_sequence` in FIFO order.
+
+The runtime retains one bounded last-successful-admission timestamp. Within that
+runtime, a backward UTC sample is refused before the guard/checkpoint/append;
+it is not clamped and creates no acceptance or sequence. Equal times are legal,
+and a valid later submission can proceed. Rejected guard requests do not advance
+the watermark. A bounded admission-in-progress flag also refuses recursive
+submission from admission callbacks, so the reentrant Condition cannot admit a
+nested later event ahead of its outer earlier event. The flag clears on every exit.
+
+Attention time-regression checks, U5's exact runtime→Attention event mapping,
+Belief/R13 identity semantics, queue capacity, event's five-field schema, and all
+persisted formats/policy/capacity remain unchanged. No HTTP-wide serialization
+or Attention-only timestamp is added. This watermark is process-local; it does
+not invent a persisted time seed or claim cross-restart clock migration support.
+The existing root/recovery chronology checks still apply across restart.
+
+Forced interleaving delays A at the queue boundary and admits B first using a
+globally ordered test clock, without sleeps/scheduler luck. Before the fix both
+regressions failed (FIFO time inversion and actual second MainLoop chat rejected
+by Attention). Runtime correction re-review and new-head CI remain Human-gated.
+
+Executed correction evidence (local, not Human acceptance): forced race tests
+**2 FAIL before fix**; runtime/new ordered-time suites **59 PASS** after fix;
+U5 + correction regressions **31 PASS**; accepted U1–U4 **285 PASS**; relevant
+runtime/MainLoop/API/WAL/recovery subset **383 PASS**; final `just check-all`
+**1901 backend PASS**, Ruff PASS, Mypy **118 files PASS**, Frontend **6/build PASS**.
+The six new cases cover forced FIFO/time order, both real chat refreshes and
+Belief/R13 identity, backward-clock refusal/equal-time continuation, guard refusal
+not advancing the watermark, and recursive guard/checkpoint refusal. Independent
+runtime review closed the reentrancy finding. Publication/CI proof will be recorded
+in Draft PR #282, followed by U5 final focused re-review; U6 stays unauthorized.
+
 ## Responsibility contract
 
 - **Owns:** same-turn capture/refresh in the existing serialized chat handler,
