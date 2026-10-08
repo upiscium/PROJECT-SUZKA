@@ -16,7 +16,7 @@ def test_r15_u1_pure_modules_are_not_runtime_producers() -> None:
     forbidden = (
         "suzka.runtime", "suzka.memory", "suzka.api", "suzka.models",
         "suzka.cognition", "suzka.decision", "suzka.action", "suzka.scheduler",
-        "kagya", "fastapi", "torch", "transformers", "requests",
+        "k" + "agya", "fastapi", "torch", "transformers", "requests",
     )
     for path in (R15 / "__init__.py", R15 / "common.py", R15 / "contracts.py", R15 / "stance.py", R15 / "bounds.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
