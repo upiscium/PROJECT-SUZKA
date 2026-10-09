@@ -80,9 +80,28 @@ v10 field/reserve spend; hitting their bound fails without silent eviction.
 Each accepted event gets a private immutable receipt with event ID/sequence/
 UTC time, exact selected Context ID/revision/projection checksum, operation
 input digest, before/after root checksums, result revision, creation flag
-and previous receipt digest. Identical retained event+input returns the
-original receipt without rerunning R09 or increasing revisions, counters or
-trust. Same ID with different event/time/target and reused sequence conflict;
+and previous receipt digest. **A paired `RelationshipObservationResult` is
+valid only if the receipt's `result_revision`/`result_state_digest` bind the
+returned snapshot revision/canonical digest AND the selected view's root
+revision/digest/axis values.** Its constructor rejects mismatched event-result
+pairs. The receipt returned to a caller is a validated **copy**, not the
+internally retained instance.
+The caller's `EventRef` is copied and validated before it enters any proof;
+later mutation of the caller-owned object cannot rewrite a retained event or
+its receipt chain.
+
+An identical retained event+input never reruns R09 and never changes root,
+receipts, history, counters or trust. If that receipt still describes the
+**current** root (including after later no-op events), replay returns
+`RelationshipObservationResult(replayed=True)` with its matching current
+snapshot/view. If later events changed the root, the return type is instead
+`RelationshipHistoricalAcknowledgement`: only the original receipt and its
+original `event_result_digest`, with **no** `snapshot` or `view`. This is a
+historical acknowledgement, **not** a reconstruction of an unretained event
+root. A separate `snapshot()` reads the latest state and must not be paired
+with the old event receipt. Tampering with a returned receipt cannot mutate
+the internally retained replay proof. Same ID with different event/time/target
+and reused sequence conflict;
 unretained older/reversed event/time rejects. The owner privately retains a
 checksum of the **complete** R09 registry generation (NOT in receipts or read
 views, because a whole-registry fingerprint can reveal private equality). A later R09 revision
@@ -113,6 +132,9 @@ cross-restart guarantee. U5 must separately prove restore/rollback and retained
 receipt evidence without cognition replay; U6 must authenticate actual
 serialized events, qualified source/current R09 views, and never publish an
 uncommitted view. Diagnostic read routes and prompt formatting are not added.
+U5/U6 consumers must distinguish the two U2 replay result types; no future
+WAL/read adapter may pair a historic receipt with the separately readable
+latest root as if it were the event-result root.
 Detached views contain IDs and bounded status/numeric *unknowns*, not
 transcripts, private R12 content, model rationale, operator profile or raw
 prompt. Existing R09/R12 and R11/R13/R14 privacy/authority are unchanged.
@@ -128,7 +150,9 @@ prompt. Existing R09/R12 and R11/R13/R14 privacy/authority are unchanged.
 
 Executable U2 tests cover full unknown axes, distinct keys with equal asserted
 identity and 1.0 confidence, complete R09 selection/lifecycle/time check,
-typed positive-source unavailability, exact and old replay/conflict, reentrant
+typed positive-source unavailability, exact and old replay/conflict, historic
+acknowledgement without current view, same-event retry after R09 changes,
+receipt mutation isolation and receipt/root/view binding, reentrant
 and intervening R09 mutation rollback, full 64-proof and 256-receipt overflow,
 detached reads/concurrent same-event calls, and U2-only import boundaries.
 Local/CI green is necessary but not a Human PASS; stop for exact-head U2 review.

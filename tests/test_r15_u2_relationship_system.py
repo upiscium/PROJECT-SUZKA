@@ -2,7 +2,7 @@
 
 import ast
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -28,6 +28,8 @@ from suzka.r15.relationship_system import (
     RelationshipAuthority,
     RelationshipCapacityExceeded,
     RelationshipEventConflict,
+    RelationshipHistoricalAcknowledgement,
+    RelationshipObservationResult,
     RelationshipSourceUnavailable,
     RelationshipSystem,
     relationship_authority_status,
@@ -119,17 +121,109 @@ def test_r15_u2_duplicate_exact_retry_and_historical_retry_do_not_inflate_root()
     second = owner.observe_current_interlocutor(event(2), "ref-b")
     replay = owner.observe_current_interlocutor(event(1), "ref-a")
     current_replay = owner.observe_current_interlocutor(event(2), "ref-b")
+    assert isinstance(replay, RelationshipHistoricalAcknowledgement)
+    assert isinstance(current_replay, RelationshipObservationResult)
     assert replay.replayed and current_replay.replayed
     assert replay.receipt.receipt_digest == first.receipt.receipt_digest
     assert current_replay.receipt.receipt_digest == second.receipt.receipt_digest
-    assert replay.snapshot == second.snapshot == current_replay.snapshot == owner.snapshot()
-    assert replay.receipt.result_revision == 1 and replay.snapshot.revision == 2
+    assert replay.receipt.result_revision == 1
+    assert replay.event_result_digest == first.snapshot.canonical_value()["state_digest"]
+    assert not hasattr(replay, "snapshot") and not hasattr(replay, "view")
+    assert second.snapshot == current_replay.snapshot == owner.snapshot()
+    assert current_replay.receipt.result_revision == current_replay.snapshot.revision == current_replay.view.root_revision
+    assert current_replay.receipt.result_state_digest == current_replay.snapshot.canonical_value()["state_digest"] == current_replay.view.root_digest
+    with pytest.raises(ValueError):
+        RelationshipObservationResult(second.snapshot, first.receipt, True, second.view)
+    with pytest.raises(ValueError):
+        RelationshipObservationResult(second.snapshot, second.receipt, True, replace(second.view, root_revision=1))
     assert len(owner.snapshot().revision_history) == 2
+    assert len(owner._receipts) == 2
     third = owner.observe_current_interlocutor(event(3), "ref-a")
     assert not third.receipt.created and third.snapshot.revision == 2
     assert third.receipt.previous_receipt_digest == second.receipt.receipt_digest
     assert third.snapshot == owner.snapshot()
     assert_unknown(third.snapshot)
+
+
+def test_r15_u2_historical_and_current_replay_after_r09_change_skip_source_and_keep_proofs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = registry("ref-a", "ref-b")
+    owner = RelationshipSystem(context)
+    first = owner.observe_current_interlocutor(event(1), "ref-a")
+    second = owner.observe_current_interlocutor(event(2), "ref-b")
+    latest = owner.snapshot()
+    before_receipts = tuple(item.receipt_digest for item in owner._receipts)
+    context.upsert_interlocutor_binding("ref-a", "unverified-person", 1.0, ("operator-assertion",))
+    context.set_current(None)
+    original_getter = ContextRegistry.state.fget
+    assert original_getter is not None
+
+    def forbid_r09_read(_: ContextRegistry) -> object:
+        raise AssertionError("a retained exact replay must not reread current R09")
+
+    monkeypatch.setattr(ContextRegistry, "state", property(forbid_r09_read))
+    historic = owner.observe_current_interlocutor(event(1), "ref-a")
+    current = owner.observe_current_interlocutor(event(2), "ref-b")
+    assert isinstance(historic, RelationshipHistoricalAcknowledgement)
+    assert historic.event_result_digest == first.receipt.result_state_digest
+    assert isinstance(current, RelationshipObservationResult)
+    assert current.receipt.result_state_digest == current.snapshot.canonical_value()["state_digest"]
+    assert current.receipt.receipt_digest == second.receipt.receipt_digest
+    assert owner.snapshot() == latest
+    assert tuple(item.receipt_digest for item in owner._receipts) == before_receipts
+    assert len(latest.revision_history) == 2
+    assert_unknown(latest)
+
+    monkeypatch.setattr(ContextRegistry, "state", property(original_getter))
+    alone_context = registry("ref-a")
+    alone = RelationshipSystem(alone_context)
+    initial = alone.observe_current_interlocutor(event(1), "ref-a")
+    alone_context.set_current(None)
+    monkeypatch.setattr(ContextRegistry, "state", property(forbid_r09_read))
+    reread = alone.observe_current_interlocutor(event(1), "ref-a")
+    assert isinstance(reread, RelationshipObservationResult)
+    assert reread.receipt.result_state_digest == initial.snapshot.canonical_value()["state_digest"]
+
+
+def test_r15_u2_caller_cannot_mutate_retained_receipt_or_forge_historical_payload() -> None:
+    owner = RelationshipSystem(registry("ref-a", "ref-b"))
+    first = owner.observe_current_interlocutor(event(1), "ref-a")
+    original_digest = first.receipt.receipt_digest
+    object.__setattr__(first.receipt, "result_revision", 99)
+    replay = owner.observe_current_interlocutor(event(1), "ref-a")
+    assert isinstance(replay, RelationshipObservationResult)
+    assert replay.receipt.receipt_digest == original_digest
+    assert replay.receipt.result_revision == replay.snapshot.revision == 1
+    owner.observe_current_interlocutor(event(2), "ref-b")
+    historical = owner.observe_current_interlocutor(event(1), "ref-a")
+    assert isinstance(historical, RelationshipHistoricalAcknowledgement)
+    assert historical.receipt.receipt_digest == original_digest
+    with pytest.raises(TypeError):
+        RelationshipHistoricalAcknowledgement(historical.receipt, False)
+    with pytest.raises(TypeError):
+        RelationshipHistoricalAcknowledgement(object())  # type: ignore[arg-type]
+
+
+def test_r15_u2_caller_owned_event_mutation_cannot_corrupt_retained_replay_proof() -> None:
+    owner = RelationshipSystem(registry("ref-a", "ref-b"))
+    submitted = event(1)
+    first = owner.observe_current_interlocutor(submitted, "ref-a")
+    original_digest = first.receipt.receipt_digest
+    second = owner.observe_current_interlocutor(event(2), "ref-b")
+    original_chain = second.receipt.previous_receipt_digest
+    object.__setattr__(submitted, "event_id", "forged-after-acceptance")
+    object.__setattr__(submitted, "event_sequence", 300)
+    object.__setattr__(submitted, "occurred_at", NOW + timedelta(seconds=300))
+
+    historical = owner.observe_current_interlocutor(event(1), "ref-a")
+    assert isinstance(historical, RelationshipHistoricalAcknowledgement)
+    assert historical.receipt.receipt_digest == original_digest == original_chain
+    assert historical.receipt.event == event(1)
+    assert owner._receipts[0].event == event(1)
+    assert owner.snapshot() == second.snapshot
+    assert len(owner._receipts) == len(owner.snapshot().revision_history) == 2
+    assert_unknown(owner.snapshot())
 
 
 def test_r15_u2_conflicting_replay_stale_event_and_time_reject_without_mutation() -> None:

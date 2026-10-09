@@ -154,10 +154,67 @@ class RelationshipObservationReceipt:
 
 @dataclass(frozen=True, slots=True)
 class RelationshipObservationResult:
+    """One event receipt paired ONLY with its exact resulting root/view."""
+
     snapshot: RelationshipState
     receipt: RelationshipObservationReceipt
     replayed: bool
     view: RelationshipSelectedView
+
+    def __post_init__(self) -> None:
+        if type(self.snapshot) is not RelationshipState or type(self.receipt) is not RelationshipObservationReceipt:
+            raise TypeError("event result requires exact root and receipt")
+        if type(self.view) is not RelationshipSelectedView or type(self.replayed) is not bool:
+            raise TypeError("event result requires exact view and replay flag")
+        self.receipt.__post_init__()
+        root_digest = self.snapshot.canonical_value()["state_digest"]
+        if (
+            self.snapshot.revision != self.receipt.result_revision
+            or root_digest != self.receipt.result_state_digest
+            or self.view.root_revision != self.snapshot.revision
+            or self.view.root_digest != root_digest
+            or self.view.interlocutor_key != self.receipt.interlocutor_key
+        ):
+            raise ValueError("event receipt, resulting root and view do not bind the same revision")
+        record = next(
+            (item for item in self.snapshot.records if item.interlocutor_key == self.receipt.interlocutor_key),
+            None,
+        )
+        if record is None or self.view.relationship_id != record.relationship_id or self.view.axes != tuple(
+            RelationshipAxisView(
+                axis.kind,
+                axis.interpretation.status,
+                axis.interpretation.estimate,
+                axis.interpretation.confidence,
+                axis.interpretation.accessibility,
+                axis.interpretation.inertia,
+            )
+            for axis in record.axes
+        ):
+            raise ValueError("event view does not describe the receipted relationship")
+
+
+@dataclass(frozen=True, slots=True)
+class RelationshipHistoricalAcknowledgement:
+    """Past event proof ONLY: no historical root retained, no current view implied.
+
+    Call snapshot()/selected_view() separately for the latest state. Neither
+    is the historical event result and must not be paired with this receipt.
+    """
+
+    receipt: RelationshipObservationReceipt
+    replayed: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.receipt) is not RelationshipObservationReceipt or type(self.replayed) is not bool or not self.replayed:
+            raise TypeError("historical acknowledgement requires an exact replay receipt")
+        self.receipt.__post_init__()
+
+    @property
+    def event_result_digest(self) -> str:
+        """Original event's root checksum, not a current-state checksum."""
+
+        return self.receipt.result_state_digest
 
 
 def _projection_digest(revision: int, records: tuple[RelationshipRecord, ...]) -> str:
@@ -263,6 +320,24 @@ class RelationshipSystem:
         return RelationshipState.from_json(root.canonical_bytes())
 
     @staticmethod
+    def _copy_receipt(receipt: RelationshipObservationReceipt) -> RelationshipObservationReceipt:
+        receipt.__post_init__()
+        source_event = receipt.event
+        return RelationshipObservationReceipt(
+            EventRef(source_event.event_id, source_event.event_sequence, source_event.occurred_at),
+            receipt.interlocutor_key,
+            receipt.context_id,
+            receipt.context_revision,
+            receipt.context_digest,
+            receipt.request_digest,
+            receipt.before_state_digest,
+            receipt.result_state_digest,
+            receipt.result_revision,
+            receipt.created,
+            receipt.previous_receipt_digest,
+        )
+
+    @staticmethod
     def _view(root: RelationshipState, key: str) -> RelationshipSelectedView | None:
         record = next((item for item in root.records if item.interlocutor_key == key), None)
         if record is None:
@@ -296,7 +371,7 @@ class RelationshipSystem:
 
     def observe_current_interlocutor(
         self, event: EventRef, interlocutor_key: str
-    ) -> RelationshipObservationResult:
+    ) -> RelationshipObservationResult | RelationshipHistoricalAcknowledgement:
         """Record R09 opaque membership as UNKNOWN; nothing about trust/identity.
 
         The future serialized caller must authenticate event and keep R09
@@ -307,6 +382,10 @@ class RelationshipSystem:
         if type(event) is not EventRef:
             raise TypeError("event must be an exact EventRef")
         event.__post_init__()
+        # A frozen caller-owned EventRef can still be changed with
+        # object.__setattr__; retain only our own validated event copy in
+        # revision proofs and receipts so the accepted identity cannot drift.
+        event = EventRef(event.event_id, event.event_sequence, event.occurred_at)
         key = identifier(interlocutor_key, "interlocutor_key")
         request_digest = checksum(_REQUEST_DOMAIN, {"event": encode(event), "interlocutor_key": key})
         with self._mutation():
@@ -314,10 +393,16 @@ class RelationshipSystem:
                 if receipt.event.event_id == event.event_id or receipt.event.event_sequence == event.event_sequence:
                     if receipt.event != event or receipt.request_digest != request_digest:
                         raise RelationshipEventConflict("event identity or input conflicts with retained proof")
+                    original_receipt = self._copy_receipt(receipt)
+                    if (
+                        self._root.revision != receipt.result_revision
+                        or self._root.canonical_value()["state_digest"] != receipt.result_state_digest
+                    ):
+                        return RelationshipHistoricalAcknowledgement(original_receipt)
                     snapshot = self._copy_root(self._root)
                     view = self._view(snapshot, key)
                     assert view is not None
-                    return RelationshipObservationResult(snapshot, receipt, True, view)
+                    return RelationshipObservationResult(snapshot, original_receipt, True, view)
             if self._receipts:
                 previous_event = self._receipts[-1].event
                 if event.event_sequence <= previous_event.event_sequence or event.occurred_at < previous_event.occurred_at:
@@ -390,7 +475,9 @@ class RelationshipSystem:
                 self._receipts[-1].receipt_digest if self._receipts else None,
             )
             updated_receipts = self._receipts + (receipt,)
-            result = RelationshipObservationResult(self._copy_root(snapshot), receipt, False, view)
+            result = RelationshipObservationResult(
+                self._copy_root(snapshot), self._copy_receipt(receipt), False, view
+            )
             # Only after every source, root, receipt and read-view preflight is
             # complete do we publish the immutable process-local bundle.
             self._root, self._receipts, self._last_registry_digest = (
