@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from suzka.emotion_contracts import EmotionState
 from suzka.r15.common import (
     MAX_COUNTER,
     MAX_RELATIONSHIPS,
@@ -31,6 +32,7 @@ from suzka.r15.common import (
 )
 from suzka.r15.contracts import (
     CapabilityHypothesis,
+    ClaimMeaning,
     NarrativeClaim,
     NarrativeClaimKind,
     NarrativeEpisode,
@@ -42,8 +44,13 @@ from suzka.r15.contracts import (
     SelfClaim,
     SelfClaimKind,
     SelfModelState,
+    SemanticCode,
+    SemanticReferentKind,
+    PropositionPolarity,
     VerifiedCompetence,
     RELATIONSHIP_DOMAIN,
+    SELF_MODEL_DOMAIN,
+    current_semantic_producer,
 )
 from suzka.r15.stance import (
     ActorCausation,
@@ -101,6 +108,46 @@ def relationship(index: int = 1) -> RelationshipRecord:
             RelationshipAxis(kind, claim(1000 + index * 6 + offset, status=InterpretationStatus.UNKNOWN))
             for offset, kind in enumerate(sorted(RelationshipAxisKind, key=lambda item: item.value))
         ),
+    )
+
+
+def narrative_claim(
+    kind: NarrativeClaimKind, interpretation: Interpretation, episode_ids: tuple[str, ...],
+    *, polarity: PropositionPolarity = PropositionPolarity.AFFIRMS,
+) -> NarrativeClaim:
+    code = {
+        NarrativeClaimKind.CONTINUITY: SemanticCode.NARRATIVE_CONTINUITY,
+        NarrativeClaimKind.ROLE: SemanticCode.NARRATIVE_ROLE_ASSISTANT,
+        NarrativeClaimKind.REINTERPRETATION: SemanticCode.NARRATIVE_REINTERPRETATION,
+        NarrativeClaimKind.CONTRADICTION: SemanticCode.NARRATIVE_CONTRADICTION,
+    }[kind]
+    meaning = ClaimMeaning(code, SemanticReferentKind.EPISODE, episode_ids[0], polarity)
+    return NarrativeClaim(
+        kind,
+        replace(interpretation, statement_id=meaning.statement_id(
+            domain="narrative", kind=kind.value, episode_ids=episode_ids
+        )),
+        episode_ids,
+        meaning,
+    )
+
+
+def self_claim(
+    kind: SelfClaimKind, interpretation: Interpretation,
+    *, polarity: PropositionPolarity = PropositionPolarity.AFFIRMS,
+) -> SelfClaim:
+    code = {
+        SelfClaimKind.IDENTITY: SemanticCode.SELF_IDENTITY_SUZKA,
+        SelfClaimKind.ROLE: SemanticCode.SELF_ROLE_ASSISTANT,
+        SelfClaimKind.POSSIBLE_TRAIT: SemanticCode.SELF_TRAIT_CAUTIOUS,
+        SelfClaimKind.LIMITATION: SemanticCode.SELF_LIMITATION_DIRECT_ACTION,
+    }[kind]
+    referent = interpretation.support[0].reference if interpretation.support else "missing-experience"
+    meaning = ClaimMeaning(code, SemanticReferentKind.EXPERIENCE, referent, polarity)
+    return SelfClaim(
+        kind,
+        replace(interpretation, statement_id=meaning.statement_id(domain="self_model", kind=kind.value)),
+        meaning,
     )
 
 
@@ -218,7 +265,7 @@ def test_r15_fake_provenance_subject_admission_and_untrusted_text_cannot_adopt()
     # Even an attacker-computed *valid checksum* is not source authentication.
     assert "admitted" not in {state.value for state in SourceDisposition}
     with pytest.raises(ValueError):
-        SelfClaim(SelfClaimKind.POSSIBLE_TRAIT, claim(witnesses=(replace(forged_subject, origin=ClaimedOrigin.OPERATOR_ASSERTION),)))
+        self_claim(SelfClaimKind.POSSIBLE_TRAIT, claim(witnesses=(replace(forged_subject, origin=ClaimedOrigin.OPERATOR_ASSERTION),)))
 
 
 def test_r15_uncommitted_retracted_superseded_experience_has_no_current_proof() -> None:
@@ -240,13 +287,13 @@ def test_r15_narrative_links_conflict_and_self_hypothesis_do_not_mutate_sources(
     observation = source(index=42)
     episode = NarrativeEpisode(DIGEST, observation, claim(witnesses=(observation,)), ())
     contested = claim(41, status=InterpretationStatus.CONTESTED)
-    narrative = NarrativeSelfState(1, 0, (episode,), (NarrativeClaim(NarrativeClaimKind.CONTRADICTION, contested, (DIGEST,)),), None, ())
-    self_model = SelfModelState(1, 0, (SelfClaim(SelfClaimKind.LIMITATION, claim(55)),), (), None, ())
+    narrative = NarrativeSelfState(1, 0, (episode,), (narrative_claim(NarrativeClaimKind.CONTRADICTION, contested, (DIGEST,)),), None, ())
+    self_model = SelfModelState(1, 0, (self_claim(SelfClaimKind.LIMITATION, claim(55)),), (), None, ())
     assert NarrativeSelfState.from_json(narrative.canonical_bytes()).claims[0].interpretation.counter
     assert SelfModelState.from_json(self_model.canonical_bytes()).claims[0].interpretation.status is InterpretationStatus.PRESENT
     assert observation == source(index=42)
     with pytest.raises(ValueError):
-        NarrativeSelfState(1, 0, (episode,), (NarrativeClaim(NarrativeClaimKind.ROLE, claim(2), ("a" * 64,)),), None, ())
+        NarrativeSelfState(1, 0, (episode,), (narrative_claim(NarrativeClaimKind.ROLE, claim(2), ("a" * 64,)),), None, ())
 
 
 def test_r15_verified_competence_never_from_attempt_handler_or_decision() -> None:
@@ -311,3 +358,148 @@ def test_r15_stance_is_current_event_only_not_actor_blame_or_durable_trust() -> 
         replace(stance, context_participant_refs=("interlocutor-2",))
     with pytest.raises(FrozenInstanceError):
         stance.uncertainty = None  # type: ignore[misc]
+
+
+def test_r15_stance_accepts_exact_finite_negative_r10_optimal_loss() -> None:
+    current = event()
+    context = replace(
+        source(SourceKind.CONTEXT), event=current,
+        source_digest=context_projection_checksum(current, "source-0", 0, ("interlocutor-1",)),
+    )
+    for optimal_loss in (-0.1, -0.0, -float.fromhex("0x1.fffffffffffffp+1023")):
+        state = EmotionState(valence=-0.25, arousal=0.2, optimal_loss=optimal_loss)
+        scalars = (state.valence.hex(), state.arousal.hex(), state.optimal_loss.hex())
+        emotion = replace(
+            source(SourceKind.EMOTION),
+            source_digest=emotion_projection_checksum(current, *scalars),
+        )
+        stance = InteractionStance(
+            current, context, emotion, ("interlocutor-1",), "interlocutor-1",
+            *scalars, None, FeltAssociation.TENTATIVE_INTERACTION, SCORE_SCALE,
+            ActorCausation.UNKNOWN,
+        )
+        assert InteractionStance.from_value(stance.canonical_value()).canonical_bytes() == stance.canonical_bytes()
+        assert stance.optimal_loss_hex == optimal_loss.hex()
+        for invalid in ("nan", "inf", "-inf", " -0x1.999999999999ap-4", "0x1p+0"):
+            with pytest.raises(ValueError):
+                emotion_projection_checksum(current, scalars[0], scalars[1], invalid)
+            with pytest.raises(ValueError):
+                replace(stance, optimal_loss_hex=invalid)
+
+
+def test_r15_semantic_meaning_identity_binds_exact_subject_predicate_polarity_and_links() -> None:
+    observation = source(index=201)
+    first = NarrativeEpisode(DIGEST, observation, claim(20, witnesses=(observation,)), ())
+    second_source = source(index=202)
+    second_id = "e" * 64
+    second = NarrativeEpisode(second_id, second_source, claim(21, witnesses=(second_source,)), ())
+    links = (second_id, DIGEST)
+    continuity = narrative_claim(NarrativeClaimKind.CONTINUITY, claim(22), links)
+    assert NarrativeSelfState.from_json(
+        NarrativeSelfState(1, 0, tuple(sorted((first, second), key=lambda item: item.episode_id)),
+                           (continuity,), None, ()).canonical_bytes()
+    ).claims[0].meaning.code is SemanticCode.NARRATIVE_CONTINUITY
+    assert current_semantic_producer(continuity.meaning) is SourceDisposition.UNAVAILABLE
+    assert continuity.interpretation.statement_id != narrative_claim(
+        NarrativeClaimKind.CONTINUITY, claim(22), (second_id, "f" * 63 + "e")
+    ).interpretation.statement_id
+    with pytest.raises(ValueError):
+        replace(continuity, meaning=replace(continuity.meaning, polarity=PropositionPolarity.DENIES))
+    with pytest.raises(ValueError):
+        narrative_claim(NarrativeClaimKind.CONTINUITY, claim(22), (second_id,))
+    with pytest.raises(ValueError):
+        replace(continuity, meaning=replace(continuity.meaning, code=SemanticCode.SELF_TRAIT_PATIENT))
+    with pytest.raises(ValueError):
+        NarrativeSelfState(1, 0, (second,), (continuity,), None, ())
+    retracted = replace(first, experience=replace(first.experience, lifecycle=SourceLifecycle.RETRACTED),
+                        interpretation=claim(20, status=InterpretationStatus.UNKNOWN))
+    with pytest.raises(ValueError):
+        NarrativeSelfState(1, 0, tuple(sorted((retracted, second), key=lambda item: item.episode_id)),
+                           (continuity,), None, ())
+
+
+def test_r15_self_meanings_are_closed_source_bound_and_opposites_stay_distinct() -> None:
+    first = self_claim(SelfClaimKind.POSSIBLE_TRAIT, claim(30))
+    patient = replace(first.meaning, code=SemanticCode.SELF_TRAIT_PATIENT)
+    denied = replace(first.meaning, polarity=PropositionPolarity.DENIES)
+    for other in (patient, denied):
+        assert other.statement_id(domain="self_model", kind=SelfClaimKind.POSSIBLE_TRAIT.value) != first.interpretation.statement_id
+        with pytest.raises(ValueError):
+            replace(first, meaning=other)
+    opposite = self_claim(SelfClaimKind.POSSIBLE_TRAIT, claim(30), polarity=PropositionPolarity.DENIES)
+    root = SelfModelState(1, 0, tuple(sorted((first, opposite), key=lambda item: item.interpretation.statement_id)), (), None, ())
+    restored = SelfModelState.from_json(root.canonical_bytes())
+    assert {item.meaning.polarity for item in restored.claims} == set(PropositionPolarity)
+    assert len({item.interpretation.statement_id for item in restored.claims}) == 2
+    assert current_semantic_producer(first.meaning) is SourceDisposition.UNAVAILABLE
+    assert source_disposition(Concept.SELF_HYPOTHESIS, first.interpretation.support[0]) is SourceDisposition.REQUIRES_TRUSTED_ROOT
+    with pytest.raises(ValueError):
+        replace(first, meaning=replace(first.meaning, referent="not-in-support"))
+    missing = replace(first.meaning, referent="not-in-support")
+    with pytest.raises(ValueError):
+        replace(first, meaning=missing, interpretation=replace(
+            first.interpretation,
+            statement_id=missing.statement_id(domain="self_model", kind=first.kind.value),
+        ))
+    with pytest.raises(ValueError):
+        self_claim(SelfClaimKind.POSSIBLE_TRAIT, claim(31, witnesses=(source(index=31, lifecycle=SourceLifecycle.RETRACTED),)))
+    with pytest.raises(ValueError):
+        self_claim(SelfClaimKind.POSSIBLE_TRAIT, claim(31, witnesses=(source(SourceKind.OPERATOR_CLAIM, index=31),)))
+    with pytest.raises(ValueError):
+        replace(first.meaning, referent="x" * 129)
+    with pytest.raises(ValueError):
+        ClaimMeaning.from_value({
+            "code": "made_up_trait", "referent_kind": "experience",
+            "referent": first.meaning.referent, "polarity": "affirms",
+        })
+
+
+def test_r15_missing_task_referent_and_unverified_competence_polarity_fail_closed() -> None:
+    meaning = ClaimMeaning(
+        SemanticCode.SELF_EPISTEMIC_TASK_UNVERIFIED,
+        SemanticReferentKind.TASK_CLASS, "task-1", PropositionPolarity.AFFIRMS,
+    )
+    unknown = claim(44, status=InterpretationStatus.UNKNOWN)
+    self_record = SelfClaim(
+        SelfClaimKind.EPISTEMIC_UNKNOWN,
+        replace(unknown, statement_id=meaning.statement_id(
+            domain="self_model", kind=SelfClaimKind.EPISTEMIC_UNKNOWN.value
+        )), meaning,
+    )
+    with pytest.raises(ValueError):
+        SelfModelState(1, 0, (self_record,), (), None, ())
+    task = CapabilityHypothesis("task-1", claim(45), VerifiedCompetence.UNKNOWN)
+    assert SelfModelState.from_json(
+        SelfModelState(1, 0, (self_record,), (task,), None, ()).canonical_bytes()
+    ).claims[0].meaning.referent == "task-1"
+    with pytest.raises(ValueError):
+        replace(meaning, polarity=PropositionPolarity.DENIES)
+    with pytest.raises(ValueError):
+        replace(self_record, interpretation=claim(44))
+
+
+def test_r15_recomputed_root_digest_does_not_hide_semantic_mismatch_or_raw_text() -> None:
+    root = SelfModelState(1, 0, (self_claim(SelfClaimKind.POSSIBLE_TRAIT, claim(71)),), (), None, ())
+    for field, value in (("polarity", "denies"), ("code", SemanticCode.SELF_TRAIT_PATIENT.value),
+                         ("referent", "missing-current-experience")):
+        raw = root.canonical_value()
+        raw["claims"][0]["meaning"][field] = value
+        raw["state_digest"] = checksum(SELF_MODEL_DOMAIN, {
+            key: item for key, item in raw.items() if key != "state_digest"
+        })
+        with pytest.raises(ValueError):
+            SelfModelState.from_value(raw)
+    raw = root.canonical_value()
+    raw["claims"][0]["meaning"]["operator_biography"] = "private false trait"
+    raw["state_digest"] = checksum(SELF_MODEL_DOMAIN, {
+        key: item for key, item in raw.items() if key != "state_digest"
+    })
+    with pytest.raises(ValueError):
+        SelfModelState.from_value(raw)
+    raw = root.canonical_value()
+    del raw["claims"][0]["meaning"]
+    raw["state_digest"] = checksum(SELF_MODEL_DOMAIN, {
+        key: item for key, item in raw.items() if key != "state_digest"
+    })
+    with pytest.raises(ValueError):
+        SelfModelState.from_value(raw)

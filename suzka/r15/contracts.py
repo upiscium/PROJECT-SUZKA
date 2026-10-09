@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Final
+from typing import Final, cast
 
 from suzka.limits import MAX_PERSISTED_REVISION
 from suzka.r15.common import (
@@ -31,8 +31,10 @@ from suzka.r15.common import (
     SourceWitness,
     canonical_json,
     check_root_digest,
+    checksum,
     closed,
     digest,
+    encode,
     exact_enum,
     identifier,
     integer,
@@ -48,6 +50,108 @@ from suzka.r15.common import (
 RELATIONSHIP_DOMAIN: Final[bytes] = b"PROJECT-SUZKA:R15:RELATIONSHIP-ROOT:V1\0"
 NARRATIVE_DOMAIN: Final[bytes] = b"PROJECT-SUZKA:R15:NARRATIVE-ROOT:V1\0"
 SELF_MODEL_DOMAIN: Final[bytes] = b"PROJECT-SUZKA:R15:SELF-MODEL-ROOT:V1\0"
+
+
+class SemanticReferentKind(str, Enum):
+    """Which owner must resolve a proposition's precise bounded target."""
+
+    EPISODE = "episode"
+    EXPERIENCE = "experience"
+    TASK_CLASS = "task_class"
+
+
+class PropositionPolarity(str, Enum):
+    AFFIRMS = "affirms"
+    DENIES = "denies"
+
+
+class SemanticCode(str, Enum):
+    """Finite semantic atoms, not text, source proof or operator-authored traits."""
+
+    NARRATIVE_CONTINUITY = "same_autobiographical_continuity"
+    NARRATIVE_ROLE_ASSISTANT = "assistant_role_in_episode"
+    NARRATIVE_ROLE_PARTNER = "conversation_partner_role_in_episode"
+    NARRATIVE_REINTERPRETATION = "reinterpret_episode_as_subjectively_uncertain"
+    NARRATIVE_CONTRADICTION = "conflicting_first_person_interpretations"
+    SELF_IDENTITY_SUZKA = "subject_identity_suzka"
+    SELF_ROLE_ASSISTANT = "subject_role_assistant"
+    SELF_ROLE_PARTNER = "subject_role_conversation_partner"
+    SELF_TRAIT_CAUTIOUS = "subject_possibly_cautious"
+    SELF_TRAIT_PATIENT = "subject_possibly_patient"
+    SELF_LIMITATION_UNVERIFIED_COMPETENCE = "subject_lacks_verified_task_competence"
+    SELF_LIMITATION_DIRECT_ACTION = "subject_lacks_independent_external_action"
+    SELF_EPISTEMIC_TASK_UNVERIFIED = "subject_task_competence_is_unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimMeaning:
+    """Closed proposition; scoped refs still require a trusted owner to resolve."""
+
+    code: SemanticCode
+    referent_kind: SemanticReferentKind
+    referent: str
+    polarity: PropositionPolarity
+
+    def __post_init__(self) -> None:
+        exact_enum(self.code, SemanticCode, "semantic code")
+        exact_enum(self.referent_kind, SemanticReferentKind, "semantic referent kind")
+        exact_enum(self.polarity, PropositionPolarity, "proposition polarity")
+        if self.referent_kind is SemanticReferentKind.EPISODE:
+            digest(self.referent, "episode referent")
+        else:
+            identifier(self.referent, "semantic referent")
+        if self.code in (
+            SemanticCode.SELF_LIMITATION_UNVERIFIED_COMPETENCE,
+            SemanticCode.SELF_EPISTEMIC_TASK_UNVERIFIED,
+            SemanticCode.SELF_LIMITATION_DIRECT_ACTION,
+        ) and self.polarity is PropositionPolarity.DENIES:
+            raise ValueError("denying this limitation would assert unverified capability")
+
+    def statement_id(self, *, domain: str, kind: str, episode_ids: tuple[str, ...] = ()) -> str:
+        self.__post_init__()
+        if type(domain) is not str or domain not in ("narrative", "self_model"):
+            raise ValueError("claim identity must use its closed owner domain")
+        if type(kind) is not str or kind not in (
+            *(member.value for member in NarrativeClaimKind),
+            *(member.value for member in SelfClaimKind),
+        ):
+            raise ValueError("claim identity requires a closed claim kind")
+        if type(episode_ids) is not tuple or len(episode_ids) > MAX_LINKS:
+            raise ValueError("claim identity has invalid linked episodes")
+        for episode_id in episode_ids:
+            digest(episode_id, "claim linked episode")
+        if domain == "self_model" and episode_ids:
+            raise ValueError("SelfModel does not own narrative episode links")
+        return checksum(
+            b"PROJECT-SUZKA:R15:SEMANTIC-CLAIM:V1\0",
+            {"domain": domain, "kind": kind, "meaning": encode(self), "episode_ids": list(episode_ids)},
+        )
+
+    @classmethod
+    def from_value(cls, value: object) -> ClaimMeaning:
+        row = closed(value, ("code", "referent_kind", "referent", "polarity"), "ClaimMeaning")
+        if type(row["referent"]) is not str:
+            raise TypeError("semantic referent must be an exact bounded string")
+        return cls(
+            parse_enum(row["code"], SemanticCode, "semantic code"),
+            parse_enum(row["referent_kind"], SemanticReferentKind, "referent kind"),
+            cast(str, row["referent"]),
+            parse_enum(row["polarity"], PropositionPolarity, "polarity"),
+        )
+
+
+def current_semantic_producer(meaning: ClaimMeaning) -> SourceDisposition:
+    """R09–R14 do not own these R15 propositions, even if syntax is valid.
+
+    U3/U4 must establish and review an exact first-person mapping and ordered
+    admission separately; R12's Experience is event lineage, not trait/role
+    semantics. Never infer this proof from source text, a digest, or operator.
+    """
+
+    if type(meaning) is not ClaimMeaning:
+        raise TypeError("semantic proposition must be exact")
+    meaning.__post_init__()
+    return SourceDisposition.UNAVAILABLE
 
 
 class RelationshipAxisKind(str, Enum):
@@ -259,11 +363,22 @@ class NarrativeClaimKind(str, Enum):
     CONTRADICTION = "contradiction"
 
 
+_NARRATIVE_CODES: Final[dict[NarrativeClaimKind, frozenset[SemanticCode]]] = {
+    NarrativeClaimKind.CONTINUITY: frozenset({SemanticCode.NARRATIVE_CONTINUITY}),
+    NarrativeClaimKind.ROLE: frozenset({
+        SemanticCode.NARRATIVE_ROLE_ASSISTANT, SemanticCode.NARRATIVE_ROLE_PARTNER,
+    }),
+    NarrativeClaimKind.REINTERPRETATION: frozenset({SemanticCode.NARRATIVE_REINTERPRETATION}),
+    NarrativeClaimKind.CONTRADICTION: frozenset({SemanticCode.NARRATIVE_CONTRADICTION}),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class NarrativeClaim:
     kind: NarrativeClaimKind
     interpretation: Interpretation
     episode_ids: tuple[str, ...]
+    meaning: ClaimMeaning
 
     def __post_init__(self) -> None:
         exact_enum(self.kind, NarrativeClaimKind, "narrative kind")
@@ -271,20 +386,37 @@ class NarrativeClaim:
             raise TypeError("narrative claim interpretation must be exact")
         self.interpretation.__post_init__()
         self.interpretation.require_sources(Concept.NARRATIVE_CLAIM)
+        if type(self.meaning) is not ClaimMeaning:
+            raise TypeError("narrative meaning must be exact")
+        self.meaning.__post_init__()
+        if (
+            self.meaning.code not in _NARRATIVE_CODES[self.kind]
+            or self.meaning.referent_kind is not SemanticReferentKind.EPISODE
+        ):
+            raise ValueError("narrative kind and source-owned episode meaning disagree")
         if type(self.episode_ids) is not tuple or len(self.episode_ids) > MAX_LINKS:
             raise ValueError("narrative episode references exceed their bound")
         for item in self.episode_ids:
             digest(item, "episode ref")
         if self.episode_ids != tuple(sorted(set(self.episode_ids))):
             raise ValueError("narrative episode references must be ordered and unique")
+        if self.meaning.referent not in self.episode_ids:
+            raise ValueError("narrative proposition's episode referent is missing")
+        if self.kind is NarrativeClaimKind.CONTINUITY and len(self.episode_ids) < 2:
+            raise ValueError("autobiographical continuity must name two distinct episodes")
+        if self.interpretation.statement_id != self.meaning.statement_id(
+            domain="narrative", kind=self.kind.value, episode_ids=self.episode_ids
+        ):
+            raise ValueError("narrative statement identity does not bind its meaning and links")
 
     @classmethod
     def from_value(cls, value: object) -> NarrativeClaim:
-        row = closed(value, ("kind", "interpretation", "episode_ids"), "NarrativeClaim")
+        row = closed(value, ("kind", "interpretation", "episode_ids", "meaning"), "NarrativeClaim")
         return cls(
             parse_enum(row["kind"], NarrativeClaimKind, "kind"),
             Interpretation.from_value(row["interpretation"]),
             tuple(digest(item, "episode ref") for item in sequence(row["episode_ids"], "episode_ids", MAX_LINKS, json_input=True)),
+            ClaimMeaning.from_value(row["meaning"]),
         )
 
 
@@ -316,6 +448,15 @@ class NarrativeSelfState:
             raise ValueError("narrative episodes and claims must be sorted and unique")
         if any(not set(item.episode_ids).issubset(ids) for item in self.claims):
             raise ValueError("narrative claim links must target retained episodes")
+        episodes_by_id = {item.episode_id: item for item in self.episodes}
+        for claim_item in self.claims:
+            if claim_item.interpretation.status is not InterpretationStatus.UNKNOWN:
+                if any(
+                    episodes_by_id[episode_id].experience.lifecycle is not SourceLifecycle.ACTIVE
+                    or episodes_by_id[episode_id].interpretation.status is InterpretationStatus.UNKNOWN
+                    for episode_id in claim_item.episode_ids
+                ):
+                    raise ValueError("a current narrative proposition cannot use an unavailable episode")
         validate_history(self.revision, self.history_anchor, self.revision_history)
 
     def canonical_value(self) -> dict[str, object]:
@@ -358,10 +499,25 @@ class SelfClaimKind(str, Enum):
     EPISTEMIC_UNKNOWN = "epistemic_unknown"
 
 
+_SELF_CODES: Final[dict[SelfClaimKind, frozenset[SemanticCode]]] = {
+    SelfClaimKind.IDENTITY: frozenset({SemanticCode.SELF_IDENTITY_SUZKA}),
+    SelfClaimKind.ROLE: frozenset({SemanticCode.SELF_ROLE_ASSISTANT, SemanticCode.SELF_ROLE_PARTNER}),
+    SelfClaimKind.POSSIBLE_TRAIT: frozenset({
+        SemanticCode.SELF_TRAIT_CAUTIOUS, SemanticCode.SELF_TRAIT_PATIENT,
+    }),
+    SelfClaimKind.LIMITATION: frozenset({
+        SemanticCode.SELF_LIMITATION_UNVERIFIED_COMPETENCE,
+        SemanticCode.SELF_LIMITATION_DIRECT_ACTION,
+    }),
+    SelfClaimKind.EPISTEMIC_UNKNOWN: frozenset({SemanticCode.SELF_EPISTEMIC_TASK_UNVERIFIED}),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class SelfClaim:
     kind: SelfClaimKind
     interpretation: Interpretation
+    meaning: ClaimMeaning
 
     def __post_init__(self) -> None:
         exact_enum(self.kind, SelfClaimKind, "self claim kind")
@@ -369,13 +525,38 @@ class SelfClaim:
             raise TypeError("self interpretation must be exact")
         self.interpretation.__post_init__()
         self.interpretation.require_sources(Concept.SELF_HYPOTHESIS)
+        if type(self.meaning) is not ClaimMeaning:
+            raise TypeError("self meaning must be exact")
+        self.meaning.__post_init__()
+        if self.meaning.code not in _SELF_CODES[self.kind]:
+            raise ValueError("self-claim kind and exact semantic predicate disagree")
+        required_kind = (
+            SemanticReferentKind.TASK_CLASS
+            if self.kind is SelfClaimKind.EPISTEMIC_UNKNOWN
+            else SemanticReferentKind.EXPERIENCE
+        )
+        if self.meaning.referent_kind is not required_kind:
+            raise ValueError("self claim's semantic referent has an invalid owner")
+        if self.meaning.referent_kind is SemanticReferentKind.TASK_CLASS:
+            if self.interpretation.status is not InterpretationStatus.UNKNOWN:
+                raise ValueError("unverified task competence cannot be a present self fact")
+        elif self.interpretation.status is not InterpretationStatus.UNKNOWN and not any(
+            item.kind is SourceKind.EXPERIENCE and item.reference == self.meaning.referent
+            for item in self.interpretation.support
+        ):
+            raise ValueError("a current self proposition lacks its source-owned referent")
+        if self.interpretation.statement_id != self.meaning.statement_id(
+            domain="self_model", kind=self.kind.value
+        ):
+            raise ValueError("self statement identity does not bind its exact meaning")
 
     @classmethod
     def from_value(cls, value: object) -> SelfClaim:
-        row = closed(value, ("kind", "interpretation"), "SelfClaim")
+        row = closed(value, ("kind", "interpretation", "meaning"), "SelfClaim")
         return cls(
             parse_enum(row["kind"], SelfClaimKind, "self claim kind"),
             Interpretation.from_value(row["interpretation"]),
+            ClaimMeaning.from_value(row["meaning"]),
         )
 
 
@@ -434,6 +615,12 @@ class SelfModelState:
         tasks = tuple(item.task_class_key for item in self.capabilities)
         if ids != tuple(sorted(set(ids))) or tasks != tuple(sorted(set(tasks))):
             raise ValueError("self claims and task classes must be sorted and unique")
+        if any(
+            item.meaning.referent not in tasks
+            for item in self.claims
+            if item.meaning.referent_kind is SemanticReferentKind.TASK_CLASS
+        ):
+            raise ValueError("SelfModel proposition targets a missing task class")
         validate_history(self.revision, self.history_anchor, self.revision_history)
 
     def canonical_value(self) -> dict[str, object]:

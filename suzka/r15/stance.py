@@ -40,14 +40,21 @@ class ActorCausation(str, Enum):
     UNKNOWN = "unknown"
 
 
-def _hex_float(value: object, name: str, *, minimum: float, maximum: float) -> str:
+def _hex_float(
+    value: object, name: str, *, minimum: float | None, maximum: float | None
+) -> str:
     if type(value) is not str:
         raise ValueError(f"{name} must be canonical binary64 hex text")
     try:
         number = float.fromhex(value)
     except ValueError as error:
         raise ValueError(f"{name} must be canonical binary64 hex text") from error
-    if not math.isfinite(number) or not minimum <= number <= maximum or number.hex() != value:
+    if (
+        not math.isfinite(number)
+        or (minimum is not None and number < minimum)
+        or (maximum is not None and number > maximum)
+        or number.hex() != value
+    ):
         raise ValueError(f"{name} must be finite, canonical and within its range")
     return value
 
@@ -103,7 +110,7 @@ class InteractionStance:
                 raise ValueError("tagged interlocutor must belong to the same selected Context")
         _hex_float(self.valence_hex, "valence", minimum=-1.0, maximum=1.0)
         _hex_float(self.arousal_hex, "arousal", minimum=0.0, maximum=1.0)
-        _hex_float(self.optimal_loss_hex, "optimal_loss", minimum=0.0, maximum=float("inf"))
+        _hex_float(self.optimal_loss_hex, "optimal_loss", minimum=None, maximum=None)
         if self.prior_committed_relationship_digest is not None:
             digest(self.prior_committed_relationship_digest, "prior relationship digest")
         exact_enum(self.association, FeltAssociation, "association")
@@ -139,7 +146,7 @@ class InteractionStance:
             None if row["interlocutor_key"] is None else identifier(row["interlocutor_key"], "interlocutor_key"),
             _hex_float(row["valence_hex"], "valence", minimum=-1.0, maximum=1.0),
             _hex_float(row["arousal_hex"], "arousal", minimum=0.0, maximum=1.0),
-            _hex_float(row["optimal_loss_hex"], "optimal_loss", minimum=0.0, maximum=float("inf")),
+            _hex_float(row["optimal_loss_hex"], "optimal_loss", minimum=None, maximum=None),
             None if row["prior_committed_relationship_digest"] is None else digest(row["prior_committed_relationship_digest"], "prior digest"),
             parse_enum(row["association"], FeltAssociation, "association"),
             None if row["uncertainty"] is None else integer(row["uncertainty"], "uncertainty", minimum=1, maximum=SCORE_SCALE),
@@ -184,6 +191,6 @@ def emotion_projection_checksum(event: EventRef, valence_hex: str, arousal_hex: 
             "event": encode(event),
             "valence_hex": _hex_float(valence_hex, "valence", minimum=-1.0, maximum=1.0),
             "arousal_hex": _hex_float(arousal_hex, "arousal", minimum=0.0, maximum=1.0),
-            "optimal_loss_hex": _hex_float(optimal_loss_hex, "optimal_loss", minimum=0.0, maximum=float("inf")),
+            "optimal_loss_hex": _hex_float(optimal_loss_hex, "optimal_loss", minimum=None, maximum=None),
         },
     )

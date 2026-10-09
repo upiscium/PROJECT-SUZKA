@@ -81,10 +81,11 @@ def test_r15_u1_obligations_index_is_complete_and_ast_checked() -> None:
             assert function in {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}, (name, filename, function)
     budget = derive_r15_schema_budget()
     for expected in (
-        "**v10 before reserve** | **116935301**",
-        "**v10 including reserve** | **133712517**",
+        f"**v10 before reserve** | **{budget.v10_before_reserve_bytes}**",
+        f"**v10 including reserve** | **{budget.v10_with_reserve_bytes}**",
         f"**Margin beyond full reserve** | **{budget.remaining_beyond_reserve_bytes}**",
         "R09", "R10", "R11", "R12", "R13", "R14", "R17/R18",
         "no present production consumer", "REQUIRES_TRUSTED_ROOT",
+        "current_semantic_producer", "negative zero",
     ):
         assert expected.lower() in document.lower(), expected

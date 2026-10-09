@@ -40,9 +40,15 @@ from suzka.r15.common import (
     source_disposition,
 )
 from suzka.r15.contracts import (
+    NarrativeClaimKind,
     NarrativeSelfState,
+    PropositionPolarity,
     RelationshipState,
+    SemanticCode,
+    SemanticReferentKind,
+    SelfClaimKind,
     SelfModelState,
+    ClaimMeaning,
 )
 
 
@@ -93,9 +99,9 @@ def test_r15_v10_projection_matches_integrated_v9_projector_and_keeps_full_reser
             budget.relationship_bytes, budget.narrative_bytes, budget.self_model_bytes
         ), strict=True)),
     )
-    assert budget.v10_before_reserve_bytes == 116_935_301
-    assert budget.v10_with_reserve_bytes == 133_712_517
-    assert budget.remaining_beyond_reserve_bytes == 505_211
+    assert budget.v10_before_reserve_bytes == 116_949_381
+    assert budget.v10_with_reserve_bytes == 133_726_597
+    assert budget.remaining_beyond_reserve_bytes == 491_131
     assert AGENT_STATE_HARD_CAP_BYTES - budget.v10_before_reserve_bytes == (
         FULL_FUTURE_RESERVE_BYTES + budget.remaining_beyond_reserve_bytes
     )
@@ -106,7 +112,7 @@ def test_r15_section_envelopes_exhaust_actual_maximum_legal_values() -> None:
     relationship, narrative, self_model = maximum_legal_r15_roots()
     assert tuple(len(root.canonical_bytes()) for root in (relationship, narrative, self_model)) == (
         budget.relationship_bytes, budget.narrative_bytes, budget.self_model_bytes
-    ) == (2_159_153, 672_317, 336_561)
+    ) == (2_159_153, 678_461, 344_497)
     assert all(len(item.interlocutor_key) == 128 for item in relationship.records)
     assert all(len(item.claimed_identity_key or "") == 128 for item in relationship.records)
     assert all(len(witness.reference) == 128 for record in relationship.records
@@ -115,6 +121,14 @@ def test_r15_section_envelopes_exhaust_actual_maximum_legal_values() -> None:
                for proof in root.revision_history)
     assert all(proof.event.occurred_at == datetime.max.replace(tzinfo=UTC)
                for root in (relationship, narrative, self_model) for proof in root.revision_history)
+    assert all(len(item.meaning.referent) == 64 for item in narrative.claims)
+    assert all(len(item.meaning.referent) == 128 for item in self_model.claims)
+    assert all(item.interpretation.statement_id == item.meaning.statement_id(
+        domain="narrative", kind=item.kind.value, episode_ids=item.episode_ids
+    ) for item in narrative.claims)
+    assert all(item.interpretation.statement_id == item.meaning.statement_id(
+        domain="self_model", kind=item.kind.value
+    ) for item in self_model.claims)
 
 
 def test_r15_capacity_is_not_a_runtime_clipper_and_one_over_fails_closed() -> None:
@@ -176,8 +190,32 @@ def test_r15_legal_status_origin_lifecycle_enum_alternatives_do_not_exceed_full_
         assert len(alternative.canonical_bytes()) <= max_relationship
 
     first_claim = narrative.claims[0]
-    for kind in type(first_claim.kind):
-        assert len(replace(narrative, claims=(replace(first_claim, kind=kind),) + narrative.claims[1:]).canonical_bytes()) <= max_narrative
+    narrative_codes = {
+        NarrativeClaimKind.CONTINUITY: (SemanticCode.NARRATIVE_CONTINUITY,),
+        NarrativeClaimKind.ROLE: (SemanticCode.NARRATIVE_ROLE_ASSISTANT, SemanticCode.NARRATIVE_ROLE_PARTNER),
+        NarrativeClaimKind.REINTERPRETATION: (SemanticCode.NARRATIVE_REINTERPRETATION,),
+        NarrativeClaimKind.CONTRADICTION: (SemanticCode.NARRATIVE_CONTRADICTION,),
+    }
+    for kind, codes in narrative_codes.items():
+        for code in codes:
+            meaning = replace(first_claim.meaning, code=code)
+            alternate_claim = replace(
+                first_claim, kind=kind, meaning=meaning,
+                interpretation=replace(first_claim.interpretation, statement_id=meaning.statement_id(
+                    domain="narrative", kind=kind.value, episode_ids=first_claim.episode_ids
+                )),
+            )
+            ordered = tuple(sorted((alternate_claim,) + narrative.claims[1:], key=lambda item: item.interpretation.statement_id))
+            assert len(replace(narrative, claims=ordered).canonical_bytes()) <= max_narrative
+    denied_meaning = replace(first_claim.meaning, polarity=PropositionPolarity.DENIES)
+    denied_claim = replace(
+        first_claim, meaning=denied_meaning,
+        interpretation=replace(first_claim.interpretation, statement_id=denied_meaning.statement_id(
+            domain="narrative", kind=first_claim.kind.value, episode_ids=first_claim.episode_ids
+        )),
+    )
+    ordered_denial = tuple(sorted((denied_claim,) + narrative.claims[1:], key=lambda item: item.interpretation.statement_id))
+    assert len(replace(narrative, claims=ordered_denial).canonical_bytes()) <= max_narrative
     # A committed Experience can be replaced in a *claim* by an adopted Belief;
     # both have maximal event metadata. The Belief spelling is shorter.
     interpretation = first_claim.interpretation
@@ -186,12 +224,41 @@ def test_r15_legal_status_origin_lifecycle_enum_alternatives_do_not_exceed_full_
     belief_claim = replace(first_claim, interpretation=replace(interpretation, support=belief_support, counter=belief_counter))
     assert len(replace(narrative, claims=(belief_claim,) + narrative.claims[1:]).canonical_bytes()) <= max_narrative
     for lifecycle in (SourceLifecycle.SUPERSEDED, SourceLifecycle.RETRACTED, SourceLifecycle.UNAVAILABLE):
-        episode = narrative.episodes[0]
+        # The full legal fixture also retains episodes outside every current
+        # claim's links; only those can become inactive without invalidating a
+        # current proposition's source-owned referent.
+        episode = narrative.episodes[-1]
         unknown = replace(episode.interpretation, status=InterpretationStatus.UNKNOWN,
                           estimate=None, confidence=None, support=(), counter=())
         inactive = replace(episode, experience=replace(episode.experience, lifecycle=lifecycle), interpretation=unknown)
-        assert len(replace(narrative, episodes=(inactive,) + narrative.episodes[1:]).canonical_bytes()) < max_narrative
+        assert len(replace(narrative, episodes=narrative.episodes[:-1] + (inactive,)).canonical_bytes()) < max_narrative
     first_self_claim = self_model.claims[0]
-    for kind in type(first_self_claim.kind):
-        alternate = replace(self_model, claims=(replace(first_self_claim, kind=kind),) + self_model.claims[1:])
-        assert len(alternate.canonical_bytes()) <= max_self_model
+    self_codes = {
+        SelfClaimKind.IDENTITY: (SemanticCode.SELF_IDENTITY_SUZKA,),
+        SelfClaimKind.ROLE: (SemanticCode.SELF_ROLE_ASSISTANT, SemanticCode.SELF_ROLE_PARTNER),
+        SelfClaimKind.POSSIBLE_TRAIT: (SemanticCode.SELF_TRAIT_CAUTIOUS, SemanticCode.SELF_TRAIT_PATIENT),
+        SelfClaimKind.LIMITATION: (
+            SemanticCode.SELF_LIMITATION_UNVERIFIED_COMPETENCE,
+            SemanticCode.SELF_LIMITATION_DIRECT_ACTION,
+        ),
+        SelfClaimKind.EPISTEMIC_UNKNOWN: (SemanticCode.SELF_EPISTEMIC_TASK_UNVERIFIED,),
+    }
+    for kind, codes in self_codes.items():
+        for code in codes:
+            meaning = ClaimMeaning(
+                code,
+                SemanticReferentKind.TASK_CLASS if kind is SelfClaimKind.EPISTEMIC_UNKNOWN else SemanticReferentKind.EXPERIENCE,
+                self_model.capabilities[0].task_class_key if kind is SelfClaimKind.EPISTEMIC_UNKNOWN else first_self_claim.meaning.referent,
+                PropositionPolarity.AFFIRMS,
+            )
+            interpretation = first_self_claim.interpretation
+            if kind is SelfClaimKind.EPISTEMIC_UNKNOWN:
+                interpretation = replace(interpretation, status=InterpretationStatus.UNKNOWN, estimate=None, confidence=None, support=(), counter=())
+            alternate_claim = replace(
+                first_self_claim, kind=kind, meaning=meaning,
+                interpretation=replace(interpretation, statement_id=meaning.statement_id(
+                    domain="self_model", kind=kind.value
+                )),
+            )
+            ordered = tuple(sorted((alternate_claim,) + self_model.claims[1:], key=lambda item: item.interpretation.statement_id))
+            assert len(replace(self_model, claims=ordered).canonical_bytes()) <= max_self_model

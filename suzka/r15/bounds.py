@@ -10,7 +10,7 @@ This is a schema-size proof, not validation of actual source authenticity.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Final
@@ -42,6 +42,7 @@ from suzka.r15.common import (
 )
 from suzka.r15.contracts import (
     CapabilityHypothesis,
+    ClaimMeaning,
     NarrativeClaim,
     NarrativeClaimKind,
     NarrativeEpisode,
@@ -55,6 +56,9 @@ from suzka.r15.contracts import (
     SelfClaim,
     SelfClaimKind,
     SelfModelState,
+    SemanticCode,
+    SemanticReferentKind,
+    PropositionPolarity,
     VerifiedCompetence,
 )
 
@@ -187,21 +191,56 @@ def maximum_legal_r15_roots() -> tuple[RelationshipState, NarrativeSelfState, Se
     )
     claims = tuple(
         NarrativeClaim(
-            max(NarrativeClaimKind, key=lambda kind: len(kind.value)),
-            _interpretation(50000 + index),
-            episode_ids[:MAX_LINKS],
+            NarrativeClaimKind.REINTERPRETATION,
+            replace(
+                _interpretation(50000 + index),
+                statement_id=ClaimMeaning(
+                    SemanticCode.NARRATIVE_REINTERPRETATION,
+                    SemanticReferentKind.EPISODE,
+                    episode_ids[index],
+                    PropositionPolarity.AFFIRMS,
+                ).statement_id(
+                    domain="narrative",
+                    kind=NarrativeClaimKind.REINTERPRETATION.value,
+                    episode_ids=episode_ids[index:index + MAX_LINKS],
+                ),
+            ),
+            episode_ids[index:index + MAX_LINKS],
+            ClaimMeaning(
+                SemanticCode.NARRATIVE_REINTERPRETATION,
+                SemanticReferentKind.EPISODE,
+                episode_ids[index],
+                PropositionPolarity.AFFIRMS,
+            ),
         )
         for index in range(MAX_NARRATIVE_CLAIMS)
     )
+    ordered_claims = tuple(sorted(claims, key=lambda item: item.interpretation.statement_id))
     narrative = NarrativeSelfState(
-        1, MAX_PERSISTED_REVISION, episodes, claims, _DIGEST,
-        _history(claims[0].interpretation.statement_id),
+        1, MAX_PERSISTED_REVISION, episodes, ordered_claims, _DIGEST,
+        _history(ordered_claims[0].interpretation.statement_id),
     )
 
     self_claims = tuple(
         SelfClaim(
-            max(SelfClaimKind, key=lambda kind: len(kind.value)),
-            _interpretation(60000 + index),
+            SelfClaimKind.LIMITATION,
+            replace(
+                _interpretation(60000 + index),
+                statement_id=ClaimMeaning(
+                    SemanticCode.SELF_LIMITATION_DIRECT_ACTION,
+                    SemanticReferentKind.EXPERIENCE,
+                    _interpretation(60000 + index).support[0].reference,
+                    PropositionPolarity.AFFIRMS,
+                ).statement_id(
+                    domain="self_model", kind=SelfClaimKind.LIMITATION.value
+                ),
+            ),
+            ClaimMeaning(
+                SemanticCode.SELF_LIMITATION_DIRECT_ACTION,
+                SemanticReferentKind.EXPERIENCE,
+                _interpretation(60000 + index).support[0].reference,
+                PropositionPolarity.AFFIRMS,
+            ),
         )
         for index in range(MAX_SELF_CLAIMS)
     )
@@ -213,9 +252,10 @@ def maximum_legal_r15_roots() -> tuple[RelationshipState, NarrativeSelfState, Se
         )
         for index in range(MAX_CAPABILITIES)
     )
+    ordered_self_claims = tuple(sorted(self_claims, key=lambda item: item.interpretation.statement_id))
     self_model = SelfModelState(
-        1, MAX_PERSISTED_REVISION, self_claims, capabilities, _DIGEST,
-        _history(self_claims[0].interpretation.statement_id),
+        1, MAX_PERSISTED_REVISION, ordered_self_claims, capabilities, _DIGEST,
+        _history(ordered_self_claims[0].interpretation.statement_id),
     )
     return relationship, narrative, self_model
 
