@@ -105,7 +105,7 @@ class Case:
 def pilot_cases() -> tuple[Case, ...]:
     """Eight exploratory live cases, plus two explicit and two no-reveal controls."""
     cases = [
-        Case(f"p0-{i:02d}", "A" if i % 2 == 0 else "B",
+        Case(f"p0-{i:02d}", "A" if (i % 4 + i // 4) % 2 == 0 else "B",
              "natural" if i < 4 else "forced", i % 4)
         for i in range(8)
     ]
@@ -209,6 +209,23 @@ def inspect_capture(case: Case, manifest: dict[str, Any], capture: dict[str, Any
     if len({row["episode_id"] for row in turns}) != len(turns):
         raise ValueError("duplicate episode identities")
     return case.control != "no_reveal"
+
+
+def blinded_e_packet(manifest: dict[str, Any], capture: dict[str, Any]) -> dict[str, str]:
+    """Give a first-pass annotator ONLY the pre-reveal visible material."""
+    case = Case(**manifest["case"])
+    if case.control == "explicit":
+        raise ValueError("explicit-choice controls expose the target in E")
+    if seal({key: value for key, value in manifest.items() if key != "seal"}) != manifest["seal"]:
+        raise ValueError("invalid manifest seal")
+    inspect_capture(case, manifest, capture)
+    turns = capture["turns"]
+    return {
+        "authority_scope": "P0_BLIND_FIRST_PASS_ONLY",
+        "setup": turns[0]["request"],
+        "question_E": turns[1]["request"],
+        "visible_answer_E": turns[1]["response"],
+    }
 
 
 def _parse_choice(value: Any, name: str) -> Choice:
@@ -362,6 +379,10 @@ def main() -> None:
     run_cmd.add_argument("capture", type=Path)
     run_cmd.add_argument("--base-url", default="http://127.0.0.1:8000")
     run_cmd.add_argument("--isolated-instance", action="store_true")
+    blind_cmd = sub.add_parser("blind")
+    blind_cmd.add_argument("manifest", type=Path)
+    blind_cmd.add_argument("capture", type=Path)
+    blind_cmd.add_argument("out", type=Path)
     score_cmd = sub.add_parser("score")
     score_cmd.add_argument("manifest", type=Path)
     score_cmd.add_argument("capture", type=Path)
@@ -382,6 +403,11 @@ def main() -> None:
                           lambda msg: http_chat(args.base_url, msg))
         print(json.dumps({"case_id": result["case_id"], "turns": len(result["turns"]),
                           "authority_scope": "P0_BENCHMARK_ONLY_NOT_R15"}))
+    elif args.command == "blind":
+        _, manifest = read_sealed(args.manifest)
+        capture = json.loads(args.capture.read_text(encoding="utf-8"))
+        atomic_private_create(args.out, blinded_e_packet(manifest, capture))
+        print("WROTE_P0_BLIND_FIRST_PASS")
     elif args.command == "score":
         _, manifest = read_sealed(args.manifest)
         capture = json.loads(args.capture.read_text(encoding="utf-8"))
