@@ -45,6 +45,12 @@ A capture.started.json sidecar is written before the first HTTP call. If the run
 
 ## Independent scoring
 
+First export only the materials observed BEFORE the reveal, hiding the case identifier and target from the first-pass observer:
+
+    python3 -m experiments.r15_p0.pilot blind       /tmp/p0-00.manifest.json /tmp/p0-00.capture.json       /tmp/p0-00.blind.json
+
+The blinded packet contains setup, question E, and the first visible answer only. The later reveal and response are withheld. Explicit-reference controls cannot be blinded and are therefore refused by this command. The case manifest itself must never be sent to the first-pass observer.
+
 An observer who has NOT seen the target must annotate the first visible answer as A, B, CLARIFY, OTHER or UNKNOWN. Both letters may occur in the text without an actual selection: NEVER use simple substring matching as proof of an A/B selection.
 
 A later observer classifies the post-reveal answer's three components. If earlier E availability in the model prompt is not independently observed, mark retrieval UNKNOWN.
