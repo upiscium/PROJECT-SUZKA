@@ -24,6 +24,7 @@ class ContextPublicationUnavailable(RuntimeError):
 
 class ContextPublicationStatus(StrEnum):
     READY = "ready"
+    STARTED_CHECKPOINT_PENDING = "started_checkpoint_pending"
     TERMINAL_PUBLICATION_PENDING = "terminal_publication_pending"
     DEGRADED = "degraded"
 
@@ -87,11 +88,12 @@ class CommittedContextReadModel:
             return self._view
 
     def append_started_checkpoint(self, append: Callable[[], None]) -> None:
-        """Fence STARTED append failure against newly admitted Context GETs.
+        """Fence STARTED append without holding a read lock across disk I/O.
 
-        This is a short critical section for one R07 append, never held over
-        handler/model execution. A failed journal STARTED checkpoint becomes
-        DEGRADED before any subsequent GET may acquire the same read gate.
+        While the durable Journal append runs, NEW Context GETs fail fast
+        rather than waiting indefinitely. Once the append finishes, a verified
+        success restores the old public READY generation; failure degrades
+        before any new GET can acquire a READY handle.
         """
         if not callable(append):
             raise TypeError("STARTED checkpoint must be callable")
@@ -101,13 +103,20 @@ class CommittedContextReadModel:
                 or self._pending is not None
             ):
                 raise ContextPublicationUnavailable("Context STARTED gate unavailable")
-            try:
-                append()
-            except BaseException:
+            self._status = ContextPublicationStatus.STARTED_CHECKPOINT_PENDING
+        try:
+            append()
+        except BaseException:
+            with self._lock:
                 self._pending = None
                 self._restoring = None
                 self._status = ContextPublicationStatus.DEGRADED
-                raise
+            raise
+        with self._lock:
+            if self._status is not ContextPublicationStatus.STARTED_CHECKPOINT_PENDING:
+                self._status = ContextPublicationStatus.DEGRADED
+                raise ContextPublicationUnavailable("Context STARTED gate diverged")
+            self._status = ContextPublicationStatus.READY
 
     def begin_terminal(
         self, *, event_id: str, sequence: int, expected_previous: PublishedContextView
