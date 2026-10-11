@@ -356,15 +356,50 @@ def test_started_failure_cannot_race_a_ready_get_admission(
             post = pool.submit(_send_chat, client, "g1p-started-fail-race")
             try:
                 assert entered_append.wait(15)
+                assert client.app.state.context_committed_reads.status is (
+                    ContextPublicationStatus.STARTED_CHECKPOINT_PENDING
+                )
                 get = pool.submit(ask_public)
                 assert submitted_get.wait(15)
-                assert not get.done()  # same short publication/append lock
+                # Disk I/O may hang; the read gate must respond promptly with
+                # 503 rather than holding an RLock over durable append().
+                assert get.result(timeout=8).status_code == 503
             finally:
                 release_append.set()
             assert post.result(timeout=40).status_code in (500, 503)
-            assert get.result(timeout=40).status_code == 503
 
         assert _public(client).status_code == 503
+
+
+def test_started_append_pending_get_is_nonblocking_then_resumes_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _client(tmp_path) as client:
+        journal = client.app.state.event_journal
+        real_append = journal.append_started
+        entered, release = Event(), Event()
+
+        def stalled_successful_append(event):
+            entered.set()
+            if not release.wait(20):
+                raise RuntimeError("fixture STARTED delay")
+            return real_append(event)
+
+        monkeypatch.setattr(journal, "append_started", stalled_successful_append)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            chat_future = pool.submit(_send_chat, client, "g1p-started-success")
+            try:
+                assert entered.wait(15)
+                assert client.app.state.context_committed_reads.status is (
+                    ContextPublicationStatus.STARTED_CHECKPOINT_PENDING
+                )
+                assert _public(client).status_code == 503
+            finally:
+                release.set()
+            assert chat_future.result(timeout=40).status_code == 200
+        final = _public(client)
+        assert final.status_code == 200
+        assert final.headers["x-context-terminal-sequence"] == "1"
 
 
 def test_frozen_context_view_recovers_after_clean_restart(tmp_path: Path) -> None:
