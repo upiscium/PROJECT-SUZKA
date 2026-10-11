@@ -4,29 +4,43 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
-from suzka.runtime import ContextType
 
 from test_fastapi_backend import PRIVATE_SENTINEL, _client, admin_headers
 from suzka.runtime import EventLifecycle
 
 
 def _seed(client: TestClient) -> tuple[str, str]:
-    registry = client.app.state.main_loop.context_registry
-    first = registry.create("ctx-a", ContextType.CONVERSATION, "web")
-    second = registry.create("ctx-b", ContextType.CONVERSATION, "web")
-    return first.context_id, second.context_id
+    """Create two publicly committed Contexts via genuine CHAT events.
+
+    Direct ContextRegistry.create() is speculative until an event terminates
+    and can no longer be used as a public-GET fixture under G1-P.
+    """
+    for session in ("g1p-seed-a", "g1p-seed-b"):
+        result = client.post(
+            "/api/chat",
+            json={
+                "message": "context fixture (synthetic)",
+                "attachments": [],
+                "client_session_id": session,
+            },
+        )
+        assert result.status_code == 200
+    frames = client.app.state.main_loop.context_registry.state.frames
+    return tuple(
+        next(frame.context_id for frame in frames if frame.source_session_id == session)
+        for session in ("g1p-seed-a", "g1p-seed-b")
+    )
 
 
 def test_context_api_requires_admin_and_projects_deterministically(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
-        _seed(client)
+        first, second = _seed(client)
         assert client.get("/api/contexts").status_code == 401
         response = client.get("/api/contexts", headers=admin_headers())
         assert response.status_code == 200
-        assert [item["context_id"] for item in response.json()["contexts"]] == [
-            "ctx-a",
-            "ctx-b",
-        ]
+        assert [item["context_id"] for item in response.json()["contexts"]] == sorted(
+            (first, second)
+        )
         assert set(response.json()["contexts"][0]) == {
             "context_id",
             "context_type",
