@@ -7,6 +7,7 @@ No new durable file or journal schema is introduced by this module.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from threading import RLock
@@ -84,6 +85,29 @@ class CommittedContextReadModel:
             if self._status is not ContextPublicationStatus.READY:
                 raise ContextPublicationUnavailable("Committed Context is unavailable")
             return self._view
+
+    def append_started_checkpoint(self, append: Callable[[], None]) -> None:
+        """Fence STARTED append failure against newly admitted Context GETs.
+
+        This is a short critical section for one R07 append, never held over
+        handler/model execution. A failed journal STARTED checkpoint becomes
+        DEGRADED before any subsequent GET may acquire the same read gate.
+        """
+        if not callable(append):
+            raise TypeError("STARTED checkpoint must be callable")
+        with self._lock:
+            if (
+                self._status is not ContextPublicationStatus.READY
+                or self._pending is not None
+            ):
+                raise ContextPublicationUnavailable("Context STARTED gate unavailable")
+            try:
+                append()
+            except BaseException:
+                self._pending = None
+                self._restoring = None
+                self._status = ContextPublicationStatus.DEGRADED
+                raise
 
     def begin_terminal(
         self, *, event_id: str, sequence: int, expected_previous: PublishedContextView
