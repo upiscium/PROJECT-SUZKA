@@ -34,3 +34,12 @@ Focused commands:
 Required before Ready or Merge: all backend tests, exact-head CI, independent correctness and security review, CP7 complete public/private Context-derived reader inventory, and separate Human integration approval. Do not claim G2 physically pure source reading or P1 genuine autobiographical reinterpretation.
 
 Design is bounded to G1-P. If the reader inventory reveals out-of-scope R14 or AgentState mutation needed, stop and request explicit Human rescoping.
+
+## STARTED checkpoint race fence
+
+Following independent Reviewer feedback, the short public GET admission lock also
+protects the Journal STARTED checkpoint append. If it fails, the read model
+is marked DEGRADED before any *new* GET can acquire the same lock and receive
+READY. A GET admitted earlier may finish using its immutable old snapshot.
+The checkpoint lock is never held across handler/model execution. This is an
+API consistency safeguard, not a G2 source verifier or a B quota/ticket lock.
