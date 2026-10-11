@@ -322,7 +322,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         def started_checkpoint(event: AgentEvent) -> None:
-            app.state.event_journal.append_started(event)
+            # STARTED append errors occur before any other G1-P callback.
+            # Fence the short Journal append against GET admission, so no
+            # new READY read can linearize after the append has failed but
+            # before AgentRuntime enters FAILED.
+            app.state.context_committed_reads.append_started_checkpoint(
+                lambda: app.state.event_journal.append_started(event)
+            )
 
         def preparation_checkpoint(event: AgentEvent, value: object) -> object:
             try:
