@@ -82,3 +82,46 @@ Score results have authority_scope P0_BENCHMARK_ONLY_NOT_R15. They are NOT nativ
 - P1 NarrativeSelf: a genuinely admitted first-person interpretation BEFORE the contrary experience, qualified independent E2 evidence and an R15-owned semantic revision of the same prior episode. P0 factual relabeling or model text saying "I learned" cannot satisfy P1.
 
 No R07-R15 production code, U1 semantic contract, source authentication, runtime persistence, model, DB1 source authority or private-data retention policy is modified by this pilot. G1-G4 and #288 remain HOLD.
+
+## Test-only evidence projection and source-gated adjudication
+
+The optional evidence_gate.py experiment is **not** a replacement for R08, R14,
+R12 or R15. It is an evaluator-side control designed to separate *source presence*
+from *interpretation*. It never mutates a Suzka domain or creates a subject
+admission. Its manifest checksum proves only local consistency, not authenticated
+R07 finality or a legitimate model belief.
+
+- select_evidence: validates the sealed synthetic manifest and original capture;
+  projects only the A/B scenario setup request, exact E question/visible answer,
+  and (when actually present) the later E2 user clarification. It omits the
+  model's response to the reveal, which is not evidence of original intent.
+  All required excerpts are selected or none are: if they exceed the given
+  UTF-8 byte budget, selection is OVER_BUDGET and the model must NOT be called.
+  It never clips a required source to make it fit.
+- model_question: makes a readable Japanese source packet for a test model,
+  with explicit UNKNOWN instructions. This source packet is benchmark-derived,
+  NOT a validated R14 prompt policy or verified R07/R12/R09 source join.
+- parse_triplet: accepts only three closed keyed rows. Free text, fabricated
+  choices, out-of-domain targets and malformed values are rejected.
+- gate_model_claim: compares the raw model answer to the actually included E2
+  and the evaluator's independent/confirmed E-response annotation. Without E2,
+  accepted target and relation must be UNKNOWN even when the model asserts
+  a confident A/B value. Without a separately confirmed original response
+  label, neither the historical choice nor the match relation can be treated
+  as known. Incorrect model fields are recorded as rejected, not magically
+  changed into a correct model answer.
+
+Important: the independent_e_annotation argument is an evaluator assertion,
+not a cryptographic proof; the entire gate is TEST ONLY. Passing the gate is
+**neither evidence of first-person interpretation, nor of P1 NarrativeSelf**.
+No raw user conversation or production private transcript should be provided.
+
+Run the additional focused controls from the repository root:
+
+    nix develop --command uv run pytest -q tests/test_r15_p0_evidence_gate.py
+    nix develop --command uv run ruff check experiments/r15_p0/evidence_gate.py tests/test_r15_p0_evidence_gate.py
+
+This experiment is deliberately separate from the frozen R08 2048-byte policy,
+R14 canonical JSON rendering, and R15 U1 semantics. A production mechanism
+would require new approved source custody, semantic authority, privacy and
+capacity proof. DO NOT treat a larger *test* budget as production authorization.
