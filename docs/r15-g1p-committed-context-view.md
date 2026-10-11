@@ -37,9 +37,11 @@ Design is bounded to G1-P. If the reader inventory reveals out-of-scope R14 or A
 
 ## STARTED checkpoint race fence
 
-Following independent Reviewer feedback, the short public GET admission lock also
-protects the Journal STARTED checkpoint append. If it fails, the read model
-is marked DEGRADED before any *new* GET can acquire the same lock and receive
-READY. A GET admitted earlier may finish using its immutable old snapshot.
-The checkpoint lock is never held across handler/model execution. This is an
-API consistency safeguard, not a G2 source verifier or a B quota/ticket lock.
+Following independent Reviewer feedback, STARTED checkpoint admission atomically
+moves the public read gate to STARTED_CHECKPOINT_PENDING. The lock is then
+released BEFORE the durable Journal STARTED append, so new Context GETs
+return generic 503 promptly even if disk I/O is stalled. A verified append
+restores the old READY generation; a failed append leaves DEGRADED. A GET
+admitted earlier may finish from its immutable old snapshot. No read gate
+lock spans durable I/O, handler/model generation or coordinator callbacks.
+This is an API consistency safeguard, not a G2 source verifier or a B lock.
