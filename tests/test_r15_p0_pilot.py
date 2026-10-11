@@ -283,7 +283,8 @@ class P0FixtureTests(unittest.TestCase):
         for base_url in (
             "https://127.0.0.1:8000",
             "http://example.com:8000",
-            "http://localhost:8000@evil.example",
+            "http://p0-test-user@localhost:8000",
+            "http://evil.example:8000",
             "http://localhost:8000/path",
             "http://localhost:8000?redirect=elsewhere",
         ):
