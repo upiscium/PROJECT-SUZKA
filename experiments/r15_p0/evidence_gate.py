@@ -45,7 +45,8 @@ class EvidencePacket:
     def source_value(self) -> dict[str, Any]:
         return {
             "authority": "P0_BENCHMARK_OBSERVATION_ONLY",
-            "case_id": self.case_id,
+            # case_id is evaluator-private; some control IDs encode the hidden
+            # A/B target and MUST NOT be emitted in model-facing evidence.
             "reveal_state": "PRESENT" if self.has_reveal else "ABSENT",
             "sources": [
                 {
