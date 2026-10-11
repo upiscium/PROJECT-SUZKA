@@ -12,6 +12,7 @@ from experiments.r15_p0.pilot import (
     Choice,
     Relation,
     atomic_private_create,
+    blinded_e_packet,
     expected_relation,
     pilot_cases,
     read_sealed,
@@ -99,6 +100,8 @@ class P0FixtureTests(unittest.TestCase):
         self.assertEqual(sum(case.lane == "natural" for case in standard), 4)
         self.assertEqual(sum(case.lane == "forced" for case in standard), 4)
         self.assertEqual(sum(case.control != "normal" for case in cases), 4)
+        for variant in range(4):
+            self.assertNotEqual(standard[variant].target, standard[variant + 4].target)
 
     def test_target_is_not_indicated_before_reveal(self) -> None:
         case = Case("no-leak", "B", "natural", 1)
@@ -109,6 +112,26 @@ class P0FixtureTests(unittest.TestCase):
             self.assertNotIn("事前に指定", transport.calls[1])
             self.assertIn("案Bです", transport.calls[2])
             self.assertTrue(score_capture(manifest, capture, ann)["probe_correct"])
+
+    def test_blinded_packet_excludes_reveal_and_case_target(self) -> None:
+        case = Case("blind-out", "B", "natural", 0)
+        temp, manifest, capture, _ann, _transport = fixture(case, Choice.A)
+        with temp:
+            packet = blinded_e_packet(manifest, capture)
+            payload = json.dumps(packet, ensure_ascii=False)
+            self.assertEqual(packet["visible_answer_E"], "元の応答")
+            self.assertNotIn("case_id", packet)
+            self.assertNotIn("sealed_target", packet)
+            self.assertNotIn("今回の比較実験で事前に", payload)
+            self.assertNotIn("元の回答との一致", payload)
+            self.assertNotIn("blind-out", payload)
+
+    def test_explicit_control_not_blind_to_target(self) -> None:
+        case = Case("explicit-cont", "B", "natural", 1, "explicit")
+        temp, manifest, capture, _ann, _transport = fixture(case, Choice.B)
+        with temp:
+            with self.assertRaisesRegex(ValueError, "expose the target"):
+                blinded_e_packet(manifest, capture)
 
     def test_seal_is_immutable_and_changed_target_fails(self) -> None:
         with TemporaryDirectory() as folder:
