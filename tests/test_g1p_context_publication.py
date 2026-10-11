@@ -332,6 +332,41 @@ def test_started_journal_checkpoint_failure_disables_get(
         assert _public(client).status_code == 503
 
 
+def test_started_failure_cannot_race_a_ready_get_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A GET newly admitted after failed STARTED append must never see READY."""
+    with _client(tmp_path) as client:
+        journal = client.app.state.event_journal
+        entered_append, release_append, submitted_get = Event(), Event(), Event()
+
+        def stalled_failing_started(_event):
+            entered_append.set()
+            if not release_append.wait(20):
+                raise RuntimeError("synthetic STARTED barrier timeout")
+            raise RuntimeError("synthetic STARTED append failed")
+
+        monkeypatch.setattr(journal, "append_started", stalled_failing_started)
+
+        def ask_public():
+            submitted_get.set()
+            return _public(client)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            post = pool.submit(_send_chat, client, "g1p-started-fail-race")
+            try:
+                assert entered_append.wait(15)
+                get = pool.submit(ask_public)
+                assert submitted_get.wait(15)
+                assert not get.done()  # same short publication/append lock
+            finally:
+                release_append.set()
+            assert post.result(timeout=40).status_code in (500, 503)
+            assert get.result(timeout=40).status_code == 503
+
+        assert _public(client).status_code == 503
+
+
 def test_frozen_context_view_recovers_after_clean_restart(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         assert _send_chat(client, "g1p-clean-restart").status_code == 200
