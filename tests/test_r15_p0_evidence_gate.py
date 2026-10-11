@@ -134,12 +134,14 @@ def test_no_annotation_cannot_assert_original_choice_or_relation() -> None:
 
 
 def test_missing_reveal_must_force_unknown_even_if_model_hallucinates_target() -> None:
-    temp, manifest, capture = fixture(Case("no-e2", "B", "forced", 2, "no_reveal"))
+    temp, manifest, capture = fixture(Case("p0-no-reveal-b", "B", "forced", 2, "no_reveal"))
     with temp:
         selected = select_evidence(manifest, capture)
         assert selected.packet is not None and not selected.packet.has_reveal
         assert [x["step"] for x in selected.packet.source_value()["sources"]] == ["setup", "E"]
         assert selected.packet.source_value()["reveal_state"] == "ABSENT"
+        assert "case_id" not in selected.packet.source_value()
+        assert "p0-no-reveal-b" not in model_question(selected)
         assert "事前に指定されていた参照先" not in model_question(selected)
         wrong = gate_model_claim(
             manifest, capture, selected, triplet("A", "B", "MATCH"),
