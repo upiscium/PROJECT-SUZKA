@@ -15,11 +15,11 @@ The existing Suzka public POST /api/chat returns episode_id and response, but ne
 ## Files and deterministic tests
 
 - pilot.py: synthetic case table, manifest precommit, chat HTTP capture, strict run-record validation and manually annotated scoring.
-- test_pilot.py: 4 core classes plus adversarial and failure tests. All fixtures are synthetic, not real Suzka semantic output.
+- tests/test_r15_p0_pilot.py: 4 core classes plus adversarial and failure tests. All fixtures are synthetic, not real Suzka semantic output.
 
 From the repository root:
 
-    python3 -m unittest -q experiments.r15_p0.test_pilot
+    python3 -m unittest discover -s tests -p test_r15_p0_pilot.py -q
     python3 -m compileall -q experiments/r15_p0
     python3 -m experiments.r15_p0.pilot cases
 
