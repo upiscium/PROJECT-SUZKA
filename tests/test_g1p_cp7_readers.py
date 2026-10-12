@@ -100,7 +100,14 @@ def _external_reader_probe(
         "value-detail": _get(client, f"/api/values/{value_id}"),
         "value-revisions": _get(client, f"/api/values/{value_id}/revisions"),
         "emotion": _get(client, "/api/state/emotion"),
-        "memory": _get(client, "/api/memory/search", query="cp7-reader-probe"),
+        # This is the actual in-flight CHAT message, not an unrelated probe.
+        # DB1 retrieval may differ by lifecycle; we inspect only Context-derived
+        # metadata without claiming R12/G2 terminal source attestation.
+        "memory": _get(
+            client,
+            "/api/memory/search",
+            query="G1-P synthetic committed-context test",
+        ),
         "memory-episode": _get(client, f"/api/memory/episodes/{episode_id}"),
         "memory-semantic": _get(client, f"/api/memory/semantic/{semantic_id}"),
         "adapters": _get(client, "/api/adapters"),
@@ -132,6 +139,9 @@ def test_cp7_context_derived_reader_matrix_does_not_expose_pending_event(
         prior_context = _public(client).json()
         prior_values = _get(client, "/api/values").json()
         prior_attention = client.app.state.main_loop.attention_view()
+        expected_event_sequence = (
+            client.app.state.context_committed_reads.snapshot().terminal_sequence + 1
+        )
 
         if phase == "external_finalize":
             owner = client.app.state.transaction_coordinator
@@ -194,6 +204,11 @@ def test_cp7_context_derived_reader_matrix_does_not_expose_pending_event(
                     # before the Context externally-terminal publication gate.
                     # This private availability is NOT an R07/G2 source proof.
                     assert current_attention != prior_attention
+                    assert current_attention.event is not None
+                    assert (
+                        current_attention.event.event_sequence
+                        == expected_event_sequence
+                    )
                 assert current_attention is not None
             finally:
                 release.set()
@@ -215,6 +230,20 @@ def test_cp7_second_debug_event_cannot_export_prompt_before_first_terminal(
     with _client(tmp_path, provider=provider) as client:
         session = f"cp7-queued-{phase}"
         prior = _public(client).json()
+        terminal_published, debug_handler_entered = Event(), Event()
+        publication = client.app.state.context_committed_reads
+        first_sequence = publication.snapshot().terminal_sequence + 1
+        original_publish_terminal = publication.publish_terminal
+
+        def observe_terminal_publication(**kwargs):
+            result = original_publish_terminal(**kwargs)
+            if kwargs.get("sequence") == first_sequence:
+                terminal_published.set()  # AFTER actual whole Context view swap
+            return result
+
+        monkeypatch.setattr(
+            publication, "publish_terminal", observe_terminal_publication
+        )
         if phase == "model":
             started, release = provider.started, provider.release
         else:
@@ -242,10 +271,24 @@ def test_cp7_second_debug_event_cannot_export_prompt_before_first_terminal(
         original_submit = runtime.submit
 
         def observed_submit(event_type, source, handler):
-            submitted = original_submit(event_type, source, handler)
             if event_type is AgentEventType.DEBUG_CHAT:
+
+                def assert_prior_terminal_before_debug_execution():
+                    # Deterministic at the actual DEBUG handler boundary. A
+                    # concurrent event regression cannot hide behind a fast
+                    # one-shot check of a Future before it ran.
+                    assert terminal_published.is_set(), (
+                        "DEBUG executed before previous event terminal publication"
+                    )
+                    debug_handler_entered.set()
+                    return handler()
+
+                submitted = original_submit(
+                    event_type, source, assert_prior_terminal_before_debug_execution
+                )
                 admitted_debug.set()
-            return submitted
+                return submitted
+            return original_submit(event_type, source, handler)
 
         monkeypatch.setattr(runtime, "submit", observed_submit)
 
@@ -269,6 +312,20 @@ def test_cp7_second_debug_event_cannot_export_prompt_before_first_terminal(
                 assert live.frames[0].source_session_id == session
                 second_future = pool.submit(debug_request)
                 assert admitted_debug.wait(15), "Debug was not submitted"
+                # Inspect the *actual* runtime queue under its condition lock.
+                # The first CHAT is still active and DEBUG is enqueued behind
+                # it; the guarded DEBUG handler also checks publication when
+                # it eventually executes after this barrier is released.
+                with runtime._condition:
+                    assert runtime._active is not None
+                    assert runtime._active[1].event_type is AgentEventType.CHAT
+                    queued_debug = [
+                        item
+                        for item in runtime._pending
+                        if item.event.event_type is AgentEventType.DEBUG_CHAT
+                    ]
+                    assert len(queued_debug) == 1
+                    assert not queued_debug[0].future.done()
                 assert not second_future.done(), (
                     "Debug response escaped before terminal"
                 )
@@ -281,6 +338,8 @@ def test_cp7_second_debug_event_cannot_export_prompt_before_first_terminal(
             assert first_future.result(timeout=45).status_code == 200
             debug_response = second_future.result(timeout=45)
             assert debug_response.status_code == 200
+            assert terminal_published.is_set()
+            assert debug_handler_entered.is_set()
             # This DEBUG result is allowed to see the prior, now-committed
             # episode; it MUST NOT return before the first terminal checkpoint.
             assert "prompt" in debug_response.json()

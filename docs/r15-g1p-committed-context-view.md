@@ -80,6 +80,9 @@ including R11 config-seeds/detail/revisions and **successful** DB1 episode and
 DB2 semantic detail reads using deliberately synthetic **pre-existing test
 rows**. The DB1/DB2 fixture writers are legacy/test-only and do NOT establish
 G2 source authority; no semantic lifecycle or no-write proof is inferred.
+The Memory search uses the **actual pending CHAT message** as its query
+rather than an unrelated probe string; source-owned retrieval may legitimately
+show existing text without attesting the same event's Context generation.
 During each CP1–CP4 probe, Context GETs with **missing and forged** admin tokens
 must both return 401, even when authorized callers see generic 503. A generic
 503 is an availability/timing signal to an already-authorized caller, not a
@@ -92,15 +95,21 @@ promise that a pending transaction's existence is itself secret.
   Private committed R14 read view remains the previous generation here.
 - **CP2** frozen R07 external finalization after internal commit: Context GET
   remains prior terminal/404 and other API readers do not disclose a newly
-  introduced Context session ID; **private** R14 read view has already changed.
+  introduced Context session ID; **private** R14 read view has already changed,
+  and its `AttentionEvent.event_sequence` equals the held runtime event's
+  sequence (not a verified R09 actor/Context source).
 - **CP3** frozen event-terminal completion: new Context GETs return bounded
   generic 503 with no source ID or generation header; unrelated allowed
   HTTP readers are separately checked, and private R14 can remain ahead.
 - **CP1–CP3/CP6** a second authenticated DEBUG_CHAT really enters the runtime
-  queue (instrumented `AgentRuntime.submit`) but **cannot finish its HTTP
-  response before the earlier event terminal**; only after release may its
-  prompt/Context observations become visible. Admin POST generation is
-  additionally tested in `tests/test_context_api.py`.
+  queue (instrumented `AgentRuntime.submit`); the test verifies the active
+  first CHAT and pending DEBUG under the actual runtime `Condition` lock,
+  rather than relying only on an immediate `Future.done()` check. Its
+  wrapped handler asserts that the first `publish_terminal()` has **actually
+  completed the whole Context swap** before the DEBUG handler begins; thus a
+  concurrent-execution regression deterministically fails. Only after the
+  first event terminal may the DEBUG prompt/Context become visible. Admin
+  POST generation is additionally tested in `tests/test_context_api.py`.
 - **CP4/CP5** failing model handler: the old Context view and R09 registry
   are restored; cross-domain negative reads still do not expose a provisional
   session. Failure **after** durable terminal but **before** Context-view swap:
