@@ -1,6 +1,12 @@
 """Administrative context lifecycle and relation routes."""
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+
+from suzka.api.context_read_model import (
+    CommittedContextReadModel,
+    ContextPublicationUnavailable,
+    PublishedContextView,
+)
 
 from suzka.api.dependencies import get_agent_runtime, get_main_loop, require_admin
 from suzka.api.runtime_execution import execute
@@ -15,8 +21,8 @@ from suzka.runtime import (
     AgentEventSource,
     AgentEventType,
     AgentRuntime,
+    AgentRuntimeStatus,
     ContextFrame,
-    ContextNotFound,
     ContextRegistry,
     SuzkaMainLoop,
 )
@@ -29,6 +35,30 @@ router = APIRouter(
 
 def _registry(main_loop: SuzkaMainLoop) -> ContextRegistry:
     return main_loop.context_registry
+
+
+def _published_context(request: Request, response: Response) -> PublishedContextView:
+    """One externally terminal generation per request (never the live registry)."""
+
+    model = getattr(request.app.state, "context_committed_reads", None)
+    runtime = getattr(request.app.state, "agent_runtime", None)
+    # Fail-stopped runtime paths such as STARTED append errors do not run the
+    # later publication checkpoints. Never claim a healthy public generation
+    # while the event's durability is indeterminate.
+    if isinstance(runtime, AgentRuntime) and runtime.status is AgentRuntimeStatus.FAILED:
+        raise HTTPException(status_code=503, detail="Committed Context unavailable")
+    if not isinstance(model, CommittedContextReadModel):
+        raise HTTPException(status_code=503, detail="Committed Context unavailable")
+    try:
+        published = model.snapshot()
+    except ContextPublicationUnavailable:
+        raise HTTPException(
+            status_code=503, detail="Committed Context unavailable"
+        ) from None
+    response.headers["X-Context-Terminal-Sequence"] = str(published.terminal_sequence)
+    response.headers["X-Context-Revision"] = str(published.state.revision)
+    response.headers["X-Context-Visibility"] = "ready"
+    return published
 
 
 def _context_id(value: str) -> str:
@@ -61,9 +91,10 @@ def _frame(frame: ContextFrame, current_context_id: str | None) -> ContextFrameR
 
 @router.get("", response_model=ContextListResponse)
 def list_contexts(
-    main_loop: SuzkaMainLoop = Depends(get_main_loop),
+    request: Request,
+    response: Response,
 ) -> ContextListResponse:
-    state = _registry(main_loop).state
+    state = _published_context(request, response).state
     return ContextListResponse(
         current_context_id=state.current_context_id,
         contexts=tuple(
@@ -74,15 +105,14 @@ def list_contexts(
 
 @router.get("/{context_id}", response_model=ContextFrameResponse)
 def get_context(
-    context_id: str, main_loop: SuzkaMainLoop = Depends(get_main_loop)
+    context_id: str, request: Request, response: Response
 ) -> ContextFrameResponse:
     checked = _context_id(context_id)
-    registry = _registry(main_loop)
-    try:
-        frame = registry.get(checked)
-    except ContextNotFound as exc:
-        raise HTTPException(status_code=404, detail="Context not found") from exc
-    return _frame(frame, registry.current_context_id)
+    state = _published_context(request, response).state
+    frame = next((frame for frame in state.frames if frame.context_id == checked), None)
+    if frame is None:
+        raise HTTPException(status_code=404, detail="Context not found")
+    return _frame(frame, state.current_context_id)
 
 
 def _transition(
@@ -95,10 +125,17 @@ def _transition(
     checked = _context_id(context_id)
     registry = _registry(main_loop)
     handler = getattr(registry, operation)
-    frame = execute(
-        runtime, AgentEventType.CONTEXT_UPDATE, source, lambda: handler(checked)
+
+    def mutate_and_project() -> ContextFrameResponse:
+        # Capture BOTH frame and current pointer in the same serialized event.
+        # execute() returns it only after terminal completion; never consult
+        # the next event's speculative registry after that boundary.
+        frame = handler(checked)
+        return _frame(frame, registry.current_context_id)
+
+    return execute(
+        runtime, AgentEventType.CONTEXT_UPDATE, source, mutate_and_project
     )
-    return _frame(frame, registry.current_context_id)
 
 
 @router.post("/{context_id}/suspend", response_model=ContextFrameResponse)
@@ -144,18 +181,19 @@ def relate_context(
     checked = _context_id(context_id)
     registry = _registry(main_loop)
 
-    def relate_and_read() -> tuple[ContextFrame, ContextFrame]:
+    def relate_and_project() -> ContextRelationResponse:
         registry.relate(checked, request.related_context_id)
-        return registry.get(checked), registry.get(request.related_context_id)
+        left = registry.get(checked)
+        right = registry.get(request.related_context_id)
+        current = registry.current_context_id
+        ordered = tuple(sorted((left, right), key=lambda frame: frame.context_id))
+        return ContextRelationResponse(
+            contexts=tuple(_frame(frame, current) for frame in ordered)
+        )
 
-    left, right = execute(
+    return execute(
         runtime,
         AgentEventType.CONTEXT_UPDATE,
         AgentEventSource.API_CONTEXT_RELATE,
-        relate_and_read,
-    )
-    current = registry.current_context_id
-    ordered = tuple(sorted((left, right), key=lambda frame: frame.context_id))
-    return ContextRelationResponse(
-        contexts=tuple(_frame(frame, current) for frame in ordered)
+        relate_and_project,
     )

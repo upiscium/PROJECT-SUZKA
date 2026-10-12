@@ -14,6 +14,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from suzka.api.routes import adapters, chat, contexts, debug, memory, sleep, values
+from suzka.api.context_read_model import (
+    CommittedContextReadModel,
+    PublishedContextView,
+)
 from suzka.config import Settings, get_settings
 from suzka.identity import ValueConflictDefinition
 from suzka.learning import AdapterRegistry, SleepCycleManager
@@ -229,6 +233,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             app.state.working_memory = app.state.main_loop.working_memory
             app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
+            # Only a reconciled, externally terminal AgentState snapshot may
+            # initialize public Context GETs. Never seed from a worker's live
+            # (potentially speculative) registry at query time. No B capture
+            # is installed by G1-P; this projection is NOT G2 source evidence.
+            restored_context = app.state.main_loop.context_registry.state
+            historical_context = getattr(snapshot, "context_state", None)
+            if historical_context is None:
+                # Older legal v1/v2 snapshots have no R09 Context root. A
+                # clean, empty restored registry is the only public projection.
+                if (
+                    restored_context.revision != 0
+                    or restored_context.frames
+                    or restored_context.current_context_id is not None
+                    or restored_context.interlocutor_bindings
+                ):
+                    raise StateRecoveryError("Legacy Context restoration is not empty")
+            elif restored_context != historical_context.to_registry_state():
+                raise StateRecoveryError("Context bootstrap does not match AgentState")
+            initial_context_view = PublishedContextView(
+                restored_context,
+                snapshot.last_processed_event_sequence,
+                snapshot_hash,
+            )
+            app.state.context_committed_reads = CommittedContextReadModel(
+                initial_context_view,
+                ready=not app.state.external_reconciliation_required,
+            )
             if isinstance(app.state.main_loop, SuzkaMainLoop):
                 checkpoint_read_views = getattr(
                     app.state.main_loop,
@@ -271,6 +302,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise
         committed_snapshot: CompatibleAgentStateSnapshot = snapshot
         committed_snapshot_hash = snapshot_hash
+        committed_context_view = initial_context_view
         committed_read_views = initial_committed_read_views
         app.state.transaction_coordinator = TransactionCoordinator(
             app.state.event_journal,
@@ -290,12 +322,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         def started_checkpoint(event: AgentEvent) -> None:
-            app.state.event_journal.append_started(event)
+            # STARTED append errors occur before any other G1-P callback.
+            # Fence the short Journal append against GET admission, so no
+            # new READY read can linearize after the append has failed but
+            # before AgentRuntime enters FAILED.
+            app.state.context_committed_reads.append_started_checkpoint(
+                lambda: app.state.event_journal.append_started(event)
+            )
 
         def preparation_checkpoint(event: AgentEvent, value: object) -> object:
-            return app.state.transaction_coordinator.prepare_result(event, value)
+            try:
+                return app.state.transaction_coordinator.prepare_result(event, value)
+            except BaseException:
+                # Runtime treats preparation uncertainty as fail-stop; the
+                # last public terminal state must not claim healthy freshness.
+                app.state.context_committed_reads.degrade()
+                raise
 
-        def internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
+        def _internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
             nonlocal committed_snapshot, committed_snapshot_hash
             nonlocal committed_read_views
             sequence = event.processing_sequence
@@ -358,31 +402,95 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             committed_snapshot_hash = candidate_hash
             return evidence
 
+        def internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
+            try:
+                return _internal_commit_checkpoint(event)
+            except BaseException:
+                # A failed or uncertain internal commit cannot leave a READY
+                # public view that implies the runtime remains healthy.
+                app.state.context_committed_reads.degrade()
+                raise
+
         def finalization_checkpoint(event: AgentEvent, evidence: object) -> None:
-            if not isinstance(evidence, InternalCommitEvidence):
-                raise StateRecoveryError("Internal commit evidence is unavailable")
-            app.state.transaction_coordinator.finalize_event(event, evidence)
+            try:
+                if not isinstance(evidence, InternalCommitEvidence):
+                    raise StateRecoveryError("Internal commit evidence is unavailable")
+                app.state.transaction_coordinator.finalize_event(event, evidence)
+            except BaseException:
+                app.state.context_committed_reads.degrade()
+                raise
 
         def terminal_completion_checkpoint(event: AgentEvent, evidence: object) -> None:
-            if not isinstance(evidence, InternalCommitEvidence):
-                raise StateRecoveryError("Internal commit evidence is unavailable")
-            app.state.state_recovery.complete_committed_event(event, evidence)
-            app.state.semantic_receipt_retention.after_terminal_completion()
+            nonlocal committed_context_view
+            try:
+                if not isinstance(evidence, InternalCommitEvidence):
+                    raise StateRecoveryError("Internal commit evidence is unavailable")
+                sequence = event.processing_sequence
+                if type(sequence) is not int or sequence <= 0:
+                    raise StateRecoveryError("Context terminal sequence unavailable")
+                if (
+                    not isinstance(committed_snapshot, AgentStateSnapshotV9)
+                    or evidence.snapshot_sequence != sequence
+                    or evidence.snapshot_hash != committed_snapshot_hash
+                    or committed_snapshot.last_processed_event_sequence != sequence
+                ):
+                    raise StateRecoveryError("Context terminal snapshot mismatch")
+                # Stage the immutable result before any terminal publication.
+                candidate = PublishedContextView(
+                    committed_snapshot.context_state.to_registry_state(),
+                    sequence,
+                    committed_snapshot_hash,
+                )
+                public_context = app.state.context_committed_reads
+                # From this linearization point until the full-view swap,
+                # new GETs receive 503. A GET admitted earlier may finish.
+                public_context.begin_terminal(
+                    event_id=event.event_id,
+                    sequence=sequence,
+                    expected_previous=committed_context_view,
+                )
+                app.state.state_recovery.complete_committed_event(event, evidence)
+                app.state.semantic_receipt_retention.after_terminal_completion()
+                # This atomic swap is before AgentRuntime resolves the future.
+                public_context.publish_terminal(
+                    event_id=event.event_id,
+                    sequence=sequence,
+                    candidate=candidate,
+                )
+                committed_context_view = candidate
+            except BaseException:
+                app.state.context_committed_reads.degrade()
+                raise
 
         def failure_checkpoint(event: AgentEvent) -> None:
-            app.state.agent_state_store.restore_into(
-                app.state.main_loop, committed_snapshot
-            )
-            if (
-                committed_read_view_publisher is not None
-                and committed_read_views is not None
-            ):
-                committed_read_view_publisher(committed_read_views)
-            app.state.event_journal.append_failed(
-                event,
-                committed_snapshot.last_processed_event_sequence,
-                committed_snapshot_hash,
-            )
+            public_context = app.state.context_committed_reads
+            prior = public_context.begin_handler_restore()
+            try:
+                app.state.agent_state_store.restore_into(
+                    app.state.main_loop, committed_snapshot
+                )
+                if (
+                    committed_read_view_publisher is not None
+                    and committed_read_views is not None
+                ):
+                    committed_read_view_publisher(committed_read_views)
+                app.state.event_journal.append_failed(
+                    event,
+                    committed_snapshot.last_processed_event_sequence,
+                    committed_snapshot_hash,
+                )
+                if (
+                    prior is not None
+                    and app.state.main_loop.context_registry.state != prior.state
+                ):
+                    raise StateRecoveryError("Context failure restore diverged")
+                # Only a normal pre-commit handler failure re-enables the
+                # previous terminal view. A preparation/internal/finalization
+                # error has already made the projection permanently DEGRADED.
+                public_context.complete_handler_restore(prior)
+            except BaseException:
+                public_context.degrade()
+                raise
 
         try:
             if getattr(app.state, "agent_runtime", None) is None:
