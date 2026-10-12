@@ -31,7 +31,7 @@ Focused commands:
     nix develop --command uv run ruff check suzka/api/context_read_model.py suzka/api/server.py suzka/api/routes/contexts.py
     nix develop --command uv run mypy suzka/api/context_read_model.py suzka/api/server.py suzka/api/routes/contexts.py
 
-Required before Ready or Merge: all backend tests, exact-head CI, independent correctness and security review, CP7 complete public/private Context-derived reader inventory, and separate Human integration approval. Do not claim G2 physically pure source reading or P1 genuine autobiographical reinterpretation.
+Required before Ready or Merge: all backend tests, exact-head CI, independent correctness and security review, CP7 complete public/private Context-derived reader inventory, and separate Human integration approval. Do not claim G2 source-preserving, epoch-coherent joined attestation or P1 genuine autobiographical reinterpretation. G2 no longer requires absolute physical no-write: see [G2 read-contract ADR](adr/2026-10-12-r15-g2-source-preserving-reads.md).
 
 Design is bounded to G1-P. If the reader inventory reveals out-of-scope R14 or AgentState mutation needed, stop and request explicit Human rescoping.
 
@@ -63,7 +63,7 @@ actual code, not inferred merely from OpenAPI routes.
 | `POST /api/chat` — `suzka/api/routes/chat.py::chat`, `runtime_execution.py::execute` | `main_loop._run_chat` creates/selects R09; reads ContextPromptView, R08 and R14 during the event | Only the completed response crosses HTTP. No GET reader of the uncommitted Context is introduced. |
 | `POST /api/chat/debug` — `suzka/api/routes/debug.py::debug_chat` | Exposes private generated **prompt**, Memory excerpts and diagnostics for that DEBUG event; prompt can contain Context derived from **that** handler | Admin only; queued behind earlier AgentRuntime event, delivered after this DEBUG event terminates. A speculative current turn can enter its own prompt, **not** another request's pre-terminal response. Debug is not a source attestor. |
 | `GET /api/values*, /api/values/config-seeds` — `suzka/api/routes/values.py` / `main_loop.value_system` | Existing R11 Value state can include declarative `context_ids`, **not** live R09 current Context | Detached R11 read projection is published at **internal** commit (pre-existing), not by G1-P. A concurrent normal CHAT does not change it in the tested matrix; G1-P does not promise cross-domain external-terminal atomicity here. |
-| `GET /api/memory/search, episodes/{id}, semantic/{id}` — `suzka/api/routes/memory.py`, `schemas/memory.py` | Source-owned DB1/DB2 content and IDs, **no explicit current R09 Context field or R14 Attention projection in these API schemas** | Independently authorized admin source reads; not protected by G1-P's Context gate. Source-owner external finality/physical no-write/retention is a **G2** problem. User-provided text could itself mention a Context identifier; the CP7 negative test checks newly created **metadata**, not an impossible ban on arbitrary text. |
+| `GET /api/memory/search, episodes/{id}, semantic/{id}` — `suzka/api/routes/memory.py`, `schemas/memory.py` | Source-owned DB1/DB2 content and IDs, **no explicit current R09 Context field or R14 Attention projection in these API schemas** | Independently authorized admin source reads; not protected by G1-P's Context gate. Source-owner external finality, evidence preservation, coherent epochs and retention are a **G2** problem; independently classified backend-internal writes are not inherently disqualifying. User-provided text could itself mention a Context identifier; the CP7 negative test checks newly created **metadata**, not an impossible ban on arbitrary text. |
 | `GET /api/state/emotion` — `suzka/api/routes/debug.py::emotion_state` | Live global R10 affect, **not** R09 actor/context attribution | Admin read can reflect in-flight R10 state; does not assert current Context terminality or external cause. Existing R10 contract is not changed. |
 | `GET /api/adapters`, `GET /health` — `suzka/api/routes/adapters.py`, `suzka/api/server.py::health` | Adapter inventory / runtime health, no R09 or R14 data | Independent API read, tested as negative-control routes. |
 | R14 private `main_loop.attention_view()`, `main_loop.r13_view()`, `_committed_read_views` — `suzka/runtime/main_loop.py` | R14 selection can derive from live Context/Working Memory; private R11/Belief/R13/R14 bundle | Existing bundle publishes at **internal** commit. At the CP2/CP3 test barriers `attention_view()` is genuinely newer than its pre-event value **while the public Context GET remains old or 503**. This is *deliberately disclosed as a distinct private generation*, NOT an externally terminal source proof; no direct HTTP route returns `attention_view`. Other trusted internal consumers must not mislabel it as G2 or leak it out of an active event. |
@@ -79,7 +79,7 @@ force an inventory review. It probes every listed public/admin GET method,
 including R11 config-seeds/detail/revisions and **successful** DB1 episode and
 DB2 semantic detail reads using deliberately synthetic **pre-existing test
 rows**. The DB1/DB2 fixture writers are legacy/test-only and do NOT establish
-G2 source authority; no semantic lifecycle or no-write proof is inferred.
+G2 source authority; no semantic lifecycle or G2 authority-preserving source proof is inferred.
 The Memory search uses the **actual pending CHAT message** as its query
 rather than an unrelated probe string; source-owned retrieval may legitimately
 show existing text without attesting the same event's Context generation.
@@ -122,7 +122,7 @@ plugin all share the G1-P external-terminal publication barrier. The measured
 R14 private early publication is **not** a public Context leak in today's
 reachable HTTP routes, but it prohibits treating private `attention_view()`
 as a G2 source proof. They do not establish G1-C historical Context capture,
-physically read-only Chroma, unforgeable nomination, positive EvidenceView,
+source-preserving coherent Chroma verification, unforgeable nomination, positive EvidenceView,
 NarrativeSelf meaning/admission, or v10/WAL behavior. Any future consumer
 exporting the private R14 view, or a discovered Context-derived HTTP field,
 requires a new scope/test gate; **do not silently refactor R14 or AgentState
