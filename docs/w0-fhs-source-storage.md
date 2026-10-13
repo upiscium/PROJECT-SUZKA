@@ -85,8 +85,10 @@ explicitly in a test-specific config; never infer durable source identity
 from the current working directory.
 
 The tests for these examples read the repository artifacts and create only
-disposable journals under `tmp_path`. They do not open Chroma, load models,
-restart a service, or admit real historical source evidence.
+disposable configuration, evaluation-input, Journal, and optional unit fixtures
+under `tmp_path`. Only the synthetic Journal is exercised as persisted source
+storage. They do not open Chroma, load models, restart a service, or admit real
+historical source evidence.
 
 Python and pytest may generate ordinary bytecode/test-runner caches if the
 parent runner permits them. For a cache-free checkout invocation, use
