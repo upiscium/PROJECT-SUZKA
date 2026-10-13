@@ -615,3 +615,33 @@ def test_fifo_evaluation_input_denies_without_blocking(
     candidate.unlink()
     os.mkfifo(candidate, mode=0o600)
     _denied(policy, AdmissionReason.IDENTITY_MISMATCH)
+
+
+def test_verified_original_config_bytes_survive_file_disappearance(
+    source_case: tuple[TrustedAdmissionPolicy, dict],
+) -> None:
+    """I1b can consume exactly the admitted bytes without reopening a path."""
+    from suzka.config.schema import Settings
+
+    policy, original_dict = source_case
+    admitted = admit_source_configuration(policy)
+    verified = admitted._validated_config_bytes
+    assert type(verified) is bytes
+    assert hashlib.sha256(verified).hexdigest() == admitted.config.digest
+    assert "_validated_config_bytes=" not in repr(admitted)
+
+    original_model = Settings.model_validate(original_dict)
+    # All effective service settings are recoverable, not just nine paths:
+    # model, generation, emotion, adapter thresholds, etc.
+    reconstructed = Settings.model_validate(yaml.safe_load(verified))
+    assert reconstructed == original_model
+
+    # An external rename/removal after I1a cannot change the immutable bytes
+    # already observed and verified by the file-descriptor admission.
+    policy.config_path.unlink()
+    assert not policy.config_path.exists()
+    assert Settings.model_validate(
+        yaml.safe_load(admitted._validated_config_bytes)
+    ) == (original_model)
+    with pytest.raises(FrozenInstanceError):
+        admitted._validated_config_bytes = b"changed"  # type: ignore[misc]

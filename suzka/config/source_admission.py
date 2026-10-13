@@ -116,9 +116,15 @@ class AdmittedEvaluation:
 
 @dataclass(frozen=True, slots=True)
 class AdmittedSourceSelection:
-    """Observed immutable data only: ALWAYS barred from owner startup."""
+    """Immutable observation only: NEVER a permit to start source owners.
+
+    The private config bytes are exactly the previously FD-verified and
+    parsed input, not a second pathname read. They may contain private data:
+    repr=False is NOT redaction by generic serializers. Never log/publish.
+    """
 
     config: FileProvenance
+    _validated_config_bytes: bytes = field(repr=False)
     source_paths: tuple[tuple[str, str], ...]
     derived_paths: tuple[tuple[str, str], ...]
     evaluation_inputs: tuple[AdmittedEvaluation, ...] = field(repr=False)
@@ -698,6 +704,7 @@ def admit_source_configuration(
                 _deny(AdmissionReason.SOURCE_MISMATCH)
         return AdmittedSourceSelection(
             config=config_proof,
+            _validated_config_bytes=config_bytes,
             source_paths=paths,
             derived_paths=derived,
             evaluation_inputs=tuple(eval_items),
