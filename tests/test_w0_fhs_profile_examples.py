@@ -19,6 +19,8 @@ import yaml
 
 from suzka.config import Settings
 from suzka.learning.eval_sets import load_eval_sets
+from suzka.memory.experience_store import ExperienceStore
+from suzka.memory.semantic_store import SemanticStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,6 +76,12 @@ def test_example_preserves_base_settings_and_uses_nine_absolute_paths() -> None:
         == STATE_ROOT / "experience"
     )
     assert typed.memory.persist_directory.parent / "semantic" == STATE_ROOT / "semantic"
+    assert ExperienceStore.from_memory_root(typed.memory.persist_directory).root == (
+        STATE_ROOT / "experience"
+    )
+    assert SemanticStore.from_memory_root(typed.memory.persist_directory).root == (
+        STATE_ROOT / "semantic"
+    )
     assert "NOT DEPLOYABLE" in CONFIG_EXAMPLE.read_text(encoding="utf-8")
 
 
@@ -186,18 +194,20 @@ try:
         journal.verify_and_reconcile(0, "a" * 64)
     assert journal.inspect().snapshot_hash == "a" * 64
     st = settings.event_journal.path.stat()
-    print(json.dumps({"device": st.st_dev, "inode": st.st_ino}))
+    print(json.dumps({"path": str(settings.event_journal.path), "device": st.st_dev, "inode": st.st_ino}))
 finally:
     journal.close()
 """
 
-    results: list[dict[str, int]] = []
+    results: list[dict[str, int | str]] = []
     for dirname in ("unrelated-cwd-1", "unrelated-cwd-2"):
         work_dir = tmp_path / dirname
         work_dir.mkdir()
         env = os.environ.copy()
         env["SUZKA_CONFIG_PATH"] = str(config_path)
         env["PYTHONPATH"] = str(ROOT)
+        # Child imports must not create __pycache__ outside tmp_path.
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         run = subprocess.run(
             [sys.executable, "-c", child],
             cwd=work_dir,
@@ -211,7 +221,9 @@ finally:
         results.append(json.loads(run.stdout))
         assert not (work_dir / ".suzka").exists()
 
+    expected_path = tmp_path / "isolated-state/journal/event_journal.jsonl"
     assert len(results) == 2 and results[0] == results[1]
+    assert all(result["path"] == str(expected_path) for result in results)
 
 
 def test_systemd_example_can_be_verified_with_test_interpreter(

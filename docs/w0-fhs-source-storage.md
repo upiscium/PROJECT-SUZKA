@@ -88,6 +88,12 @@ The tests for these examples read the repository artifacts and create only
 disposable journals under `tmp_path`. They do not open Chroma, load models,
 restart a service, or admit real historical source evidence.
 
+Python and pytest may generate ordinary bytecode/test-runner caches if the
+parent runner permits them. For a cache-free checkout invocation, use
+`PYTHONDONTWRITEBYTECODE=1 pytest -p no:cacheprovider ...`; the cross-CWD
+child processes explicitly disable bytecode creation. Such caches are not
+source-owner evidence or part of the persistent-data migration.
+
 ## File ownership and service manager hazards
 
 The intended private state directory is service-owned (for example,
