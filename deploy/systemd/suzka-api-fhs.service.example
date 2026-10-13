@@ -1,0 +1,24 @@
+# W0-I0 DESIGN EXAMPLE - DO NOT INSTALL/ACTIVATE (I1/I2 BLOCKED).
+# The absolute venv path must be deployed from a pinned noneditable package.
+# A pre-service owner-config/continuation preflight is NOT implemented.
+[Unit]
+Description=PROJECT-SUZKA backend (FHS proposal, not activation-ready)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=suzka
+Group=suzka
+EnvironmentFile=/etc/project-suzka/backend.env
+UMask=0077
+RuntimeDirectory=project-suzka
+RuntimeDirectoryMode=0700
+# StateDirectory intentionally omitted: existing evidence must not be chowned.
+# This command is an example. The install location is not active or verified.
+ExecStart=/opt/project-suzka/venv/bin/python3 -m suzka.api.server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
