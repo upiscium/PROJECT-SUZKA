@@ -1,0 +1,108 @@
+# W0-I0 DESIGN EXAMPLE, NOT DEPLOYABLE UNTIL I1/I2 APPROVED
+# This file is an example for /etc/project-suzka/config.yaml.
+# Evaluation inputs must be installed and verified before evaluation.
+# Repository development/dummy model defaults remain; no production activation.
+project:
+  name: PROJECT-SUZKA
+  environment: development
+model:
+  primary_id: google/gemma-4-E4B
+  fallback_id: google/gemma-4-E2B
+  provider: dummy
+  device: auto
+  dtype: auto
+  load_in_4bit: true
+generation:
+  max_new_tokens: 512
+  temperature: 0.7
+  top_p: 0.95
+  do_sample: true
+emotion:
+  baseline_surprisal: 1.0
+  high_emotion_threshold: 0.75
+  decay_rate: 0.05
+memory:
+  persist_directory: /var/lib/project-suzka/chroma
+  db1_collection: hippocampus
+  db2_collection: cortex
+  db1_top_k: 5
+  db2_top_k: 5
+  embedding_model_id: sentence-transformers/all-MiniLM-L6-v2
+  default_record_type: episodic
+working_memory:
+  item_capacity: 32
+  projection_max_bytes: 2048
+sleep:
+  enabled: true
+  dream_dataset_path: /var/lib/project-suzka/dreams/dream_dataset.jsonl
+  min_emotion_score: 0.75
+  max_episodes_per_cycle: 100
+qlora:
+  output_dir: /var/lib/project-suzka/adapters
+  dry_run: true
+  r: 16
+  alpha: 32
+  lora_alpha: 32
+  dropout: 0.05
+  lora_dropout: 0.05
+  learning_rate: 0.0002
+  num_train_epochs: 1
+  max_steps: 10
+adapter_registry:
+  path: /var/lib/project-suzka/adapter_registry.json
+  eval_result_dir: /var/lib/project-suzka/eval_results
+  eval_sets:
+  - /usr/share/project-suzka/eval_sets/default.json
+  trial_threshold: 0.8
+  reject_threshold: 0.4
+  allowed_states:
+  - candidate
+  - trial_active
+  - approved
+  - active
+  - rejected
+  - archived
+  manual_approval_required: true
+api:
+  host: 127.0.0.1
+  port: 8000
+  admin_token_env: SUZKA_ADMIN_TOKEN
+  cors_origins:
+  - http://localhost:3000
+  - http://127.0.0.1:3000
+frontend:
+  base_url: http://localhost:3000
+  api_base_url: http://127.0.0.1:8000
+runtime:
+  queue_capacity: 64
+agent_state:
+  path: /var/lib/project-suzka/agent_state.json
+event_journal:
+  path: /var/lib/project-suzka/journal/event_journal.jsonl
+  max_bytes: 1048576
+  retained_files: 4
+state_wal:
+  directory: /var/lib/project-suzka/state_wal
+values:
+  seeds:
+  - value_id: care
+    name: care
+    scope: subject
+    polarity: 1
+    strength: 0.8
+    confidence: 0.8
+    stability: 0.8
+    allowed_update_rate: 0.05
+  - value_id: honesty
+    name: honesty
+    scope: subject
+    polarity: 1
+    strength: 0.8
+    confidence: 0.8
+    stability: 0.85
+    allowed_update_rate: 0.04
+  conflicts:
+  - conflict_id: compassionate-honesty
+    name: compassionate-honesty
+    left_value_id: care
+    right_value_id: honesty
