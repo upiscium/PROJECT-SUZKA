@@ -641,7 +641,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
-app = create_app()
+# No module-level ASGI app: plain imports must not select ambient settings.
 
 
 def main() -> None:
@@ -649,7 +649,7 @@ def main() -> None:
 
     settings = get_settings()
     uvicorn.run(
-        "suzka.api.server:app",
+        "suzka.api.dev_asgi:app",
         host=settings.api.host,
         port=settings.api.port,
         reload=False,

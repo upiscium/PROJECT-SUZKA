@@ -5,7 +5,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from suzka.api.server import app
+from suzka.api.server import create_app
 from suzka.config import Settings, load_settings
 from suzka.config.schema import (
     AppraisalSettings,
@@ -291,4 +291,5 @@ def test_api_settings_come_from_config() -> None:
 
 
 def test_fastapi_app_is_importable() -> None:
-    assert app.title == load_settings(CONFIG_PATH).project.name
+    settings = load_settings(CONFIG_PATH)
+    assert create_app(settings).title == settings.project.name
