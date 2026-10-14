@@ -7,9 +7,12 @@ change runtime path semantics, create an installation, register an existing
 source, migrate data, install a systemd unit, or authorize G2 evidence issuance.
 
 In particular, **do not install or activate the example service unit**.
-W0-I1 (trusted configuration/source-owner admission) and W0-I2 (external
-installation/continuation registration and pre-service validation) are not
-implemented. Migration and activation each require further Human approval.
+W0-I1a now provides merged, read-only configuration/source observation
+(PR #304), but its result remains `SOURCE_START_BLOCKED_PENDING_I2` and the
+actual served application does not consume that admission. W0-I1b trusted
+production app wiring and W0-I2 external installation/continuation
+registration and pre-service validation are **not** implemented. Migration
+and activation each require further Human approval.
 The active `deploy/systemd/suzka-api.service`, existing
 `deploy/env/backend.env.example`, repository `config.yaml`, and runtime
 configuration loader remain unchanged.
@@ -157,3 +160,40 @@ See [#299](https://github.com/upiscium/PROJECT-SUZKA/issues/299)
 for the approved architectural direction, and
 [#300](https://github.com/upiscium/PROJECT-SUZKA/issues/300)
 for the five-new-file I0 implementation scope.
+
+## W0-I1b-S0a — development-only ASGI import boundary (not service admission)
+
+This section records the bounded, developer-only import split tracked by
+[Issue #307](https://github.com/upiscium/PROJECT-SUZKA/issues/307).
+It does **not** authorize installed service changes, activation, new Source
+Owner startup, or I2 FIRST_INSTALL/CONTINUATION.
+
+- `suzka.api.server` retains `create_app(explicit_settings)` and the current
+  FastAPI lifespan/routes but no longer exports a module-level `app` that
+  silently loads environment/default configuration on import. Plain import
+  is **not** an admission result and does not construct a configured app.
+- `suzka.api.dev_asgi:app` is an **untrusted development-only** ASGI target.
+  Importing it intentionally selects the development config through the
+  current `get_settings()` fallback; it is not an I1a or I2 verified service.
+- `python -m suzka.api.server` and `just api` remain developer commands and
+  use the explicit `dev_asgi:app` Uvicorn target. These commands do **not**
+  provide a trusted production launcher or restrict Source Owner authority.
+- The previous external `suzka.api.server:app` address is **intentionally
+  retired**; existing direct users will fail on import and must be inventoried
+  and migrated before a separately authorized merge/rollout. The repository
+  alone does not prove that other installed clients are unaffected.
+- The existing `deploy/systemd/suzka-api.service` and nonactive FHS example
+  still run the developer module. They have **not** been changed or verified
+  as production installation artifacts and must **not** be started/deployed as
+  an authenticated service. A later root-managed, actual-executable/ASGI
+  admission gate must validate the served production target, not a label in
+  documentation or an arbitrary environment flag.
+
+S0a separates imports only. Later, independently Human-gated S0b/I2 work must
+bind the admitted, exact configuration bytes to the actual served app and
+verify installation/continuation **before** the first JournalLease, WAL,
+Chroma or other persistent Source Owner effect, as well as before any
+systemd-managed state-directory mutation. S0c must constrain all runtime
+injected owners, mutable Source paths and E2 evaluation-input writes. An
+S0a Draft PR may be prepared after code approval, but **merge/rollout remain
+separately Human-gated** because of the intentional `server:app` break.
