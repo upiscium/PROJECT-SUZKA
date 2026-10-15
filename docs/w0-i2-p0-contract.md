@@ -6,8 +6,11 @@ installation guide, a verified bootstrap, or authorization to create,
 replace, recover, or read a real Source Owner.
 
 The module is deliberately disconnected from the application. It must not
-be imported by server.py, dev_asgi.py, I1a, Journal, WAL, Chroma or an
-installed service. It does not read environment settings, install under
+be imported by server.py, dev_asgi.py, I1a, Journal, WAL, Chroma or the
+API worker/Owner code. A future separately Human-gated operator-controlled
+supervisor may use P0 only for nonauthorizing mechanical CAS after its
+privileged authority has been implemented; no installed service currently
+derives boot authority from P0. It does not read environment settings, install under
 /etc or /var, grant root privileges, contact a service, or return a startup
 capability. Existing deployed services must not rely on it.
 
