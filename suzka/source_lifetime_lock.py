@@ -325,6 +325,7 @@ def acquire(policy: Policy) -> LiveClaim:
     sourcefd = -1
     custodyfd = -1
     lockfd = -1
+    handed_off = False
     try:
         sourcefd = _open_directory(
             policy.source, policy.limits, ClaimReason.SOURCE_CHANGED
@@ -352,21 +353,18 @@ def acquire(policy: Policy) -> LiveClaim:
         finally:
             os.close(source_verify)
         claim = LiveClaim(policy, custodyfd, lockfd, sourcefd)
-        try:
-            claim.recheck()
-        except BaseException:
-            # Never leak the lock when revalidation refuses. Keep the
-            # original exception and let the outer cleanup close the FDs.
-            del claim
-            raise
+        # Ownership transfers only after the final recheck succeeds.
+        # A failed recheck takes the outer finally path and closes all FDs.
+        claim.recheck()
+        handed_off = True
         return claim
     except ClaimDenied:
         raise
     except (OSError, OverflowError, UnicodeError, ValueError):
         _deny(ClaimReason.UNSTABLE)
     finally:
-        # Ownership is transferred to a valid claim only on successful return.
-        if "claim" not in locals():
+        # Never rely on locals() or a deleted variable to decide FD ownership.
+        if not handed_off:
             if lockfd >= 0:
                 os.close(lockfd)
             if custodyfd >= 0:

@@ -292,6 +292,23 @@ def test_no_automatic_release_after_cancelled_coordinator(policy: s.Policy) -> N
         fresh.recheck()
 
 
+def test_failed_acquisition_recheck_releases_unreturned_lock(
+    policy: s.Policy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed final recheck must not strand any claimed file descriptor."""
+
+    def reject_recheck(_claim: s.LiveClaim) -> None:
+        raise s.ClaimDenied(s.ClaimReason.SOURCE_CHANGED)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(s.LiveClaim, "recheck", reject_recheck)
+        denied(lambda: s.acquire(policy), s.ClaimReason.SOURCE_CHANGED)
+    # The failed constructor did not return a LiveClaim. The same physical
+    # Source lock must nevertheless be free for a new eligible claimant.
+    with disposable_claim(policy) as fresh:
+        fresh.recheck()
+
+
 def test_recheck_missing_paths_are_typed_and_path_free(policy: s.Policy) -> None:
     claim = s.acquire(policy)
     source = Path(policy.source.path)
