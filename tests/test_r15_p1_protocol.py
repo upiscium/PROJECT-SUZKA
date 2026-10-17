@@ -76,7 +76,7 @@ class FixtureTransport:
         self.s2 = (
             reply(
                 "S2",
-                referent="B",
+                referent="A" if case.control == "no_reveal" else "B",
                 rationale="E2はユーザーの補足であり客観的証明ではない",
                 evidence_steps=["E", "S1"] if case.control == "no_reveal" else None,
             )
@@ -135,6 +135,7 @@ def test_s1_is_physically_recorded_before_transport_observes_e2(tmp_path: Path) 
         "has_e2": True,
         "pre_e2_blind": True,
         "candidate_changed": True,
+        "referent_changed": True,
         "episode_count": 5,
         "production_r15_admission": False,
     }
@@ -151,6 +152,7 @@ def test_no_reveal_has_no_e2_and_does_not_claim_revealed_truth(tmp_path: Path) -
     )
     report = audit_trial(manifest, output)
     assert report["has_e2"] is False
+    assert report["referent_changed"] is False
     assert report["episode_count"] == 4
     assert not transport.checkpoint_observed_before_e2
     assert "補足E2は存在しません" in transport.calls[-1]
@@ -171,11 +173,24 @@ def test_s1_request_is_identical_for_hidden_a_and_b() -> None:
     b = Case("p1-hidden-b", "B", "natural", 0)
     assert a.prompts()["E"] == b.prompts()["E"]
     assert a.prompts()["setup"] == b.prompts()["setup"]
-    assert s1_request() == s1_request()
+    s1_a = s1_request(a.prompts()["E"], "Aを暫定的に選びました")
+    s1_b = s1_request(b.prompts()["E"], "Aを暫定的に選びました")
+    assert s1_a == s1_b
     assert a.prompts()["reveal"] != b.prompts()["reveal"]
+    assert "Aを暫定的に選びました" in s1_a
     for hidden in ("p1-hidden-a", "p1-hidden-b"):
-        assert hidden not in s1_request()
-    assert "事前に指定されていた参照先" not in s1_request()
+        assert hidden not in s1_a
+    assert "事前に指定されていた参照先" not in s1_a
+
+
+def test_s2_prompt_discloses_e2_only_after_e2_exists(tmp_path: Path) -> None:
+    manifest, output, case, transport = run_good(tmp_path)
+    assert transport.checkpoint_observed_before_e2
+    assert case.prompts()["reveal"] not in transport.calls[2]
+    assert case.prompts()["reveal"] in transport.calls[4]
+    assert "synthetic visible answer E" in transport.calls[2]
+    assert "synthetic visible answer E" in transport.calls[4]
+    assert audit_trial(manifest, output)["has_e2"] is True
 
 
 def test_model_reports_are_only_candidates_even_if_rationale_claims_authority(
@@ -318,6 +333,20 @@ def test_files_private_and_non_overwriting(tmp_path: Path) -> None:
         assert stat.S_IMODE(file.stat().st_mode) == 0o600
     with pytest.raises(TrialRefused):
         run_trial(manifest, output, FixtureTransport(output, case))
+
+
+def test_rationale_only_paraphrase_is_not_cognitive_update(tmp_path: Path) -> None:
+    manifest, output, case = paths(tmp_path)
+    fake = FixtureTransport(
+        output,
+        case,
+        s1=reply("S1", referent="A", rationale="最初は案Aと考えた"),
+        s2=reply("S2", referent="A", rationale="今回も案Aと考える"),
+    )
+    run_trial(manifest, output, fake)
+    report = audit_trial(manifest, output)
+    assert report["candidate_changed"] is False
+    assert report["referent_changed"] is False
 
 
 def test_unchanged_s1_s2_candidate_does_not_fabricate_a_revision(

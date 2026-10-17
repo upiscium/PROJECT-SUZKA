@@ -32,14 +32,16 @@ The production R15 schemas and no-change owner remain in Draft PR #285.
 2. A create-only STARTED marker is written before any transport call.
 3. The transport receives setup and E, returning real visible replies and
    distinct episode IDs.
-4. A target-independent S1 prompt asks for a provisional FIRST-PERSON
-   interpretation of E and possible misunderstanding. Its raw model reply
+4. A target-independent S1 prompt includes the already observed E question
+   and visible answer, then asks for a provisional FIRST-PERSON interpretation
+   and possible misunderstanding. No E2/hidden target is included. Its raw model reply
    must parse as a strict candidate. The evaluator create-only writes
    capture.json.s1.json and requests file fsync, directory fsync and readback.
 5. Only AFTER S1 readback does the transport receive the E2 reveal for normal
    and explicit control trials. No-reveal controls OMIT E2 completely.
-6. A separate S2 prompt includes S1 and, where present, newly observed E2.
-   A final create-only capture records all original turns and frozen S1 hash.
+6. A separate S2 prompt quotes the observed E and S1, plus the actual
+   user-statement text of E2 only when E2 exists. A final create-only capture
+   records all original turns and frozen S1 hash.
 7. audit_trial reads marker, checkpoint, manifest and final capture; checks
    stage chronology, original E/S1, exact prompt bytes, episode uniqueness,
    declared evidence-step labels, candidate schemas and canonical hashes.
@@ -66,8 +68,11 @@ rationale may mention belief, trust or capabilities, but doing so has no
 authority or production state effect. Audit status is always
 P1_TEST_ONLY_CANDIDATES_NOT_R15 and production_r15_admission is always false.
 
-The candidate_changed flag only compares modeled candidate values. It does
-not imply NarrativeSelf revision or verified accuracy. Correct P0 objective
+The candidate_changed flag compares the structured assumed referent,
+assessment and uncertainty (not free-text rationale). referent_changed detects
+an A/B/UNKNOWN shift separately, and a same-scenario no-reveal control is
+needed before attributing change to E2. Neither flag proves actual
+NarrativeSelf revision or verified accuracy. Correct P0 objective
 reclassification and a genuine persistent S1→S2 subjective update are two
 different outcomes and must never be reported interchangeably.
 
