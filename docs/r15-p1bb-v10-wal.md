@@ -15,9 +15,13 @@ it is not a narrative-writing API.
 
 **May.** Preserve the existing full-legal U1 RelationshipState,
 NarrativeSelfState and SelfModelState roots as closed canonical data alongside
-the bounded private narrative_admission_checkpoint. Source-scoped A/B/UNKNOWN
-meaning may be technically resumed from actual stored episode IDs. A later
-positive claim is still provisional: the original E and later E2 were model
+the bounded private narrative_admission_checkpoint. The P1b-B1 finite
+positive path resumes ONLY supported A/B meanings; an UNKNOWN interpretation
+does not become an admitted positive claim and must remain absent/held.
+The general scoped key format can name UNKNOWN, but this v10 continuation
+deliberately refuses it until a separately reviewed positive UNKNOWN
+revision topology exists. A later positive claim is still provisional:
+the original E and later E2 were model
 or user statements, not verified external human intent.
 
 **Must not.** Let user/model/handler/Web text set trust, identity, verified
@@ -48,6 +52,11 @@ Decision. U2/U4 positive subjective experience updates also remain pending.
   canonical narrative_admission_checkpoint from P1b-B preflight #330.
   It contains identifiers/sequence, anonymous Context and U3 revision
   binding only; no raw prompt, user text, model rationale or hidden thought.
+  The stored initial E and later E2 event IDs/sequences are cross-checked
+  against the corresponding U3 source witnesses and original E counterevidence.
+  Setup/S1/S2 technical episode references not retained as U3 witnesses
+  require renewed R07/R12/DB1 qualification before any future adoption;
+  checkpoint syntax alone never grants source trust.
 - P1b-A source-gate matches the terminal R07 CHAT to committed R12 and
   DB1 and the original anonymous R09 Context before any new positive
   subjective update. The checkpoint is technical replay lineage, not a

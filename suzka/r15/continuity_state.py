@@ -150,6 +150,49 @@ class NarrativeContinuation:
             None,
         )
 
+    def _validate_retained_source_witnesses(self, root: NarrativeSelfState) -> None:
+        """Bind the actual persisted E/E2 witness events to replay refs.
+
+        U1 currently retains these witnessed events; setup/S1/S2 episode
+        references beyond those witnesses remain technical replay hints and
+        MUST be requalified against the live source owners before use.
+        """
+        first = tuple(ep for ep in root.episodes if not ep.links)
+        if len(first) != 1:
+            raise ContinuityInvalid("original interpretation source is ambiguous")
+        original = first[0]
+        initial_ref = self.first_sources[1]
+        original_event = original.experience.event
+        if original_event is None:
+            raise ContinuityInvalid("original Experience event is absent")
+        if (
+            initial_ref.event_id != original_event.event_id
+            or initial_ref.event_sequence != original_event.event_sequence
+        ):
+            raise ContinuityInvalid("original E reference differs from U3 witness")
+
+        if self.revision == 2:
+            revised = tuple(ep for ep in root.episodes if ep.links)
+            if len(revised) != 1:
+                raise ContinuityInvalid("revised interpretation source is ambiguous")
+            later = revised[0]
+            subsequent_ref = self.revised_sources[3]
+            subsequent_event = later.experience.event
+            if subsequent_event is None:
+                raise ContinuityInvalid("revised Experience event is absent")
+            if (
+                subsequent_ref.event_id != subsequent_event.event_id
+                or subsequent_ref.event_sequence != subsequent_event.event_sequence
+            ):
+                raise ContinuityInvalid("reported E2 differs from U3 witness")
+            if not any(
+                item.event is not None
+                and item.event.event_id == original_event.event_id
+                and item.event.event_sequence == original_event.event_sequence
+                for item in later.interpretation.counter
+            ):
+                raise ContinuityInvalid("revised counterevidence lost original E")
+
     def canonical_value(self, root: NarrativeSelfState) -> dict[str, object]:
         if type(root) is not NarrativeSelfState or root.revision != self.revision:
             raise ContinuityInvalid("continuation revision/root mismatch")
@@ -192,6 +235,7 @@ class NarrativeContinuation:
                 raise ContinuityInvalid("option meaning scope changed")
             if self.revision == 2 and self.revised_sources[:3] != self.first_sources:
                 raise ContinuityInvalid("reinterpreted source lost S1 evidence")
+            self._validate_retained_source_witnesses(root)
             last = root.revision_history[-1].event
             if (
                 self.last_review_event_id != last.event_id

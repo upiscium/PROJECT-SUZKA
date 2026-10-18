@@ -55,6 +55,14 @@ def _snapshot(
 
 def test_full_legal_v10_budget_reserves_all_16_mib() -> None:
     proof = require_preflight_capacity()
+    # Independently compare the experiment's prior projected codec bound
+    # with the *real product* V10 projector. The two must not drift.
+    from suzka.runtime.agent_state import project_agent_state_v10_schema_max_bytes
+
+    assert project_agent_state_v10_schema_max_bytes() == (
+        projected_v10_with_continuity_bytes()
+    )
+    assert project_agent_state_v10_schema_max_bytes() == 133_729_894
     assert proof["untouched_reserve_bytes"] == 16 * 1024 * 1024
     assert proof["hard_cap_bytes"] == 128 * 1024 * 1024
     assert 0 < proof["private_checkpoint_max_bytes"] < 32 * 1024

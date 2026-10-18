@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterator
 
@@ -11,6 +12,8 @@ import pytest
 
 from experiments.r15_p1.protocol import run_trial
 from suzka.api.server import create_app
+from suzka.r15.continuity_state import ContinuityInvalid
+from suzka.r15.qualified_proposal import QualifiedTurnRef, scoped_option_key
 from suzka.learning import AdapterRegistry
 from suzka.memory import DualMemorySystem
 from suzka.runtime.agent_runtime import (
@@ -151,3 +154,113 @@ def test_wal_committed_but_not_terminal_event_recovers_once(
             assert actual.snapshot().revision == 2
         else:
             assert restarted.app.state.external_reconciliation_required
+
+
+def test_private_checkpoint_cannot_rebind_witnessed_original_e(
+    tmp_path: Path,
+) -> None:
+    """An ordered but forged E reference must not survive U3 restore."""
+    with source_ready_for_later_reinterpretation(tmp_path) as (
+        client,
+        runtime,
+        owner,
+        refs,
+        _settings,
+    ):
+        root, history = owner._technical_state_for_agent_state()
+        assert root.revision == 1
+        original = history.first_sources[1]
+        forged = QualifiedTurnRef(
+            "forged-original-e-event", original.event_sequence, original.episode_id
+        )
+        changed = replace(
+            history,
+            first_sources=(history.first_sources[0], forged, history.first_sources[2]),
+        )
+        with pytest.raises(ContinuityInvalid, match="original E reference"):
+            changed.canonical_value(root)
+        stored = client.app.state.agent_state_store.load()
+        assert isinstance(stored, AgentStateSnapshotV10)
+        tampered = stored.model_dump(mode="python")
+        tampered["narrative_admission_checkpoint"]["first_sources"][1]["event_id"] = (
+            forged.event_id
+        )
+        with pytest.raises(ValueError):
+            AgentStateSnapshotV10.model_validate(tampered)
+        assert owner.snapshot() == root
+
+
+def test_private_checkpoint_cannot_rebind_witnessed_later_e2(
+    tmp_path: Path,
+) -> None:
+    with source_ready_for_later_reinterpretation(tmp_path) as (
+        client,
+        runtime,
+        owner,
+        refs,
+        _settings,
+    ):
+        admitted = _admit(runtime, owner, refs)
+        assert admitted.changed and admitted.snapshot.revision == 2
+        root, history = owner._technical_state_for_agent_state()
+        original = history.revised_sources[3]
+        forged = QualifiedTurnRef(
+            "forged-later-e2-event", original.event_sequence, original.episode_id
+        )
+        revised = list(history.revised_sources)
+        revised[3] = forged
+        changed = replace(history, revised_sources=tuple(revised))
+        with pytest.raises(ContinuityInvalid, match="reported E2"):
+            changed.canonical_value(root)
+        stored = client.app.state.agent_state_store.load()
+        assert isinstance(stored, AgentStateSnapshotV10)
+        tampered = stored.model_dump(mode="python")
+        tampered["narrative_admission_checkpoint"]["revised_sources"][3]["event_id"] = (
+            forged.event_id
+        )
+        with pytest.raises(ValueError):
+            AgentStateSnapshotV10.model_validate(tampered)
+        assert owner.snapshot() == root
+
+
+def test_unknown_referent_is_not_admitted_as_source_qualified_positive(
+    tmp_path: Path,
+) -> None:
+    """UNKNOWN remains a held/unadmitted hypothesis in this finite MVI."""
+    with source_ready_for_later_reinterpretation(tmp_path) as (
+        _client,
+        _runtime,
+        owner,
+        _refs,
+        _settings,
+    ):
+        root, history = owner._technical_state_for_agent_state()
+        assert root.revision == 1
+        original = root.episodes[0]
+        from suzka.r15.contracts import NarrativeSelfState
+        from suzka.r15.qualified_proposal import restore_scoped_option
+
+        unknown_interpretation = replace(
+            original.interpretation,
+            statement_id=scoped_option_key(history.source_scope, "UNKNOWN"),
+        )
+        assert (
+            restore_scoped_option(
+                history.source_scope, unknown_interpretation.statement_id
+            )
+            == "UNKNOWN"
+        )
+        hypothetical = NarrativeSelfState(
+            1,
+            1,
+            (replace(original, interpretation=unknown_interpretation),),
+            root.claims,
+            root.history_anchor,
+            root.revision_history,
+        )
+        with pytest.raises(ContinuityInvalid, match="UNKNOWN"):
+            replace(
+                history,
+                root_digest=hypothetical.canonical_value()["state_digest"],
+            ).canonical_value(hypothetical)
+        assert owner.snapshot() == root
