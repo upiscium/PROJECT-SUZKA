@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import inspect
 from typing import TYPE_CHECKING, Callable, cast
@@ -123,6 +123,7 @@ from suzka.runtime.r13_codec import (
 )
 
 if TYPE_CHECKING:
+    from suzka.r15.state_port import R15StatePort
     from suzka.memory.episodic_participant import MemoryEpisodicParticipant
     from suzka.memory.experience_participant import MemoryExperienceParticipant
     from suzka.runtime.agent_state import (
@@ -209,6 +210,7 @@ class _AgentStatePorts:
     goal_state_port: GoalStatePort
     commitment_state_port: CommitmentStatePort
     attention_state_port: AttentionStatePort
+    r15_state_port: R15StatePort | None = None
 
 
 def _validated_attention_view(value: object) -> AttentionSelectedView:
@@ -437,6 +439,7 @@ class SuzkaMainLoop:
             attention_authority = AttentionSystem(attention_system.snapshot())
         self._attention_system = attention_authority
         self._attention_state_port = AttentionStatePort(attention_authority)
+        self._r15_state_port: R15StatePort | None = None
         self._agent_state_ports = _AgentStatePorts(
             self,
             self,
@@ -466,6 +469,23 @@ class SuzkaMainLoop:
         """Expose the exact state-port topology consumed by AgentState only."""
 
         return self._agent_state_ports
+
+    def _enable_r15_state_port(self) -> R15StatePort:
+        """Attach the unique R15 U2/U3/U4 technical port at startup only.
+
+        This is NOT a new public Model/Operator setter or API. Older direct
+        MainLoop instances without this port continue emitting V9 state.
+        """
+        # Import lazily: Memory participants load the runtime package while
+        # the suzka.memory module is only partially initialized.
+        from suzka.r15.state_port import R15StatePort
+
+        if self._r15_state_port is not None:
+            return self._r15_state_port
+        port = R15StatePort(self.context_registry)
+        self._r15_state_port = port
+        self._agent_state_ports = replace(self._agent_state_ports, r15_state_port=port)
+        return port
 
     @property
     def value_system(self) -> ValueSystem:

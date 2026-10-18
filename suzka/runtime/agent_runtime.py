@@ -23,6 +23,7 @@ class AgentEventType(str, Enum):
     CONTEXT_UPDATE = "context_update"
     EMOTION_TICK = "emotion_tick"
     VALUE_GOVERNANCE = "value_governance"
+    NARRATIVE_REVIEW = "narrative_review"
 
 
 class AgentEventSource(str, Enum):
@@ -46,6 +47,7 @@ class AgentEventSource(str, Enum):
     API_ADAPTER_ACTIVATE = "api.adapters.activate"
     API_ADAPTER_REJECT = "api.adapters.reject"
     RUNTIME_EMOTION_TIMER = "runtime.emotion_timer"
+    RUNTIME_NARRATIVE_REVIEW = "runtime.narrative_review"
 
 
 class AgentRuntimeStatus(str, Enum):
@@ -169,9 +171,7 @@ class AgentRuntime:
             or initial_sequence < 0
             or initial_sequence > MAX_PERSISTED_EVENT_SEQUENCE
         ):
-            raise ValueError(
-                "initial_sequence must be a bounded non-negative integer"
-            )
+            raise ValueError("initial_sequence must be a bounded non-negative integer")
         self._queue_capacity = queue_capacity
         self._pre_admission_guard = pre_admission_guard
         self._admission_checkpoint = admission_checkpoint
@@ -268,9 +268,7 @@ class AgentRuntime:
             or initial_sequence < 0
             or initial_sequence > MAX_PERSISTED_EVENT_SEQUENCE
         ):
-            raise ValueError(
-                "initial_sequence must be a bounded non-negative integer"
-            )
+            raise ValueError("initial_sequence must be a bounded non-negative integer")
         with self._condition:
             if self._status is not AgentRuntimeStatus.CREATED:
                 raise RuntimeError(
@@ -405,9 +403,7 @@ class AgentRuntime:
                     self._condition.notify_all()
                     return
                 if self._sequence >= MAX_PERSISTED_EVENT_SEQUENCE:
-                    self._fail_stop_locked(
-                        phase=AgentRuntimeDurabilityPhase.STARTED
-                    )
+                    self._fail_stop_locked(phase=AgentRuntimeDurabilityPhase.STARTED)
                     continue
                 pending = self._pending.popleft()
                 self._sequence += 1
