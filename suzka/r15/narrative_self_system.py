@@ -1,10 +1,11 @@
-"""U3 process-local NarrativeSelf boundary with NO positive source producer.
+"""U3 process-local NarrativeSelf and narrow P1b-A source-qualified review.
 
-Neither R07/R12's joined finalized Experience nor an R15 subject-owned
-semantic/admission producer is available as an independently side-effect-free
-read. This owner can review an event boundary without changing its empty U1
-root and can report explicit unavailability; it cannot install a caller-made
-episode/claim, consume a SourceWitness as proof or authenticate EventRef.
+Generic free-form biography, trust, traits and model/operator declarations
+remain unavailable and cannot install any caller-made state. The optional
+internal P1b-A source gate can qualify a *finite* self-referent interpretation
+from real completed R07/R12/DB1 events in an anonymous R09 Context, but only
+inside a distinct serialized Runtime event. No generic U3 semantic issuer,
+AgentState v10/WAL persistence or production MainLoop consumer exists.
 """
 
 from __future__ import annotations
@@ -19,6 +20,12 @@ from suzka.limits import MAX_PERSISTED_REVISION
 from suzka.r15.common import (
     Concept,
     EventRef,
+    Interpretation,
+    InterpretationStatus,
+    Accessibility,
+    Inertia,
+    RevisionProof,
+    RevisionReason,
     SourceDisposition,
     SourceWitness,
     checksum,
@@ -27,7 +34,21 @@ from suzka.r15.common import (
     exact_enum,
     source_disposition,
 )
-from suzka.r15.contracts import ClaimMeaning, NarrativeSelfState, current_semantic_producer
+from suzka.r15.contracts import (
+    ClaimMeaning,
+    NarrativeEpisode,
+    NarrativeLink,
+    NarrativeLinkKind,
+    NarrativeSelfState,
+    current_semantic_producer,
+)
+from suzka.r15.qualified_proposal import (
+    QualifiedNarrativeSourceGate,
+    QualifiedProposalUnavailable,
+    QualifiedTurnRef,
+    scoped_option_key,
+    restore_scoped_option,
+)
 
 
 MAX_NARRATIVE_BOUNDARY_RECEIPTS: Final = 256
@@ -86,15 +107,18 @@ def narrative_availability(
     if meaning is not None and type(meaning) is not ClaimMeaning:
         raise TypeError("meaning must be an exact closed ClaimMeaning")
     concept = (
-        Concept.NARRATIVE_EPISODE if capability is NarrativeCapability.EPISODE_INDEX
+        Concept.NARRATIVE_EPISODE
+        if capability is NarrativeCapability.EPISODE_INDEX
         else Concept.NARRATIVE_CLAIM
     )
     source_status = (
-        SourceDisposition.UNAVAILABLE if source is None
+        SourceDisposition.UNAVAILABLE
+        if source is None
         else source_disposition(concept, source)
     )
     semantic_status = (
-        SourceDisposition.UNAVAILABLE if meaning is None
+        SourceDisposition.UNAVAILABLE
+        if meaning is None
         else current_semantic_producer(meaning)
     )
     return NarrativeAvailability(
@@ -124,7 +148,10 @@ class NarrativeBoundaryReceipt:
         if type(self.event) is not EventRef:
             raise TypeError("receipt event must be exact")
         self.event.__post_init__()
-        if type(self.result_revision) is not int or not 0 <= self.result_revision <= MAX_PERSISTED_REVISION:
+        if (
+            type(self.result_revision) is not int
+            or not 0 <= self.result_revision <= MAX_PERSISTED_REVISION
+        ):
             raise ValueError("receipt revision must be a bounded exact integer")
         digest(self.request_digest, "request_digest")
         digest(self.result_state_digest, "result_state_digest")
@@ -147,9 +174,15 @@ class NarrativeBoundaryResult:
     replayed: bool
 
     def __post_init__(self) -> None:
-        if type(self.snapshot) is not NarrativeSelfState or type(self.view) is not NarrativeReadView:
+        if (
+            type(self.snapshot) is not NarrativeSelfState
+            or type(self.view) is not NarrativeReadView
+        ):
             raise TypeError("result root/view must be exact")
-        if type(self.receipt) is not NarrativeBoundaryReceipt or type(self.replayed) is not bool:
+        if (
+            type(self.receipt) is not NarrativeBoundaryReceipt
+            or type(self.replayed) is not bool
+        ):
             raise TypeError("result receipt/replay flag must be exact")
         self.receipt.__post_init__()
         root_digest = self.snapshot.canonical_value()["state_digest"]
@@ -169,7 +202,11 @@ class NarrativeHistoricalAcknowledgement:
     replayed: bool = True
 
     def __post_init__(self) -> None:
-        if type(self.receipt) is not NarrativeBoundaryReceipt or type(self.replayed) is not bool or not self.replayed:
+        if (
+            type(self.receipt) is not NarrativeBoundaryReceipt
+            or type(self.replayed) is not bool
+            or not self.replayed
+        ):
             raise TypeError("historical acknowledgement needs an exact replay receipt")
         self.receipt.__post_init__()
 
@@ -212,25 +249,68 @@ def _result_for(
     no production method can install such a root until separately reviewed.
     """
 
-    if type(root) is not NarrativeSelfState or type(receipt) is not NarrativeBoundaryReceipt:
+    if (
+        type(root) is not NarrativeSelfState
+        or type(receipt) is not NarrativeBoundaryReceipt
+    ):
         raise TypeError("replay classification needs exact root and receipt")
     receipt.__post_init__()
     if type(replayed) is not bool:
         raise TypeError("replayed must be an exact bool")
-    if root.revision != receipt.result_revision or root.canonical_value()["state_digest"] != receipt.result_state_digest:
+    if (
+        root.revision != receipt.result_revision
+        or root.canonical_value()["state_digest"] != receipt.result_state_digest
+    ):
         if not replayed:
             raise ValueError("a fresh event cannot claim another result root")
         return NarrativeHistoricalAcknowledgement(_copy_receipt(receipt))
     snapshot = _copy_root(root)
-    return NarrativeBoundaryResult(snapshot, _view(snapshot), _copy_receipt(receipt), replayed)
+    return NarrativeBoundaryResult(
+        snapshot, _view(snapshot), _copy_receipt(receipt), replayed
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class NarrativeQualifiedResult:
+    """Private process-local accepted *interpretation*, NOT verified intent."""
+
+    snapshot: NarrativeSelfState
+    event: EventRef
+    stage: str
+    selected_referent: str
+    changed: bool
+    source_scope: str
+
+
+_NARRATIVE_EPISODE_DOMAIN: Final = b"PROJECT-SUZKA:R15:P1BA:EPISODE:V1\0"
+_NARRATIVE_CHANGE_DOMAIN: Final = b"PROJECT-SUZKA:R15:P1BA:REVISION:V1\0"
+_ZERO_DIGEST: Final = "0" * 64
+
+
+def _source_episode_id(scope: str, stage: str) -> str:
+    return checksum(_NARRATIVE_EPISODE_DOMAIN, {"scope": scope, "stage": stage})
+
+
+def _source_episode_digest(episode: NarrativeEpisode) -> str:
+    return checksum(_NARRATIVE_CHANGE_DOMAIN, encode(episode))
 
 
 class NarrativeSelfSystem:
-    """No source/claim setter: U3 only owns process-local UNKNOWN absence."""
+    """U3 owner: no general setter; narrowly-qualified internal P1b-A review."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, source_gate: QualifiedNarrativeSourceGate | None = None
+    ) -> None:
+        if (
+            source_gate is not None
+            and type(source_gate) is not QualifiedNarrativeSourceGate
+        ):
+            raise TypeError("invalid R15 source gate")
+        self._source_gate = source_gate
         self._root = NarrativeSelfState(1, 0, (), (), None, ())
         self._receipts: tuple[NarrativeBoundaryReceipt, ...] = ()
+        self._first_sources: tuple[QualifiedTurnRef, ...] | None = None
+        self._revised_sources: tuple[QualifiedTurnRef, ...] | None = None
         self._lock = RLock()
         self._mutating = False
         self._reentrant_attempted = False
@@ -257,6 +337,179 @@ class NarrativeSelfSystem:
         with self._lock:
             return _view(self._root)
 
+    def _review_committed_turns(
+        self,
+        sources: tuple[QualifiedTurnRef, ...],
+    ) -> NarrativeQualifiedResult:
+        """Internal-only MVI subject review, never a model/API source setter.
+
+        The bound gate re-reads real terminal R07, R12, DB1 and anonymous R09
+        inside an actual dedicated AgentRuntime worker event. An external
+        model/user merely naming A/B or presenting an EventRef has no power to
+        adopt any self/relationship/competence truth.
+        """
+        if type(sources) is not tuple or any(
+            type(item) is not QualifiedTurnRef for item in sources
+        ):
+            raise QualifiedProposalUnavailable("unqualified source request")
+        gate = self._source_gate
+        if gate is None:
+            raise QualifiedProposalUnavailable("no source owner bound")
+        stage = "S1" if len(sources) == 3 else "S2" if len(sources) == 5 else ""
+        if not stage:
+            raise QualifiedProposalUnavailable("invalid narrative review stage")
+
+        with self._mutation():
+            review_event = gate.current_review_event()
+            if self._receipts:
+                last = self._receipts[-1].event
+                if (
+                    review_event.event_sequence <= last.event_sequence
+                    or review_event.occurred_at < last.occurred_at
+                ):
+                    raise NarrativeEventConflict(
+                        "narrative event predates boundary receipt"
+                    )
+            if self._root.revision_history:
+                last = self._root.revision_history[-1].event
+                if (
+                    review_event.event_sequence <= last.event_sequence
+                    or review_event.occurred_at < last.occurred_at
+                ):
+                    raise NarrativeEventConflict("narrative event did not advance")
+            # This source read is NOT a source transfer of authority. The gate
+            # independently confirms the ordinary Journal + Experience +
+            # Episodic owners on each attempt, and returns only a finite option.
+            proposal = gate.qualify(sources, stage=stage)
+            if self._first_sources is not None and sources[:3] != self._first_sources:
+                raise NarrativeEventConflict(
+                    "different original first-person experience"
+                )
+            current = self._root
+            if stage == "S1" and self._first_sources is not None:
+                if current.revision != 1:
+                    raise NarrativeEventConflict(
+                        "old initial experience cannot replace revision"
+                    )
+                return NarrativeQualifiedResult(
+                    _copy_root(current),
+                    review_event,
+                    stage,
+                    restore_scoped_option(
+                        proposal.source_scope,
+                        current.episodes[0].interpretation.statement_id,
+                    ),
+                    False,
+                    proposal.source_scope,
+                )
+            if stage == "S2":
+                if self._first_sources is None or current.revision == 0:
+                    raise NarrativeEventConflict("initial interpretation not admitted")
+                if self._revised_sources is not None:
+                    if sources != self._revised_sources:
+                        raise NarrativeEventConflict(
+                            "second reinterpretation needs a new stage"
+                        )
+                    return NarrativeQualifiedResult(
+                        _copy_root(current),
+                        review_event,
+                        stage,
+                        proposal.selected,
+                        False,
+                        proposal.source_scope,
+                    )
+            if stage == "S1" and current.revision != 0:
+                raise NarrativeEventConflict(
+                    "S1 admission requires initial empty state"
+                )
+            if stage == "S2" and current.revision != 1:
+                raise NarrativeEventConflict(
+                    "reinterpretation requires one prior revision"
+                )
+
+            episode_id = _source_episode_id(proposal.source_scope, stage)
+            primary = proposal.source
+            other = proposal.contrary
+            episode = NarrativeEpisode(
+                episode_id,
+                primary,
+                Interpretation(
+                    scoped_option_key(proposal.source_scope, proposal.selected),
+                    InterpretationStatus.PRESENT
+                    if stage == "S1"
+                    else InterpretationStatus.CONTESTED,
+                    500_000,
+                    250_000,
+                    (primary,),
+                    () if other is None else (other,),
+                    Accessibility.CURRENT,
+                    Inertia.TENTATIVE if stage == "S1" else Inertia.REVISABLE,
+                ),
+                ()
+                if stage == "S1"
+                else (
+                    NarrativeLink(
+                        NarrativeLinkKind.EPISODE,
+                        _source_episode_id(proposal.source_scope, "S1"),
+                    ),
+                ),
+            )
+            old_proof = (
+                current.revision_history[-1] if current.revision_history else None
+            )
+            previous_digest = (
+                _source_episode_digest(current.episodes[0])
+                if old_proof is not None
+                else _ZERO_DIGEST
+            )
+            current_digest = _source_episode_digest(episode)
+            revision = current.revision + 1
+            proof = RevisionProof(
+                revision,
+                review_event,
+                _source_episode_id(proposal.source_scope, "TARGET"),
+                previous_digest,
+                current_digest,
+                (primary.source_digest,),
+                () if other is None else (other.source_digest,),
+                RevisionReason.INITIAL_INTERPRETATION
+                if stage == "S1"
+                else RevisionReason.QUALIFIED_REINTERPRETATION,
+                None if old_proof is None else old_proof.record_digest,
+            )
+            candidate = NarrativeSelfState(
+                1,
+                revision,
+                tuple(
+                    sorted(
+                        (*current.episodes, episode), key=lambda item: item.episode_id
+                    )
+                ),
+                current.claims,
+                current.history_anchor,
+                (*current.revision_history, proof),
+            )
+            detached = _copy_root(candidate)
+            if self._reentrant_attempted:
+                raise NarrativeEventConflict(
+                    "reentrant source review invalidates admission"
+                )
+            # No mutable root is published until all proof/serialization checks
+            # complete. U5 later owns WAL/state recovery; this is process-local.
+            self._root = detached
+            if stage == "S1":
+                self._first_sources = sources
+            else:
+                self._revised_sources = sources
+            return NarrativeQualifiedResult(
+                _copy_root(detached),
+                review_event,
+                stage,
+                proposal.selected,
+                True,
+                proposal.source_scope,
+            )
+
     def review_boundary(
         self, event: EventRef
     ) -> NarrativeBoundaryResult | NarrativeHistoricalAcknowledgement:
@@ -266,31 +519,55 @@ class NarrativeSelfSystem:
             raise TypeError("event must be an exact EventRef")
         event.__post_init__()
         event = EventRef(event.event_id, event.event_sequence, event.occurred_at)
-        request_digest = checksum(_REQUEST_DOMAIN, {"event": encode(event), "operation": "availability_review"})
+        request_digest = checksum(
+            _REQUEST_DOMAIN,
+            {"event": encode(event), "operation": "availability_review"},
+        )
         with self._mutation():
             for receipt in self._receipts:
-                if receipt.event.event_id == event.event_id or receipt.event.event_sequence == event.event_sequence:
-                    if receipt.event != event or receipt.request_digest != request_digest:
-                        raise NarrativeEventConflict("retained event identity or operation conflicts")
+                if (
+                    receipt.event.event_id == event.event_id
+                    or receipt.event.event_sequence == event.event_sequence
+                ):
+                    if (
+                        receipt.event != event
+                        or receipt.request_digest != request_digest
+                    ):
+                        raise NarrativeEventConflict(
+                            "retained event identity or operation conflicts"
+                        )
                     result = _result_for(self._root, receipt, replayed=True)
                     if self._reentrant_attempted:
-                        raise NarrativeEventConflict("reentrant replay invalidated the request")
+                        raise NarrativeEventConflict(
+                            "reentrant replay invalidated the request"
+                        )
                     return result
             if self._receipts:
                 latest = self._receipts[-1].event
-                if event.event_sequence <= latest.event_sequence or event.occurred_at < latest.occurred_at:
-                    raise NarrativeEventConflict("unverifiable older or regressing event")
+                if (
+                    event.event_sequence <= latest.event_sequence
+                    or event.occurred_at < latest.occurred_at
+                ):
+                    raise NarrativeEventConflict(
+                        "unverifiable older or regressing event"
+                    )
             if len(self._receipts) >= MAX_NARRATIVE_BOUNDARY_RECEIPTS:
-                raise NarrativeCapacityExceeded("Narrative request receipt window is full")
+                raise NarrativeCapacityExceeded(
+                    "Narrative request receipt window is full"
+                )
             root = self._root
             receipt = NarrativeBoundaryReceipt(
-                event, request_digest, root.revision,
+                event,
+                request_digest,
+                root.revision,
                 str(root.canonical_value()["state_digest"]),
                 self._receipts[-1].receipt_digest if self._receipts else None,
             )
             result = _result_for(root, receipt, replayed=False)
             assert isinstance(result, NarrativeBoundaryResult)
             if self._reentrant_attempted:
-                raise NarrativeEventConflict("reentrant boundary request invalidated the event")
+                raise NarrativeEventConflict(
+                    "reentrant boundary request invalidated the event"
+                )
             self._receipts = self._receipts + (receipt,)
             return result
