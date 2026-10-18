@@ -163,6 +163,8 @@ class NarrativeContinuation:
         original = first[0]
         initial_ref = self.first_sources[1]
         original_event = original.experience.event
+        if original_event is None:
+            raise ContinuityInvalid("original Experience event is absent")
         if (
             initial_ref.event_id != original_event.event_id
             or initial_ref.event_sequence != original_event.event_sequence
@@ -176,13 +178,16 @@ class NarrativeContinuation:
             later = revised[0]
             subsequent_ref = self.revised_sources[3]
             subsequent_event = later.experience.event
+            if subsequent_event is None:
+                raise ContinuityInvalid("revised Experience event is absent")
             if (
                 subsequent_ref.event_id != subsequent_event.event_id
                 or subsequent_ref.event_sequence != subsequent_event.event_sequence
             ):
                 raise ContinuityInvalid("reported E2 differs from U3 witness")
             if not any(
-                item.event.event_id == original_event.event_id
+                item.event is not None
+                and item.event.event_id == original_event.event_id
                 and item.event.event_sequence == original_event.event_sequence
                 for item in later.interpretation.counter
             ):
