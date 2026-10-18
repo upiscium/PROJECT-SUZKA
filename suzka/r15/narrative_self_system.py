@@ -42,6 +42,7 @@ from suzka.r15.contracts import (
     NarrativeSelfState,
     current_semantic_producer,
 )
+from suzka.r15.continuity_state import NarrativeContinuation, ContinuityInvalid
 from suzka.r15.qualified_proposal import (
     QualifiedNarrativeSourceGate,
     QualifiedProposalUnavailable,
@@ -311,6 +312,7 @@ class NarrativeSelfSystem:
         self._receipts: tuple[NarrativeBoundaryReceipt, ...] = ()
         self._first_sources: tuple[QualifiedTurnRef, ...] | None = None
         self._revised_sources: tuple[QualifiedTurnRef, ...] | None = None
+        self._source_context_id: str | None = None
         self._lock = RLock()
         self._mutating = False
         self._reentrant_attempted = False
@@ -336,6 +338,67 @@ class NarrativeSelfSystem:
     def selected_view(self) -> NarrativeReadView:
         with self._lock:
             return _view(self._root)
+
+    def _bind_source_gate_for_state(self, gate: QualifiedNarrativeSourceGate) -> None:
+        """One-time internal startup binding, never a caller-supplied proof."""
+        if type(gate) is not QualifiedNarrativeSourceGate:
+            raise TypeError("source gate must be the owned runtime reader")
+        with self._mutation():
+            if self._source_gate is not None:
+                raise NarrativeEventConflict("source gate already bound")
+            self._source_gate = gate
+
+    def _technical_state_for_agent_state(
+        self,
+    ) -> tuple[NarrativeSelfState, NarrativeContinuation]:
+        """Export the U3 root and source replay scope under the SAME owner lock."""
+        with self._lock:
+            root = _copy_root(self._root)
+            if root.revision == 0:
+                return root, NarrativeContinuation.empty(root)
+            if (
+                self._first_sources is None
+                or self._source_context_id is None
+                or (root.revision == 2 and self._revised_sources is None)
+            ):
+                raise ContinuityInvalid("R15 owner lost qualified technical history")
+            current = root.revision_history[-1].event
+            state = NarrativeContinuation(
+                str(root.canonical_value()["state_digest"]),
+                root.revision,
+                self._first_sources[0].episode_id,
+                self._source_context_id,
+                self._first_sources,
+                self._revised_sources or (),
+                current.event_id,
+                current.event_sequence,
+            )
+            state.canonical_value(root)
+            return root, state
+
+    def _restore_technical_for_agent_state(
+        self,
+        root: NarrativeSelfState,
+        continuation: NarrativeContinuation,
+    ) -> None:
+        """U5-only exact technical restore, not a general admission/setter."""
+        if (
+            type(root) is not NarrativeSelfState
+            or type(continuation) is not NarrativeContinuation
+        ):
+            raise TypeError("technical root and continuation must be exact")
+        detached = _copy_root(root)
+        checked = NarrativeContinuation.from_value(
+            continuation.canonical_value(detached), detached
+        )
+        with self._mutation():
+            self._root = detached
+            self._first_sources = checked.first_sources or None
+            self._revised_sources = checked.revised_sources or None
+            self._source_context_id = checked.context_id
+            # No-change U3 acknowledgements were process-local and cannot
+            # be reinterpreted as durable Experience/subject acceptance.
+            self._receipts = ()
 
     def _review_committed_turns(
         self,
@@ -494,11 +557,14 @@ class NarrativeSelfSystem:
                 raise NarrativeEventConflict(
                     "reentrant source review invalidates admission"
                 )
-            # No mutable root is published until all proof/serialization checks
-            # complete. U5 later owns WAL/state recovery; this is process-local.
+            if stage == "S2" and self._source_context_id != proposal.context_id:
+                raise NarrativeEventConflict("context changed across reinterpretation")
+            # Publish the root only after all source/context checks complete.
+            # The outer AgentState/WAL gate owns crash consistency.
             self._root = detached
             if stage == "S1":
                 self._first_sources = sources
+                self._source_context_id = proposal.context_id
             else:
                 self._revised_sources = sources
             return NarrativeQualifiedResult(

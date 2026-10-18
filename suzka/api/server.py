@@ -19,6 +19,10 @@ from suzka.identity import ValueConflictDefinition
 from suzka.learning import AdapterRegistry, SleepCycleManager
 from suzka.memory import DualMemorySystem, ExperienceStore
 from suzka.models import load_model_provider
+from suzka.r15.qualified_proposal import (
+    QualifiedNarrativeSourceGate,
+    QualifiedProposalUnavailable,
+)
 from suzka.runtime import (
     AgentEvent,
     AgentRuntime,
@@ -228,6 +232,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "Main loop and Experience store do not match after startup"
                 )
             app.state.working_memory = app.state.main_loop.working_memory
+            # U5 technical port exists BEFORE v10/v9 snapshot restore.
+            app.state.r15_state_port = app.state.main_loop._enable_r15_state_port()
             app.state.agent_state_store.restore_into(app.state.main_loop, snapshot)
             if isinstance(app.state.main_loop, SuzkaMainLoop):
                 checkpoint_read_views = getattr(
@@ -300,53 +306,63 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             nonlocal committed_read_views
             sequence = event.processing_sequence
             assert sequence is not None
-            validate_belief_commit = getattr(
-                app.state.main_loop, "_validate_belief_event_commit", None
-            )
-            if callable(validate_belief_commit):
-                validate_belief_commit(event)
-            app.state.main_loop._validate_value_event_commit(event)
-            candidate = app.state.agent_state_store.capture(
-                app.state.main_loop, sequence
-            )
-            candidate_hash = app.state.agent_state_store.snapshot_hash(candidate)
-            prepared_read_views: tuple[
-                object, Callable[[object], None]
-            ] | None = None
-            if isinstance(app.state.main_loop, SuzkaMainLoop):
-                assert isinstance(candidate, AgentStateSnapshotV9)
-                value_snapshot = _domain_value_system(
-                    candidate.value_state
-                ).snapshot()
-                belief_snapshot = _domain_belief_system(
-                    candidate.belief_state
-                ).snapshot()
-                prepare_attention_read_views = getattr(
-                    app.state.main_loop,
-                    "_prepare_committed_attention_read_views",
-                    None,
+            # Before the first WAL mutation, failure is definitively not a
+            # committed R15 revision. Restore all domains including U3 now.
+            # Once commit_internal_candidate begins, WAL publication may be
+            # indeterminate: do NOT roll back a possibly committed revision.
+            try:
+                validate_belief_commit = getattr(
+                    app.state.main_loop, "_validate_belief_event_commit", None
                 )
-                if not callable(prepare_attention_read_views):
-                    raise StateRecoveryError(
-                        "Committed Attention read-view hooks are unavailable"
-                    )
-                publisher = committed_read_view_publisher
-                if publisher is None:
-                    raise StateRecoveryError(
-                        "Committed Attention read-view publisher is unavailable"
-                    )
-                prepared_read_views = prepare_attention_read_views(
-                    value_snapshot,
-                    belief_snapshot,
-                    candidate.r13_state,
-                    candidate.attention_state,
-                    retain_selection=True,
+                if callable(validate_belief_commit):
+                    validate_belief_commit(event)
+                app.state.main_loop._validate_value_event_commit(event)
+                candidate = app.state.agent_state_store.capture(
+                    app.state.main_loop, sequence
                 )
-                if prepared_read_views is None:
-                    raise StateRecoveryError(
-                        "Committed read views were not prepared"
+                candidate_hash = app.state.agent_state_store.snapshot_hash(candidate)
+                prepared_read_views: tuple[object, Callable[[object], None]] | None = (
+                    None
+                )
+                if isinstance(app.state.main_loop, SuzkaMainLoop):
+                    assert isinstance(candidate, AgentStateSnapshotV9)
+                    value_snapshot = _domain_value_system(
+                        candidate.value_state
+                    ).snapshot()
+                    belief_snapshot = _domain_belief_system(
+                        candidate.belief_state
+                    ).snapshot()
+                    prepare_attention_read_views = getattr(
+                        app.state.main_loop,
+                        "_prepare_committed_attention_read_views",
+                        None,
                     )
-                prepared_read_views = (prepared_read_views, publisher)
+                    if not callable(prepare_attention_read_views):
+                        raise StateRecoveryError(
+                            "Committed Attention read-view hooks are unavailable"
+                        )
+                    publisher = committed_read_view_publisher
+                    if publisher is None:
+                        raise StateRecoveryError(
+                            "Committed Attention read-view publisher is unavailable"
+                        )
+                    prepared_read_views = prepare_attention_read_views(
+                        value_snapshot,
+                        belief_snapshot,
+                        candidate.r13_state,
+                        candidate.attention_state,
+                        retain_selection=True,
+                    )
+                    if prepared_read_views is None:
+                        raise StateRecoveryError(
+                            "Committed read views were not prepared"
+                        )
+                    prepared_read_views = (prepared_read_views, publisher)
+            except Exception:
+                app.state.agent_state_store.restore_into(
+                    app.state.main_loop, committed_snapshot
+                )
+                raise
             evidence = app.state.state_recovery.commit_internal_candidate(
                 event, committed_snapshot, candidate
             )
@@ -412,6 +428,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             app.state.main_loop.bind_runtime(app.state.agent_runtime)
             app.state.sleep_cycle_manager.bind_runtime(app.state.agent_runtime)
+            try:
+                narrative_reader = QualifiedNarrativeSourceGate(
+                    app.state.agent_runtime,
+                    app.state.event_journal,
+                    app.state.experience_store,
+                    app.state.memory_system,
+                    app.state.main_loop.context_registry,
+                )
+            except QualifiedProposalUnavailable:
+                # Older authorized injected MainLoops can use a distinct
+                # Experience storage root. They retain their original
+                # functionality, but NEVER gain positive R15 source/admission
+                # authority from these mismatched owners. If this instance
+                # has a restored subjective revision, refuse startup instead
+                # of silently running with unqualified biography.
+                if app.state.r15_state_port.narrative.snapshot().revision != 0:
+                    raise StateRecoveryError(
+                        "Persisted R15 narrative Source owners are inconsistent"
+                    ) from None
+            else:
+                app.state.r15_state_port.narrative._bind_source_gate_for_state(
+                    narrative_reader
+                )
         except BaseException:
             app.state.event_journal.close()
             raise

@@ -34,6 +34,7 @@ from pydantic import (
     model_validator,
 )
 
+from suzka.r15.contracts import NarrativeSelfState, RelationshipState, SelfModelState
 from suzka.attention.contracts import AttentionContinuity
 from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
 from suzka.belief import (
@@ -150,6 +151,7 @@ from suzka.runtime.r13_codec import (
 
 if TYPE_CHECKING:
     from suzka.runtime.main_loop import SuzkaMainLoop
+    from suzka.r15.state_port import R15StatePort, R15TechnicalSnapshot
 
 
 AGENT_STATE_MAX_SERIALIZED_BYTES: Final[int] = 128 * 1024 * 1024
@@ -218,6 +220,7 @@ class AttentionAgentStatePorts(AgentStatePorts, Protocol):
 AGENT_STATE_V7_SCHEMA_VERSION: Literal[7] = 7
 AGENT_STATE_SCHEMA_VERSION_V8: Literal[8] = 8
 CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[9] = 9
+AGENT_STATE_V10_SCHEMA_VERSION: Literal[10] = 10
 
 
 class _StateModel(BaseModel):
@@ -239,9 +242,7 @@ class EmotionStateSnapshot(_StateModel):
 
 class _AgentStateSnapshotBase(_StateModel):
     saved_at: datetime
-    last_processed_event_sequence: int = Field(
-        ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE
-    )
+    last_processed_event_sequence: int = Field(ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE)
     emotion_state: EmotionStateSnapshot
 
     @field_validator("saved_at", mode="before")
@@ -317,9 +318,7 @@ class WorkingMemorySnapshot(_StateModel):
     """Canonical Working Memory authority embedded in AgentState v2."""
 
     revision: int = Field(ge=0, le=MAX_PERSISTED_REVISION)
-    items: tuple[WorkingMemoryItemSnapshot, ...] = Field(
-        max_length=MAX_ITEM_CAPACITY
-    )
+    items: tuple[WorkingMemoryItemSnapshot, ...] = Field(max_length=MAX_ITEM_CAPACITY)
 
     @field_validator("items", mode="before")
     @classmethod
@@ -397,9 +396,7 @@ class ContextFrameSnapshot(_StateModel):
     started_at: datetime
     last_active_at: datetime
 
-    @field_validator(
-        "participant_refs", "related_context_ids", mode="before"
-    )
+    @field_validator("participant_refs", "related_context_ids", mode="before")
     @classmethod
     def parse_reference_lists(cls, value: object) -> object:
         return _tuple_value(value)
@@ -538,8 +535,10 @@ class CalibrationEntrySnapshot(_StateModel):
     @field_validator("model_key")
     @classmethod
     def require_opaque_key(cls, value: str) -> str:
-        if len(value) != 70 or not value.startswith("model.") or any(
-            character not in "0123456789abcdef" for character in value[6:]
+        if (
+            len(value) != 70
+            or not value.startswith("model.")
+            or any(character not in "0123456789abcdef" for character in value[6:])
         ):
             raise ValueError("model_key must be an opaque model key")
         return value
@@ -740,7 +739,11 @@ class ValueRevisionRecordSnapshot(_StateModel):
         return _require_context_utc(value)
 
     @field_validator(
-        "from_revision", "to_revision", "event_sequence", "target_revision", mode="before"
+        "from_revision",
+        "to_revision",
+        "event_sequence",
+        "target_revision",
+        mode="before",
     )
     @classmethod
     def reject_boolean_record_integer(cls, value: object) -> object:
@@ -789,7 +792,9 @@ class ValueSystemStateSnapshot(_StateModel):
     histories: tuple[ValueRevisionHistorySnapshot, ...]
     evidence_ledgers: tuple[ValueEvidenceLedgerSnapshot, ...]
 
-    @field_validator("values", "conflicts", "histories", "evidence_ledgers", mode="before")
+    @field_validator(
+        "values", "conflicts", "histories", "evidence_ledgers", mode="before"
+    )
     @classmethod
     def parse_value_snapshot_lists(cls, value: object) -> object:
         return _tuple_value(value)
@@ -850,17 +855,20 @@ class ValueRevisionDeltaSnapshot(_StateModel):
 
     @field_validator("evidence_ref_indices")
     @classmethod
-    def require_canonical_evidence_indices(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+    def require_canonical_evidence_indices(
+        cls, value: tuple[int, ...]
+    ) -> tuple[int, ...]:
         if len(value) > VALUE_MAX_EVIDENCE_REFS:
             raise ValueError("Value revision evidence indexes exceed their bound")
         if any(
-            type(index) is not int
-            or not 0 <= index < VALUE_MAX_APPLIED_EVIDENCE_REFS
+            type(index) is not int or not 0 <= index < VALUE_MAX_APPLIED_EVIDENCE_REFS
             for index in value
         ):
             raise ValueError("Value revision evidence index is outside its bound")
         if value != tuple(sorted(set(value))):
-            raise ValueError("Value revision evidence indexes must be ordered and unique")
+            raise ValueError(
+                "Value revision evidence indexes must be ordered and unique"
+            )
         return value
 
     @field_validator("polarity", "opposition_count", mode="before")
@@ -888,7 +896,9 @@ class ValueRevisionDeltaSnapshot(_StateModel):
     @classmethod
     def require_delta_opposition_count(cls, value: int) -> int:
         if not 0 <= value <= VALUE_MAX_OPPOSITION_COUNT:
-            raise ValueError("Value revision delta opposition count is outside its bound")
+            raise ValueError(
+                "Value revision delta opposition count is outside its bound"
+            )
         return value
 
 
@@ -922,15 +932,20 @@ class ValueRevisionRecordSnapshotV7(_StateModel):
     @classmethod
     def require_record_evidence_indices(cls, value: tuple[int, ...]) -> tuple[int, ...]:
         if len(value) > VALUE_MAX_REFS:
-            raise ValueError("Value revision record evidence indexes exceed their bound")
+            raise ValueError(
+                "Value revision record evidence indexes exceed their bound"
+            )
         if any(
-            type(index) is not int
-            or not 0 <= index < VALUE_MAX_APPLIED_EVIDENCE_REFS
+            type(index) is not int or not 0 <= index < VALUE_MAX_APPLIED_EVIDENCE_REFS
             for index in value
         ):
-            raise ValueError("Value revision record evidence index is outside its bound")
+            raise ValueError(
+                "Value revision record evidence index is outside its bound"
+            )
         if value != tuple(sorted(set(value))):
-            raise ValueError("Value revision record evidence indexes must be ordered and unique")
+            raise ValueError(
+                "Value revision record evidence indexes must be ordered and unique"
+            )
         return value
 
     @field_validator("recorded_at", mode="before")
@@ -944,7 +959,11 @@ class ValueRevisionRecordSnapshotV7(_StateModel):
         return _require_context_utc(value)
 
     @field_validator(
-        "from_revision", "to_revision", "event_sequence", "target_revision", mode="before"
+        "from_revision",
+        "to_revision",
+        "event_sequence",
+        "target_revision",
+        mode="before",
     )
     @classmethod
     def reject_boolean_record_integer_v7(cls, value: object) -> object:
@@ -1016,7 +1035,9 @@ class ValueRevisionHistorySnapshotV7(_StateModel):
         if any(value is None for value in anchor_values) and not all(
             value is None for value in anchor_values
         ):
-            raise ValueError("Value history anchor fields must be all present or absent")
+            raise ValueError(
+                "Value history anchor fields must be all present or absent"
+            )
         return self
 
 
@@ -1027,9 +1048,7 @@ class ValueSystemStateSnapshotV7(_StateModel):
     values: tuple[ValueStateSnapshot, ...] = Field(
         max_length=VALUE_MAX_AUTHORITATIVE_VALUES
     )
-    conflicts: tuple[ValueConflictSnapshot, ...] = Field(
-        max_length=VALUE_MAX_CONFLICTS
-    )
+    conflicts: tuple[ValueConflictSnapshot, ...] = Field(max_length=VALUE_MAX_CONFLICTS)
     histories: tuple[ValueRevisionHistorySnapshotV7, ...] = Field(
         max_length=VALUE_MAX_AUTHORITATIVE_VALUES
     )
@@ -1037,7 +1056,9 @@ class ValueSystemStateSnapshotV7(_StateModel):
         max_length=VALUE_MAX_AUTHORITATIVE_VALUES
     )
 
-    @field_validator("values", "conflicts", "histories", "evidence_ledgers", mode="before")
+    @field_validator(
+        "values", "conflicts", "histories", "evidence_ledgers", mode="before"
+    )
     @classmethod
     def parse_value_snapshot_lists_v7(cls, value: object) -> object:
         return _tuple_value(value)
@@ -1066,9 +1087,9 @@ class ValueSystemStateSnapshotV7(_StateModel):
             (conflict.left_value_id, conflict.right_value_id)
             for conflict in self.conflicts
         )
-        max_conflicts = VALUE_MAX_AUTHORITATIVE_VALUES * (
-            VALUE_MAX_AUTHORITATIVE_VALUES - 1
-        ) // 2
+        max_conflicts = (
+            VALUE_MAX_AUTHORITATIVE_VALUES * (VALUE_MAX_AUTHORITATIVE_VALUES - 1) // 2
+        )
         if len(conflict_pairs) > max_conflicts:
             raise ValueError("Value conflicts exceed their authoritative bound")
         if conflict_pairs != tuple(sorted(set(conflict_pairs))):
@@ -1087,8 +1108,12 @@ ValueRevisionHistoryV7Snapshot = ValueRevisionHistorySnapshotV7
 
 class BeliefPropositionStateSnapshot(_StateModel):
     canonical_text: str = Field(max_length=BELIEF_MAX_PROPOSITION_CODEPOINTS)
-    subject: str | None = Field(default=None, max_length=BELIEF_MAX_COMPONENT_CODEPOINTS)
-    predicate: str | None = Field(default=None, max_length=BELIEF_MAX_COMPONENT_CODEPOINTS)
+    subject: str | None = Field(
+        default=None, max_length=BELIEF_MAX_COMPONENT_CODEPOINTS
+    )
+    predicate: str | None = Field(
+        default=None, max_length=BELIEF_MAX_COMPONENT_CODEPOINTS
+    )
     object: str | None = Field(default=None, max_length=BELIEF_MAX_COMPONENT_CODEPOINTS)
     proposition_digest: str = Field(min_length=64, max_length=64)
 
@@ -1120,7 +1145,10 @@ class BeliefSubjectAdmissionStateSnapshot(_StateModel):
 
     @model_validator(mode="after")
     def require_canonical_refs(self) -> BeliefSubjectAdmissionStateSnapshot:
-        if len(self.evidence_refs) == 0 or len(self.evidence_refs) > BELIEF_MAX_EVIDENCE:
+        if (
+            len(self.evidence_refs) == 0
+            or len(self.evidence_refs) > BELIEF_MAX_EVIDENCE
+        ):
             raise ValueError("Belief admission evidence is outside its bound")
         if self.evidence_refs != tuple(sorted(set(self.evidence_refs))):
             raise ValueError("Belief admission evidence must be ordered and unique")
@@ -1140,7 +1168,9 @@ class BeliefRevisionStateSnapshot(_StateModel):
         "expiration",
     ]
     created_at: datetime
-    previous_revision_digest: str | None = Field(default=None, min_length=64, max_length=64)
+    previous_revision_digest: str | None = Field(
+        default=None, min_length=64, max_length=64
+    )
     event_id: str = Field(min_length=1, max_length=128)
     event_sequence: int = Field(ge=1)
     evidence_refs: tuple[str, ...]
@@ -1185,7 +1215,9 @@ class BeliefRecordStateSnapshot(_StateModel):
     superseded_by_id: str | None = Field(default=None, max_length=128)
     revision: int = Field(ge=0)
     revision_history: tuple[BeliefRevisionStateSnapshot, ...]
-    history_anchor_digest: str | None = Field(default=None, min_length=64, max_length=64)
+    history_anchor_digest: str | None = Field(
+        default=None, min_length=64, max_length=64
+    )
     schema_version: Literal[1] = 1
     record_digest: str = Field(min_length=64, max_length=64)
 
@@ -1196,9 +1228,7 @@ class BeliefRecordStateSnapshot(_StateModel):
             raise ValueError("Belief confidence must be finite")
         return value
 
-    @field_validator(
-        "context_scope", "evidence", "revision_history", mode="before"
-    )
+    @field_validator("context_scope", "evidence", "revision_history", mode="before")
     @classmethod
     def parse_belief_lists(cls, value: object) -> object:
         return _tuple_value(value)
@@ -1302,10 +1332,7 @@ def _schema_max_belief_record() -> dict[str, object]:
         },
         "record_digest": _BELIEF_MAX_DIGEST,
         "revision": _BELIEF_SCHEMA_MAX_REVISION,
-        "revision_history": [
-            _schema_max_belief_revision()
-        ]
-        * BELIEF_MAX_REVISIONS,
+        "revision_history": [_schema_max_belief_revision()] * BELIEF_MAX_REVISIONS,
         "schema_version": 1,
         "subject_admission": {
             "admission_digest": _BELIEF_MAX_DIGEST,
@@ -1369,9 +1396,13 @@ class BeliefSystemStateSnapshot(_StateModel):
         ids = tuple(record.belief_id for record in self.records)
         if ids != tuple(sorted(set(ids))):
             raise ValueError("Belief records must be ordered and unique")
-        if len(_canonical_json_bytes(self.model_dump(mode="json"))) > BELIEF_MAX_SERIALIZED_BYTES:
+        if (
+            len(_canonical_json_bytes(self.model_dump(mode="json")))
+            > BELIEF_MAX_SERIALIZED_BYTES
+        ):
             raise ValueError("Belief section exceeds its serialized byte bound")
         return self
+
 
 class AgentStateSnapshotV4(_AgentStateSnapshotBase):
     """Exact retained R10 canonical AgentState v4 schema."""
@@ -1562,6 +1593,66 @@ class AgentStateSnapshotV9(_AgentStateSnapshotBase):
         return self
 
 
+class AgentStateSnapshotV10(AgentStateSnapshotV9):
+    """R15 U5: exact U1 roots and private source-scoped narrative continuity.
+
+    V10 inherits every V9 privacy, Attention, event-fence and Value/Belief
+    validator. It never acts as a model/operator setter for subjective truth.
+    """
+
+    # One intentional schema-discriminator narrowing across versioned Pydantic
+    # subclasses. Runtime validators enforce strict exact 10; V9 stays exact 9.
+    schema_version: Literal[10] = AGENT_STATE_V10_SCHEMA_VERSION  # type: ignore[assignment]
+    relationship_state: dict[str, Any]
+    narrative_self_state: dict[str, Any]
+    self_model_state: dict[str, Any]
+    narrative_admission_checkpoint: dict[str, Any]
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_exact_schema_version(cls, value: object) -> object:
+        if isinstance(value, Mapping) and "schema_version" in value:
+            schema_version = value["schema_version"]
+            if type(schema_version) is not int or schema_version != 10:
+                raise ValueError("schema_version must be the exact integer 10")
+        return value
+
+    @model_validator(mode="after")
+    def validate_r15_roots_and_bound_events(self) -> AgentStateSnapshotV10:
+        # Lazy import is mandatory: R15 Source gate imports Memory participants,
+        # whose coordinator imports AgentState through StateRecovery.
+        from suzka.r15.continuity_state import NarrativeContinuation
+
+        try:
+            rel = RelationshipState.from_value(self.relationship_state)
+            narrative = NarrativeSelfState.from_value(self.narrative_self_state)
+            self_model = SelfModelState.from_value(self.self_model_state)
+            continuation = NarrativeContinuation.from_value(
+                self.narrative_admission_checkpoint, narrative
+            )
+            # All three records are necessarily exact, not caller-supplied
+            # free text, arbitrary U3 roots or self-attested semantic evidence.
+            if (
+                rel.canonical_value() != self.relationship_state
+                or narrative.canonical_value() != self.narrative_self_state
+                or self_model.canonical_value() != self.self_model_state
+                or continuation.canonical_value(narrative)
+                != self.narrative_admission_checkpoint
+            ):
+                raise ValueError("R15 canonical roots differ from snapshot")
+            for state in (rel, narrative, self_model):
+                for revision in state.revision_history:
+                    if (
+                        revision.event.event_sequence
+                        > self.last_processed_event_sequence
+                        or revision.event.occurred_at > self.saved_at
+                    ):
+                        raise ValueError("R15 revision is in the future of AgentState")
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError("invalid R15 owner state or continuation") from exc
+        return self
+
+
 # The unqualified name denotes the current schema; retained callers should use
 # the versioned shape when they intentionally construct an older schema.
 AgentStateSnapshot = AgentStateSnapshotV9
@@ -1576,11 +1667,12 @@ CompatibleAgentStateSnapshot = Annotated[
     | AgentStateSnapshotV6
     | AgentStateSnapshotV7
     | AgentStateSnapshotV8
-    | AgentStateSnapshotV9,
+    | AgentStateSnapshotV9
+    | AgentStateSnapshotV10,
     Field(discriminator="schema_version"),
 ]
-_COMPATIBLE_SNAPSHOT_ADAPTER: TypeAdapter[CompatibleAgentStateSnapshot] = (
-    TypeAdapter(CompatibleAgentStateSnapshot)
+_COMPATIBLE_SNAPSHOT_ADAPTER: TypeAdapter[CompatibleAgentStateSnapshot] = TypeAdapter(
+    CompatibleAgentStateSnapshot
 )
 
 
@@ -1591,7 +1683,9 @@ def validate_compatible_agent_state_snapshot(
 
     raw = (
         value.model_dump(mode="python")
-        if isinstance(value, (AgentStateSnapshotV8, AgentStateSnapshotV9))
+        if isinstance(
+            value, (AgentStateSnapshotV8, AgentStateSnapshotV9, AgentStateSnapshotV10)
+        )
         else value
     )
     validated = _COMPATIBLE_SNAPSHOT_ADAPTER.validate_python(raw)
@@ -1712,9 +1806,7 @@ def _schema_max_context() -> dict[str, object]:
     return {
         "current_context_id": _SCHEMA_MAX_IDENTIFIER,
         "frames": [frame for _ in range(MAX_CONTEXTS)],
-        "interlocutor_bindings": [
-            binding for _ in range(MAX_INTERLOCUTOR_BINDINGS)
-        ],
+        "interlocutor_bindings": [binding for _ in range(MAX_INTERLOCUTOR_BINDINGS)],
         "revision": MAX_PERSISTED_REVISION,
     }
 
@@ -1731,9 +1823,7 @@ def _schema_max_calibration_entry() -> dict[str, object]:
 def _schema_max_appraisal() -> dict[str, object]:
     entry = _schema_max_calibration_entry()
     return {
-        "calibration_entries": [
-            entry for _ in range(CALIBRATION_MAX_ENTRIES)
-        ],
+        "calibration_entries": [entry for _ in range(CALIBRATION_MAX_ENTRIES)],
         "last_emotion_update_at": _SCHEMA_MAX_DATETIME,
     }
 
@@ -1765,9 +1855,7 @@ def _schema_max_value_state() -> dict[str, object]:
         "allowed_update_rate": _SCHEMA_MAX_UNIT_FLOAT,
         "confidence": _SCHEMA_MAX_UNIT_FLOAT,
         "concept": _schema_max_text(VALUE_MAX_CONCEPT_CODEPOINTS),
-        "context_ids": [
-            _SCHEMA_MAX_IDENTIFIER for _ in range(VALUE_MAX_CONTEXT_IDS)
-        ],
+        "context_ids": [_SCHEMA_MAX_IDENTIFIER for _ in range(VALUE_MAX_CONTEXT_IDS)],
         "evidence_refs": [
             _SCHEMA_MAX_IDENTIFIER for _ in range(VALUE_MAX_EVIDENCE_REFS)
         ],
@@ -1791,8 +1879,7 @@ def _schema_max_value_revision_delta() -> dict[str, object]:
     return {
         "confidence": _SCHEMA_MAX_UNIT_FLOAT,
         "evidence_ref_indices": [
-            VALUE_MAX_APPLIED_EVIDENCE_REFS - 1
-            for _ in range(VALUE_MAX_EVIDENCE_REFS)
+            VALUE_MAX_APPLIED_EVIDENCE_REFS - 1 for _ in range(VALUE_MAX_EVIDENCE_REFS)
         ],
         "frozen": True,
         "opposition_count": VALUE_MAX_OPPOSITION_COUNT,
@@ -1831,9 +1918,7 @@ def _schema_max_value_revision_record_v6() -> dict[str, object]:
         "before_digest": _SCHEMA_MAX_DIGEST,
         "event_id": _SCHEMA_MAX_IDENTIFIER,
         "event_sequence": VALUE_MAX_EVENT_SEQUENCE,
-        "evidence_refs": [
-            _SCHEMA_MAX_IDENTIFIER for _ in range(VALUE_MAX_REFS)
-        ],
+        "evidence_refs": [_SCHEMA_MAX_IDENTIFIER for _ in range(VALUE_MAX_REFS)],
         "from_revision": VALUE_MAX_REVISION,
         "operation": _schema_max_enum_value(ValueRevisionOperation),
         "origin_id": _SCHEMA_MAX_DIGEST,
@@ -1886,17 +1971,13 @@ def _schema_max_value_state_v6() -> dict[str, object]:
         "left_value_id": _SCHEMA_MAX_IDENTIFIER,
         "right_value_id": "b" * MAX_IDENTIFIER_CODEPOINTS,
     }
-    max_conflicts = VALUE_MAX_AUTHORITATIVE_VALUES * (
-        VALUE_MAX_AUTHORITATIVE_VALUES - 1
-    ) // 2
+    max_conflicts = (
+        VALUE_MAX_AUTHORITATIVE_VALUES * (VALUE_MAX_AUTHORITATIVE_VALUES - 1) // 2
+    )
     return {
         "conflicts": [conflict for _ in range(max_conflicts)],
-        "evidence_ledgers": [
-            ledger for _ in range(VALUE_MAX_AUTHORITATIVE_VALUES)
-        ],
-        "histories": [
-            history for _ in range(VALUE_MAX_AUTHORITATIVE_VALUES)
-        ],
+        "evidence_ledgers": [ledger for _ in range(VALUE_MAX_AUTHORITATIVE_VALUES)],
+        "histories": [history for _ in range(VALUE_MAX_AUTHORITATIVE_VALUES)],
         "schema_version": 1,
         "values": [value for _ in range(VALUE_MAX_AUTHORITATIVE_VALUES)],
     }
@@ -1910,17 +1991,13 @@ def _schema_max_value_state_v7() -> dict[str, object]:
         "left_value_id": _SCHEMA_MAX_IDENTIFIER,
         "right_value_id": "b" * MAX_IDENTIFIER_CODEPOINTS,
     }
-    max_conflicts = VALUE_MAX_AUTHORITATIVE_VALUES * (
-        VALUE_MAX_AUTHORITATIVE_VALUES - 1
-    ) // 2
+    max_conflicts = (
+        VALUE_MAX_AUTHORITATIVE_VALUES * (VALUE_MAX_AUTHORITATIVE_VALUES - 1) // 2
+    )
     return {
         "conflicts": [conflict for _ in range(max_conflicts)],
-        "evidence_ledgers": [
-            ledger for _ in range(VALUE_MAX_AUTHORITATIVE_VALUES)
-        ],
-        "histories": [
-            history for _ in range(VALUE_MAX_AUTHORITATIVE_VALUES)
-        ],
+        "evidence_ledgers": [ledger for _ in range(VALUE_MAX_AUTHORITATIVE_VALUES)],
+        "histories": [history for _ in range(VALUE_MAX_AUTHORITATIVE_VALUES)],
         "schema_version": 2,
         "values": [value for _ in range(VALUE_MAX_AUTHORITATIVE_VALUES)],
     }
@@ -1972,21 +2049,22 @@ def _schema_envelope_size(field_maxima: Mapping[str, int]) -> int:
     """Count compact JSON braces, keys, colons, and commas exactly."""
 
     fields = tuple(sorted(field_maxima))
-    return 2 + sum(
-        len(_canonical_json_bytes(field_name)) + 1 + field_maxima[field_name]
-        for field_name in fields
-    ) + max(0, len(fields) - 1)
+    return (
+        2
+        + sum(
+            len(_canonical_json_bytes(field_name)) + 1 + field_maxima[field_name]
+            for field_name in fields
+        )
+        + max(0, len(fields) - 1)
+    )
 
 
-AGENT_STATE_V7_SCHEMA_FIELD_MAX_BYTES: Final[dict[str, int]] = (
-    _schema_max_field_bytes()
-)
+AGENT_STATE_V7_SCHEMA_FIELD_MAX_BYTES: Final[dict[str, int]] = _schema_max_field_bytes()
 AGENT_STATE_V7_BASE_MAX_SERIALIZED_BYTES: Final[int] = _schema_envelope_size(
     AGENT_STATE_V7_SCHEMA_FIELD_MAX_BYTES
 )
 AGENT_STATE_V7_SCHEMA_MAX_SERIALIZED_BYTES: Final[int] = (
-    AGENT_STATE_V7_BASE_MAX_SERIALIZED_BYTES
-    + AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
+    AGENT_STATE_V7_BASE_MAX_SERIALIZED_BYTES + AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
 )
 if AGENT_STATE_V7_SCHEMA_MAX_SERIALIZED_BYTES > AGENT_STATE_MAX_SERIALIZED_BYTES:
     raise RuntimeError("AgentState V7 capacity exceeds the hard serialized byte bound")
@@ -2010,8 +2088,7 @@ AGENT_STATE_V8_BASE_MAX_SERIALIZED_BYTES: Final[int] = _schema_envelope_size(
     AGENT_STATE_V8_SCHEMA_FIELD_MAX_BYTES
 )
 AGENT_STATE_V8_SCHEMA_MAX_SERIALIZED_BYTES: Final[int] = (
-    AGENT_STATE_V8_BASE_MAX_SERIALIZED_BYTES
-    + AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
+    AGENT_STATE_V8_BASE_MAX_SERIALIZED_BYTES + AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
 )
 if AGENT_STATE_V8_SCHEMA_MAX_SERIALIZED_BYTES > AGENT_STATE_MAX_SERIALIZED_BYTES:
     raise RuntimeError("AgentState V8 capacity exceeds the hard serialized byte bound")
@@ -2037,8 +2114,7 @@ AGENT_STATE_V9_BASE_MAX_SERIALIZED_BYTES: Final[int] = _schema_envelope_size(
     AGENT_STATE_V9_SCHEMA_FIELD_MAX_BYTES
 )
 AGENT_STATE_V9_SCHEMA_MAX_SERIALIZED_BYTES: Final[int] = (
-    AGENT_STATE_V9_BASE_MAX_SERIALIZED_BYTES
-    + AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
+    AGENT_STATE_V9_BASE_MAX_SERIALIZED_BYTES + AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
 )
 if AGENT_STATE_V9_SCHEMA_MAX_SERIALIZED_BYTES > AGENT_STATE_MAX_SERIALIZED_BYTES:
     raise RuntimeError("AgentState V9 capacity exceeds the hard serialized byte bound")
@@ -2048,8 +2124,8 @@ if AGENT_STATE_V9_SCHEMA_MAX_SERIALIZED_BYTES > AGENT_STATE_MAX_SERIALIZED_BYTES
 AGENT_STATE_V6_SCHEMA_FIELD_MAX_BYTES: Final[dict[str, int]] = (
     _schema_max_field_bytes_v6()
 )
-AGENT_STATE_V6_SCHEMA_MAX_SERIALIZED_BYTES: Final[int] = (
-    _schema_envelope_size(AGENT_STATE_V6_SCHEMA_FIELD_MAX_BYTES)
+AGENT_STATE_V6_SCHEMA_MAX_SERIALIZED_BYTES: Final[int] = _schema_envelope_size(
+    AGENT_STATE_V6_SCHEMA_FIELD_MAX_BYTES
 )
 
 
@@ -2099,6 +2175,34 @@ def project_agent_state_schema_max_bytes(
             )
         projected[field_name] = maximum
     return _schema_envelope_size(projected) + AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
+
+
+def project_agent_state_v10_schema_max_bytes() -> int:
+    """Prove V10 full-legal R15 roots + technical checkpoint + full reserve.
+
+    This uses the existing authoritative V9 per-field schema maxima and the
+    *full-legal* U1 R15 maximum, never sample subject state or discounted
+    future-reserve bytes. Test-only P1b-B preflight must agree exactly.
+    """
+    from suzka.r15.bounds import derive_r15_schema_budget
+    from suzka.r15.continuity_state import MAX_CHECKPOINT_BYTES, checkpoint_max_bytes
+
+    budget = derive_r15_schema_budget()
+    if checkpoint_max_bytes() != MAX_CHECKPOINT_BYTES:
+        raise RuntimeError("R15 continuation worst-case bound changed")
+    projected = project_agent_state_schema_max_bytes(
+        schema_version=10,
+        base_schema_version=9,
+        added_field_maxima={
+            "relationship_state": budget.relationship_bytes,
+            "narrative_self_state": budget.narrative_bytes,
+            "self_model_state": budget.self_model_bytes,
+            "narrative_admission_checkpoint": checkpoint_max_bytes(),
+        },
+    )
+    if projected > AGENT_STATE_MAX_SERIALIZED_BYTES:
+        raise RuntimeError("AgentState V10 exceeds 128MiB with full reserve")
+    return projected
 
 
 class _LegacyEmotionState(_StateModel):
@@ -2243,7 +2347,9 @@ def _value_snapshot(value: ValueState) -> ValueStateSnapshot:
     )
 
 
-def _revision_record_snapshot(record: ValueRevisionRecord) -> ValueRevisionRecordSnapshot:
+def _revision_record_snapshot(
+    record: ValueRevisionRecord,
+) -> ValueRevisionRecordSnapshot:
     return ValueRevisionRecordSnapshot(
         value_id=record.value_id,
         from_revision=record.from_revision,
@@ -2281,7 +2387,9 @@ def _ledger_indices(
     try:
         return tuple(positions[reference] for reference in evidence_refs)
     except KeyError:
-        raise ValueDomainError("Value revision evidence is absent from its ledger") from None
+        raise ValueDomainError(
+            "Value revision evidence is absent from its ledger"
+        ) from None
 
 
 def _revision_delta_snapshot(
@@ -2336,8 +2444,7 @@ def _history_snapshot_v7(
         history_anchor_digest=history.history_anchor_digest,
         history_anchor_state_digest=history.history_anchor_state_digest,
         records=tuple(
-            _revision_record_snapshot_v7(record, ledger)
-            for record in history.records
+            _revision_record_snapshot_v7(record, ledger) for record in history.records
         ),
     )
 
@@ -2428,7 +2535,10 @@ def _belief_revision_snapshot(
 
 
 def _belief_record_snapshot(record: BeliefRecord) -> BeliefRecordStateSnapshot:
-    if not record.revision_history or record.revision_history[-1].revision != record.revision:
+    if (
+        not record.revision_history
+        or record.revision_history[-1].revision != record.revision
+    ):
         raise ValueError("Belief history must include the current revision")
     admission = record.subject_admission
     admission_snapshot = (
@@ -2568,9 +2678,7 @@ def _domain_belief_record(snapshot: BeliefRecordStateSnapshot) -> BeliefRecord:
 
 
 def _domain_belief_system(snapshot: BeliefSystemStateSnapshot) -> BeliefSystem:
-    system = BeliefSystem(
-        _domain_belief_record(record) for record in snapshot.records
-    )
+    system = BeliefSystem(_domain_belief_record(record) for record in snapshot.records)
     authority = system.snapshot()
     if (
         snapshot.schema_version != authority.schema_version
@@ -2669,9 +2777,7 @@ def _domain_revision_v7(
     if snapshot.value_id != basis.value_id:
         raise ValueDomainError("Value revision basis has a mismatched Value ID")
     delta = snapshot.after_state_delta
-    after_origin = basis.origin.model_copy(
-        update={"admission": delta.origin_admission}
-    )
+    after_origin = basis.origin.model_copy(update={"admission": delta.origin_admission})
     after_state = ValueState(
         value_id=basis.value_id,
         revision=snapshot.to_revision,
@@ -2726,8 +2832,7 @@ def _domain_history_v7(
         history_anchor_digest=snapshot.history_anchor_digest,
         history_anchor_state_digest=snapshot.history_anchor_state_digest,
         records=tuple(
-            _domain_revision_v7(record, basis, ledger)
-            for record in snapshot.records
+            _domain_revision_v7(record, basis, ledger) for record in snapshot.records
         ),
     )
     validate_value_history_immutable_basis(history)
@@ -2735,24 +2840,18 @@ def _domain_history_v7(
 
 
 def _domain_value_system_v7(snapshot: ValueSystemStateSnapshotV7) -> ValueSystem:
-    values = {
-        value.value_id: _domain_value(value) for value in snapshot.values
-    }
+    values = {value.value_id: _domain_value(value) for value in snapshot.values}
     ledgers = {
-        ledger.value_id: ledger.evidence_refs
-        for ledger in snapshot.evidence_ledgers
+        ledger.value_id: ledger.evidence_refs for ledger in snapshot.evidence_ledgers
     }
     ledger_digests = {
-        ledger.value_id: ledger.ledger_digest
-        for ledger in snapshot.evidence_ledgers
+        ledger.value_id: ledger.ledger_digest for ledger in snapshot.evidence_ledgers
     }
     histories = {
         history.value_id: _domain_history_v7(
             history,
             next(
-                value
-                for value in snapshot.values
-                if value.value_id == history.value_id
+                value for value in snapshot.values if value.value_id == history.value_id
             ),
             ledgers[history.value_id],
         )
@@ -3031,6 +3130,17 @@ def _attention_state_port(main_loop: SuzkaMainLoop) -> AttentionStatePort | None
     return cast(AttentionStatePort, port)
 
 
+def _r15_state_port(main_loop: SuzkaMainLoop) -> R15StatePort | None:
+    """Resolve one typed U5 owner port; absence preserves old V9 callers."""
+    from suzka.r15.state_port import R15StatePort
+
+    owner = getattr(main_loop, "agent_state_ports", None)
+    port = getattr(owner, "r15_state_port", None)
+    if port is not None and type(port) is not R15StatePort:
+        raise ValueError("R15 technical state port has an invalid owner")
+    return port
+
+
 def _r13_state_snapshot(
     motivation: MotivationSystemSnapshot,
     goal: GoalSystemSnapshot,
@@ -3108,7 +3218,9 @@ class AgentStateStore:
         conflicts = tuple(value_conflicts)
         if any(not isinstance(seed, ValueSeedDeclaration) for seed in seeds):
             raise TypeError("value_seeds must contain ValueSeedDeclaration values")
-        if any(not isinstance(conflict, ValueConflictDefinition) for conflict in conflicts):
+        if any(
+            not isinstance(conflict, ValueConflictDefinition) for conflict in conflicts
+        ):
             raise TypeError(
                 "value_conflicts must contain ValueConflictDefinition values"
             )
@@ -3324,6 +3436,18 @@ class AgentStateStore:
                     "AgentState snapshot schema is invalid"
                 )
             raise schema_failure
+        if version == AGENT_STATE_V10_SCHEMA_VERSION:
+            try:
+                loaded_v10 = AgentStateSnapshotV10.model_validate(raw)
+                self._validate_value_configuration(loaded_v10)
+                _domain_value_system(loaded_v10.value_state)
+                _domain_belief_system(loaded_v10.belief_state)
+                validated_attention_continuity(loaded_v10.attention_state)
+                return loaded_v10
+            except AgentStateLoadError:
+                raise
+            except Exception:
+                raise AgentStateLoadError("AgentState v10 schema is invalid") from None
         if version == CURRENT_AGENT_STATE_SCHEMA_VERSION:
             schema_failure = None
             try:
@@ -3469,7 +3593,9 @@ class AgentStateStore:
                 _domain_belief_system(validated.belief_state)
             payload = self._canonical_bytes(validated)
             if len(payload) > AGENT_STATE_MAX_SERIALIZED_BYTES:
-                raise ValueError("AgentState snapshot exceeds its serialized byte bound")
+                raise ValueError(
+                    "AgentState snapshot exceeds its serialized byte bound"
+                )
             return payload
         except (AgentStateConfigurationDrift, AgentStateLoadError):
             raise
@@ -3581,6 +3707,7 @@ class AgentStateStore:
         | AgentStateSnapshotV7
         | AgentStateSnapshotV8
         | AgentStateSnapshotV9
+        | AgentStateSnapshotV10
     ):
         capture_failure: AgentStateSaveError | None = None
         try:
@@ -3638,9 +3765,7 @@ class AgentStateStore:
             if has_r13_ports and belief_snapshot is None:
                 raise ValueError("R13 capture requires the Belief state port")
             attention_snapshot = (
-                validated_attention_continuity(
-                    attention_port.export_attention_state()
-                )
+                validated_attention_continuity(attention_port.export_attention_state())
                 if attention_port is not None
                 else None
             )
@@ -3650,6 +3775,13 @@ class AgentStateStore:
                 raise ValueError(
                     "Attention capture requires complete Belief and R13 state ports"
                 )
+            r15_port = _r15_state_port(main_loop)
+            if r15_port is not None and (
+                attention_snapshot is None
+                or not has_r13_ports
+                or belief_snapshot is None
+            ):
+                raise ValueError("R15 capture requires complete V9 owner topology")
             common: dict[str, Any] = dict(
                 saved_at=self._now(),
                 last_processed_event_sequence=sequence,
@@ -3741,6 +3873,21 @@ class AgentStateStore:
                         belief_state=_belief_state_snapshot(belief_snapshot),
                         r13_state=r13_state,
                     )
+                if r15_port is not None:
+                    r15 = r15_port._capture_for_agent_state()
+                    return AgentStateSnapshotV10(
+                        **common,
+                        value_state=value_state,
+                        belief_state=_belief_state_snapshot(belief_snapshot),
+                        r13_state=r13_state,
+                        attention_state=attention_snapshot,
+                        relationship_state=r15.relationship.canonical_value(),
+                        narrative_self_state=r15.narrative.canonical_value(),
+                        self_model_state=r15.self_model.canonical_value(),
+                        narrative_admission_checkpoint=(
+                            r15.continuation.canonical_value(r15.narrative)
+                        ),
+                    )
                 return AgentStateSnapshotV9(
                     **common,
                     value_state=value_state,
@@ -3782,6 +3929,10 @@ class AgentStateStore:
         goal_port: GoalStatePort | None = None
         commitment_port: CommitmentStatePort | None = None
         attention_port: AttentionStatePort | None = None
+        r15_port: R15StatePort | None = None
+        previous_r15: R15TechnicalSnapshot | None = None
+        restored_r15: R15TechnicalSnapshot | None = None
+        r15_rollback_failed = False
         attention_restore_transaction: AttentionRestoreTransaction | None = None
         prepared_read_views: object | None = None
         publish_read_views: Callable[[object], object] | None = None
@@ -3830,6 +3981,31 @@ class AgentStateStore:
                 main_loop, require_complete_topology=False
             )
             attention_port = _attention_state_port(main_loop)
+            r15_port = _r15_state_port(main_loop)
+            if r15_port is not None or isinstance(validated, AgentStateSnapshotV10):
+                from suzka.r15.continuity_state import NarrativeContinuation
+                from suzka.r15.state_port import R15TechnicalSnapshot
+            if isinstance(validated, AgentStateSnapshotV10):
+                if r15_port is None:
+                    raise AgentStateLoadError(
+                        "AgentState V10 restore requires a bound R15 technical port"
+                    )
+                restored_narrative = NarrativeSelfState.from_value(
+                    validated.narrative_self_state
+                )
+                restored_r15 = R15TechnicalSnapshot(
+                    RelationshipState.from_value(validated.relationship_state),
+                    restored_narrative,
+                    SelfModelState.from_value(validated.self_model_state),
+                    NarrativeContinuation.from_value(
+                        validated.narrative_admission_checkpoint,
+                        restored_narrative,
+                    ),
+                ).revalidate()
+            elif r15_port is not None:
+                # V9 and older have no R15 source evidence. Bootstrap UNKNOWN;
+                # never infer any biography from the previous Chat transcript.
+                restored_r15 = R15TechnicalSnapshot.empty()
             r13_state = (
                 validated.r13_state
                 if isinstance(validated, (AgentStateSnapshotV8, AgentStateSnapshotV9))
@@ -4001,13 +4177,13 @@ class AgentStateStore:
             if belief_port is not None:
                 previous_belief_snapshot = belief_port.export_belief_state()
                 if not isinstance(previous_belief_snapshot, BeliefSystemSnapshot):
-                    raise AgentStateLoadError("Belief state port returned an invalid snapshot")
+                    raise AgentStateLoadError(
+                        "Belief state port returned an invalid snapshot"
+                    )
                 belief_port_was_present = True
 
             if motivation_port is not None:
-                previous_motivation_snapshot = (
-                    motivation_port.export_motivation_state()
-                )
+                previous_motivation_snapshot = motivation_port.export_motivation_state()
                 if (
                     R13GraphSnapshot.capture(previous_motivation_snapshot).domain
                     != "motivation"
@@ -4022,9 +4198,7 @@ class AgentStateStore:
                         "Goal state port returned an invalid snapshot"
                     )
             if commitment_port is not None:
-                previous_commitment_snapshot = (
-                    commitment_port.export_commitment_state()
-                )
+                previous_commitment_snapshot = commitment_port.export_commitment_state()
                 if (
                     R13GraphSnapshot.capture(previous_commitment_snapshot).domain
                     != "commitment"
@@ -4121,6 +4295,8 @@ class AgentStateStore:
             )
             previous_calibration = calibration.export()
             previous_temporal = current_temporal
+            if r15_port is not None:
+                previous_r15 = r15_port._capture_for_agent_state()
             if attention_port is not None:
                 try:
                     attention_restore_transaction = (
@@ -4173,6 +4349,9 @@ class AgentStateStore:
                 optimal_loss=emotion.optimal_loss,
             )
             emotion_engine.temporal_state = restored_temporal
+            if restored_r15 is not None:
+                assert r15_port is not None
+                r15_port._restore_for_agent_state(restored_r15)
             if attention_restore_transaction is not None:
                 attention_restore_transaction.publish()
             if read_views_prepared:
@@ -4184,12 +4363,22 @@ class AgentStateStore:
             if attention_restore_transaction is not None:
                 attention_restore_transaction.complete()
         except Exception as error:
-            if isinstance(
-                error, AgentStateConfigurationDrift
-            ) and not state_mutation_started:
+            if (
+                isinstance(error, AgentStateConfigurationDrift)
+                and not state_mutation_started
+            ):
                 raise
             if isinstance(error, AgentStateLoadError) and not state_mutation_started:
                 raise
+            if (
+                r15_port is not None
+                and previous_r15 is not None
+                and state_mutation_started
+            ):
+                try:
+                    r15_port._restore_for_agent_state(previous_r15)
+                except Exception:
+                    r15_rollback_failed = True
             for domain, port, previous_snapshot in reversed(attempted_r13_restores):
                 try:
                     if domain == "motivation":
@@ -4249,7 +4438,11 @@ class AgentStateStore:
                     belief_port.restore_belief_state(previous_belief_snapshot)
                 except Exception:
                     pass
-            restore_failure = AgentStateLoadError("AgentState restore failed")
+            restore_failure = AgentStateLoadError(
+                "AgentState R15 rollback failed"
+                if r15_rollback_failed
+                else "AgentState restore failed"
+            )
         finally:
             if attention_restore_transaction is not None:
                 attention_restore_transaction.close()
@@ -4315,6 +4508,10 @@ class AgentStateStore:
             _validated_r13_state_snapshot(snapshot.r13_state)
         if isinstance(snapshot, AgentStateSnapshotV9):
             validated_attention_continuity(snapshot.attention_state)
+        if isinstance(snapshot, AgentStateSnapshotV10):
+            # Pydantic model_copy(update=...) and mutable nested dicts are
+            # NOT authority. Recheck all V10 R15 root digests and event fences.
+            AgentStateSnapshotV10.model_validate(snapshot.model_dump(mode="python"))
         payload = json.dumps(
             snapshot.model_dump(mode="json"),
             ensure_ascii=False,

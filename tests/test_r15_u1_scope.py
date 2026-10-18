@@ -41,6 +41,31 @@ def test_r15_u1_pure_modules_are_not_runtime_producers() -> None:
                 assert not (node.func.attr == "now" and isinstance(node.func.value, ast.Name) and node.func.value.id == "datetime")
             if isinstance(node, ast.Name):
                 assert node.id not in {"uuid4", "ModelInference", "AgentRuntime", "StateWAL"}
+    # U1 pure schemas stay independent, but Human-approved P1b-B1 adds a
+    # deliberately narrow, private U5 state-port consumer. New r15 imports
+    # outside these exact three runtime owners remain forbidden.
+    permitted_r15_runtime_imports = {
+        ROOT / "suzka" / "api" / "server.py": {
+            "suzka.r15.qualified_proposal": {
+                "QualifiedNarrativeSourceGate", "QualifiedProposalUnavailable",
+            },
+        },
+        ROOT / "suzka" / "runtime" / "main_loop.py": {
+            "suzka.r15.state_port": {"R15StatePort"},
+        },
+        ROOT / "suzka" / "runtime" / "agent_state.py": {
+            "suzka.r15.contracts": {
+                "NarrativeSelfState", "RelationshipState", "SelfModelState",
+            },
+            "suzka.r15.state_port": {
+                "R15StatePort", "R15TechnicalSnapshot",
+            },
+            "suzka.r15.bounds": {"derive_r15_schema_budget"},
+            "suzka.r15.continuity_state": {
+                "NarrativeContinuation", "MAX_CHECKPOINT_BYTES", "checkpoint_max_bytes",
+            },
+        },
+    }
     for path in (ROOT / "suzka").rglob("*.py"):
         if R15 in path.parents:
             continue
@@ -49,13 +74,19 @@ def test_r15_u1_pure_modules_are_not_runtime_producers() -> None:
             if isinstance(node, ast.Import):
                 assert all(not alias.name.startswith("suzka.r15") for alias in node.names), path
             elif isinstance(node, ast.ImportFrom):
-                assert not (node.module or "").startswith("suzka.r15"), path
+                module_name = node.module or ""
+                if module_name.startswith("suzka.r15"):
+                    approved = permitted_r15_runtime_imports.get(path, {}).get(module_name)
+                    assert approved is not None, (path, module_name)
+                    assert all(alias.name in approved for alias in node.names), (path, module_name)
                 if node.module == "suzka":
                     assert all(alias.name != "r15" for alias in node.names), path
             elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "__import__":
                 assert not any(isinstance(arg, ast.Constant) and arg.value == "suzka.r15" for arg in node.args), path
     main_loop = (ROOT / "suzka" / "runtime" / "main_loop.py").read_text(encoding="utf-8")
-    assert "suzka.r15" not in main_loop
+    assert "RelationshipSystem(" not in main_loop
+    assert "NarrativeSelfSystem(" not in main_loop
+    assert "_review_committed_turns(" not in main_loop
     assert "observe_metacognition(" not in main_loop
     assert "assess_metacognition(" not in main_loop
 

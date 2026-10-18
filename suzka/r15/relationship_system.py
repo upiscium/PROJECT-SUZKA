@@ -364,6 +364,16 @@ class RelationshipSystem:
         with self._lock:
             return self._copy_root(self._root)
 
+    def _restore_technical_for_agent_state(self, state: RelationshipState) -> None:
+        """U5-only exact root restoration; no subjective axis admission."""
+        if type(state) is not RelationshipState:
+            raise TypeError("Relationship technical state must be exact")
+        detached = self._copy_root(state)
+        with self._mutation():
+            self._root = detached
+            self._receipts = ()
+            self._last_registry_digest = None
+
     def selected_view(self, interlocutor_key: str) -> RelationshipSelectedView | None:
         key = identifier(interlocutor_key, "interlocutor_key")
         with self._lock:

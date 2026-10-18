@@ -280,6 +280,15 @@ class SelfModelSystem:
         with self._lock:
             return _copy_root(self._root)
 
+    def _restore_technical_for_agent_state(self, state: SelfModelState) -> None:
+        """U5-only exact root restoration; no traits or competence adopted."""
+        if type(state) is not SelfModelState:
+            raise TypeError("SelfModel technical state must be exact")
+        detached = SelfModelState.from_json(state.canonical_bytes())
+        with self._mutation():
+            self._root = detached
+            self._receipts = ()
+
     def selected_view(self) -> SelfModelReadView:
         with self._lock:
             return _view(self._root)

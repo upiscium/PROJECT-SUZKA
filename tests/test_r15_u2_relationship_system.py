@@ -427,7 +427,23 @@ def test_r15_u2_module_is_not_a_runtime_or_source_truth_consumer() -> None:
     assert not any(isinstance(node, ast.Name) and node.id in {
         "uuid4", "datetime", "AgentStateSnapshotV10", "GoalSystem", "Decision"
     } for node in ast.walk(tree))
-    assert "suzka.r15" not in (ROOT / "suzka" / "runtime" / "main_loop.py").read_text(encoding="utf-8")
+    # The U5 owner topology can reference the private R15 technical port.
+    # MainLoop itself still cannot create a Relationship claim or directly
+    # take R09/DB1 source-truth authority from the U2 domain.
+    main_loop = (ROOT / "suzka" / "runtime" / "main_loop.py").read_text(encoding="utf-8")
+    source_imports = [
+        node for node in ast.walk(ast.parse(main_loop))
+        if isinstance(node, ast.ImportFrom)
+        and (node.module or "").startswith("suzka.r15")
+    ]
+    assert len(source_imports) == 2
+    assert all(node.module == "suzka.r15.state_port" for node in source_imports)
+    assert all(
+        [item.name for item in node.names] == ["R15StatePort"]
+        for node in source_imports
+    )
+    assert "RelationshipSystem(" not in main_loop
+    assert "observe_current_interlocutor(" not in main_loop
 
 
 def test_r15_u2_documented_unavailability_and_full_reserve_match_pure_u1() -> None:
