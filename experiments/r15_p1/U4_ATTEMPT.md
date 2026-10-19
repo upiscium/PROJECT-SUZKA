@@ -4,7 +4,7 @@ Parent: Issue #334, R15 #283, MVI delivery #323.
 
 **Purpose:** Check whether the already accepted U1 CapabilityHypothesis can represent one observed attempt to resolve the previous-option referent, while VerifiedCompetence stays UNKNOWN. This is not an evaluation of actual task success, general intelligence, personality or emotion.
 
-**Owns:** Evaluator-side typed candidate and disposable cooperative source reads of terminal R07 Chat, active R12 Experience, actual DB1 question/visible answer, and matching anonymous R09 Context. It reuses already qualified, in-process U3 S1→S2 solely to verify meaning.
+**Owns:** Evaluator-side typed candidate and disposable cooperative source reads of terminal R07 Chat, active R12 Experience, actual DB1 question/visible answer, and matching anonymous R09 Context. It reads the actual bound in-process U3 owner (not a caller-created U1 root) and independently reopens E/E2 to verify the observed meaning.
 
 **May:** Produce a DETACHED test-only canonical SelfModelState containing an attempted=PRESENT CapabilityHypothesis for one task class, with confidence in the observed occurrence of that attempt, while verified_competence stays UNKNOWN. Confidence does not measure task accuracy.
 

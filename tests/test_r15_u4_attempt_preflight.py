@@ -15,11 +15,11 @@ from experiments.r15_p1.u4_attempt_preflight import (
 from suzka.memory.experience_participant import experience_id_for_event
 from suzka.r15.common import InterpretationStatus
 from suzka.r15.contracts import (
-    NarrativeSelfState,
     SelfModelState,
     VerifiedCompetence,
 )
 from suzka.r15.qualified_proposal import QualifiedTurnRef
+from suzka.r15.narrative_self_system import NarrativeSelfSystem
 from suzka.r15.self_model_system import SelfModelSystem
 
 from test_r15_p1bb_failures import source_ready_for_later_reinterpretation
@@ -40,9 +40,7 @@ def test_actual_completed_experience_can_encode_attempt_without_verified_skill(
         assert accepted.changed and accepted.snapshot.revision == 2
         source_gate = narrative_owner._source_gate
         assert source_gate is not None
-        detached = inspect_bounded_referent_attempt(
-            source_gate, narrative_owner.snapshot(), refs
-        )
+        detached = inspect_bounded_referent_attempt(source_gate, narrative_owner, refs)
         assert detached.event_count == 5
         assert detached.original_interpretation == "A"
         assert detached.current_interpretation == "B"
@@ -79,9 +77,8 @@ def test_missing_or_forged_events_fail_closed_without_real_u4_state_change(
     ):
         source_gate = narrative_owner._source_gate
         assert source_gate is not None
-        initial = narrative_owner.snapshot()
         with pytest.raises(SelfAttemptUnavailable):
-            inspect_bounded_referent_attempt(source_gate, initial, refs)
+            inspect_bounded_referent_attempt(source_gate, narrative_owner, refs)
         _admit(runtime, narrative_owner, refs)
         baseline = narrative_owner.snapshot()
         for bogus in (
@@ -97,7 +94,7 @@ def test_missing_or_forged_events_fail_closed_without_real_u4_state_change(
             (refs[0], refs[2], refs[1], refs[3], refs[4]),
         ):
             with pytest.raises(SelfAttemptUnavailable):
-                inspect_bounded_referent_attempt(source_gate, baseline, bogus)
+                inspect_bounded_referent_attempt(source_gate, narrative_owner, bogus)
         assert narrative_owner.snapshot() == baseline
         assert SelfModelSystem().snapshot().revision == 0
 
@@ -122,12 +119,12 @@ def test_retracted_later_source_refuses_attempt_update(
         path.unlink()
         try:
             with pytest.raises(SelfAttemptUnavailable):
-                inspect_bounded_referent_attempt(source_gate, root, refs)
+                inspect_bounded_referent_attempt(source_gate, narrative_owner, refs)
             assert narrative_owner.snapshot() == root
         finally:
             path.write_bytes(stored)
             path.chmod(0o600)
-        valid = inspect_bounded_referent_attempt(source_gate, root, refs)
+        valid = inspect_bounded_referent_attempt(source_gate, narrative_owner, refs)
         assert (
             valid.root.capabilities[0].verified_competence is VerifiedCompetence.UNKNOWN
         )
@@ -149,13 +146,13 @@ def test_unrelated_empty_or_caller_supplied_narrative_has_no_u4_authority(
         with pytest.raises(SelfAttemptUnavailable):
             inspect_bounded_referent_attempt(
                 source_gate,
-                NarrativeSelfState(1, 0, (), (), None, ()),
+                NarrativeSelfSystem(),
                 refs,
             )
         with pytest.raises(SelfAttemptUnavailable):
             inspect_bounded_referent_attempt(
                 source_gate,
-                narrative_owner.snapshot(),
+                narrative_owner,
                 tuple(refs[:3]),
             )
         # The factory produces only detached data. There is intentionally

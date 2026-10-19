@@ -22,10 +22,10 @@ from suzka.r15.common import (
 )
 from suzka.r15.contracts import (
     CapabilityHypothesis,
-    NarrativeSelfState,
     SelfModelState,
     VerifiedCompetence,
 )
+from suzka.r15.narrative_self_system import NarrativeSelfSystem
 from suzka.r15.qualified_proposal import (
     QualifiedNarrativeSourceGate,
     QualifiedProposalUnavailable,
@@ -60,7 +60,7 @@ class DetachedSelfAttempt:
 
 def inspect_bounded_referent_attempt(
     gate: QualifiedNarrativeSourceGate,
-    narrative: NarrativeSelfState,
+    narrative_owner: NarrativeSelfSystem,
     source_refs: tuple[QualifiedTurnRef, ...],
 ) -> DetachedSelfAttempt:
     """Qualify one observable attempted answer and detached SelfModel U1 value.
@@ -70,14 +70,17 @@ def inspect_bounded_referent_attempt(
     """
     if (
         type(gate) is not QualifiedNarrativeSourceGate
-        or type(narrative) is not NarrativeSelfState
+        or type(narrative_owner) is not NarrativeSelfSystem
+        or narrative_owner._source_gate is not gate
         or type(source_refs) is not tuple
         or len(source_refs) != 5
         or any(type(ref) is not QualifiedTurnRef for ref in source_refs)
-        or narrative.revision != 2
     ):
         raise SelfAttemptUnavailable("source-qualified candidate unavailable")
     try:
+        narrative = narrative_owner.snapshot()
+        if narrative.revision != 2:
+            raise SelfAttemptUnavailable("narrative has not admitted later evidence")
         observations = tuple(gate._read(ref) for ref in source_refs)
         sequences = tuple(item.event.event_sequence for item in observations)
         if (
