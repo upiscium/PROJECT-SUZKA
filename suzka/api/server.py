@@ -559,6 +559,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.r15_state_port.narrative._bind_source_gate_for_state(
                     narrative_reader
                 )
+                # U6 uses the already-authoritative WAL/Runtime, no new owner.
+                app.state.r15_state_port._bind_private_read_sources(
+                    app.state.agent_state_store, app.state.agent_runtime
+                )
         except BaseException:
             app.state.event_journal.close()
             raise

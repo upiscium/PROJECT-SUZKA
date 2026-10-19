@@ -1205,7 +1205,44 @@ class SuzkaMainLoop:
             value_view,
             attention_payload=attention_payload,
         )
+        # U6b: strictly current, source-qualified *private* interpretation.
+        # Only an explicit request about the previous option warrants a
+        # response-conditioning hint.  All other Chat/debug paths are unchanged.
+        narrative_view = None
+        if (
+            not capture_debug
+            and event is not None
+            and self._r15_state_port is not None
+            and self._requests_prior_interpretation(user_input)
+        ):
+            from suzka.r15.private_projection import PrivateReadStatus
+
+            proposed = self._r15_state_port._read_private_narrative_in_chat(
+                event, current_context.context_id
+            )
+            if proposed.status is PrivateReadStatus.QUALIFIED:
+                narrative_view = proposed
+                prompt = self._prepend_private_interpretation(prompt, proposed)
+
         raw_response = self.agent.generate(prompt)
+        # The model may have run while an external Source was retired or the
+        # committed WAL changed. Reject *before* creating response participants:
+        # no stale source-conditioned words may escape/commit on such a race.
+        if narrative_view is not None:
+            if (
+                self._runtime is None
+                or not isinstance(self._runtime, AgentRuntime)
+                or self._runtime.current_event() is not event
+                or self._r15_state_port is None
+                or event is None
+                or self._r15_state_port._read_private_narrative_in_chat(
+                    event, current_context.context_id
+                )
+                != narrative_view
+            ):
+                raise RuntimeError(
+                    "private interpretation became unavailable during Chat"
+                )
         processed_response = self.postprocessor.process(raw_response)
         memory_participant = MemoryEpisodicParticipant(
             self.memory_system,
@@ -1445,6 +1482,57 @@ class SuzkaMainLoop:
             motivation_state=motivation_state,
             goal_state=goal_state,
             commitment_state=commitment_state,
+        )
+
+    @staticmethod
+    def _requests_prior_interpretation(user_input: str) -> bool:
+        """Conservative explicit-recall use, not a generic conversation setter."""
+        if type(user_input) is not str or len(user_input.encode("utf-8")) > 512:
+            return False
+        return any(
+            phrase in user_input
+            for phrase in (
+                "前の案",
+                "前回の案",
+                "以前の案",
+                "先ほどの案",
+                "前回の解釈",
+                "以前の解釈",
+                "解釈の訂正",
+                "以前の参照先",
+                "prior interpretation",
+                "earlier interpretation",
+            )
+        )
+
+    @staticmethod
+    def _prepend_private_interpretation(prompt: str, projection: object) -> str:
+        """Finite public-safe semantics only; never append owner Source text."""
+        from suzka.r15.private_projection import (
+            PrivateNarrativeProjection,
+            PrivateReadStatus,
+        )
+
+        if (
+            type(projection) is not PrivateNarrativeProjection
+            or projection.status is not PrivateReadStatus.QUALIFIED
+            or projection.revision not in (1, 2)
+            or projection.original_referent not in ("A", "B")
+            or projection.current_referent not in ("A", "B")
+            or projection.later_user_reported != (projection.revision == 2)
+        ):
+            raise ValueError("unqualified private interpretation cannot be used")
+        report = "yes" if projection.later_user_reported else "no"
+        return (
+            "Internal bounded first-person provisional interpretation, "
+            "for the user's explicit request about the preceding exercise ONLY:\n"
+            f"- My earlier tentative option: {projection.original_referent}\n"
+            f"- My current tentative option: {projection.current_referent}\n"
+            f"- Later user-reported correction exists: {report}\n"
+            "The user's later report is not independently verified human intent. "
+            "Do not claim competence, personal identity, trust, objective success, "
+            "or certainty. No hidden history or Source IDs are available. "
+            "Use the current provisional option, not a stale earlier one.\n\n" + prompt
         )
 
     def _build_prompt(
