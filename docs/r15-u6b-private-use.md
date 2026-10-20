@@ -27,8 +27,11 @@ hidden thought or Goal/Tool authorization.
 
 ## Safe bounded Chat consumer
 
-Only an explicit, finite recall phrase in the user's current request allows
-the qualifying read to condition the existing Chat prompt. The projection
+Only an explicit, finite recall phrase **and** a recognizable cue to the
+bounded referent-resolution exercise (such as 暫定解釈 / 比較実験) in the
+user's current request allow the qualifying read to condition Chat. A generic
+"前の案" about an unrelated plan is insufficient. This lexical gate is intentionally
+conservative, not a general proof of user-topic intent. The projection
 prefix contains only fixed strings + finite A/B, and labels all interpretations
 **provisional**. It explicitly forbids a verified-intent/success/skill/trust
 claim. New participant or changed Context forces HOLD. Otherwise the existing

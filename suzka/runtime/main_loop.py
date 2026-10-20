@@ -1493,20 +1493,32 @@ class SuzkaMainLoop:
         """Conservative explicit-recall use, not a generic conversation setter."""
         if type(user_input) is not str or len(user_input.encode("utf-8")) > 512:
             return False
-        return any(
-            phrase in user_input
-            for phrase in (
-                "前の案",
-                "前回の案",
-                "以前の案",
-                "先ほどの案",
-                "前回の解釈",
-                "以前の解釈",
-                "解釈の訂正",
-                "以前の参照先",
-                "prior interpretation",
-                "earlier interpretation",
-            )
+        # Recalling any "previous plan" is insufficient: the bounded U3
+        # evidence only concerns the one referent-resolution exercise.
+        # Require both a retrospective cue and an explicit exercise cue.
+        lowered = user_input.casefold()
+        retrospective = (
+            "前の案",
+            "前回の案",
+            "以前の案",
+            "先ほどの案",
+            "前回の解釈",
+            "以前の解釈",
+            "解釈の訂正",
+            "以前の参照先",
+            "prior interpretation",
+            "earlier interpretation",
+        )
+        exercise = (
+            "暫定解釈",
+            "比較実験",
+            "参照先の解釈",
+            "referent interpretation",
+            "referent-resolution",
+            "provisional interpretation",
+        )
+        return any(cue in lowered for cue in retrospective) and any(
+            cue in lowered for cue in exercise
         )
 
     @staticmethod

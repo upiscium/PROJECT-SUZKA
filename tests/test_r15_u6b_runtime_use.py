@@ -118,13 +118,22 @@ def test_next_real_chat_and_restart_use_current_provisional_option(
         )
 
 
+@pytest.mark.parametrize(
+    "message",
+    (
+        UNRELATED,
+        "前の案で採用したストレージ構成を説明して。",
+        "以前の参照先URLを教えて。",
+        "以前の解釈で使ったDocker設定について教えて。",
+    ),
+)
 def test_nonrecall_chat_never_injects_private_interpretation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, message: str
 ) -> None:
     stages = _stages(tmp_path, no_reveal=False)
     client, provider, _ = next(stages)
     prompts = _capture_answer(provider, monkeypatch)
-    response = client.post("/api/chat", json={"message": UNRELATED, "attachments": []})
+    response = client.post("/api/chat", json={"message": message, "attachments": []})
     assert response.status_code == 200
     assert len(prompts) == 1 and HINT not in prompts[0]
     stages.close()
