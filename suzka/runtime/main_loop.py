@@ -1215,14 +1215,18 @@ class SuzkaMainLoop:
             and self._r15_state_port is not None
             and self._requests_prior_interpretation(user_input)
         ):
-            from suzka.r15.private_projection import PrivateReadStatus
-
             proposed = self._r15_state_port._read_private_narrative_in_chat(
                 event, current_context.context_id
             )
-            if proposed.status is PrivateReadStatus.QUALIFIED:
+            if proposed.qualified:
                 narrative_view = proposed
-                prompt = self._prepend_private_interpretation(prompt, proposed)
+                prompt = self._prepend_private_interpretation(
+                    prompt,
+                    proposed.original_referent,
+                    proposed.current_referent,
+                    proposed.revision,
+                    proposed.later_user_reported,
+                )
 
         raw_response = self.agent.generate(prompt)
         # The model may have run while an external Source was retired or the
@@ -1506,28 +1510,31 @@ class SuzkaMainLoop:
         )
 
     @staticmethod
-    def _prepend_private_interpretation(prompt: str, projection: object) -> str:
+    def _prepend_private_interpretation(
+        prompt: str,
+        original: str | None,
+        current: str | None,
+        revision: int | None,
+        later_reported: bool,
+    ) -> str:
         """Finite public-safe semantics only; never append owner Source text."""
-        from suzka.r15.private_projection import (
-            PrivateNarrativeProjection,
-            PrivateReadStatus,
-        )
-
         if (
-            type(projection) is not PrivateNarrativeProjection
-            or projection.status is not PrivateReadStatus.QUALIFIED
-            or projection.revision not in (1, 2)
-            or projection.original_referent not in ("A", "B")
-            or projection.current_referent not in ("A", "B")
-            or projection.later_user_reported != (projection.revision == 2)
+            type(revision) is not int
+            or revision not in (1, 2)
+            or type(original) is not str
+            or original not in ("A", "B")
+            or type(current) is not str
+            or current not in ("A", "B")
+            or type(later_reported) is not bool
+            or later_reported != (revision == 2)
         ):
             raise ValueError("unqualified private interpretation cannot be used")
-        report = "yes" if projection.later_user_reported else "no"
+        report = "yes" if later_reported else "no"
         return (
             "Internal bounded first-person provisional interpretation, "
             "for the user's explicit request about the preceding exercise ONLY:\n"
-            f"- My earlier tentative option: {projection.original_referent}\n"
-            f"- My current tentative option: {projection.current_referent}\n"
+            f"- My earlier tentative option: {original}\n"
+            f"- My current tentative option: {current}\n"
             f"- Later user-reported correction exists: {report}\n"
             "The user's later report is not independently verified human intent. "
             "Do not claim competence, personal identity, trust, objective success, "

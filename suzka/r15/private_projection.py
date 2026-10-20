@@ -47,6 +47,10 @@ class PrivateNarrativeProjection:
     current_referent: str | None
     later_user_reported: bool
 
+    @property
+    def qualified(self) -> bool:
+        return self.status is PrivateReadStatus.QUALIFIED
+
 
 HOLD = PrivateNarrativeProjection(PrivateReadStatus.HOLD, None, None, None, False)
 

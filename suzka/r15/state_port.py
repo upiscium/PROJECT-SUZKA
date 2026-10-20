@@ -90,7 +90,7 @@ class R15StatePort:
         The qualified gate is already the one bound to the Narrative owner.
         No second StateStore, public API, operator/model override or setter.
         """
-        if type(store) is not AgentStateStore or type(runtime) is not AgentRuntime:
+        if not isinstance(store, AgentStateStore) or type(runtime) is not AgentRuntime:
             raise TypeError("private read requires exact existing owners")
         with self._owner_lock:
             gate = self.narrative._source_gate
