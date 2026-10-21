@@ -296,3 +296,107 @@ def test_retired_source_after_admission_refuses_new_review_not_past_revision(
     resumed, _ = _review(client)
     assert not resumed.changed
     stages.close()
+
+
+def test_restored_same_task_with_nonproducer_proof_is_not_positive_u4(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    from suzka.r15.common import RevisionReason
+    from suzka.r15.contracts import SelfModelState
+
+    stages = _stages(tmp_path, no_reveal=False)
+    client, _, _ = next(stages)
+    owner = client.app.state.r15_state_port.self_model
+    admitted, _ = _review(client)
+    good = admitted.snapshot
+    assert owner.task_view(TASK_CLASS).tracked
+    capability = good.capabilities[0]
+    proof = good.revision_history[0]
+    evidence = capability.attempted.support[0]
+    assert evidence.event is not None
+
+    adversarial_roots = (
+        SelfModelState(
+            1,
+            1,
+            (),
+            (
+                replace(
+                    capability, attempted=replace(capability.attempted, confidence=1)
+                ),
+            ),
+            None,
+            (proof,),
+        ),
+        SelfModelState(
+            1,
+            1,
+            (),
+            (
+                replace(
+                    capability,
+                    attempted=replace(capability.attempted, statement_id="e" * 64),
+                ),
+            ),
+            None,
+            (proof,),
+        ),
+        SelfModelState(
+            1,
+            1,
+            (),
+            (capability,),
+            None,
+            (replace(proof, target_id="e" * 64),),
+        ),
+        SelfModelState(
+            1,
+            1,
+            (),
+            (capability,),
+            None,
+            (replace(proof, before_digest="e" * 64),),
+        ),
+        SelfModelState(
+            1,
+            1,
+            (),
+            (capability,),
+            None,
+            (replace(proof, support_digests=("e" * 64,)),),
+        ),
+        SelfModelState(
+            1,
+            1,
+            (),
+            (capability,),
+            None,
+            (replace(proof, reason=RevisionReason.QUALIFIED_REINTERPRETATION),),
+        ),
+        SelfModelState(
+            1,
+            1,
+            (),
+            (capability,),
+            None,
+            (replace(proof, event=evidence.event),),
+        ),
+    )
+    try:
+        for malformed_producer_shape in adversarial_roots:
+            # These are legal U1 typed values; they are not valid records
+            # produced by this source-qualified U4 path.
+            restored = SelfModelState.from_json(
+                malformed_producer_shape.canonical_bytes()
+            )
+            owner._restore_technical_for_agent_state(restored)
+            view = owner.task_view(TASK_CLASS)
+            assert not view.tracked
+            assert view.attempted_status is InterpretationStatus.UNKNOWN
+            assert view.verified_competence is VerifiedCompetence.UNKNOWN
+    finally:
+        owner._restore_technical_for_agent_state(good)
+    assert owner.task_view(TASK_CLASS).tracked
+    stages.close()

@@ -360,7 +360,7 @@ def _is_closed_admitted_attempt(
     if len(attempt.support) != 1:
         return False
     evidence = attempt.support[0]
-    if witness is not None and evidence != witness:
+    if evidence.event is None or (witness is not None and evidence != witness):
         return False
     expected_statement = checksum(
         _ATTEMPT_STATEMENT_DOMAIN,
@@ -378,6 +378,8 @@ def _is_closed_admitted_attempt(
         and attempt.accessibility is Accessibility.CURRENT
         and attempt.inertia is Inertia.TENTATIVE
         and proof.target_id == expected_statement
+        and proof.event.event_sequence > evidence.event.event_sequence
+        and proof.event.occurred_at >= evidence.event.occurred_at
         and proof.before_digest
         == str(SelfModelState(1, 0, (), (), None, ()).canonical_value()["state_digest"])
         and proof.after_digest
