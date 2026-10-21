@@ -10,6 +10,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from threading import RLock
 
+from suzka.r15.private_projection import (
+    HOLD,
+    PrivateNarrativeProjection,
+    read_private_committed_narrative,
+)
+from suzka.r15.qualified_proposal import QualifiedNarrativeSourceGate
+from suzka.runtime.agent_runtime import (
+    AgentEvent,
+    AgentEventSource,
+    AgentEventType,
+    AgentRuntime,
+)
+from suzka.runtime.agent_state import AgentStateStore
+
 from suzka.r15.continuity_state import NarrativeContinuation
 from suzka.r15.contracts import (
     NarrativeSelfState,
@@ -65,6 +79,62 @@ class R15StatePort:
         self.relationship = RelationshipSystem(context)
         self.narrative = NarrativeSelfSystem()
         self.self_model = SelfModelSystem()
+        self._private_read_store: AgentStateStore | None = None
+        self._private_read_runtime: AgentRuntime | None = None
+
+    def _bind_private_read_sources(
+        self, store: AgentStateStore, runtime: AgentRuntime
+    ) -> None:
+        """Startup-only binding to the EXISTING WAL and serialized runtime.
+
+        The qualified gate is already the one bound to the Narrative owner.
+        No second StateStore, public API, operator/model override or setter.
+        """
+        if not isinstance(store, AgentStateStore) or type(runtime) is not AgentRuntime:
+            raise TypeError("private read requires exact existing owners")
+        with self._owner_lock:
+            gate = self.narrative._source_gate
+            if (
+                type(gate) is not QualifiedNarrativeSourceGate
+                or gate._runtime is not runtime
+            ):
+                raise RuntimeError("private read source owners are not bound")
+            if self._private_read_store is not None and (
+                self._private_read_store is not store
+                or self._private_read_runtime is not runtime
+            ):
+                raise RuntimeError("private read owners cannot be rebound")
+            self._private_read_store = store
+            self._private_read_runtime = runtime
+
+    def _read_private_narrative_in_chat(
+        self, event: AgentEvent, context_id: str
+    ) -> PrivateNarrativeProjection:
+        """An internal read ONLY inside the actual CHAT/API_CHAT worker."""
+        with self._owner_lock:
+            runtime = self._private_read_runtime
+            store = self._private_read_store
+            gate = self.narrative._source_gate
+            if (
+                type(event) is not AgentEvent
+                or runtime is None
+                or store is None
+                or type(gate) is not QualifiedNarrativeSourceGate
+                or gate._runtime is not runtime
+                or runtime.current_event() is not event
+                or event.event_type is not AgentEventType.CHAT
+                or event.source is not AgentEventSource.API_CHAT
+                or type(event.processing_sequence) is not int
+                or type(context_id) is not str
+            ):
+                return HOLD
+            return read_private_committed_narrative(
+                store,
+                self,
+                gate,
+                context_id=context_id,
+                event_sequence=event.processing_sequence,
+            )
 
     def _capture_for_agent_state(self) -> R15TechnicalSnapshot:
         """Detach all three roots, U3 evidence scope and review under one port."""
