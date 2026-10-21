@@ -199,3 +199,82 @@ def test_wrong_episode_id_cannot_yield_positive_wal_attribution(
         with pytest.raises(AssertionError, match="not uniquely committed"):
             _event_time_from_existing_wal(client, "fabricated-episode")
         assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def test_missing_retained_event_transition_refuses_retroactive_attribution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulate WAL rebaseline retention loss, not a fake user identity."""
+    app, *_ = scenario(tmp_path, no_reveal=True)
+    with TestClient(app) as client:
+        episode = _chat(client, "u2-wal-pruned", "original-opaque")
+        qualified = _event_time_from_existing_wal(client, episode)
+        assert qualified.participant_refs == ("original-opaque",)
+        from test_r15_p1b_positive import _source_ref
+
+        original_event = _source_ref(client, episode)
+        wal = client.app.state.state_wal
+        inspect = wal.inspect
+        full = inspect()
+        retained_other_records = tuple(
+            row
+            for row in full.records
+            if not (
+                isinstance(row, TransitionRecord)
+                and str(row.event_id) == original_event.event_id
+            )
+        )
+        assert len(retained_other_records) < len(full.records)
+        # Synthetic inspection result only. Do not replace real WAL files.
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                wal,
+                "inspect",
+                lambda: full.model_copy(update={"records": retained_other_records}),
+            )
+            with pytest.raises(
+                AssertionError, match="historical event-time WAL record not retained"
+            ):
+                _event_time_from_existing_wal(client, episode)
+        assert _event_time_from_existing_wal(client, episode) == qualified
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def test_distinct_opaque_refs_not_merged_by_identical_messages(tmp_path: Path) -> None:
+    """Same display text does not establish real-world person identity."""
+    app, *_ = scenario(tmp_path, no_reveal=True)
+    with TestClient(app) as client:
+        first = _chat(client, "u2-wal-person-one", "opaque-person-a")
+        second = _chat(client, "u2-wal-person-two", "opaque-person-b")
+        observed_a = _event_time_from_existing_wal(client, first)
+        observed_b = _event_time_from_existing_wal(client, second)
+        assert observed_a.context_id != observed_b.context_id
+        assert observed_a.participant_refs == ("opaque-person-a",)
+        assert observed_b.participant_refs == ("opaque-person-b",)
+        assert not observed_a.person_verified
+        assert not observed_b.person_verified
+        assert not observed_a.relationship_admitted
+        assert not observed_b.relationship_admitted
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def test_anonymous_narrative_reader_cannot_be_reused_as_u2_participant_issuer(
+    tmp_path: Path,
+) -> None:
+    """U3's deliberate anonymous-only reader is NOT U2's future issuer."""
+    from suzka.r15.qualified_proposal import QualifiedProposalUnavailable
+    from test_r15_p1b_positive import _source_ref
+
+    app, *_ = scenario(tmp_path, no_reveal=True)
+    with TestClient(app) as client:
+        episode = _chat(client, "u2-wal-gate-difference", "opaque-interlocutor")
+        observed = _event_time_from_existing_wal(client, episode)
+        assert observed.participant_refs == ("opaque-interlocutor",)
+        gate = client.app.state.r15_state_port.narrative._source_gate
+        assert gate is not None
+        source_ref = _source_ref(client, episode)
+        with pytest.raises(
+            QualifiedProposalUnavailable, match="event-time context ambiguous"
+        ):
+            gate._read(source_ref)
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
