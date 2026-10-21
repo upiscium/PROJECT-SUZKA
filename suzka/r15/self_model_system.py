@@ -338,6 +338,57 @@ class SelfAttemptResult:
             raise ValueError("unqualified task-attempt result")
 
 
+def _is_closed_admitted_attempt(
+    root: SelfModelState, witness: SourceWitness | None = None
+) -> bool:
+    """Recognize only this internal producer's canonical task root.
+
+    This structural check is NOT a current R07/R12 Source attestation. A
+    restored legal U1 root with some other task cannot become a positive U4
+    occurrence view merely by having the right field types.
+    """
+    if (
+        type(root) is not SelfModelState
+        or root.revision != 1
+        or root.claims
+        or len(root.capabilities) != 1
+        or len(root.revision_history) != 1
+    ):
+        return False
+    capability = root.capabilities[0]
+    attempt = capability.attempted
+    if len(attempt.support) != 1:
+        return False
+    evidence = attempt.support[0]
+    if witness is not None and evidence != witness:
+        return False
+    expected_statement = checksum(
+        _ATTEMPT_STATEMENT_DOMAIN,
+        {"task_class": TASK_CLASS, "experience": evidence.reference},
+    )
+    proof = root.revision_history[0]
+    return (
+        capability.task_class_key == TASK_CLASS
+        and capability.verified_competence is VerifiedCompetence.UNKNOWN
+        and attempt.status is InterpretationStatus.PRESENT
+        and attempt.statement_id == expected_statement
+        and attempt.estimate == SCORE_SCALE
+        and attempt.confidence == SCORE_SCALE
+        and attempt.counter == ()
+        and attempt.accessibility is Accessibility.CURRENT
+        and attempt.inertia is Inertia.TENTATIVE
+        and proof.target_id == expected_statement
+        and proof.before_digest
+        == str(SelfModelState(1, 0, (), (), None, ()).canonical_value()["state_digest"])
+        and proof.after_digest
+        == checksum(_ATTEMPT_CAPABILITY_DOMAIN, encode(capability))
+        and proof.support_digests == (evidence.source_digest,)
+        and proof.counter_digests == ()
+        and proof.reason is RevisionReason.INITIAL_INTERPRETATION
+        and proof.previous_digest is None
+    )
+
+
 class SelfModelSystem:
     """A single qualified task-attempt owner; never verified capability."""
 
@@ -381,15 +432,11 @@ class SelfModelSystem:
             return _view(self._root)
 
     def task_view(self, task_class_key: str) -> SelfTaskView:
-        """Read already-admitted task occurrence, never infer task success."""
+        """Read the bounded producer-shaped task occurrence, not success."""
 
         key = validate_identifier(task_class_key)
         with self._lock:
-            match = next(
-                (cap for cap in self._root.capabilities if cap.task_class_key == key),
-                None,
-            )
-            if match is None:
+            if key != TASK_CLASS or not _is_closed_admitted_attempt(self._root):
                 return SelfTaskView(
                     key,
                     False,
@@ -397,12 +444,13 @@ class SelfModelSystem:
                     None,
                     VerifiedCompetence.UNKNOWN,
                 )
+            attempted = self._root.capabilities[0]
             return SelfTaskView(
                 key,
                 True,
-                match.attempted.status,
-                match.attempted.confidence,
-                match.verified_competence,
+                attempted.attempted.status,
+                attempted.attempted.confidence,
+                attempted.verified_competence,
             )
 
     def _bind_source_qualified_attempt_gate(
@@ -442,26 +490,7 @@ class SelfModelSystem:
                 ):
                     raise SelfModelEventConflict("SelfModel review predates revision")
             if current.revision != 0 or current.capabilities or current.claims:
-                if (
-                    current.revision != 1
-                    or len(current.capabilities) != 1
-                    or current.capabilities[0].task_class_key != TASK_CLASS
-                    or current.capabilities[0].attempted.support != (witness,)
-                    or current.capabilities[0].attempted.statement_id != statement_id
-                    or current.capabilities[0].attempted.status
-                    is not InterpretationStatus.PRESENT
-                    or current.capabilities[0].attempted.estimate != SCORE_SCALE
-                    or current.capabilities[0].attempted.confidence != SCORE_SCALE
-                    or current.capabilities[0].attempted.counter
-                    or current.capabilities[0].verified_competence
-                    is not VerifiedCompetence.UNKNOWN
-                    or len(current.revision_history) != 1
-                    or current.revision_history[0].target_id != statement_id
-                    or current.revision_history[0].support_digests
-                    != (witness.source_digest,)
-                    or current.revision_history[0].reason
-                    is not RevisionReason.INITIAL_INTERPRETATION
-                ):
+                if not _is_closed_admitted_attempt(current, witness):
                     raise SelfModelEventConflict(
                         "different existing SelfModel cannot be overwritten"
                     )

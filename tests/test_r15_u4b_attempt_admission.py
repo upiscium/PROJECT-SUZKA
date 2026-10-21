@@ -141,6 +141,13 @@ def test_unauthorized_event_cannot_adopt_and_cannot_be_called_directly(
     )
     with pytest.raises(AgentRuntimeExecutionError):
         invalid.result(timeout=30)
+    invalid_type = client.app.state.agent_runtime.submit(
+        AgentEventType.CHAT,
+        AgentEventSource.RUNTIME_SELF_ATTEMPT_REVIEW,
+        port._review_source_qualified_self_attempt,
+    )
+    with pytest.raises(AgentRuntimeExecutionError):
+        invalid_type.result(timeout=30)
     assert port.self_model.snapshot().revision == 0
 
     # A model/operator statement is untrusted conversation, not a U4 setter.
@@ -241,4 +248,51 @@ def test_observed_task_view_cannot_upgrade_verified_competence(
         client.app.state.agent_state_store.load().self_model_state
         == positive.snapshot.canonical_value()
     )
+    stages.close()
+
+
+def test_restored_legal_but_unqualified_task_is_not_a_positive_u4_view() -> None:
+    from suzka.r15.self_model_system import SelfModelSystem
+    from test_r15_u4_self_model_system import _synthetic_self_root
+
+    owner = SelfModelSystem()
+    owner._restore_technical_for_agent_state(_synthetic_self_root())
+    assert owner.snapshot().revision == 1  # U5 preserves legal typed payloads
+    view = owner.task_view("task:python")
+    assert not view.tracked
+    assert view.attempted_status is InterpretationStatus.UNKNOWN
+    assert view.verified_competence is VerifiedCompetence.UNKNOWN
+
+
+def test_retired_source_after_admission_refuses_new_review_not_past_revision(
+    tmp_path: Path,
+) -> None:
+    stages = _stages(tmp_path, no_reveal=False)
+    client, _provider, refs = next(stages)
+    accepted, _ = _review(client)
+    assert accepted.changed
+    store = client.app.state.experience_store
+    source = refs[1]
+    path = store.record_path(
+        experience_id_for_event(source.event_id, source.event_sequence), 0
+    )
+    saved = path.read_bytes()
+    path.unlink()
+    try:
+        with pytest.raises(AgentRuntimeExecutionError):
+            _review(client)
+        # A committed historical attempt is retained. Its read view is not a
+        # fresh Source assertion: no new use/admission passes with retired E.
+        view = client.app.state.r15_state_port.self_model.task_view(TASK_CLASS)
+        assert view.tracked
+        assert view.verified_competence is VerifiedCompetence.UNKNOWN
+        assert (
+            client.app.state.agent_state_store.load().self_model_state
+            == accepted.snapshot.canonical_value()
+        )
+    finally:
+        path.write_bytes(saved)
+        path.chmod(0o600)
+    resumed, _ = _review(client)
+    assert not resumed.changed
     stages.close()
