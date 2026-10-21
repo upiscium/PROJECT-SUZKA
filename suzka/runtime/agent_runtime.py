@@ -24,6 +24,7 @@ class AgentEventType(str, Enum):
     EMOTION_TICK = "emotion_tick"
     VALUE_GOVERNANCE = "value_governance"
     NARRATIVE_REVIEW = "narrative_review"
+    SELF_ATTEMPT_REVIEW = "self_attempt_review"
 
 
 class AgentEventSource(str, Enum):
@@ -48,6 +49,7 @@ class AgentEventSource(str, Enum):
     API_ADAPTER_REJECT = "api.adapters.reject"
     RUNTIME_EMOTION_TIMER = "runtime.emotion_timer"
     RUNTIME_NARRATIVE_REVIEW = "runtime.narrative_review"
+    RUNTIME_SELF_ATTEMPT_REVIEW = "runtime.self_attempt_review"
 
 
 class AgentRuntimeStatus(str, Enum):
