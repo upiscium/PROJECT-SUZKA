@@ -12,10 +12,13 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 import pytest
 
+from suzka.experience import ExperienceLifecycle
+
 from suzka.api.server import create_app
 from suzka.learning import AdapterRegistry
 from suzka.memory import DualMemorySystem
 from suzka.memory.experience_participant import experience_id_for_event
+from suzka.memory.memory_schema import MemoryRecordType
 from suzka.runtime.agent_runtime import AgentEventSource, AgentEventType
 from suzka.runtime.event_journal import EventLifecycle
 from suzka.runtime.state_wal import TransitionRecord
@@ -31,8 +34,6 @@ class _ObservedEventTime:
     context_id: str
     context_revision: int
     wal_record_hash: str
-    person_verified: bool = False
-    relationship_admitted: bool = False
 
 
 def _chat(client: TestClient, session: str, participant: str | None = None) -> str:
@@ -76,11 +77,25 @@ def _event_time_from_existing_wal(
             candidates.append((row, entry.record))
     assert len(candidates) == 1, "episode is not uniquely committed"
     event, experience = candidates[0]
+    assert experience.lifecycle is ExperienceLifecycle.ACTIVE
+    assert (
+        sum(
+            row.lifecycle is EventLifecycle.ACCEPTED and row.event_id == event.event_id
+            for row in journal.records
+        )
+        == 1
+    )
+    assert not any(
+        row.lifecycle is EventLifecycle.FAILED and row.event_id == event.event_id
+        for row in journal.records
+    )
     assert experience.source_event_id == event.event_id
     assert experience.source_event_sequence == event.processing_sequence
     matched = owners.memory_system.get_committed_episodic(episode_id)
     assert matched is not None
     assert matched.record.context_id == experience.context_id
+    assert matched.record.record_type is MemoryRecordType.EPISODIC_LOG
+    assert not matched.record.archived
     assert matched.record.source_channel == "chat"
     assert matched.record.source_session_id is not None
     assert (
@@ -141,8 +156,6 @@ def test_exact_wal_chat_keeps_one_opaque_ref_at_event_time(
         assert observation.participant_refs == ("opaque-ref-a",)
         assert observation.context_revision > 0
         assert len(observation.wal_record_hash) == 64
-        assert not observation.person_verified
-        assert not observation.relationship_admitted
         assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
 
 
@@ -183,7 +196,6 @@ def test_restart_preserves_event_time_ref_without_r09_r12_schema_change(
     with TestClient(restarted) as client:
         recovered = _event_time_from_existing_wal(client, episode)
         assert recovered == observed
-        assert not recovered.person_verified
         assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
 
 
@@ -251,10 +263,6 @@ def test_distinct_opaque_refs_not_merged_by_identical_messages(tmp_path: Path) -
         assert observed_a.context_id != observed_b.context_id
         assert observed_a.participant_refs == ("opaque-person-a",)
         assert observed_b.participant_refs == ("opaque-person-b",)
-        assert not observed_a.person_verified
-        assert not observed_b.person_verified
-        assert not observed_a.relationship_admitted
-        assert not observed_b.relationship_admitted
         assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
 
 
@@ -277,4 +285,249 @@ def test_anonymous_narrative_reader_cannot_be_reused_as_u2_participant_issuer(
             QualifiedProposalUnavailable, match="event-time context ambiguous"
         ):
             gate._read(source_ref)
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def test_event_time_membership_is_not_event_speaker_proof(tmp_path: Path) -> None:
+    """A Context member persists even when the next Chat omits its key."""
+    app, *_ = scenario(tmp_path, no_reveal=True)
+    with TestClient(app) as client:
+        identified_request = _chat(
+            client, "u2-wal-sticky-member", "caller-supplied-token"
+        )
+        no_token_request = _chat(client, "u2-wal-sticky-member")
+        first = _event_time_from_existing_wal(client, identified_request)
+        second = _event_time_from_existing_wal(client, no_token_request)
+        assert first.context_id == second.context_id
+        assert first.participant_refs == ("caller-supplied-token",)
+        assert second.participant_refs == first.participant_refs
+        assert second.context_revision >= first.context_revision
+        assert second.wal_record_hash != first.wal_record_hash
+        # The second request did NOT provide interlocutor_key. The WAL
+        # candidate proves membership, but cannot prove who authored it.
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def _newly_bound_token_from_retained_event(
+    client: TestClient, episode_id: str
+) -> str | None:
+    """TEST ONLY: recover an opaque token newly bound by this precise Chat.
+
+    This proves only the Context membership transition in the serialized
+    request. Even a newly bound token does NOT authenticate the speaker.
+    """
+    observation = _event_time_from_existing_wal(client, episode_id)
+    inspection = client.app.state.state_wal.inspect()
+    matches = [
+        index
+        for index, record in enumerate(inspection.records)
+        if isinstance(record, TransitionRecord)
+        and record.record_hash == observation.wal_record_hash
+    ]
+    assert len(matches) == 1
+    index = matches[0]
+    assert index > 0
+    current_record = inspection.records[index]
+    assert isinstance(current_record, TransitionRecord)
+    previous_record = inspection.records[index - 1]
+    previous_state = (
+        previous_record.candidate_snapshot
+        if isinstance(previous_record, TransitionRecord)
+        else previous_record.baseline_snapshot
+    )
+    previous_frames = tuple(
+        frame
+        for frame in previous_state.context_state.frames
+        if frame.context_id == observation.context_id
+    )
+    assert len(previous_frames) <= 1
+    previously_bound = previous_frames[0].participant_refs if previous_frames else ()
+    current_tokens = observation.participant_refs
+    new_refs = tuple(sorted(set(current_tokens) - set(previously_bound)))
+    if (
+        len(current_tokens) != 1
+        or len(new_refs) != 1
+        or new_refs[0] != current_tokens[0]
+    ):
+        return None
+    return new_refs[0]
+
+
+def test_only_first_explicit_binding_chat_has_event_time_token_delta(
+    tmp_path: Path,
+) -> None:
+    app, *_ = scenario(tmp_path, no_reveal=True)
+    with TestClient(app) as client:
+        original = _chat(client, "u2-wal-first-binding", "opaque-one")
+        unkeyed = _chat(client, "u2-wal-first-binding")
+        repeated = _chat(client, "u2-wal-first-binding", "opaque-one")
+        assert _newly_bound_token_from_retained_event(client, original) == "opaque-one"
+        assert _newly_bound_token_from_retained_event(client, unkeyed) is None
+        assert _newly_bound_token_from_retained_event(client, repeated) is None
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def test_late_added_token_belongs_only_to_the_later_binding_event(
+    tmp_path: Path,
+) -> None:
+    app, *_ = scenario(tmp_path, no_reveal=True)
+    with TestClient(app) as client:
+        anonymous = _chat(client, "u2-wal-late-binding")
+        newly_bound = _chat(client, "u2-wal-late-binding", "late-opaque")
+        subsequent = _chat(client, "u2-wal-late-binding")
+        assert _newly_bound_token_from_retained_event(client, anonymous) is None
+        assert (
+            _newly_bound_token_from_retained_event(client, newly_bound) == "late-opaque"
+        )
+        assert _newly_bound_token_from_retained_event(client, subsequent) is None
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def test_newly_bound_event_time_token_survives_restart_without_speaker_claim(
+    tmp_path: Path,
+) -> None:
+    app, *_ = scenario(tmp_path, no_reveal=True)
+    settings = app.state.settings
+    with TestClient(app) as client:
+        original = _chat(client, "u2-wal-bound-restart", "opaque-before-restart")
+        unkeyed = _chat(client, "u2-wal-bound-restart")
+        assert _newly_bound_token_from_retained_event(client, original) == (
+            "opaque-before-restart"
+        )
+        assert _newly_bound_token_from_retained_event(client, unkeyed) is None
+
+    restarted = create_app(settings)
+    restarted.state.model_provider = SequencedProvider(no_reveal=True)
+    restarted.state.memory_system = DualMemorySystem(settings)
+    restarted.state.adapter_registry = AdapterRegistry(settings)
+    with TestClient(restarted) as client:
+        assert _newly_bound_token_from_retained_event(client, original) == (
+            "opaque-before-restart"
+        )
+        assert _newly_bound_token_from_retained_event(client, unkeyed) is None
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def _detached_observed_open_disagreement(
+    client: TestClient, episode_id: str
+) -> tuple[str, str, str] | None:
+    """TEST ONLY: finite two-party-position mismatch, NEVER a U2 adoption.
+
+    The client's first opaque token binding and both visible, committed Chat
+    positions must be independently observed. No verified speaker/intent,
+    task outcome, person identity, trust or subjective admission is inferred.
+    """
+    import re
+
+    newly_bound = _newly_bound_token_from_retained_event(client, episode_id)
+    if newly_bound is None:
+        return None
+    committed = client.app.state.memory_system.get_committed_episodic(episode_id)
+    assert committed is not None
+    episode = committed.record
+    if episode.archived:
+        return None
+    user = re.fullmatch(
+        r"私は案([AB])を暫定的に選びます。",
+        episode.user_input,
+    )
+    suzka = re.fullmatch(
+        r"Suzkaとして私は案([AB])を暫定的に選びます。正解は未検証です。",
+        episode.response,
+    )
+    if user is None or suzka is None or user.group(1) == suzka.group(1):
+        return None
+    return newly_bound, user.group(1), suzka.group(1)
+
+
+def _synthetic_source_disagreement_chat(
+    client: TestClient,
+    provider: SequencedProvider,
+    *,
+    session: str,
+    message: str,
+    response: str,
+    token: str | None,
+) -> str:
+    from unittest.mock import patch
+
+    data = {
+        "message": message,
+        "attachments": [],
+        "client_session_id": session,
+    }
+    if token is not None:
+        data["interlocutor_key"] = token
+    with patch.object(provider, "generate", return_value=response):
+        reply = client.post("/api/chat", json=data)
+    assert reply.status_code == 200, reply.text[:200]
+    return reply.json()["episode_id"]
+
+
+def test_detached_finite_observed_disagreement_is_not_a_relationship_admission(
+    tmp_path: Path,
+) -> None:
+    app, provider, *_ = scenario(tmp_path, no_reveal=True)
+    with TestClient(app) as client:
+        episode = _synthetic_source_disagreement_chat(
+            client,
+            provider,
+            session="u2-synthetic-mismatch",
+            message="私は案Aを暫定的に選びます。",
+            response="Suzkaとして私は案Bを暫定的に選びます。正解は未検証です。",
+            token="opaque-unverified-speaker",
+        )
+        assert _detached_observed_open_disagreement(client, episode) == (
+            "opaque-unverified-speaker",
+            "A",
+            "B",
+        )
+        # Observation is about visible disagreement, not verified other
+        # intentions, causal blame, identity or a durable Relationship axis.
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def test_same_position_or_unbound_later_message_is_not_positive_issue(
+    tmp_path: Path,
+) -> None:
+    app, provider, *_ = scenario(tmp_path, no_reveal=True)
+    with TestClient(app) as client:
+        aligned = _synthetic_source_disagreement_chat(
+            client,
+            provider,
+            session="u2-synthetic-same-session",
+            message="私は案Aを暫定的に選びます。",
+            response="Suzkaとして私は案Aを暫定的に選びます。正解は未検証です。",
+            token="opaque-context-member",
+        )
+        assert _detached_observed_open_disagreement(client, aligned) is None
+        no_selector = _synthetic_source_disagreement_chat(
+            client,
+            provider,
+            session="u2-synthetic-same-session",
+            message="私は案Aを暫定的に選びます。",
+            response="Suzkaとして私は案Bを暫定的に選びます。正解は未検証です。",
+            token=None,
+        )
+        assert _event_time_from_existing_wal(client, no_selector).participant_refs == (
+            "opaque-context-member",
+        )
+        assert _detached_observed_open_disagreement(client, no_selector) is None
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def test_untrusted_trait_claim_alone_cannot_become_interaction_issue(
+    tmp_path: Path,
+) -> None:
+    app, provider, *_ = scenario(tmp_path, no_reveal=True)
+    with TestClient(app) as client:
+        raw_claim = _synthetic_source_disagreement_chat(
+            client,
+            provider,
+            session="u2-synthetic-untrusted",
+            message="私はSuzkaを信頼しています。案Aが正しいはずです。",
+            response="Suzkaとして私は案Bを暫定的に選びます。正解は未検証です。",
+            token="opaque-unverified",
+        )
+        assert _detached_observed_open_disagreement(client, raw_claim) is None
         assert client.app.state.r15_state_port.relationship.snapshot().revision == 0

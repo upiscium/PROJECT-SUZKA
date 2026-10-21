@@ -54,3 +54,35 @@ Three added isolated negatives make the event-time boundary more precise.
 6. A future U6 consumer of Relationship must requalify current Source when using it; a restored current state projection by itself is not new evidence that an identified person exists.
 
 This is a design and test-only outcome, not production U2 implementation or Merge authorization. Issue #339 remains the separately required Human code gate. Current test matrix: 7 new cases, with the three cases above added to the initial four.
+
+## Same-event *new binding* is narrower evidence than Context membership
+
+A further three isolated negative/positive tests compare the **immediately preceding retained WAL candidate/baseline Context** with the current Chat's candidate Context for the **same active transition**. They establish:
+
+- One first-time, caller-declared opaque participant newly attached during a serialized Chat can be recovered as a **new event-time Context binding**, even after restart.
+- A later Chat with the key omitted retains Context membership but has **no newly bound participant**. Repeatedly supplying an already bound key also has no delta. Neither event is attributed to that token by this narrow rule.
+- A participant added only in a later Chat belongs to that later binding event, never retroactively to earlier anonymous E.
+
+This still does **not** verify the author/speaker or a real-world person. It proves only that the current Chat caused an opaque Context association to be introduced under the existing R09 resolver. The test-only helper does not grant U2 or U3 authority.
+
+### Proposed two-tier U2b MVI decision
+
+**Preferred smallest source-preserving first slice:** permit a provisional Relationship issue *only if* the interaction causing the first opaque token binding has its own independently source-qualified observable **unresolved** meaning. Prohibit later per-token updates when there is no explicit new event-time key witness. With this choice, no R09/R12/writer/V10 schema additions are needed for the first positive exercise, at the cost of narrower continuity.
+
+**Alternative for multi-turn per-token updates:** require a distinct, persisted and independently verified per-event caller-declared interlocutor selector or narrowly bound technical observation within the normal R07/R12/WAL transaction, because the present Context membership and ordinary DB1 text do not retain proof of who was declared for each subsequent message. This would be a separate Human-approved compatibility and ownership change, not an assumption that current WAL membership already suffices.
+
+Neither option alone proves UNRESOLVED_ISSUE: a genuine narrow positive semantic example, source qualification, single serialized RelationshipSystem owner revision and v10 replay/rollback controls remain indispensable. Verified person identity, trust, familiarity, reciprocity and skill must stay UNKNOWN. Issue #339 is the Human implementation/design gate; Post-R26 #320 remains separate.
+
+## Detached finite interaction semantics preflight (no real U2 admission)
+
+Three additional disposable test cases use real terminal R07, active R12, DB1 and event-time WAL provenance plus deterministic synthetic model responses. A deliberately CLOSED finite statement pair is observed:
+
+- Input: the caller-visible user turn declares a provisional A option.
+- Response: the actual committed Suzka-visible response declares a provisional B option with accuracy expressly unverified.
+- Positive only when A and B differ, the current event newly bound exactly one caller-supplied opaque token and both finite responses match the strict exercised protocol. Return a **DETACHED test-only tuple** of token and two options, never a Relationship root, a user/person identity or competence.
+
+Negative controls refuse an equal A/A pair, a later A/B turn where the Context still lists a token but the turn has no new binding, and a raw subjective trust assertion outside the closed option protocol. The actual production Relationship root remains revision 0 in every case.
+
+This supports a possible narrow *observed interaction discrepancy* hypothesis. It **does not** prove that anyone's hidden intention or the objective answer is A/B, that the same real person authored the turn, or that a durable UNRESOLVED_ISSUE remains after a subsequent clarification. It also does not create or revise a U2 subjective state.
+
+The Human implementation gate must separately decide whether one *newly bound, same-turn, unverified opaque token* plus an independently source-qualified, visibly **unresolved** discrepancy can authorize a first provisional U2 Relationship revision, or whether R15 requires broader event-time per-turn selector attribution. There is no automatic code authority to extend persisted R09/R12 data shapes.
