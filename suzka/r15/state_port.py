@@ -10,6 +10,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from threading import RLock
 
+from suzka.r15.attempt_producer import (
+    QualifiedSelfAttemptGate,
+    QualifiedSelfAttemptUnavailable,
+)
 from suzka.r15.private_projection import (
     HOLD,
     PrivateNarrativeProjection,
@@ -32,7 +36,7 @@ from suzka.r15.contracts import (
 )
 from suzka.r15.narrative_self_system import NarrativeSelfSystem
 from suzka.r15.relationship_system import RelationshipSystem
-from suzka.r15.self_model_system import SelfModelSystem
+from suzka.r15.self_model_system import SelfAttemptResult, SelfModelSystem
 from suzka.runtime.context import ContextRegistry
 
 
@@ -99,13 +103,41 @@ class R15StatePort:
                 or gate._runtime is not runtime
             ):
                 raise RuntimeError("private read source owners are not bound")
-            if self._private_read_store is not None and (
-                self._private_read_store is not store
-                or self._private_read_runtime is not runtime
-            ):
+            if self._private_read_store is not None:
+                if (
+                    self._private_read_store is store
+                    and self._private_read_runtime is runtime
+                ):
+                    return
                 raise RuntimeError("private read owners cannot be rebound")
+            # Existing AgentStateStore subclasses may be injected by older
+            # recovery tests. Only the exact production owner can authorize
+            # a new positive U4; subclasses retain the old fail-closed path.
+            if type(store) is AgentStateStore:
+                self.self_model._bind_source_qualified_attempt_gate(
+                    QualifiedSelfAttemptGate(store, self, gate, runtime)
+                )
             self._private_read_store = store
             self._private_read_runtime = runtime
+
+    def _review_source_qualified_self_attempt(self) -> SelfAttemptResult:
+        """Internal self-attempt adoption, never callable as a model setter."""
+
+        with self._owner_lock:
+            runtime = self._private_read_runtime
+            event = None if runtime is None else runtime.current_event()
+            if (
+                type(runtime) is not AgentRuntime
+                or type(event) is not AgentEvent
+                or event.event_type is not AgentEventType.SELF_ATTEMPT_REVIEW
+                or event.source is not AgentEventSource.RUNTIME_SELF_ATTEMPT_REVIEW
+                or type(event.processing_sequence) is not int
+                or event.processing_sequence < 1
+            ):
+                raise QualifiedSelfAttemptUnavailable(
+                    "SelfModel revision requires the internal Actor event"
+                )
+            return self.self_model._review_source_qualified_attempt()
 
     def _read_private_narrative_in_chat(
         self, event: AgentEvent, context_id: str
