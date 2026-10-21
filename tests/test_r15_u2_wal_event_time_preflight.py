@@ -408,7 +408,7 @@ def test_newly_bound_event_time_token_survives_restart_without_speaker_claim(
         assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
 
 
-def _detached_observed_open_disagreement(
+def _detached_observed_position_mismatch(
     client: TestClient, episode_id: str
 ) -> tuple[str, str, str] | None:
     """TEST ONLY: finite two-party-position mismatch, NEVER a U2 adoption.
@@ -428,11 +428,11 @@ def _detached_observed_open_disagreement(
     if episode.archived:
         return None
     user = re.fullmatch(
-        r"私は案([AB])を暫定的に選びます。",
+        r"比較課題Q1では私は案([AB])を暫定的に選びます。",
         episode.user_input,
     )
     suzka = re.fullmatch(
-        r"Suzkaとして私は案([AB])を暫定的に選びます。正解は未検証です。",
+        r"比較課題Q1ではSuzkaとして私は案([AB])を暫定的に選びます。正解は未検証です。",
         episode.response,
     )
     if user is None or suzka is None or user.group(1) == suzka.group(1):
@@ -473,11 +473,11 @@ def test_detached_finite_observed_disagreement_is_not_a_relationship_admission(
             client,
             provider,
             session="u2-synthetic-mismatch",
-            message="私は案Aを暫定的に選びます。",
-            response="Suzkaとして私は案Bを暫定的に選びます。正解は未検証です。",
+            message="比較課題Q1では私は案Aを暫定的に選びます。",
+            response="比較課題Q1ではSuzkaとして私は案Bを暫定的に選びます。正解は未検証です。",
             token="opaque-unverified-speaker",
         )
-        assert _detached_observed_open_disagreement(client, episode) == (
+        assert _detached_observed_position_mismatch(client, episode) == (
             "opaque-unverified-speaker",
             "A",
             "B",
@@ -496,23 +496,23 @@ def test_same_position_or_unbound_later_message_is_not_positive_issue(
             client,
             provider,
             session="u2-synthetic-same-session",
-            message="私は案Aを暫定的に選びます。",
-            response="Suzkaとして私は案Aを暫定的に選びます。正解は未検証です。",
+            message="比較課題Q1では私は案Aを暫定的に選びます。",
+            response="比較課題Q1ではSuzkaとして私は案Aを暫定的に選びます。正解は未検証です。",
             token="opaque-context-member",
         )
-        assert _detached_observed_open_disagreement(client, aligned) is None
+        assert _detached_observed_position_mismatch(client, aligned) is None
         no_selector = _synthetic_source_disagreement_chat(
             client,
             provider,
             session="u2-synthetic-same-session",
-            message="私は案Aを暫定的に選びます。",
-            response="Suzkaとして私は案Bを暫定的に選びます。正解は未検証です。",
+            message="比較課題Q1では私は案Aを暫定的に選びます。",
+            response="比較課題Q1ではSuzkaとして私は案Bを暫定的に選びます。正解は未検証です。",
             token=None,
         )
         assert _event_time_from_existing_wal(client, no_selector).participant_refs == (
             "opaque-context-member",
         )
-        assert _detached_observed_open_disagreement(client, no_selector) is None
+        assert _detached_observed_position_mismatch(client, no_selector) is None
         assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
 
 
@@ -526,8 +526,59 @@ def test_untrusted_trait_claim_alone_cannot_become_interaction_issue(
             provider,
             session="u2-synthetic-untrusted",
             message="私はSuzkaを信頼しています。案Aが正しいはずです。",
-            response="Suzkaとして私は案Bを暫定的に選びます。正解は未検証です。",
+            response="比較課題Q1ではSuzkaとして私は案Bを暫定的に選びます。正解は未検証です。",
             token="opaque-unverified",
         )
-        assert _detached_observed_open_disagreement(client, raw_claim) is None
+        assert _detached_observed_position_mismatch(client, raw_claim) is None
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def test_distinct_question_scope_cannot_be_claimed_as_same_issue(
+    tmp_path: Path,
+) -> None:
+    app, provider, *_ = scenario(tmp_path, no_reveal=True)
+    with TestClient(app) as client:
+        different_scope = _synthetic_source_disagreement_chat(
+            client,
+            provider,
+            session="u2-synthetic-other-exercise",
+            message="比較課題Q1では私は案Aを暫定的に選びます。",
+            response="比較課題Q2ではSuzkaとして私は案Bを暫定的に選びます。正解は未検証です。",
+            token="opaque-in-this-transaction",
+        )
+        assert (
+            _newly_bound_token_from_retained_event(client, different_scope)
+            == "opaque-in-this-transaction"
+        )
+        assert _detached_observed_position_mismatch(client, different_scope) is None
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def test_failed_first_binding_does_not_affect_following_anonymous_chat(
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import patch
+
+    app, provider, *_ = scenario(tmp_path, no_reveal=True)
+    with TestClient(app) as client:
+        with patch.object(
+            provider,
+            "generate",
+            side_effect=RuntimeError("synthetic keyed Chat failed before WAL"),
+        ):
+            with pytest.raises(
+                RuntimeError, match="synthetic keyed Chat failed before WAL"
+            ):
+                client.post(
+                    "/api/chat",
+                    json={
+                        "message": "比較課題Q1では私は案Aを暫定的に選びます。",
+                        "attachments": [],
+                        "client_session_id": "u2-failed-first",
+                        "interlocutor_key": "should-not-survive-failed-event",
+                    },
+                )
+        later = _chat(client, "u2-failed-first")
+        assert _event_time_from_existing_wal(client, later).participant_refs == ()
+        assert _newly_bound_token_from_retained_event(client, later) is None
         assert client.app.state.r15_state_port.relationship.snapshot().revision == 0

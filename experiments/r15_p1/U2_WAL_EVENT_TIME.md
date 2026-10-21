@@ -1,6 +1,6 @@
 # R15 U2 — retained event-time R09 participant in existing StateWAL (TEST ONLY)
 
-Parent: Issue #339, R15 #283, MVI #323, prior event-time volatile preflight Draft PR #340. Base: merged #342 on rebuild/develop at 9084333e9c0c6290b68f68e712a7aad523170153.
+Parent: Issue #339, R15 #283, MVI #323, prior event-time volatile preflight Draft PR #340. **Current base:** merged #345 on rebuild/develop at 98777c88a0cb3b49f9b94ac91e84d88486a9d507. The earlier #342 baseline was advanced by a normal merge into this test-only branch.
 
 ## Question
 
@@ -53,7 +53,7 @@ Three added isolated negatives make the event-time boundary more precise.
 5. Prefer existing R07/R09/R12/DB1 and StateWAL read interfaces without changing their persisted shape. Do not add a general SourceEpoch framework for this MVI. If a specific failed test demonstrates the need for a new historical owner or compatibility field, return to the Human design gate first.
 6. A future U6 consumer of Relationship must requalify current Source when using it; a restored current state projection by itself is not new evidence that an identified person exists.
 
-This is a design and test-only outcome, not production U2 implementation or Merge authorization. Issue #339 remains the separately required Human code gate. Current test matrix: 7 new cases, with the three cases above added to the initial four.
+This is a design and test-only outcome, not production U2 implementation or Merge authorization. Issue #339 remains the separately required Human code gate. The current test-only matrix now includes 16 isolated cases. The initial four cases were expanded with WAL retention, U3 gate isolation, sticky Context membership, newly introduced same-event token deltas and restart, a closed same-scope Q1 finite position mismatch, cross-scope/equal-position/raw-trust negatives, and failure rollback.
 
 ## Same-event *new binding* is narrower evidence than Context membership
 
@@ -86,3 +86,11 @@ Negative controls refuse an equal A/A pair, a later A/B turn where the Context s
 This supports a possible narrow *observed interaction discrepancy* hypothesis. It **does not** prove that anyone's hidden intention or the objective answer is A/B, that the same real person authored the turn, or that a durable UNRESOLVED_ISSUE remains after a subsequent clarification. It also does not create or revise a U2 subjective state.
 
 The Human implementation gate must separately decide whether one *newly bound, same-turn, unverified opaque token* plus an independently source-qualified, visibly **unresolved** discrepancy can authorize a first provisional U2 Relationship revision, or whether R15 requires broader event-time per-turn selector attribution. There is no automatic code authority to extend persisted R09/R12 data shapes.
+
+## Final test-only semantic and rollback clarifications
+
+The candidate helper is named *position mismatch*, not *unresolved relationship*: it can only return a detached triple of first-bound opaque token and the two visible A/B choices. Its exact closed protocol includes the **same fixed comparison task Q1 in both committed messages**, with an explicit unverified outcome in Suzka's response. A message about Q1 with a response about Q2 is rejected, even if the letters differ. A disagreement is **not** by itself an authenticated durable UNRESOLVED_ISSUE, objective correctness or real-world other-person claim.
+
+A new negative test forces a keyed first Chat to fail during model generation, after the Context could have been modified in memory but before the transaction commits. The existing R07/StateWAL handler failure callback restores the last committed Context; a subsequent unkeyed Chat remains anonymous and has no new participant-binding delta. The test is limited to this failure phase, not every storage crash/failover path.
+
+These tests demonstrate the smallest closed semantic *candidate* suitable for considering a future U2b positive owner, not a production emitter. A future source-qualified Relationship owner still must distinguish current, truly unresolved subjective interaction evidence from an already resolved or unrelated statement, and must never grant a verified speaker, trust or competence based on the mere presence of an opaque ref.
