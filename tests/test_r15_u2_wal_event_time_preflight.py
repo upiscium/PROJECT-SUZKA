@@ -582,3 +582,114 @@ def test_failed_first_binding_does_not_affect_following_anonymous_chat(
         assert _event_time_from_existing_wal(client, later).participant_refs == ()
         assert _newly_bound_token_from_retained_event(client, later) is None
         assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def _is_unique_scoped_token_at_review(client: TestClient, episode_id: str) -> bool:
+    """TEST ONLY: necessary Context uniqueness, not person authentication.
+
+    Count *all retained R09 Context frames*, including closed ones: simply
+    closing an old Context cannot retrospectively disambiguate the same
+    caller-selected token between two different conversation histories.
+    """
+    from suzka.runtime.context import ContextStatus
+
+    observation = _event_time_from_existing_wal(client, episode_id)
+    if len(observation.participant_refs) != 1:
+        return False
+    token = observation.participant_refs[0]
+    frames = client.app.state.main_loop.context_registry.state.frames
+    eligible = tuple(frame for frame in frames if token in frame.participant_refs)
+    return (
+        len(eligible) == 1
+        and eligible[0].context_id == observation.context_id
+        and eligible[0].status is ContextStatus.ACTIVE
+    )
+
+
+def test_identical_caller_token_in_distinct_contexts_is_not_unique_person(
+    tmp_path: Path,
+) -> None:
+    app, *_ = scenario(tmp_path, no_reveal=True)
+    with TestClient(app) as client:
+        first = _chat(client, "u2-two-sessions-a", "same-opaque-ref")
+        assert (
+            _newly_bound_token_from_retained_event(client, first) == "same-opaque-ref"
+        )
+        assert _is_unique_scoped_token_at_review(client, first)
+
+        second = _chat(client, "u2-two-sessions-b", "same-opaque-ref")
+        assert (
+            _newly_bound_token_from_retained_event(client, second) == "same-opaque-ref"
+        )
+        assert (
+            _event_time_from_existing_wal(client, first).context_id
+            != _event_time_from_existing_wal(client, second).context_id
+        )
+        assert not _is_unique_scoped_token_at_review(client, first)
+        assert not _is_unique_scoped_token_at_review(client, second)
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def test_distinct_claimed_tokens_in_distinct_contexts_do_not_collide(
+    tmp_path: Path,
+) -> None:
+    app, *_ = scenario(tmp_path, no_reveal=True)
+    with TestClient(app) as client:
+        first = _chat(client, "u2-distinct-session-a", "opaque-a")
+        second = _chat(client, "u2-distinct-session-b", "opaque-b")
+        assert _is_unique_scoped_token_at_review(client, first)
+        assert _is_unique_scoped_token_at_review(client, second)
+        # Uniqueness is necessary for a narrow association, not sufficient
+        # for authenticating either person or opening any Relationship axis.
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def test_closing_prior_context_does_not_sanitize_reused_caller_token(
+    tmp_path: Path,
+) -> None:
+    app, *_ = scenario(tmp_path, no_reveal=True)
+    with TestClient(app) as client:
+        first = _chat(client, "u2-historical-session-a", "shared-opaque")
+        second = _chat(client, "u2-historical-session-b", "shared-opaque")
+        assert not _is_unique_scoped_token_at_review(client, second)
+        old_context_id = _event_time_from_existing_wal(client, first).context_id
+        closed = client.post(
+            f"/api/contexts/{old_context_id}/close",
+            headers={"X-SUZKA-Admin-Token": "not-real"},
+        )
+        assert closed.status_code == 200, closed.text[:200]
+        assert not _is_unique_scoped_token_at_review(client, second)
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+
+
+def test_admitted_system_values_do_not_issue_subject_relationship_interpretation(
+    tmp_path: Path,
+) -> None:
+    from suzka.identity.origin import ValueAdmissionStatus
+    from suzka.r15.common import SourceDisposition
+    from suzka.r15.relationship_system import (
+        RelationshipAuthority,
+        relationship_authority_status,
+    )
+
+    app, *_ = scenario(tmp_path, no_reveal=True)
+    with TestClient(app) as client:
+        values = client.app.state.main_loop.value_system.snapshot().values
+        assert {value.value_id for value in values} == {"care", "honesty"}
+        assert all(
+            value.is_active()
+            and value.origin.admission is ValueAdmissionStatus.SYSTEM_AUTHORIZED
+            for value in values
+        )
+        _chat(client, "u2-values-are-not-source", "unverified-opaque")
+        assert client.app.state.main_loop.value_system.snapshot().values == values
+        assert (
+            relationship_authority_status(
+                RelationshipAuthority.POSITIVE_AXIS_INTERPRETATION
+            )
+            is SourceDisposition.UNAVAILABLE
+        )
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
+        # A real R11 ValueState is useful normative context, but nothing in
+        # that value's provenance establishes a specific interpersonal
+        # dispute or verifies the current speaker/intent.
