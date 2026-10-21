@@ -17,12 +17,17 @@ from typing import Final
 from fastapi.testclient import TestClient
 import pytest
 
+from suzka.memory.dual_memory_system import (
+    EpisodicMemoryFormatError,
+    EpisodicMemoryReadError,
+)
+from suzka.runtime.event_journal import EventJournalError
+from suzka.runtime.state_wal import StateWALError, TransitionRecord
 from suzka.r15.relationship_system import (
     RelationshipAuthority,
     relationship_authority_status,
 )
 from suzka.r15.common import SourceDisposition
-from suzka.runtime.state_wal import TransitionRecord
 
 from test_r15_p1_owner_bridge import SequencedProvider, scenario
 from test_r15_u2_wal_event_time_preflight import (
@@ -31,8 +36,9 @@ from test_r15_u2_wal_event_time_preflight import (
     _synthetic_source_disagreement_chat,
 )
 
-# Independent, CLOSED, code-owned research rule about a shared referent.
-# It is deliberately NOT R13 Goal adoption or operator/user-authored truth.
+# A TEST-OWNED, importable sentinel, not a protected Source issuer.
+# The model text may be fully user-induced; output is NOT SUZKA's internal
+# belief, and this test must never become production Relationship authority.
 _RESEARCH_INTERACTION_RULE: Final = object()
 _COMMON_REFERENT_USER = re.compile(
     r"共同の指示語「前の案」について、私が指している対象は案([AB])です。"
@@ -58,7 +64,7 @@ class _ObservedReferentMismatch:
     wal_record_hash: str
     caller_token: str
     reported_user_referent: str
-    observed_suzka_referent: str
+    visible_response_referent: str
 
 
 def _observe_referent(
@@ -153,9 +159,14 @@ def _review_epistemic_concern(
         RuntimeError,
         TypeError,
         ValueError,
+        StateWALError,
+        EventJournalError,
+        EpisodicMemoryReadError,
+        EpisodicMemoryFormatError,
+        IndexError,
     ):
         return _EpistemicTriage.STALE_HOLD
-    if observed.reported_user_referent == observed.observed_suzka_referent:
+    if observed.reported_user_referent == observed.visible_response_referent:
         return _EpistemicTriage.NO_SHARED_REFERENT_ISSUE
     if rule is not _RESEARCH_INTERACTION_RULE:
         return _EpistemicTriage.OBSERVED_MISMATCH_ONLY
@@ -268,9 +279,12 @@ def test_preference_trust_and_different_phrases_are_not_common_ground(
             suzka=suzka,
             token="caller-opaque",
         )
-        assert _observe_referent(client, ep) is None
+        observation = _observe_referent(client, ep)
+        assert observation is None
         assert (
-            _review_epistemic_concern(client, None, rule=_RESEARCH_INTERACTION_RULE)
+            _review_epistemic_concern(
+                client, observation, rule=_RESEARCH_INTERACTION_RULE
+            )
             is _EpistemicTriage.UNKNOWN
         )
         assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
@@ -371,7 +385,7 @@ def test_missing_r10_social_signal_and_r13_goal_do_not_issue_relationship(
         )
 
 
-def test_retired_r12_experience_blocks_referent_interpretation(
+def test_deleted_r12_record_blocks_referent_interpretation(
     tmp_path: Path,
 ) -> None:
     from test_r15_p1b_positive import _source_ref
@@ -444,6 +458,25 @@ def test_foreign_or_modified_referent_observation_has_no_authority(
             _review_epistemic_concern(
                 client,
                 replace(observed, caller_token="different-token"),
+                rule=_RESEARCH_INTERACTION_RULE,
+            )
+            is _EpistemicTriage.STALE_HOLD
+        )
+        assert (
+            _review_epistemic_concern(
+                client,
+                replace(
+                    observed,
+                    visible_response_referent=observed.reported_user_referent,
+                ),
+                rule=_RESEARCH_INTERACTION_RULE,
+            )
+            is _EpistemicTriage.STALE_HOLD
+        )
+        assert (
+            _review_epistemic_concern(
+                client,
+                replace(observed, context_id="another-context"),
                 rule=_RESEARCH_INTERACTION_RULE,
             )
             is _EpistemicTriage.STALE_HOLD
