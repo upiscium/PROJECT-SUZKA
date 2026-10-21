@@ -647,6 +647,8 @@ def test_distinct_claimed_tokens_in_distinct_contexts_do_not_collide(
 def test_closing_prior_context_does_not_sanitize_reused_caller_token(
     tmp_path: Path,
 ) -> None:
+    from suzka.runtime.context import ContextStatus
+
     app, *_ = scenario(tmp_path, no_reveal=True)
     with TestClient(app) as client:
         first = _chat(client, "u2-historical-session-a", "shared-opaque")
@@ -658,6 +660,12 @@ def test_closing_prior_context_does_not_sanitize_reused_caller_token(
             headers={"X-SUZKA-Admin-Token": "not-real"},
         )
         assert closed.status_code == 200, closed.text[:200]
+        old_frame = next(
+            frame
+            for frame in client.app.state.main_loop.context_registry.state.frames
+            if frame.context_id == old_context_id
+        )
+        assert old_frame.status is ContextStatus.CLOSED
         assert not _is_unique_scoped_token_at_review(client, second)
         assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
 
@@ -689,7 +697,7 @@ def test_admitted_system_values_do_not_issue_subject_relationship_interpretation
             )
             is SourceDisposition.UNAVAILABLE
         )
-        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
         # A real R11 ValueState is useful normative context, but nothing in
         # that value's provenance establishes a specific interpersonal
         # dispute or verifies the current speaker/intent.
+        assert client.app.state.r15_state_port.relationship.snapshot().revision == 0
