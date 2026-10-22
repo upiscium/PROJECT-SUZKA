@@ -116,10 +116,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state, "memory_system", None
             ) or DualMemorySystem(app_settings)
             app.state.semantic_store = app.state.memory_system.semantic_store
-            app.state.semantic_receipt_retention = (
-                SemanticReceiptRetentionCoordinator(
-                    app.state.event_journal, app.state.semantic_store
-                )
+            app.state.semantic_receipt_retention = SemanticReceiptRetentionCoordinator(
+                app.state.event_journal, app.state.semantic_store
             )
             injected_main_loop = getattr(app.state, "main_loop", None)
             if injected_main_loop is not None and not isinstance(
@@ -178,9 +176,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     participants_consistent = reconciliation.participants_consistent
                     degraded_reason = reconciliation.degraded_reason
                 else:
-                    app.state.startup_reconciliation.ensure_adoption_baseline(
-                        recovery
-                    )
+                    app.state.startup_reconciliation.ensure_adoption_baseline(recovery)
                 if participants_consistent:
                     participants_consistent, degraded_reason = (
                         app.state.startup_reconciliation.reconcile_terminal_semantic_projections()
@@ -197,9 +193,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     raise StateRecoveryError("Degraded startup requires schema 3")
                 startup_state = app.state.state_recovery.inspect_degraded_startup()
             app.state.external_reconciliation_required = (
-                (recovery.external_reconciliation_required if recovery else False)
-                or not participants_consistent
-            )
+                recovery.external_reconciliation_required if recovery else False
+            ) or not participants_consistent
             app.state.reconciliation_degraded_reason = degraded_reason
             retention_status = app.state.event_journal.admission_status()
             app.state.startup_retention_admission_available = retention_status.available
@@ -323,9 +318,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             del event
 
         def pre_admission_guard(event: AgentEvent) -> bool:
-            return app.state.event_journal.append_accepted_if_admission_available(
-                event
-            )
+            return app.state.event_journal.append_accepted_if_admission_available(event)
 
         def started_checkpoint(event: AgentEvent) -> None:
             # STARTED append errors occur before any other G1-P callback.
@@ -563,6 +556,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.r15_state_port._bind_private_read_sources(
                     app.state.agent_state_store, app.state.agent_runtime
                 )
+                # U2b: the same Subject/Journal/Experience/DB1/Context/WAL
+                # owners, with no new external Source or schema migration.
+                if (
+                    type(app.state.agent_state_store) is AgentStateStore
+                    and type(app.state.event_journal) is EventJournal
+                    and type(app.state.experience_store) is ExperienceStore
+                    and type(app.state.memory_system) is DualMemorySystem
+                    and type(app.state.state_wal) is StateWAL
+                ):
+                    app.state.r15_state_port._bind_private_relationship_sources(
+                        app.state.agent_state_store,
+                        app.state.agent_runtime,
+                        app.state.event_journal,
+                        app.state.experience_store,
+                        app.state.memory_system,
+                        app.state.state_wal,
+                        app.state.main_loop.context_registry,
+                    )
         except BaseException:
             app.state.event_journal.close()
             raise
