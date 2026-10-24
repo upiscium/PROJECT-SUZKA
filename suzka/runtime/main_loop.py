@@ -100,6 +100,7 @@ from suzka.runtime.context import (
     ContextRegistry,
     ContextRegistryState,
     ContextStatus,
+    ContextType,
     validate_context_registry_state,
 )
 from suzka.runtime.attention_state_codec import validated_attention_continuity
@@ -482,7 +483,7 @@ class SuzkaMainLoop:
 
         if self._r15_state_port is not None:
             return self._r15_state_port
-        port = R15StatePort(self.context_registry)
+        port = R15StatePort(self.context_registry, self.emotion_engine)
         self._r15_state_port = port
         self._agent_state_ports = replace(self._agent_state_ports, r15_state_port=port)
         return port
@@ -1138,6 +1139,7 @@ class SuzkaMainLoop:
         )
 
         event = self._validated_chat_event(capture_debug=capture_debug)
+        pre_context_state = context_registry.state
         current_context = resolve_chat_context(context_registry, selectors)
         provenance = (
             current_context.context_id,
@@ -1160,6 +1162,25 @@ class SuzkaMainLoop:
             primary_loss=measurement.raw_loss if measurement.valid else None,
         )
         emotion_state = emotion_update.state
+        scoped_interaction = None
+        # Prompt privacy must not depend on whether a scoped observation
+        # was admitted (cross-Context collisions must also remain private).
+        r15_context_safe_chat = (
+            not capture_debug
+            and event is not None
+            and self._r15_state_port is not None
+            and context_registry is self.context_registry
+            and emotion_engine is self.emotion_engine
+        )
+        if r15_context_safe_chat and event is not None and self._r15_state_port is not None:
+            scoped_interaction = self._r15_state_port._scoped_interaction_in_chat(
+                event,
+                pre_context_state,
+                current_context,
+                emotion_engine,
+                emotion_state,
+                None if selectors is None else selectors.interlocutor_key,
+            )
         memory_context = self.memory_system.retrieve_context(user_input)
         working_memory.advance()
         candidates = [
@@ -1197,14 +1218,35 @@ class SuzkaMainLoop:
             if event is not None
             else None
         )
+        prompt_context_view = context_view
+        if r15_context_safe_chat:
+            # The Context remains authoritative only in R09. These literal
+            # categories are not a second Context or an identity projection.
+            if current_context.context_type is not ContextType.CONVERSATION:
+                raise RuntimeError("unsupported scoped interaction Context type")
+            prompt_context_view = ContextPromptView(
+                context_id="context.withheld",
+                context_type=ContextType.CONVERSATION.value,
+                source_channel=(
+                    current_context.source_channel
+                    if current_context.source_channel in ("chat", "web")
+                    else "other"
+                ),
+                source_session_id=None,
+                participant_refs=(),
+            )
         prompt = self._build_prompt(
             user_input,
             emotion_state,
             working_memory_view,
-            context_view,
+            prompt_context_view,
             value_view,
             attention_payload=attention_payload,
         )
+        if scoped_interaction is not None:
+            from suzka.r15.scoped_interaction import neutral_prompt_line
+
+            prompt = neutral_prompt_line(scoped_interaction) + prompt
         # U6b: strictly current, source-qualified *private* interpretation.
         # Only an explicit request about the previous option warrants a
         # response-conditioning hint.  All other Chat/debug paths are unchanged.
@@ -1229,6 +1271,20 @@ class SuzkaMainLoop:
                 )
 
         raw_response = self.agent.generate(prompt)
+        if scoped_interaction is not None:
+            if (
+                self._r15_state_port is None
+                or event is None
+                or self._r15_state_port._scoped_interaction_in_chat(
+                    event,
+                    pre_context_state,
+                    current_context,
+                    emotion_engine,
+                    emotion_state,
+                    None if selectors is None else selectors.interlocutor_key,
+                ) != scoped_interaction
+            ):
+                raise RuntimeError("scoped interaction source changed during Chat")
         # The model may have run while an external Source was retired or the
         # committed WAL changed. Reject *before* creating response participants:
         # no stale source-conditioned words may escape/commit on such a race.
@@ -1559,7 +1615,7 @@ class SuzkaMainLoop:
         user_input: str,
         emotion_state: EmotionState,
         working_memory_view: WorkingMemoryView,
-        context_view: ContextPromptView,
+        context_view: ContextPromptView | None,
         value_view: ValuePromptView,
         *,
         attention_payload: AttentionPromptPayload | None = None,
