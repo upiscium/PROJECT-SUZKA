@@ -52,6 +52,7 @@ def test_r15_u1_pure_modules_are_not_runtime_producers() -> None:
         },
         ROOT / "suzka" / "runtime" / "main_loop.py": {
             "suzka.r15.state_port": {"R15StatePort"},
+            "suzka.r15.scoped_interaction": {"neutral_prompt_line"},
         },
         ROOT / "suzka" / "runtime" / "agent_state.py": {
             "suzka.r15.contracts": {

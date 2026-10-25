@@ -380,9 +380,24 @@ def test_test_harness_metacognition_observes_the_exact_live_r14_turn_only(
         )
         assert observation.event == expected_event
         assert assessment.event == expected_event
+        assert len(built_prompts) == 1
         assert len(provider.prompts) == 1
-        assert built_prompts == provider.prompts
+        expected_interaction_prefix = (
+            "Current interaction interpretation: UNKNOWN. A Context participant "
+            "reference is not an authenticated speaker or person; do not infer "
+            "trust, familiarity, reciprocity, caution, or interpersonal causation.\n\n"
+        )
+        assert provider.prompts == [expected_interaction_prefix + built_prompts[0]]
         assert "metacognition" not in provider.prompts[0].lower()
+        current_context = loop.context_registry.current_context
+        assert current_context is not None
+        for private_value in (
+            current_context.context_id,
+            current_context.source_session_id,
+            *current_context.participant_refs,
+        ):
+            if private_value:
+                assert private_value not in provider.prompts[0]
         assert provider.views == [initial_committed_view]
         assert loop.attention_view().event == expected_event
 

@@ -427,20 +427,26 @@ def test_r15_u2_module_is_not_a_runtime_or_source_truth_consumer() -> None:
     assert not any(isinstance(node, ast.Name) and node.id in {
         "uuid4", "datetime", "AgentStateSnapshotV10", "GoalSystem", "Decision"
     } for node in ast.walk(tree))
-    # The U5 owner topology can reference the private R15 technical port.
-    # MainLoop itself still cannot create a Relationship claim or directly
-    # take R09/DB1 source-truth authority from the U2 domain.
+    # U5's private technical port and U2's neutral prompt projection are the
+    # only approved imports. MainLoop still cannot create a Relationship claim
+    # or directly take R09/DB1 source-truth authority from the U2 domain.
     main_loop = (ROOT / "suzka" / "runtime" / "main_loop.py").read_text(encoding="utf-8")
+    runtime_tree = ast.parse(main_loop)
     source_imports = [
-        node for node in ast.walk(ast.parse(main_loop))
+        (node.module, tuple(item.name for item in node.names))
+        for node in ast.walk(runtime_tree)
         if isinstance(node, ast.ImportFrom)
         and (node.module or "").startswith("suzka.r15")
     ]
-    assert len(source_imports) == 2
-    assert all(node.module == "suzka.r15.state_port" for node in source_imports)
+    assert sorted(source_imports) == [
+        ("suzka.r15.scoped_interaction", ("neutral_prompt_line",)),
+        ("suzka.r15.state_port", ("R15StatePort",)),
+        ("suzka.r15.state_port", ("R15StatePort",)),
+    ]
     assert all(
-        [item.name for item in node.names] == ["R15StatePort"]
-        for node in source_imports
+        not item.name.startswith("suzka.r15")
+        for node in ast.walk(runtime_tree) if isinstance(node, ast.Import)
+        for item in node.names
     )
     assert "RelationshipSystem(" not in main_loop
     assert "observe_current_interlocutor(" not in main_loop
