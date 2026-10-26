@@ -25,6 +25,7 @@ class AgentEventType(str, Enum):
     VALUE_GOVERNANCE = "value_governance"
     NARRATIVE_REVIEW = "narrative_review"
     SELF_ATTEMPT_REVIEW = "self_attempt_review"
+    RELATIONSHIP_REVIEW = "relationship_review"
 
 
 class AgentEventSource(str, Enum):
@@ -50,6 +51,7 @@ class AgentEventSource(str, Enum):
     RUNTIME_EMOTION_TIMER = "runtime.emotion_timer"
     RUNTIME_NARRATIVE_REVIEW = "runtime.narrative_review"
     RUNTIME_SELF_ATTEMPT_REVIEW = "runtime.self_attempt_review"
+    RUNTIME_RELATIONSHIP_REVIEW = "runtime.relationship_review"
 
 
 class AgentRuntimeStatus(str, Enum):

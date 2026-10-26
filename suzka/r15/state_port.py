@@ -10,6 +10,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from threading import RLock
 
+from suzka.r15.interaction_producer import (
+    QualifiedInteractionSourceGate,
+    QualifiedInteractionUnavailable,
+)
 from suzka.r15.attempt_producer import (
     QualifiedSelfAttemptGate,
     QualifiedSelfAttemptUnavailable,
@@ -44,6 +48,9 @@ from suzka.runtime.agent_runtime import (
     AgentRuntime,
 )
 from suzka.runtime.agent_state import AgentStateStore
+from suzka.runtime.event_journal import EventJournal
+from suzka.runtime.state_wal import StateWAL
+from suzka.memory import DualMemorySystem, ExperienceStore
 
 from suzka.r15.continuity_state import NarrativeContinuation
 from suzka.r15.contracts import (
@@ -52,7 +59,10 @@ from suzka.r15.contracts import (
     SelfModelState,
 )
 from suzka.r15.narrative_self_system import NarrativeSelfSystem
-from suzka.r15.relationship_system import RelationshipSystem
+from suzka.r15.relationship_system import (
+    RelationshipIssueReviewResult,
+    RelationshipSystem,
+)
 from suzka.r15.self_model_system import SelfAttemptResult, SelfModelSystem
 from suzka.runtime.context import (
     ContextFrame,
@@ -266,6 +276,63 @@ class R15StatePort:
                     "SelfModel revision requires the internal Actor event"
                 )
             return self.self_model._review_source_qualified_attempt()
+
+    def _bind_private_relationship_sources(
+        self,
+        store: AgentStateStore,
+        runtime: AgentRuntime,
+        journal: EventJournal,
+        experience: ExperienceStore,
+        memory: DualMemorySystem,
+        wal: StateWAL,
+        contexts: ContextRegistry,
+    ) -> None:
+        """One existing-owner binding, no R09/R12/StateWAL writer or API."""
+
+        with self._owner_lock:
+            if (
+                type(store) is not AgentStateStore
+                or type(runtime) is not AgentRuntime
+                or type(journal) is not EventJournal
+                or type(experience) is not ExperienceStore
+                or type(memory) is not DualMemorySystem
+                or type(wal) is not StateWAL
+                or contexts is not self.relationship._registry
+                or store is not self._private_read_store
+                or runtime is not self._private_read_runtime
+            ):
+                raise QualifiedInteractionUnavailable("U2 source owners mismatch")
+            self.relationship._bind_source_qualified_q1_gate(
+                QualifiedInteractionSourceGate(
+                    store,
+                    self,
+                    runtime,
+                    journal,
+                    experience,
+                    memory,
+                    wal,
+                    contexts,
+                )
+            )
+
+    def _review_source_qualified_q1_interaction(self) -> RelationshipIssueReviewResult:
+        """Only an actual serial RELATIONSHIP_REVIEW may mutate U2."""
+
+        with self._owner_lock:
+            runtime = self._private_read_runtime
+            event = None if runtime is None else runtime.current_event()
+            if (
+                type(runtime) is not AgentRuntime
+                or type(event) is not AgentEvent
+                or event.event_type is not AgentEventType.RELATIONSHIP_REVIEW
+                or event.source is not AgentEventSource.RUNTIME_RELATIONSHIP_REVIEW
+                or type(event.processing_sequence) is not int
+                or event.processing_sequence < 1
+            ):
+                raise QualifiedInteractionUnavailable(
+                    "U2 admission requires actual internal Actor event"
+                )
+            return self.relationship._review_source_qualified_q1()
 
     def _read_private_narrative_in_chat(
         self, event: AgentEvent, context_id: str
