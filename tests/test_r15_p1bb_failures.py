@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+from hashlib import sha256
+from inspect import getfile
+import json
 from pathlib import Path
 from typing import Iterator
+from unittest.mock import Mock
 
 from fastapi.testclient import TestClient
 import pytest
@@ -13,17 +17,40 @@ import pytest
 from experiments.r15_p1.protocol import run_trial
 from suzka.api.server import create_app
 from suzka.r15.continuity_state import ContinuityInvalid
-from suzka.r15.qualified_proposal import QualifiedTurnRef, scoped_option_key
+from suzka.r15.common import canonical_json
+from suzka.r15.narrative_self_system import NarrativeSelfSystem
+from suzka.r15.qualified_proposal import (
+    QualifiedNarrativeSourceGate,
+    QualifiedProposalUnavailable,
+    QualifiedTurnRef,
+    scoped_option_key,
+)
 from suzka.learning import AdapterRegistry
 from suzka.memory import DualMemorySystem
+from suzka.memory.experience_participant import experience_id_for_event
+from suzka.persona.prompt_builder import PromptBuilder
 from suzka.runtime.agent_runtime import (
+    AgentEvent,
     AgentEventSource,
     AgentEventType,
     AgentRuntimeDurabilityError,
     AgentRuntimeDurabilityPhase,
+    AgentRuntimeExecutionError,
     AgentRuntimeStatus,
 )
-from suzka.runtime.agent_state import AgentStateSnapshotV10
+from suzka.runtime.agent_state import AgentStateSnapshotV10, AgentStateStore
+from suzka.runtime.event_journal import EventLifecycle, EventRecoveryCategory
+from suzka.runtime.startup_reconciliation import (
+    StartupReconciliationCoordinator,
+    StartupReconciliationResult,
+)
+from suzka.runtime.state_recovery import (
+    StateRecoveryCoordinator,
+    StateRecoveryError,
+    StateRecoveryResult,
+)
+from suzka.runtime.state_wal import StateWAL, StateWALIntegrityError
+from suzka.runtime.working_memory import WorkingMemory
 
 from test_r15_p1_owner_bridge import scenario, SequencedProvider
 from test_r15_p1b_positive import _admit, _source_ref
@@ -154,6 +181,246 @@ def test_wal_committed_but_not_terminal_event_recovers_once(
             assert actual.snapshot().revision == 2
         else:
             assert restarted.app.state.external_reconciliation_required
+
+
+def test_true_rollback_restores_retained_nonempty_r15_v10_without_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On-disk S2 loss selects exact S1, not cognition or new source authority."""
+    repo = Path(__file__).resolve().parents[1]
+    for implementation in (
+        StateRecoveryCoordinator,
+        AgentStateStore,
+        StateWAL,
+        StartupReconciliationCoordinator,
+        NarrativeSelfSystem,
+    ):
+        assert Path(getfile(implementation)).resolve().is_relative_to(repo / "suzka")
+
+    with source_ready_for_later_reinterpretation(tmp_path) as (
+        client,
+        runtime,
+        owner,
+        refs,
+        settings,
+    ):
+        store = client.app.state.agent_state_store
+        journal = client.app.state.event_journal
+        wal = client.app.state.state_wal
+        recovery = client.app.state.state_recovery
+        older = store.load()
+        assert isinstance(older, AgentStateSnapshotV10)
+        technical = client.app.state.r15_state_port._capture_for_agent_state()
+        narrative_bytes = technical.narrative.canonical_bytes()
+        continuation_bytes = canonical_json(
+            technical.continuation.canonical_value(technical.narrative)
+        )
+        assert older.narrative_self_state == technical.narrative.canonical_value()
+        assert older.narrative_self_state["revision"] == 1
+        assert older.narrative_self_state["episodes"]
+        assert older.narrative_admission_checkpoint["stage"] == "S1"
+        assert technical.continuation.first_sources == refs[:3]
+        assert technical.continuation.revised_sources == ()
+        assert older.relationship_state["revision"] == 0
+        assert older.self_model_state["revision"] == 0
+        older_bytes = store.path.read_bytes()
+        anchored = recovery.prepare_startup()
+        recovery.publish_boot_anchor(anchored)
+        anchor = wal.inspect_boot_anchor()
+        predecessor = wal.root / "generations" / f"{anchor.generation_id}.jsonl"
+        predecessor_bytes = predecessor.read_bytes()
+        assert wal.inspect_anchored_prefix()[1] == older
+
+        # A torn manifest with valid canonical S1 invokes real exact-current
+        # repair, creating a distinct successor without touching the retained
+        # generation or its boot anchor. No fabricated recovery category/setter.
+        (wal.root / "manifest.json").write_bytes(b"{")
+        repaired = recovery.prepare_startup()
+        assert repaired.exact_current_reconstructed
+        assert not repaired.true_rollback_performed
+        assert not repaired.external_reconciliation_required
+        assert repaired.snapshot == older
+        successor = repaired.manifest
+        assert successor.active_generation_id != anchor.generation_id
+        assert recovery.prepare_startup().snapshot == older
+        second = _admit(runtime, owner, refs)
+        assert second.changed and second.snapshot.revision == 2
+        newer = store.load()
+        assert isinstance(newer, AgentStateSnapshotV10)
+        assert newer.narrative_self_state != older.narrative_self_state
+        assert newer.narrative_admission_checkpoint["stage"] == "S2"
+        assert newer.last_processed_event_sequence > older.last_processed_event_sequence
+        reviews = tuple(
+            row
+            for row in journal.inspect().records
+            if row.event_type is AgentEventType.NARRATIVE_REVIEW
+        )
+        assert sum(row.lifecycle is EventLifecycle.COMPLETED for row in reviews) == 2
+        high_water = journal.inspect().processing_high_water
+        lost_source = client.app.state.experience_store.record_path(
+            experience_id_for_event(refs[3].event_id, refs[3].event_sequence), 0
+        )
+        lost_source_bytes = lost_source.read_bytes()
+        assert predecessor.read_bytes() == predecessor_bytes
+
+    # Simulated process loss: invalidate only the successor's S2 transition,
+    # plus a torn canonical snapshot. A valid current file would permit exact
+    # current WAL repair instead of exercising true rollback.
+    generation = wal.root / "generations" / f"{successor.active_generation_id}.jsonl"
+    lines = generation.read_bytes().splitlines(keepends=True)
+    assert len(lines) == 2
+    transition = json.loads(lines[-1])
+    assert transition["candidate_snapshot"]["narrative_self_state"]["revision"] == 2
+    transition["record_hash"] = "0" * 64
+    lines[-1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    generation.write_bytes(b"".join(lines))
+    corrupt_bytes = generation.read_bytes()
+    store.path.write_bytes(b"{")
+    with pytest.raises(StateWALIntegrityError):
+        wal.inspect()
+    assert wal.inspect_anchored_prefix()[1] == older
+
+    observed: list[tuple[StateRecoveryResult, StartupReconciliationResult]] = []
+    reconcile = StartupReconciliationCoordinator.reconcile_recovery_gate
+
+    def observe_real_gate(
+        coordinator: StartupReconciliationCoordinator,
+        rolled_back: StateRecoveryResult,
+    ) -> StartupReconciliationResult:
+        assert rolled_back.true_rollback_performed
+        assert rolled_back.external_reconciliation_required
+        assert rolled_back.snapshot == older
+        assert rolled_back.processing_high_water == high_water
+        inspected = coordinator.journal.inspect()
+        completed = inspected.records[-1]
+        assert completed.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+        assert completed.recovery_category is EventRecoveryCategory.TRUE_ROLLBACK
+        assert inspected.external_reconciliation_required
+        manifest = coordinator.state_recovery.wal.inspect().active_manifest
+        assert manifest is not None and manifest.external_reconciliation_required
+        # Real mandatory gate rejects mutation BEFORE any publication.
+        rejected = AgentEvent(
+            second.event.event_id,
+            AgentEventType.NARRATIVE_REVIEW,
+            AgentEventSource.RUNTIME_NARRATIVE_REVIEW,
+            second.event.occurred_at,
+            high_water + 1,
+        )
+        before = coordinator.journal.path.read_bytes()
+        with pytest.raises(StateRecoveryError, match="recovery-gated"):
+            coordinator.state_recovery.commit_internal_candidate(rejected, older, newer)
+        assert coordinator.journal.path.read_bytes() == before
+        result = reconcile(coordinator, rolled_back)
+        observed.append((rolled_back, result))
+        return result
+
+    restarted_app = create_app(settings)
+    provider = SequencedProvider()
+    restarted_app.state.model_provider = provider
+    restarted_app.state.memory_system = DualMemorySystem(settings)
+    restarted_app.state.adapter_registry = AdapterRegistry(settings)
+    no_replay = Mock(side_effect=AssertionError("startup replayed cognition/admission"))
+    with monkeypatch.context() as guard:
+        guard.setattr(
+            StartupReconciliationCoordinator,
+            "reconcile_recovery_gate",
+            observe_real_gate,
+        )
+        guard.setattr(SequencedProvider, "generate", no_replay)
+        guard.setattr(PromptBuilder, "build", no_replay)
+        guard.setattr(DualMemorySystem, "retrieve_context", no_replay)
+        guard.setattr(WorkingMemory, "select", no_replay)
+        guard.setattr(NarrativeSelfSystem, "_review_committed_turns", no_replay)
+        guard.setattr(QualifiedNarrativeSourceGate, "qualify", no_replay)
+        with TestClient(restarted_app):
+            assert len(observed) == 1
+            rolled_back, reconciled = observed[0]
+            assert reconciled.participants_consistent
+            assert not reconciled.recovery.external_reconciliation_required
+            assert reconciled.recovery.snapshot == older
+            state = restarted_app.state
+            assert not state.external_reconciliation_required
+            assert state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+            assert state.agent_state_store.load() == older
+            assert state.agent_state_store.path.read_bytes() == older_bytes
+            restored = state.r15_state_port._capture_for_agent_state()
+            assert restored == technical
+            assert restored.narrative.canonical_bytes() == narrative_bytes
+            assert (
+                canonical_json(
+                    restored.continuation.canonical_value(restored.narrative)
+                )
+                == continuation_bytes
+            )
+            inspected = state.event_journal.inspect()
+            assert inspected.processing_high_water == high_water
+            assert (
+                tuple(
+                    row
+                    for row in inspected.records
+                    if row.event_type is AgentEventType.NARRATIVE_REVIEW
+                )
+                == reviews
+            )
+            assert inspected.completed_startup_reconciliations[-1].completed
+            assert inspected.terminal_gate_clear is not None
+            assert any(
+                row.lifecycle is EventLifecycle.CLEAR_PREPARED
+                for row in inspected.records
+            )
+            manifest = state.state_wal.inspect().active_manifest
+            assert (
+                manifest is not None and not manifest.external_reconciliation_required
+            )
+            assert predecessor.read_bytes() == predecessor_bytes
+            assert generation.read_bytes() == corrupt_bytes
+            assert no_replay.call_count == 0
+            assert provider.calls == 0
+            guard.undo()
+
+            # Losing actual E2 evidence after proof-bound gate clear must not
+            # regenerate S2 from retained source identifiers or the old S2 WAL.
+            # Preserve the bytes outside the owner rather than deleting history.
+            missing = tmp_path / "unavailable-e2.json"
+            lost_source.rename(missing)
+            with pytest.raises(AgentRuntimeExecutionError) as failure:
+                _admit(state.agent_runtime, state.r15_state_port.narrative, refs)
+            assert isinstance(failure.value.__cause__, QualifiedProposalUnavailable)
+            assert state.r15_state_port._capture_for_agent_state() == technical
+            assert state.agent_state_store.path.read_bytes() == older_bytes
+            assert missing.read_bytes() == lost_source_bytes
+            after = state.event_journal.inspect()
+            assert (
+                sum(
+                    row.event_type is AgentEventType.NARRATIVE_REVIEW
+                    and row.lifecycle is EventLifecycle.COMPLETED
+                    for row in after.records
+                )
+                == 2
+            )
+            assert after.records[-1].lifecycle is EventLifecycle.FAILED
+            assert after.records[-1].event_id == failure.value.event.event_id
+            assert provider.calls == 0
+            print(
+                "U5_TRUE_ROLLBACK",
+                {
+                    "retained_generation": str(anchor.generation_id),
+                    "corrupt_successor": str(successor.active_generation_id),
+                    "recovery_generation": str(
+                        rolled_back.manifest.active_generation_id
+                    ),
+                    "snapshot_sequence": older.last_processed_event_sequence,
+                    "processing_high_water": high_water,
+                    "source_refusal_sequence": failure.value.event.processing_sequence,
+                    "snapshot_sha256": sha256(older_bytes).hexdigest(),
+                    "narrative_sha256": sha256(narrative_bytes).hexdigest(),
+                    "continuation_sha256": sha256(continuation_bytes).hexdigest(),
+                    "first_sources": refs[:3],
+                    "missing_e2": refs[3],
+                    "gate": "required -> proof-bound clear -> missing-source refusal",
+                },
+            )
 
 
 def test_private_checkpoint_cannot_rebind_witnessed_original_e(
