@@ -1,5 +1,45 @@
 # R15 MVI whole-stage evidence index
 
+## Post-merge R15 bounded MVI acceptance addendum (2026-11-01)
+
+> **Current authoritative status:** The 49-row matrix below is the historical
+> `2026-10-29` evidence-index snapshot, not an up-to-date whole-stage verdict.
+> The subsequent [#283/147 integration evidence](https://github.com/upiscium/PROJECT-SUZKA/issues/283#issuecomment-6545054727)
+> and [#283/148 explicit Human decision](https://github.com/upiscium/PROJECT-SUZKA/issues/283#issuecomment-6545296263)
+> supersede its **pre-U5 statements about current test/CI/acceptance status**.
+> The #323-amended **R15 bounded MVI was Human-accepted**, not the original
+> positive-complete A1–A27/F1–F22 contract. D9, source qualification,
+> provenance, recovery, privacy and full AgentState reserve remain mandatory.
+>
+> The accepted integrated source is
+> `rebuild/develop@0d87c481b5b5a8997336e5c8ec5a6126af4f6858`
+> (Git tree `c26bc4312d697f095fc88ca7dbcabc2b4495ea63`).
+> [PR #353](https://github.com/upiscium/PROJECT-SUZKA/pull/353)
+> added the **test-only** witness
+> `tests/test_r15_p1bb_failures.py::test_true_rollback_restores_retained_nonempty_r15_v10_without_replay`:
+> a real newer corrupted WAL generation rolls back to the retained **nonempty
+> R15 v10 S1** state and exact continuation, without cognition replay, and
+> source/reconciliation checks fail closed. This fills the mandatory U5
+> evidence gap identified in #283/143; it does **not** certify every mixed
+> legacy generation or hypothetical crash boundary.
+>
+> [Post-merge CI #41204429172](https://github.com/upiscium/PROJECT-SUZKA/actions/runs/41204429172)
+> succeeded for **Backend and Frontend** on that exact merge commit.
+> Independent whole-stage delta reviewer reported
+> `MVI_READY_FOR_HUMAN_STAGE_GATE` before the separate Human acceptance.
+> The U7 two-case Gemma4 demonstration remains **limited scientific evidence**:
+> unsubstantiated cost figures, no-E2 candidate overconfidence, and blocked
+> independent private semantic reviews are **not** fixed or marked PASS.
+> Deferred original positive Relationship/identity, advanced accessibility,
+> G2 and generation-identity obligations remain tracked in #323/#324/#343/#346.
+>
+> **Historical-matrix reading rule:** keep all original classifications,
+> especially A19 accessibility `PARTIAL_OR_UNVERIFIED`, without promotion to
+> full-clause PASS. The A23/F20/U5 and CI/Authority paragraphs below describe
+> what was available **at the frozen index's construction**, not the current
+> post-#353 acceptance. This addendum changes no product authority,
+> deployment, Release, Source activation, Issue closure or R16 approval.
+
 Run: R15-U7-MATRIX-20261029-01, instruction rev 1. This is a docs/test-only
 index at base commit `4b1dc8486a55a2fd2a8a459912f533e7c27b30f7`, Git tree
 `4108b9f89d6250f5a6d375949f9978ff0ed0358b`. It supplements, not replaces,
