@@ -27,8 +27,10 @@ from suzka.r15.qualified_proposal import (
     QualifiedNarrativeSourceGate,
     QualifiedProposalUnavailable,
 )
+from suzka.r16.source_owner import _MotivationSourceOwner, _MotivationSourceUnavailable
 from suzka.runtime import (
     AgentEvent,
+    AgentEventType,
     AgentRuntime,
     AgentRuntimeStatus,
     AgentStateStore,
@@ -116,10 +118,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state, "memory_system", None
             ) or DualMemorySystem(app_settings)
             app.state.semantic_store = app.state.memory_system.semantic_store
-            app.state.semantic_receipt_retention = (
-                SemanticReceiptRetentionCoordinator(
-                    app.state.event_journal, app.state.semantic_store
-                )
+            app.state.semantic_receipt_retention = SemanticReceiptRetentionCoordinator(
+                app.state.event_journal, app.state.semantic_store
             )
             injected_main_loop = getattr(app.state, "main_loop", None)
             if injected_main_loop is not None and not isinstance(
@@ -178,9 +178,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     participants_consistent = reconciliation.participants_consistent
                     degraded_reason = reconciliation.degraded_reason
                 else:
-                    app.state.startup_reconciliation.ensure_adoption_baseline(
-                        recovery
-                    )
+                    app.state.startup_reconciliation.ensure_adoption_baseline(recovery)
                 if participants_consistent:
                     participants_consistent, degraded_reason = (
                         app.state.startup_reconciliation.reconcile_terminal_semantic_projections()
@@ -197,9 +195,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     raise StateRecoveryError("Degraded startup requires schema 3")
                 startup_state = app.state.state_recovery.inspect_degraded_startup()
             app.state.external_reconciliation_required = (
-                (recovery.external_reconciliation_required if recovery else False)
-                or not participants_consistent
-            )
+                recovery.external_reconciliation_required if recovery else False
+            ) or not participants_consistent
             app.state.reconciliation_degraded_reason = degraded_reason
             retention_status = app.state.event_journal.admission_status()
             app.state.startup_retention_admission_available = retention_status.available
@@ -323,9 +320,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             del event
 
         def pre_admission_guard(event: AgentEvent) -> bool:
-            return app.state.event_journal.append_accepted_if_admission_available(
-                event
-            )
+            return app.state.event_journal.append_accepted_if_admission_available(event)
 
         def started_checkpoint(event: AgentEvent) -> None:
             # STARTED append errors occur before any other G1-P callback.
@@ -345,6 +340,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.context_committed_reads.degrade()
                 raise
 
+        def _r16_owner_for_commit(event: AgentEvent) -> _MotivationSourceOwner | None:
+            owner = getattr(app.state, "_motivation_source_owner", None)
+            # Legacy injected owners need not support R16, but no R16 mutation
+            # may commit unless its exact qualified Source Owner was installed.
+            if (
+                owner is None
+                and event.event_type is AgentEventType.MOTIVATION_SOURCE_REVIEW
+            ):
+                raise StateRecoveryError("R16 Motivation source owner unavailable")
+            return owner
+
+        def _clear_r16_source(event: AgentEvent) -> None:
+            owner = getattr(app.state, "_motivation_source_owner", None)
+            if owner is not None:
+                owner._clear(event)
+
         def _internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
             nonlocal committed_snapshot, committed_snapshot_hash
             nonlocal committed_read_views
@@ -355,6 +366,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # Once commit_internal_candidate begins, WAL publication may be
             # indeterminate: do NOT roll back a possibly committed revision.
             try:
+                source_owner = _r16_owner_for_commit(event)
+                if source_owner is not None:
+                    source_owner._validate_commit(event)
                 validate_belief_commit = getattr(
                     app.state.main_loop, "_validate_belief_event_commit", None
                 )
@@ -424,6 +438,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except BaseException:
                 # A failed or uncertain internal commit cannot leave a READY
                 # public view that implies the runtime remains healthy.
+                _clear_r16_source(event)
                 app.state.context_committed_reads.degrade()
                 raise
 
@@ -433,6 +448,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     raise StateRecoveryError("Internal commit evidence is unavailable")
                 app.state.transaction_coordinator.finalize_event(event, evidence)
             except BaseException:
+                _clear_r16_source(event)
                 app.state.context_committed_reads.degrade()
                 raise
 
@@ -477,8 +493,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except BaseException:
                 app.state.context_committed_reads.degrade()
                 raise
+            finally:
+                _clear_r16_source(event)
 
         def failure_checkpoint(event: AgentEvent) -> None:
+            _clear_r16_source(event)
             public_context = app.state.context_committed_reads
             prior = public_context.begin_handler_restore()
             try:
@@ -536,6 +555,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             app.state.main_loop.bind_runtime(app.state.agent_runtime)
             app.state.sleep_cycle_manager.bind_runtime(app.state.agent_runtime)
+            # Internal selection only; no endpoint, CHAT auto-submit or timer.
+            # Preserve legacy injected-runtime startup without admitting U2a
+            # from an unqualified Journal/Store/Context owner combination.
+            try:
+                app.state._motivation_source_owner = _MotivationSourceOwner(
+                    app.state.main_loop,
+                    app.state.agent_runtime,
+                    app.state.event_journal,
+                    app.state.experience_store,
+                    app.state.memory_system,
+                    app.state.main_loop.context_registry,
+                )
+            except _MotivationSourceUnavailable:
+                app.state._motivation_source_owner = None
             try:
                 narrative_reader = QualifiedNarrativeSourceGate(
                     app.state.agent_runtime,
