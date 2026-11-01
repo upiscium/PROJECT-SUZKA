@@ -14,21 +14,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from enum import Enum
-from typing import ClassVar, Final, Self
+from hashlib import sha256
+from json import dumps, loads
+from typing import ClassVar, Final, Self, TypeVar, cast
 
+from suzka.identifiers import validate_identifier
 from suzka.limits import MAX_PERSISTED_REVISION
-from suzka.r15.common import (
-    canonical_json,
-    checksum,
-    closed,
-    digest,
-    exact_enum,
-    identifier,
-    integer,
-    parse_enum,
-    parse_json,
-    sequence,
-)
 
 SCHEMA_VERSION: Final = 1
 MAX_STEPS: Final = 4
@@ -36,6 +27,136 @@ MAX_EDGES: Final = 6
 MAX_CANDIDATES: Final = 3
 MAX_JSON_BYTES: Final = 65_536
 UNCERTAINTY_SCALE: Final = 1_000_000
+
+
+# Private pure R16 codec primitives. R15's import boundary explicitly forbids
+# later-stage code from importing suzka.r15.common. Retain its canonical v1
+# encoding semantics here without registering a new R15 consumer/owner.
+MAX_JSON_NESTING: Final = 32
+_EnumT = TypeVar("_EnumT", bound=Enum)
+
+
+def exact_enum(value: object, kind: type[_EnumT], name: str) -> _EnumT:
+    if type(value) is not kind:
+        raise TypeError(f"{name} must be a {kind.__name__}")
+    return cast(_EnumT, value)
+
+
+def parse_enum(value: object, kind: type[_EnumT], name: str) -> _EnumT:
+    if type(value) is not str:
+        raise TypeError(f"{name} must be a string")
+    try:
+        return kind(value)
+    except ValueError as error:
+        raise ValueError(f"{name} is not a supported value") from error
+
+
+def integer(value: object, name: str, *, maximum: int, minimum: int = 0) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be an exact bounded integer")
+    return value
+
+
+def identifier(value: object, name: str) -> str:
+    try:
+        return validate_identifier(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} is not a bounded opaque identifier") from error
+
+
+def digest(value: object, name: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be 64 lowercase hex characters")
+    return value
+
+
+def closed(value: object, names: tuple[str, ...], name: str) -> dict[str, object]:
+    if (
+        type(value) is not dict
+        or set(value) != set(names)
+        or any(type(key) is not str for key in value)
+    ):
+        raise ValueError(f"{name} must have exactly its declared fields")
+    return value
+
+
+def sequence(
+    value: object, name: str, maximum: int, *, json_input: bool
+) -> tuple[object, ...]:
+    if json_input:
+        if type(value) is not list:
+            raise TypeError(f"{name} must be a JSON array")
+        values = tuple(cast(list[object], value))
+    else:
+        if type(value) is not tuple:
+            raise TypeError(f"{name} must be a tuple")
+        values = cast(tuple[object, ...], value)
+    if len(values) > maximum:
+        raise ValueError(f"{name} exceeds its bound")
+    return values
+
+
+def canonical_json(value: object) -> bytes:
+    return dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def checksum(domain: bytes, value: object) -> str:
+    # A checksum binds bytes, never issuer authenticity or source authority.
+    return sha256(domain + canonical_json(value)).hexdigest()
+
+
+def parse_json(payload: bytes, maximum: int) -> object:
+    if type(payload) is not bytes or len(payload) > maximum:
+        raise ValueError("R16 JSON exceeds its declared byte bound")
+    text = payload.decode("utf-8")
+    depth = 0
+    quoted = False
+    escaped = False
+    for character in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+        elif character == '"':
+            quoted = True
+        elif character in "[{":
+            depth += 1
+            if depth > MAX_JSON_NESTING:
+                raise ValueError("R16 JSON nesting exceeds its bound")
+        elif character in "]}":
+            depth -= 1
+
+    def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate R16 JSON key")
+            result[key] = item
+        return result
+
+    def reject_constant(value: str) -> object:
+        raise ValueError(f"nonfinite R16 JSON constant: {value}")
+
+    try:
+        result = loads(text, object_pairs_hook=unique, parse_constant=reject_constant)
+        if canonical_json(result) != payload:
+            raise ValueError("R16 JSON must use its exact canonical encoding")
+        return result
+    except (RecursionError, OverflowError) as error:
+        raise ValueError("invalid R16 JSON nesting") from error
 
 
 class StepKind(str, Enum):

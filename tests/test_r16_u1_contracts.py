@@ -554,10 +554,13 @@ def test_exports_and_direct_imports_remain_pure_without_runtime_authority() -> N
         "__future__",
         "dataclasses",
         "enum",
+        "hashlib",
+        "json",
         "typing",
+        "suzka.identifiers",
         "suzka.limits",
-        "suzka.r15.common",
     }
+    assert "suzka.r15.common" not in imported
     assert not any(isinstance(node, ast.Import) for node in ast.walk(tree))
     assert set(r16.__all__) == {
         "CandidateKind",
