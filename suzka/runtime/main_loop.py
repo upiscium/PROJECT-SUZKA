@@ -124,6 +124,7 @@ from suzka.runtime.r13_codec import (
 )
 
 if TYPE_CHECKING:
+    from suzka.r16.source_owner import _MotivationSourceOwner
     from suzka.r15.state_port import R15StatePort
     from suzka.memory.episodic_participant import MemoryEpisodicParticipant
     from suzka.memory.experience_participant import MemoryExperienceParticipant
@@ -266,9 +267,7 @@ def _attention_view_matches_state(
 ) -> bool:
     """Check that the selection metadata is bound to an exact continuity root."""
 
-    target_by_id = {
-        item.candidate_id: item.target for item in snapshot.candidates
-    }
+    target_by_id = {item.candidate_id: item.target for item in snapshot.candidates}
     return (
         view.revision == snapshot.revision
         and view.event == snapshot.last_event
@@ -324,6 +323,7 @@ class SuzkaMainLoop:
             memory_system.settings.memory.persist_directory
         )
         self._runtime: object | None = None
+        self._motivation_source_owner: _MotivationSourceOwner | None = None
         self.working_memory_resolver = MemoryWorkingMemoryResolver(memory_system)
         self.session_state = session_state or SessionState()
         self.working_memory = (
@@ -358,9 +358,7 @@ class SuzkaMainLoop:
             if not isinstance(loss_calibration, LossCalibration):
                 raise TypeError("loss_calibration must be LossCalibration")
             if loss_calibration.approved_keys != approved_keys:
-                raise ValueError(
-                    "loss_calibration approved keys do not match settings"
-                )
+                raise ValueError("loss_calibration approved keys do not match settings")
             self.loss_calibration = loss_calibration
         self.emotion_engine = emotion_engine or EmotionEngineAllostasis(
             EmotionState(optimal_loss=settings.emotion.baseline_surprisal),
@@ -378,7 +376,9 @@ class SuzkaMainLoop:
         self.context_registry = (
             context_registry if context_registry is not None else ContextRegistry()
         )
-        configured_seeds = tuple(seed.to_declaration() for seed in settings.values.seeds)
+        configured_seeds = tuple(
+            seed.to_declaration() for seed in settings.values.seeds
+        )
         configured_conflicts = tuple(
             ValueConflictDefinition(
                 left_value_id=conflict.left_value_id,
@@ -410,9 +410,7 @@ class SuzkaMainLoop:
             if not isinstance(motivation_system, MotivationSystem):
                 raise TypeError("motivation_system must be MotivationSystem")
             motivation_authority = MotivationSystem()
-            motivation_authority.restore_motivation_state(
-                motivation_system.snapshot()
-            )
+            motivation_authority.restore_motivation_state(motivation_system.snapshot())
         self._motivation_system = motivation_authority
         if goal_system is None:
             goal_authority = GoalSystem()
@@ -428,9 +426,7 @@ class SuzkaMainLoop:
             if not isinstance(commitment_system, CommitmentSystem):
                 raise TypeError("commitment_system must be CommitmentSystem")
             commitment_authority = CommitmentSystem()
-            commitment_authority.restore_commitment_state(
-                commitment_system.snapshot()
-            )
+            commitment_authority.restore_commitment_state(commitment_system.snapshot())
         self._commitment_system = commitment_authority
         if attention_system is None:
             attention_authority = AttentionSystem()
@@ -449,13 +445,9 @@ class SuzkaMainLoop:
         )
         initial_r13_state = R13StateSnapshot(
             schema_version=R13_CODEC_SCHEMA_VERSION,
-            motivation=R13GraphSnapshot.capture(
-                self._motivation_system.snapshot()
-            ),
+            motivation=R13GraphSnapshot.capture(self._motivation_system.snapshot()),
             goal=R13GraphSnapshot.capture(self._goal_system.snapshot()),
-            commitment=R13GraphSnapshot.capture(
-                self._commitment_system.snapshot()
-            ),
+            commitment=R13GraphSnapshot.capture(self._commitment_system.snapshot()),
         )
         self._committed_read_views = self._prepare_committed_attention_read_views(
             authority.snapshot(),
@@ -492,9 +484,7 @@ class SuzkaMainLoop:
     def value_system(self) -> ValueSystem:
         """Return a detached read-only-by-convention Value projection."""
 
-        return ValueSystem.restore_snapshot(
-            self._committed_read_views.value_snapshot
-        )
+        return ValueSystem.restore_snapshot(self._committed_read_views.value_snapshot)
 
     @property
     def _committed_value_snapshot(self) -> ValueSystemSnapshot:
@@ -545,9 +535,7 @@ class SuzkaMainLoop:
     def belief_system(self) -> BeliefSystem:
         """Return a detached read-only-by-convention Belief projection."""
 
-        return BeliefSystem.restore_snapshot(
-            self._committed_read_views.belief_snapshot
-        )
+        return BeliefSystem.restore_snapshot(self._committed_read_views.belief_snapshot)
 
     def export_belief_state(self) -> BeliefSystemSnapshot:
         """Export an immutable Belief snapshot for AgentState capture."""
@@ -592,6 +580,32 @@ class SuzkaMainLoop:
 
         self._motivation_system.restore_motivation_state(snapshot)
 
+    def _bind_motivation_source_owner(self, owner: _MotivationSourceOwner) -> None:
+        from suzka.r16.source_owner import _MotivationSourceOwner
+
+        if type(owner) is not _MotivationSourceOwner or owner._loop is not self:
+            raise RuntimeError("invalid Motivation source owner")
+        if self._motivation_source_owner is not None:
+            raise RuntimeError("Motivation source owner is already bound")
+        self._motivation_source_owner = owner
+
+    def _apply_motivation_source(
+        self, owner: _MotivationSourceOwner, nonce: object
+    ) -> str:
+        """Worker-only mutation from the bound presenter, never caller evidence.
+
+        The existing R13 policy may retain a first-threshold proposal witness;
+        this method never presents it to GoalSystem or CommitmentSystem.
+        """
+        if (
+            self._motivation_source_owner is None
+            or owner is not self._motivation_source_owner
+        ):
+            raise RuntimeError("unbound Motivation source presenter")
+        # R13 MainLoop deliberately owns no producer calls: only the verified
+        # R16 source owner may present and apply previously committed evidence.
+        return owner._apply_verified_source(self, nonce)
+
     def export_goal_state(self) -> GoalSystemSnapshot:
         """Export a complete immutable Goal snapshot for AgentState."""
 
@@ -607,9 +621,7 @@ class SuzkaMainLoop:
 
         return self._commitment_system.snapshot()
 
-    def restore_commitment_state(
-        self, snapshot: CommitmentSystemSnapshot
-    ) -> None:
+    def restore_commitment_state(self, snapshot: CommitmentSystemSnapshot) -> None:
         """Replace only Commitment authority through the AgentState port."""
 
         self._commitment_system.restore_commitment_state(snapshot)
@@ -622,9 +634,7 @@ class SuzkaMainLoop:
     def attention_view(self) -> AttentionSelectedView:
         """Return a detached copy of only the last committed Attention metadata."""
 
-        return _validated_attention_view(
-            self._committed_read_views.attention_view
-        )
+        return _validated_attention_view(self._committed_read_views.attention_view)
 
     @staticmethod
     def _prepare_committed_r13_view(
@@ -665,9 +675,7 @@ class SuzkaMainLoop:
             view,
         )
 
-    def _publish_committed_r13_view(
-        self, bundle: _CommittedR13Bundle
-    ) -> None:
+    def _publish_committed_r13_view(self, bundle: _CommittedR13Bundle) -> None:
         """Publish R13 while preserving Value/Belief views for compatibility."""
 
         current = self._committed_read_views
@@ -808,9 +816,7 @@ class SuzkaMainLoop:
                 if revision.record_digest not in prior_digests
             )
             if not new_revisions:
-                raise BeliefDomainError(
-                    "Belief change has no committing revision"
-                )
+                raise BeliefDomainError("Belief change has no committing revision")
             for revision in new_revisions:
                 if (
                     revision.event_id != event.event_id
@@ -835,9 +841,7 @@ class SuzkaMainLoop:
         previous_histories = {
             history.value_id: history for history in previous.histories
         }
-        current_histories = {
-            history.value_id: history for history in current.histories
-        }
+        current_histories = {history.value_id: history for history in current.histories}
         previous_ledgers = dict(previous.evidence_ledgers)
         current_ledgers = dict(current.evidence_ledgers)
         previous_ledger_digests = dict(previous.evidence_ledger_digests)
@@ -932,7 +936,9 @@ class SuzkaMainLoop:
         event = self._runtime.current_event()
         if event is None:
             raise RuntimeError("chat requires the active runtime event")
-        expected_type = AgentEventType.DEBUG_CHAT if capture_debug else AgentEventType.CHAT
+        expected_type = (
+            AgentEventType.DEBUG_CHAT if capture_debug else AgentEventType.CHAT
+        )
         expected_source = (
             AgentEventSource.API_CHAT_DEBUG
             if capture_debug
@@ -945,13 +951,14 @@ class SuzkaMainLoop:
         return event
 
     def _governance_context(
-        self,
-        runtime: AgentRuntime, expected_source: AgentEventSource
+        self, runtime: AgentRuntime, expected_source: AgentEventSource
     ) -> tuple[ValueMutationEvidence, IdentityOrigin]:
         if not isinstance(runtime, AgentRuntime):
             raise TypeError("governance runtime must be an AgentRuntime")
         if self._runtime is not runtime:
-            raise ValueDomainError("governance runtime is not the bound application runtime")
+            raise ValueDomainError(
+                "governance runtime is not the bound application runtime"
+            )
         event = runtime.current_event()
         if event is None:
             raise ValueDomainError("Value governance requires the active runtime event")
@@ -981,17 +988,15 @@ class SuzkaMainLoop:
         evidence, origin = self._governance_context(
             runtime, AgentEventSource.API_VALUES_FREEZE
         )
-        return self._value_system.freeze(
-            value_id, evidence, governance_origin=origin
-        )
+        return self._value_system.freeze(value_id, evidence, governance_origin=origin)
 
-    def unfreeze_value(self, runtime: AgentRuntime, value_id: str) -> ValueMutationResult:
+    def unfreeze_value(
+        self, runtime: AgentRuntime, value_id: str
+    ) -> ValueMutationResult:
         evidence, origin = self._governance_context(
             runtime, AgentEventSource.API_VALUES_UNFREEZE
         )
-        return self._value_system.unfreeze(
-            value_id, evidence, governance_origin=origin
-        )
+        return self._value_system.unfreeze(value_id, evidence, governance_origin=origin)
 
     def rollback_value(
         self, runtime: AgentRuntime, value_id: str, target_revision: int
@@ -1172,7 +1177,11 @@ class SuzkaMainLoop:
             and context_registry is self.context_registry
             and emotion_engine is self.emotion_engine
         )
-        if r15_context_safe_chat and event is not None and self._r15_state_port is not None:
+        if (
+            r15_context_safe_chat
+            and event is not None
+            and self._r15_state_port is not None
+        ):
             scoped_interaction = self._r15_state_port._scoped_interaction_in_chat(
                 event,
                 pre_context_state,
@@ -1282,7 +1291,8 @@ class SuzkaMainLoop:
                     emotion_engine,
                     emotion_state,
                     None if selectors is None else selectors.interlocutor_key,
-                ) != scoped_interaction
+                )
+                != scoped_interaction
             ):
                 raise RuntimeError("scoped interaction source changed during Chat")
         # The model may have run while an external Source was retired or the
@@ -1350,9 +1360,7 @@ class SuzkaMainLoop:
                 for reason in emotion_update.reasons
             )
             experience_record = ExperienceRecord(
-                experience_id=experience_id_for_event(
-                    event.event_id, event_sequence
-                ),
+                experience_id=experience_id_for_event(event.event_id, event_sequence),
                 revision=0,
                 lifecycle=ExperienceLifecycle.ACTIVE,
                 source_event_id=event.event_id,
@@ -1454,8 +1462,7 @@ class SuzkaMainLoop:
                 "Attention refresh requires the exact bound handler event"
             )
         if type(event) is not AgentEvent or (
-            type(event.processing_sequence) is not int
-            or event.processing_sequence <= 0
+            type(event.processing_sequence) is not int or event.processing_sequence <= 0
         ):
             raise RuntimeError("Attention refresh requires a validated runtime event")
         if type(current_context) is not ContextFrame:
@@ -1665,9 +1672,7 @@ class SuzkaMainLoop:
             **keyword_arguments,
         )
 
-    def _chat_result(
-        self, computed: _ComputedChat, transaction_id: str
-    ) -> ChatResult:
+    def _chat_result(self, computed: _ComputedChat, transaction_id: str) -> ChatResult:
         return ChatResult(
             episode_id=computed.memory_participant.episode_id(transaction_id),
             response=computed.response,
