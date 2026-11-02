@@ -72,11 +72,7 @@ from suzka.motivation.commitment_system import (
 )
 from suzka.motivation.goal_system import GoalSystem, GoalSystemSnapshot
 from suzka.motivation.projection import R13PromptView
-from suzka.motivation.system import (
-    MotivationMutationEvidence,
-    MotivationSystem,
-    MotivationSystemSnapshot,
-)
+from suzka.motivation.system import MotivationSystem, MotivationSystemSnapshot
 from suzka.persona import (
     ConsciousAgent,
     ContextPromptView,
@@ -606,25 +602,9 @@ class SuzkaMainLoop:
             or owner is not self._motivation_source_owner
         ):
             raise RuntimeError("unbound Motivation source presenter")
-        event, evidence = owner._present(self, nonce)
-        if evidence is None:
-            return "neutral_no_eligible_appraisal"
-        if any(
-            entry.evidence.source_ref == evidence.source_ref
-            for entry in self._motivation_system.snapshot().evidence_ledger
-        ):
-            raise ValueError("Motivation source identity already consumed")
-        assert event.processing_sequence is not None
-        self._motivation_system.apply_evidence(
-            evidence,
-            MotivationMutationEvidence(
-                event.event_id,
-                event.processing_sequence,
-                event.requested_at,
-                (evidence.source_ref,),
-            ),
-        )
-        return "motivation_evidence_applied"
+        # R13 MainLoop deliberately owns no producer calls: only the verified
+        # R16 source owner may present and apply previously committed evidence.
+        return owner._apply_verified_source(self, nonce)
 
     def export_goal_state(self) -> GoalSystemSnapshot:
         """Export a complete immutable Goal snapshot for AgentState."""

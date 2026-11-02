@@ -30,7 +30,11 @@ from suzka.memory.experience_participant import experience_id_for_event
 from suzka.memory.experience_store import ExperienceStoreError
 from suzka.memory.memory_schema import MemoryRecordType
 from suzka.motivation.common import R13Reference, R13ReferenceKind
-from suzka.motivation.system import MotivationEvidence, MotivationExperienceEvidence
+from suzka.motivation.system import (
+    MotivationEvidence,
+    MotivationExperienceEvidence,
+    MotivationMutationEvidence,
+)
 from suzka.runtime.agent_runtime import (
     AgentEvent,
     AgentEventOutcome,
@@ -216,6 +220,34 @@ class _MotivationSourceOwner:
                 authority_witness_digest=pending.record_digest,
             )
         )
+
+    def _apply_verified_source(self, loop: SuzkaMainLoop, nonce: object) -> str:
+        """Apply one R16-qualified source through existing R13 policy only.
+
+        The worker/event/nonce gate resides in _present; no caller may supply
+        evidence or a digest. Existing R13 MotivationSystem remains the
+        mutation authority, while MainLoop exposes no direct R13 producer call.
+        """
+        event, evidence = self._present(loop, nonce)
+        if evidence is None:
+            return "neutral_no_eligible_appraisal"
+        motivation = loop._motivation_system
+        if any(
+            item.evidence.source_ref == evidence.source_ref
+            for item in motivation.snapshot().evidence_ledger
+        ):
+            raise ValueError("Motivation source identity already consumed")
+        assert event.processing_sequence is not None
+        motivation.apply_evidence(
+            evidence,
+            MotivationMutationEvidence(
+                event.event_id,
+                event.processing_sequence,
+                event.requested_at,
+                (evidence.source_ref,),
+            ),
+        )
+        return "motivation_evidence_applied"
 
     def _read(
         self, source: _MotivationSourceRef, event: AgentEvent
