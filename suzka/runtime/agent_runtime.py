@@ -26,6 +26,8 @@ class AgentEventType(str, Enum):
     NARRATIVE_REVIEW = "narrative_review"
     SELF_ATTEMPT_REVIEW = "self_attempt_review"
     MOTIVATION_SOURCE_REVIEW = "motivation_source_review"
+    GOAL_PROPOSAL_REVIEW = "goal_proposal_review"
+    GOAL_ADOPTION_REVIEW = "goal_adoption_review"
 
 
 class AgentEventSource(str, Enum):
@@ -52,6 +54,8 @@ class AgentEventSource(str, Enum):
     RUNTIME_NARRATIVE_REVIEW = "runtime.narrative_review"
     RUNTIME_SELF_ATTEMPT_REVIEW = "runtime.self_attempt_review"
     RUNTIME_MOTIVATION_SOURCE_REVIEW = "runtime.motivation_source_review"
+    RUNTIME_GOAL_PROPOSAL_REVIEW = "runtime.goal_proposal_review"
+    RUNTIME_GOAL_ADOPTION_REVIEW = "runtime.goal_adoption_review"
 
 
 class AgentRuntimeStatus(str, Enum):
