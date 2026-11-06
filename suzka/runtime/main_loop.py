@@ -125,6 +125,7 @@ from suzka.runtime.r13_codec import (
 
 if TYPE_CHECKING:
     from suzka.r16.source_owner import _MotivationSourceOwner
+    from suzka.r16.goal_owner import _GoalSourceOwner
     from suzka.r15.state_port import R15StatePort
     from suzka.memory.episodic_participant import MemoryEpisodicParticipant
     from suzka.memory.experience_participant import MemoryExperienceParticipant
@@ -324,6 +325,7 @@ class SuzkaMainLoop:
         )
         self._runtime: object | None = None
         self._motivation_source_owner: _MotivationSourceOwner | None = None
+        self._goal_source_owner: _GoalSourceOwner | None = None
         self.working_memory_resolver = MemoryWorkingMemoryResolver(memory_system)
         self.session_state = session_state or SessionState()
         self.working_memory = (
@@ -605,6 +607,25 @@ class SuzkaMainLoop:
         # R13 MainLoop deliberately owns no producer calls: only the verified
         # R16 source owner may present and apply previously committed evidence.
         return owner._apply_verified_source(self, nonce)
+
+    def _bind_goal_source_owner(self, owner: _GoalSourceOwner) -> None:
+        from suzka.r16.goal_owner import _GoalSourceOwner
+
+        if type(owner) is not _GoalSourceOwner or owner._loop is not self:
+            raise RuntimeError("invalid Goal Source owner")
+        if self._goal_source_owner is not None:
+            raise RuntimeError("Goal Source owner already bound")
+        self._goal_source_owner = owner
+
+    def _propose_goal_source(self, owner: _GoalSourceOwner, nonce: object) -> str:
+        if owner is not self._goal_source_owner or owner is None:
+            raise RuntimeError("unbound Goal proposal owner")
+        return owner._propose(self, nonce)
+
+    def _review_goal_source(self, owner: _GoalSourceOwner, nonce: object) -> str:
+        if owner is not self._goal_source_owner or owner is None:
+            raise RuntimeError("unbound Goal review owner")
+        return owner._review(self, nonce)
 
     def export_goal_state(self) -> GoalSystemSnapshot:
         """Export a complete immutable Goal snapshot for AgentState."""
