@@ -29,6 +29,10 @@ from suzka.r15.qualified_proposal import (
 )
 from suzka.r16.source_owner import _MotivationSourceOwner, _MotivationSourceUnavailable
 from suzka.r16.goal_owner import _GoalSourceOwner, _GoalSourceUnavailable
+from suzka.r16.commitment_owner import (
+    _CommitmentSourceOwner,
+    _CommitmentSourceUnavailable,
+)
 from suzka.runtime import (
     AgentEvent,
     AgentEventType,
@@ -361,6 +365,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise StateRecoveryError("R16 Goal Source owner unavailable")
             return owner
 
+        def _r16_commitment_owner_for_commit(
+            event: AgentEvent,
+        ) -> _CommitmentSourceOwner | None:
+            owner = getattr(app.state, "_commitment_source_owner", None)
+            if owner is None and event.event_type in {
+                AgentEventType.COMMITMENT_PROPOSAL_REVIEW,
+                AgentEventType.COMMITMENT_ACCEPTANCE_REVIEW,
+            }:
+                raise StateRecoveryError("R16 Commitment Source owner unavailable")
+            return owner
+
         def _clear_r16_source(event: AgentEvent) -> None:
             owner = getattr(app.state, "_motivation_source_owner", None)
             if owner is not None:
@@ -368,6 +383,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             goal_owner = getattr(app.state, "_goal_source_owner", None)
             if goal_owner is not None:
                 goal_owner._clear(event)
+            commitment_owner = getattr(app.state, "_commitment_source_owner", None)
+            if commitment_owner is not None:
+                commitment_owner._clear(event)
 
         def _internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
             nonlocal committed_snapshot, committed_snapshot_hash
@@ -385,6 +403,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 goal_owner = _r16_goal_owner_for_commit(event)
                 if goal_owner is not None:
                     goal_owner._validate_commit(event)
+                commitment_owner = _r16_commitment_owner_for_commit(event)
+                if commitment_owner is not None:
+                    commitment_owner._validate_commit(event)
                 validate_belief_commit = getattr(
                     app.state.main_loop, "_validate_belief_event_commit", None
                 )
@@ -597,6 +618,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             except _GoalSourceUnavailable:
                 app.state._goal_source_owner = None
+            try:
+                source_owner = app.state._motivation_source_owner
+                if source_owner is None:
+                    raise _CommitmentSourceUnavailable("Motivation owner unavailable")
+                app.state._commitment_source_owner = _CommitmentSourceOwner(
+                    app.state.main_loop,
+                    app.state.agent_runtime,
+                    app.state.event_journal,
+                    source_owner,
+                )
+            except _CommitmentSourceUnavailable:
+                app.state._commitment_source_owner = None
             try:
                 narrative_reader = QualifiedNarrativeSourceGate(
                     app.state.agent_runtime,
