@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     from suzka.r16.source_owner import _MotivationSourceOwner
     from suzka.r16.goal_owner import _GoalSourceOwner
     from suzka.r16.commitment_owner import _CommitmentSourceOwner
+    from suzka.r16.plan_preview import _PlanPreviewOwner, _PlanPreviewResult
     from suzka.r15.state_port import R15StatePort
     from suzka.memory.episodic_participant import MemoryEpisodicParticipant
     from suzka.memory.experience_participant import MemoryExperienceParticipant
@@ -328,6 +329,7 @@ class SuzkaMainLoop:
         self._motivation_source_owner: _MotivationSourceOwner | None = None
         self._goal_source_owner: _GoalSourceOwner | None = None
         self._commitment_source_owner: _CommitmentSourceOwner | None = None
+        self._plan_preview_owner: _PlanPreviewOwner | None = None
         self.working_memory_resolver = MemoryWorkingMemoryResolver(memory_system)
         self.session_state = session_state or SessionState()
         self.working_memory = (
@@ -661,6 +663,22 @@ class SuzkaMainLoop:
         if owner is not self._commitment_source_owner or owner is None:
             raise RuntimeError("unbound Commitment acceptance owner")
         return owner._review(self, nonce)
+
+    def _bind_plan_preview_owner(self, owner: _PlanPreviewOwner) -> None:
+        from suzka.r16.plan_preview import _PlanPreviewOwner
+
+        if type(owner) is not _PlanPreviewOwner or owner._loop is not self:
+            raise RuntimeError("invalid Plan Preview owner")
+        if self._plan_preview_owner is not None:
+            raise RuntimeError("Plan Preview owner already bound")
+        self._plan_preview_owner = owner
+
+    def _review_plan_preview(
+        self, owner: _PlanPreviewOwner, nonce: object
+    ) -> _PlanPreviewResult:
+        if owner is not self._plan_preview_owner or owner is None:
+            raise RuntimeError("unbound Plan Preview owner")
+        return owner._preview(self, nonce)
 
     def export_commitment_state(self) -> CommitmentSystemSnapshot:
         """Export a complete immutable Commitment snapshot for AgentState."""
