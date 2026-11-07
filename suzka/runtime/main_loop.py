@@ -126,6 +126,7 @@ from suzka.runtime.r13_codec import (
 if TYPE_CHECKING:
     from suzka.r16.source_owner import _MotivationSourceOwner
     from suzka.r16.goal_owner import _GoalSourceOwner
+    from suzka.r16.commitment_owner import _CommitmentSourceOwner
     from suzka.r15.state_port import R15StatePort
     from suzka.memory.episodic_participant import MemoryEpisodicParticipant
     from suzka.memory.experience_participant import MemoryExperienceParticipant
@@ -326,6 +327,7 @@ class SuzkaMainLoop:
         self._runtime: object | None = None
         self._motivation_source_owner: _MotivationSourceOwner | None = None
         self._goal_source_owner: _GoalSourceOwner | None = None
+        self._commitment_source_owner: _CommitmentSourceOwner | None = None
         self.working_memory_resolver = MemoryWorkingMemoryResolver(memory_system)
         self.session_state = session_state or SessionState()
         self.working_memory = (
@@ -636,6 +638,29 @@ class SuzkaMainLoop:
         """Replace only Goal authority through the AgentState port."""
 
         self._goal_system.restore_goal_state(snapshot)
+
+    def _bind_commitment_source_owner(self, owner: _CommitmentSourceOwner) -> None:
+        from suzka.r16.commitment_owner import _CommitmentSourceOwner
+
+        if type(owner) is not _CommitmentSourceOwner or owner._loop is not self:
+            raise RuntimeError("invalid Commitment Source owner")
+        if self._commitment_source_owner is not None:
+            raise RuntimeError("Commitment Source owner already bound")
+        self._commitment_source_owner = owner
+
+    def _propose_commitment_source(
+        self, owner: _CommitmentSourceOwner, nonce: object
+    ) -> str:
+        if owner is not self._commitment_source_owner or owner is None:
+            raise RuntimeError("unbound Commitment proposal owner")
+        return owner._propose(self, nonce)
+
+    def _review_commitment_source(
+        self, owner: _CommitmentSourceOwner, nonce: object
+    ) -> str:
+        if owner is not self._commitment_source_owner or owner is None:
+            raise RuntimeError("unbound Commitment acceptance owner")
+        return owner._review(self, nonce)
 
     def export_commitment_state(self) -> CommitmentSystemSnapshot:
         """Export a complete immutable Commitment snapshot for AgentState."""
