@@ -1,5 +1,9 @@
 # PROJECT-SUZKA
 
+## Research Philosophy
+
+- [PROJECT-SUZKA — 設計思想・研究原則](PHILOSOPHY.md): research purpose, human-like cognition, imperfection-versus-defect criteria, and architectural decision boundaries.
+
 ## Local Runbook
 
 - Start the API with `just api`; it serves FastAPI on the `api.host` and `api.port` values from `config.yaml`.
