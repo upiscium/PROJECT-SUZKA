@@ -30,6 +30,7 @@ class AgentEventType(str, Enum):
     GOAL_ADOPTION_REVIEW = "goal_adoption_review"
     COMMITMENT_PROPOSAL_REVIEW = "commitment_proposal_review"
     COMMITMENT_ACCEPTANCE_REVIEW = "commitment_acceptance_review"
+    PLAN_PREVIEW_REVIEW = "plan_preview_review"
 
 
 class AgentEventSource(str, Enum):
@@ -60,6 +61,7 @@ class AgentEventSource(str, Enum):
     RUNTIME_GOAL_ADOPTION_REVIEW = "runtime.goal_adoption_review"
     RUNTIME_COMMITMENT_PROPOSAL_REVIEW = "runtime.commitment_proposal_review"
     RUNTIME_COMMITMENT_ACCEPTANCE_REVIEW = "runtime.commitment_acceptance_review"
+    RUNTIME_PLAN_PREVIEW_REVIEW = "runtime.plan_preview_review"
 
 
 class AgentRuntimeStatus(str, Enum):

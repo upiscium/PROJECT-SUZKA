@@ -33,6 +33,7 @@ from suzka.r16.commitment_owner import (
     _CommitmentSourceOwner,
     _CommitmentSourceUnavailable,
 )
+from suzka.r16.plan_preview import _PlanPreviewOwner, _PlanSourceUnavailable
 from suzka.runtime import (
     AgentEvent,
     AgentEventType,
@@ -376,6 +377,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise StateRecoveryError("R16 Commitment Source owner unavailable")
             return owner
 
+        def _r16_plan_preview_for_commit(event: AgentEvent) -> _PlanPreviewOwner | None:
+            owner = getattr(app.state, "_plan_preview_owner", None)
+            if owner is None and event.event_type is AgentEventType.PLAN_PREVIEW_REVIEW:
+                raise StateRecoveryError("R16 Plan Preview owner unavailable")
+            return owner
+
         def _clear_r16_source(event: AgentEvent) -> None:
             owner = getattr(app.state, "_motivation_source_owner", None)
             if owner is not None:
@@ -386,6 +393,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             commitment_owner = getattr(app.state, "_commitment_source_owner", None)
             if commitment_owner is not None:
                 commitment_owner._clear(event)
+            preview_owner = getattr(app.state, "_plan_preview_owner", None)
+            if preview_owner is not None:
+                preview_owner._clear(event)
 
         def _internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
             nonlocal committed_snapshot, committed_snapshot_hash
@@ -406,6 +416,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 commitment_owner = _r16_commitment_owner_for_commit(event)
                 if commitment_owner is not None:
                     commitment_owner._validate_commit(event)
+                preview_owner = _r16_plan_preview_for_commit(event)
+                if preview_owner is not None:
+                    preview_owner._validate_commit(event)
                 validate_belief_commit = getattr(
                     app.state.main_loop, "_validate_belief_event_commit", None
                 )
@@ -630,6 +643,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             except _CommitmentSourceUnavailable:
                 app.state._commitment_source_owner = None
+            try:
+                source_owner = app.state._motivation_source_owner
+                goal_owner = app.state._goal_source_owner
+                commitment_owner = app.state._commitment_source_owner
+                if source_owner is None or goal_owner is None or commitment_owner is None:
+                    raise _PlanSourceUnavailable("R16 prerequisite owners unavailable")
+                app.state._plan_preview_owner = _PlanPreviewOwner(
+                    app.state.main_loop,
+                    app.state.agent_runtime,
+                    app.state.event_journal,
+                    source_owner,
+                    goal_owner,
+                    commitment_owner,
+                )
+            except _PlanSourceUnavailable:
+                app.state._plan_preview_owner = None
             try:
                 narrative_reader = QualifiedNarrativeSourceGate(
                     app.state.agent_runtime,
