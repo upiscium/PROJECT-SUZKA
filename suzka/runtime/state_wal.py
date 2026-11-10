@@ -312,7 +312,7 @@ class _VerifiedGeneration:
     device: int
     inode: int
     length: int
-    prefix_digest: str
+    last_line: bytes
     scan: _GenerationScan
 
 
@@ -1024,8 +1024,17 @@ class StateWAL:
     clear_gate_if_matches = clear_external_reconciliation_gate
 
     @staticmethod
-    def _read_regular_with_identity(path: Path) -> tuple[bytes, int, int]:
-        """Read like ``_read_regular`` and return the opened file's dev/inode."""
+    def _read_generation_bytes(
+        path: Path, cached: _VerifiedGeneration | None
+    ) -> tuple[bytes, bool, int, int]:
+        """Read a generation like ``_read_regular``.
+
+        When ``cached`` describes the same file (dev/inode), the file has not
+        shrunk, and the last verified line is still byte-identical at its
+        verified position, only the bytes after the verified prefix are read
+        and ``(suffix, True, dev, inode)`` is returned.  Otherwise the whole
+        file is read and ``(content, False, dev, inode)`` is returned.
+        """
         parent_descriptor = -1
         descriptor = -1
         try:
@@ -1042,7 +1051,24 @@ class StateWAL:
             status = os.fstat(descriptor)
             with os.fdopen(descriptor, "rb") as source:
                 descriptor = -1
-                return source.read(), status.st_dev, status.st_ino
+                if (
+                    cached is not None
+                    and cached.device == status.st_dev
+                    and cached.inode == status.st_ino
+                    and status.st_size >= cached.length
+                ):
+                    tail_start = cached.length - len(cached.last_line)
+                    source.seek(tail_start)
+                    data = source.read()
+                    if data.startswith(cached.last_line):
+                        return (
+                            data[len(cached.last_line) :],
+                            True,
+                            status.st_dev,
+                            status.st_ino,
+                        )
+                    source.seek(0)
+                return source.read(), False, status.st_dev, status.st_ino
         except FileNotFoundError:
             raise StateWALMissing("WAL artifact is absent") from None
         except Exception:
@@ -1061,58 +1087,56 @@ class StateWAL:
     def _read_generation_cached(self, manifest: Manifest) -> _GenerationScan:
         """Verify the active generation, re-verifying only appended lines.
 
-        The cache is an in-process optimisation, never an authority: it is
-        used only when the same manifest, the same file (dev/inode) and a
-        byte-identical verified prefix (SHA-256) are observed.  Otherwise, or
-        after any failure, the whole generation is verified again.  A fresh
-        instance (every process start) has no cache, so startup always
-        performs a full verification.
+        The cache is an in-process optimisation, never an authority.  It is
+        used only for the same manifest and the same file (dev/inode) that has
+        not shrunk and whose last verified line is still byte-identical at
+        its verified position; then only appended lines are verified.
+        Otherwise, or after any failure, the whole generation is verified
+        again.  A fresh instance (every process start) has no cache, so
+        startup always performs a full verification.
+
+        Threat model: the WAL has a single cooperative writer (this process,
+        under the Journal lease).  An in-place rewrite of an earlier,
+        already-verified line that preserves the file size and the last line
+        is not detected by the cached path; it is detected by the next full
+        verification (process start or ``invalidate_verification_cache``).
         """
         with self._lock:
-            raw, device, inode = self._read_regular_with_identity(
-                self._generation_path(manifest.active_generation_id)
-            )
             cached = self._verified
-            digest = hashlib.sha256()
-            scan: _GenerationScan
-            suffix = raw
-            if (
-                cached is not None
-                and cached.manifest_hash == manifest.manifest_hash
-                and cached.generation_id == manifest.active_generation_id
-                and cached.device == device
-                and cached.inode == inode
-                and len(raw) >= cached.length
+            if cached is not None and (
+                cached.manifest_hash != manifest.manifest_hash
+                or cached.generation_id != manifest.active_generation_id
             ):
-                digest.update(raw[: cached.length])
-                if digest.hexdigest() == cached.prefix_digest:
-                    scan = cached.scan.copy()
-                    suffix = raw[cached.length :]
-                else:
-                    digest = hashlib.sha256()
-                    scan = _GenerationScan()
+                cached = None
+            data, incremental, device, inode = self._read_generation_bytes(
+                self._generation_path(manifest.active_generation_id), cached
+            )
+            scan: _GenerationScan
+            if incremental:
+                assert cached is not None
+                scan = cached.scan.copy()
+                base_length = cached.length
+                previous_last_line = cached.last_line
             else:
                 scan = _GenerationScan()
-            if suffix is raw:
-                digest = hashlib.sha256()
+                base_length = 0
+                previous_last_line = b""
             self._verified = None
-            self._verify_generation_lines(
-                manifest, suffix.splitlines(keepends=True), scan
-            )
+            lines = data.splitlines(keepends=True)
+            self._verify_generation_lines(manifest, lines, scan)
             if (
                 not scan.records
                 or scan.records[0].record_id != manifest.active_baseline_record_id
                 or scan.hashes[0] != manifest.active_baseline_record_hash
             ):
                 raise StateWALIntegrityError("WAL manifest does not anchor generation")
-            digest.update(suffix)
             self._verified = _VerifiedGeneration(
                 manifest_hash=manifest.manifest_hash,
                 generation_id=manifest.active_generation_id,
                 device=device,
                 inode=inode,
-                length=len(raw),
-                prefix_digest=digest.hexdigest(),
+                length=base_length + len(data),
+                last_line=lines[-1] if lines else previous_last_line,
                 scan=scan.copy(),
             )
             return scan

@@ -105,24 +105,48 @@ def test_fresh_instance_always_verifies_the_whole_generation(
     assert verified == [6]
 
 
-def test_in_place_rewrite_of_verified_prefix_with_same_size_is_detected(
+def _rewrite_line_same_size(path: Path, index: int) -> None:
+    lines = path.read_bytes().splitlines(keepends=True)
+    record = json.loads(lines[index])
+    record["candidate_snapshot"]["emotion_state"]["valence"] = 0.2
+    tampered = (
+        json.dumps(record, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
+    assert len(tampered) == len(lines[index])
+    with path.open("r+b") as handle:  # same inode, same size
+        handle.seek(sum(len(line) for line in lines[:index]))
+        handle.write(tampered)
+
+
+def test_rewrite_of_last_verified_line_is_detected_by_cached_path(
     tmp_path: Path,
 ) -> None:
     wal = _bootstrap(tmp_path)
     _append(wal, 10, 12, value=0.1)
     _append(wal, 12, 13, value=0.1)
     wal.inspect()
-    path = _generation_path(wal)
-    lines = path.read_bytes().splitlines(keepends=True)
-    record = json.loads(lines[1])
-    record["candidate_snapshot"]["emotion_state"]["valence"] = 0.2
-    tampered = (
-        json.dumps(record, sort_keys=True, separators=(",", ":")).encode() + b"\n"
-    )
-    assert len(tampered) == len(lines[1])
-    with path.open("r+b") as handle:  # same inode, same size
-        handle.seek(len(lines[0]))
-        handle.write(tampered)
+    _rewrite_line_same_size(_generation_path(wal), 2)
+    with pytest.raises(StateWALIntegrityError):
+        wal.inspect()
+
+
+def test_deep_same_size_rewrite_is_detected_by_full_verification(
+    tmp_path: Path,
+) -> None:
+    """Documented threat model: single cooperative writer.
+
+    A same-size rewrite of an earlier verified line that keeps the last line
+    intact is not re-read by the cached path; any full verification (process
+    start, explicit invalidation) detects it.
+    """
+    wal = _bootstrap(tmp_path)
+    _append(wal, 10, 12, value=0.1)
+    _append(wal, 12, 13, value=0.1)
+    wal.inspect()
+    _rewrite_line_same_size(_generation_path(wal), 1)
+    with pytest.raises(StateWALIntegrityError):
+        _fresh(wal).inspect()
+    wal.invalidate_verification_cache()
     with pytest.raises(StateWALIntegrityError):
         wal.inspect()
 
