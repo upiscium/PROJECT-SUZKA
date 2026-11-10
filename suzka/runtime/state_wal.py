@@ -898,6 +898,20 @@ class StateWAL:
             return False
 
     def inspect_optional(self) -> StateWALInspection:
+        return self._inspect_optional(full_verification=False)
+
+    def _inspect_full(self) -> StateWALInspection:
+        """Inspect with a full verification that bypasses the in-process cache.
+
+        Recovery-facing reads (``reconstruct``) use this so that they never
+        depend on the cooperative-writer assumption of the cached path.
+        """
+        inspection = self._inspect_optional(full_verification=True)
+        if not inspection.exists:
+            raise StateWALMissing("WAL is absent")
+        return inspection
+
+    def _inspect_optional(self, *, full_verification: bool) -> StateWALInspection:
         if not self._prepare_for_read():
             return StateWALInspection(
                 exists=False,
@@ -938,7 +952,11 @@ class StateWAL:
             )
             if manifest.manifest_hash != expected:
                 raise ValueError
-            scan = self._read_generation_cached(manifest)
+            scan = (
+                self._read_generation(manifest)
+                if full_verification
+                else self._read_generation_cached(manifest)
+            )
         except StateWALMissing:
             raise StateWALIntegrityError("active WAL generation is absent") from None
         except StateWALError:
@@ -1099,7 +1117,16 @@ class StateWAL:
         under the Journal lease).  An in-place rewrite of an earlier,
         already-verified line that preserves the file size and the last line
         is not detected by the cached path; it is detected by the next full
-        verification (process start or ``invalidate_verification_cache``).
+        verification (process start, ``invalidate_verification_cache`` or the
+        recovery-facing ``reconstruct``, which always verifies fully).
+
+        Costs and sharing: the cache retains the verified records of the
+        active generation for the process lifetime, so memory is proportional
+        to the generation size (bounded once generations roll over, #382).
+        Returned inspections share the same frozen record objects; callers
+        must not mutate nested snapshot containers.  The whole read-verify
+        step runs under ``self._lock`` and is therefore serialised with
+        appends.
         """
         with self._lock:
             cached = self._verified
@@ -1141,9 +1168,8 @@ class StateWAL:
             )
             return scan
 
-    def _read_generation(
-        self, manifest: Manifest
-    ) -> tuple[list[BaselineRecord | TransitionRecord], list[str]]:
+    def _read_generation(self, manifest: Manifest) -> _GenerationScan:
+        """Fully verify the active generation without using or updating the cache."""
         raw_lines = self._read_regular(
             self._generation_path(manifest.active_generation_id)
         ).splitlines(keepends=True)
@@ -1155,7 +1181,7 @@ class StateWAL:
             or scan.hashes[0] != manifest.active_baseline_record_hash
         ):
             raise StateWALIntegrityError("WAL manifest does not anchor generation")
-        return scan.records, scan.hashes
+        return scan
 
     def _verify_generation_lines(
         self,
@@ -1216,7 +1242,6 @@ class StateWAL:
                         raise ValueError
                     if record.candidate_snapshot_sequence <= state_sequence:
                         raise ValueError
-                    events.add(record.event_id)
                 else:
                     if records or record.previous_record_hash is not None:
                         raise ValueError
@@ -1239,7 +1264,10 @@ class StateWAL:
                     processing_sequence = record.journal_processing_high_water
                 if record.generation_id != manifest.active_generation_id:
                     raise ValueError
+                # ``scan`` is mutated only after the line passed every check.
                 ids.add(record.record_id)
+                if isinstance(record, TransitionRecord):
+                    events.add(record.event_id)
                 records.append(record)
                 hashes.append(record.record_hash)
                 scan.state_sequence = state_sequence
@@ -1582,7 +1610,7 @@ class StateWAL:
     ) -> CompatibleAgentStateSnapshot:
         if sequence is not None:
             _validate_sequence(sequence, "snapshot sequence")
-        inspection = self.inspect()
+        inspection = self._inspect_full()
         found: CompatibleAgentStateSnapshot | None = None
         for record in inspection.records:
             snapshot = (

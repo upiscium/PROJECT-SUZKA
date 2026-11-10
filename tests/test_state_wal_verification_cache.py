@@ -263,3 +263,51 @@ def test_failed_verification_clears_cache(tmp_path: Path) -> None:
     assert wal._verified is None
     path.write_bytes(good)
     assert wal.inspect() == _fresh(wal).inspect()
+
+
+def test_reconstruct_always_verifies_fully_and_detects_deep_rewrite(
+    tmp_path: Path,
+) -> None:
+    wal = _bootstrap(tmp_path)
+    _append(wal, 10, 12, value=0.1)
+    _append(wal, 12, 13, value=0.1)
+    wal.inspect()  # warm the cache
+    assert wal.reconstruct(sequence=12) == make_snapshot(12, value=0.1)
+    _rewrite_line_same_size(_generation_path(wal), 1)
+    with pytest.raises(StateWALIntegrityError):
+        wal.reconstruct(sequence=12)
+
+
+def test_custom_snapshot_hash_matches_full_verification(tmp_path: Path) -> None:
+    def custom(snapshot):  # type: ignore[no-untyped-def]
+        return "c" * 63 + str(snapshot.last_processed_event_sequence % 10)
+
+    wal = StateWAL(tmp_path / "wal", snapshot_hash=custom)
+    wal.bootstrap(make_snapshot(10), 10)
+    _append(wal, 10, 12)
+    _append(wal, 12, 13)
+    cached = wal.inspect()
+    full = StateWAL(tmp_path / "wal", snapshot_hash=custom).inspect()
+    assert cached == full
+    assert cached.latest_snapshot_hash == custom(make_snapshot(13))
+
+
+def test_valid_line_followed_by_broken_line_does_not_advance_cache(
+    tmp_path: Path,
+) -> None:
+    wal = _bootstrap(tmp_path)
+    _append(wal, 10, 12)
+    wal.inspect()
+    path = _generation_path(wal)
+    good = path.read_bytes()
+    other = StateWAL(wal.root)
+    _append(other, 12, 13)  # a valid appended line written by another handle
+    valid_suffix = path.read_bytes()[len(good) :]
+    with path.open("ab") as handle:
+        handle.write(b"garbage\n")
+    with pytest.raises(StateWALIntegrityError):
+        wal.inspect()
+    assert wal._verified is None
+    path.write_bytes(good + valid_suffix)
+    assert wal.inspect() == _fresh(wal).inspect()
+    assert wal.inspect().latest_snapshot_sequence == 13
