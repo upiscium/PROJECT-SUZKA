@@ -2913,7 +2913,11 @@ class EventJournal:
         return tuple(records)
 
     def invalidate_verification_cache(self) -> None:
-        """Forget cached segment parses; the next read verifies everything."""
+        """Forget cached segment parses; the next read verifies everything.
+
+        Used by tests and available to diagnostics/repair tooling that wants a
+        full re-verification without restarting the process.
+        """
         with self._lock:
             self._segment_cache.clear()
 

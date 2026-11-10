@@ -227,3 +227,32 @@ def test_replaced_inode_is_read_in_full(
     assert len(value.records) == total
     assert sum(parsed) == total
     value.close()
+
+
+def test_random_appends_and_rotations_match_fresh_verification(
+    tmp_path: Path,
+) -> None:
+    """Seeded property test: after every step the cached read equals a fresh one."""
+    import random
+
+    rng = random.Random(20261110)
+    path = tmp_path / "events.jsonl"
+    value = _journal(path, max_bytes=6_000, retained=200)
+    value.verify_and_reconcile(0, HASH_0)
+    number = 1
+    for _ in range(25):
+        count = rng.randint(1, 3)
+        _populate(value, number, count)
+        number += count
+        cached = value.records
+        observer = EventJournal.__new__(EventJournal)
+        # Full verification of the same bytes without taking the lease: reuse
+        # the journal's own reader with an empty cache.
+        observer.path = value.path
+        observer._lock = value._lock
+        observer._segment_cache = {}
+        with value._lock:
+            fresh = observer._read_records_unlocked()
+        assert cached == fresh
+    assert sorted(tmp_path.glob("events.jsonl.[0-9]*"))
+    value.close()
