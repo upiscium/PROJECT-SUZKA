@@ -254,5 +254,171 @@ def test_random_appends_and_rotations_match_fresh_verification(
         with value._lock:
             fresh = observer._read_records_unlocked()
         assert cached == fresh
+        assert value._verify_records(cached) == _fresh_verification(fresh)
     assert sorted(tmp_path.glob("events.jsonl.[0-9]*"))
+    value.close()
+
+
+# --- IP-2b: resumable _verify_records state -------------------------------
+
+
+def _fresh_verification(records):  # type: ignore[no-untyped-def]
+    """The reference: a full verification with no cached verifier state."""
+    return EventJournal._verify_records_from(records, None)[0]
+
+
+def _outcome(call):  # type: ignore[no-untyped-def]
+    try:
+        return ("ok", call())
+    except EventJournalIntegrityError as error:
+        return ("error", str(error))
+
+
+def _observer(value: EventJournal) -> EventJournal:
+    observer = EventJournal.__new__(EventJournal)
+    observer._lock = value._lock
+    observer._verifier_state = None
+    return observer
+
+
+def _transaction_journal(path: Path) -> EventJournal:
+    from tests.test_event_journal import (
+        HASH_2,
+        PARTICIPANTS,
+        TX_ID,
+        bootstrap_v3,
+        prepared_transaction,
+    )
+    from suzka.runtime.event_journal import ParticipantOutcome
+
+    value = bootstrap_v3(path)
+    item = prepared_transaction(value)
+    value.append_participant_finalized(
+        item, TX_ID, PARTICIPANTS[0], HASH_1, ParticipantOutcome.FINALIZED
+    )
+    value.append_participant_finalized(
+        item, TX_ID, PARTICIPANTS[1], HASH_2, ParticipantOutcome.ALREADY_CONSISTENT
+    )
+    value.append_transaction_completed(item, TX_ID)
+    anchor = value.records[0]
+    value.append_completed(
+        item,
+        1,
+        HASH_1,
+        anchor.wal_generation_id,
+        anchor.wal_record_id,
+        anchor.wal_record_hash,
+    )
+    return value
+
+
+def _gate_clear_journal(path: Path) -> EventJournal:
+    from tests.test_event_journal import (
+        append_u5_clear,
+        append_u5_reconciliation,
+        startup_reconciliation_journal,
+    )
+
+    value = startup_reconciliation_journal(path)
+    append_u5_reconciliation(value)
+    append_u5_clear(value)
+    append_u5_clear(value, terminal=True)
+    return value
+
+
+@pytest.mark.parametrize(
+    "build", [_transaction_journal, _gate_clear_journal], ids=["tx", "gate"]
+)
+def test_every_prefix_matches_fresh_verification(tmp_path: Path, build) -> None:  # type: ignore[no-untyped-def]
+    """Walk prefixes in order, then backwards: each result equals a full one."""
+    value = build(tmp_path / "events.jsonl")
+    records = value.records
+    observer = _observer(value)
+    order = [*range(1, len(records) + 1), *range(len(records), 0, -1)]
+    for length in order:
+        prefix = records[:length]
+        cached = _outcome(lambda: observer._verify_records(prefix))
+        assert cached == _outcome(lambda: _fresh_verification(prefix)), length
+    value.close()
+
+
+def test_verifier_processes_only_the_new_suffix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "events.jsonl"
+    value = _journal(path)
+    value.verify_and_reconcile(0, HASH_0)
+    _populate(value, 1, 5)
+    value._verify_records(value.records)
+    started: list[int] = []
+    original = EventJournal._initial_verifier_state
+
+    def counting(records):  # type: ignore[no-untyped-def]
+        started.append(len(records))
+        return original(records)
+
+    monkeypatch.setattr(EventJournal, "_initial_verifier_state", staticmethod(counting))
+    _populate(value, 6, 3)
+    result = value._verify_records(value.records)
+    assert started == []
+    assert result == _fresh_verification(value.records)
+    value.close()
+
+
+def test_rejected_candidate_clears_verifier_state(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    value = _journal(path)
+    value.verify_and_reconcile(0, HASH_0)
+    _populate(value, 1, 2)
+    records = value.records
+    value._verify_records(records)
+    duplicate = records[-1]
+    with pytest.raises(EventJournalIntegrityError):
+        value._verify_records((*records, duplicate))
+    assert value._verifier_state is None
+    assert value._verify_records(records) == _fresh_verification(records)
+    value.close()
+
+
+def test_shorter_or_divergent_input_never_reuses_a_longer_state(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    value = _journal(path)
+    value.verify_and_reconcile(0, HASH_0)
+    _populate(value, 1, 3)
+    records = value.records
+    full = value._verify_records(records)
+    shorter = records[:-2]
+    assert value._verify_records(shorter) == _fresh_verification(shorter)
+    assert value._verify_records(shorter) != full
+    divergent = (*records[:-1], records[-1].model_copy(update={"record_id": "x"}))
+    assert _outcome(lambda: value._verify_records(divergent)) == _outcome(
+        lambda: _fresh_verification(divergent)
+    )
+    value.close()
+
+
+def test_earlier_results_are_not_mutated_by_later_verification(
+    tmp_path: Path,
+) -> None:
+    value = _transaction_journal(tmp_path / "events.jsonl")
+    records = value.records
+    observer = _observer(value)
+    early = observer._verify_records(records[:-2])
+    snapshot = _fresh_verification(records[:-2])
+    observer._verify_records(records)
+    assert early == snapshot
+    value.close()
+
+
+def test_invalidation_also_drops_verifier_state(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    value = _journal(path)
+    value.verify_and_reconcile(0, HASH_0)
+    _populate(value, 1, 2)
+    value._verify_records(value.records)
+    assert value._verifier_state is not None
+    value.invalidate_verification_cache()
+    assert value._verifier_state is None
     value.close()

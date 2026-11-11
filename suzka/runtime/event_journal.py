@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 import fcntl
@@ -1059,6 +1059,61 @@ class _VerifiedJournal:
     terminal_gate_clear: EventJournalGateClear | None = None
 
 
+@dataclass(slots=True)
+class _VerifierState:
+    """Resumable state of ``_verify_records`` after a verified record prefix.
+
+    ``_verify_records`` is a pure function of the record sequence. This holds
+    its loop state after ``records`` so that a later call whose input starts
+    with exactly these records only processes the new suffix (IP-2b, #383).
+    It is in-process only and is owned by exactly one verification at a time.
+    """
+
+    records: tuple[EventJournalRecord, ...]
+    high_water: int
+    snapshot_sequence: int
+    snapshot_hash: str
+    journal_lineage_id: str | None
+    wal_generation_id: str | None
+    wal_record_id: str | None
+    wal_record_hash: str | None
+    wal_snapshot_sequence: int | None
+    wal_snapshot_hash: str | None
+    external_reconciliation_required: bool
+    v2_seen: bool
+    v3_seen: bool
+    v3_migration_anchor_hash: str | None
+    processing_event_id: str | None = None
+    gate_clear_open: bool = False
+    open_events: dict[str, _EventState] = field(default_factory=dict)
+    accepted_queue: list[str] = field(default_factory=list)
+    seen_event_ids: set[str] = field(default_factory=set)
+    seen_record_ids: set[str] = field(default_factory=set)
+    recovery_open: dict[str, EventJournalRecord] = field(default_factory=dict)
+    seen_recovery_ids: set[str] = field(default_factory=set)
+    completed_recoveries: dict[str, EventJournalRecord] = field(default_factory=dict)
+    startup_open: dict[str, dict[str, Any]] = field(default_factory=dict)
+    startup_seen_ids: set[str] = field(default_factory=set)
+    startup_seen_recovery_ids: set[str] = field(default_factory=set)
+    startup_completed: list[dict[str, Any]] = field(default_factory=list)
+    transactions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    baseline_records_seen: list[EventJournalRecord] = field(default_factory=list)
+    gate_records: list[EventJournalRecord] = field(default_factory=list)
+    transaction_views: dict[str, EventJournalTransaction] = field(
+        default_factory=dict
+    )
+    result: _VerifiedJournal | None = None
+
+
+_GATE_LIFECYCLES = frozenset(
+    {
+        EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED,
+        EventLifecycle.CLEAR_PREPARED,
+        EventLifecycle.CLEARED,
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class EventJournalOpenEvent:
     event_id: str
@@ -1256,6 +1311,7 @@ class EventJournal:
         self._append_stage_hook = append_stage_hook
         self._lock = RLock()
         self._segment_cache: dict[tuple[int, int], _CachedSegment] = {}
+        self._verifier_state: _VerifierState | None = None
         if lease is not None and (lease.path != self.path or not lease.held):
             raise ValueError("EventJournal lease does not match configured path")
         self._lease = (
@@ -2913,13 +2969,16 @@ class EventJournal:
         return tuple(records)
 
     def invalidate_verification_cache(self) -> None:
-        """Forget cached segment parses; the next read verifies everything.
+        """Forget cached segment parses and verifier state.
+
+        The next read and the next ``_verify_records`` verify everything.
 
         Used by tests and available to diagnostics/repair tooling that wants a
         full re-verification without restarting the process.
         """
         with self._lock:
             self._segment_cache.clear()
+            self._verifier_state = None
 
     def _verify_segment_records(
         self,
@@ -3133,73 +3192,85 @@ class EventJournal:
     def _verify_records(
         self, records: tuple[EventJournalRecord, ...]
     ) -> _VerifiedJournal:
-        if (
-            not records
-            or records[0].lifecycle is not EventLifecycle.CHECKPOINT
-            or records[0].schema_version not in {1, 2, 3}
-        ):
-            raise EventJournalIntegrityError("EventJournal lacks checkpoint authority")
-        checkpoint = records[0]
-        assert checkpoint.processing_sequence is not None
-        assert checkpoint.snapshot_sequence is not None
-        assert checkpoint.snapshot_hash is not None
-        high_water = checkpoint.processing_sequence
-        snapshot_sequence = checkpoint.snapshot_sequence
-        snapshot_hash = checkpoint.snapshot_hash
-        if (
-            type(high_water) is not int
-            or type(snapshot_sequence) is not int
-            or high_water > MAX_PERSISTED_EVENT_SEQUENCE
-            or snapshot_sequence > MAX_PERSISTED_EVENT_SEQUENCE
-        ):
-            raise EventJournalIntegrityError(
-                "EventJournal processing sequence is outside its bound"
-            )
-        journal_lineage_id = checkpoint.journal_lineage_id
-        wal_generation_id = checkpoint.wal_generation_id
-        wal_record_id = checkpoint.wal_record_id
-        wal_record_hash = checkpoint.wal_record_hash
-        wal_snapshot_sequence = snapshot_sequence
-        wal_snapshot_hash = snapshot_hash
-        external_reconciliation_required = bool(
-            checkpoint.external_reconciliation_required
-        )
-        if checkpoint.schema_version >= 2 and (
-            checkpoint.wal_generation_id is None
-            or checkpoint.wal_record_id is None
-            or checkpoint.wal_record_hash is None
-            or checkpoint.journal_lineage_id is None
-            or checkpoint.migration_previous_v1_hash is not None
-            or checkpoint.migration_previous_v2_hash is not None
-        ):
-            raise EventJournalIntegrityError("WAL-bound checkpoint anchor is invalid")
-        if snapshot_sequence > high_water:
-            raise EventJournalIntegrityError("Checkpoint sequence is impossible")
-        open_events: dict[str, _EventState] = {}
-        accepted_queue: list[str] = []
-        processing_event_id: str | None = None
-        seen_event_ids: set[str] = set()
-        seen_record_ids: set[str] = set()
-        recovery_open: dict[str, EventJournalRecord] = {}
-        seen_recovery_ids: set[str] = set()
-        completed_recoveries: dict[str, EventJournalRecord] = {}
-        startup_open: dict[str, dict[str, Any]] = {}
-        startup_seen_ids: set[str] = set()
-        startup_seen_recovery_ids: set[str] = set()
-        startup_completed: list[dict[str, Any]] = []
-        v2_seen = checkpoint.schema_version == 2
-        v3_seen = checkpoint.schema_version == 3
-        v3_migration_anchor_hash = checkpoint.v3_migration_anchor_hash
-        transactions: dict[str, dict[str, Any]] = {}
-        baseline_records_seen: list[EventJournalRecord] = []
-        gate_clear_open = False
+        with self._lock:
+            state = self._take_verifier_state(records)
+            if state is not None and state.result is not None:
+                if len(records) == len(state.records):
+                    result = replace(state.result, records=records)
+                    self._verifier_state = state
+                    return result
+            result, state = self._verify_records_from(records, state)
+            self._verifier_state = state
+            return result
 
-        for record in records:
+    def _take_verifier_state(
+        self, records: tuple[EventJournalRecord, ...]
+    ) -> _VerifierState | None:
+        """Detach the cached state if ``records`` extends its verified prefix.
+
+        The cache is cleared before any verification work, so a failure never
+        leaves a partially advanced state behind.
+        """
+        state = getattr(self, "_verifier_state", None)
+        self._verifier_state = None
+        if state is None:
+            return None
+        prefix = len(state.records)
+        if len(records) < prefix or records[:prefix] != state.records:
+            return None
+        return state
+
+    @staticmethod
+    def _verify_records_from(
+        records: tuple[EventJournalRecord, ...], verifier: _VerifierState | None
+    ) -> tuple[_VerifiedJournal, _VerifierState]:
+        if verifier is not None:
+            start = len(verifier.records)
+        else:
+            start = 0
+            verifier = EventJournal._initial_verifier_state(records)
+        high_water = verifier.high_water
+        snapshot_sequence = verifier.snapshot_sequence
+        snapshot_hash = verifier.snapshot_hash
+        journal_lineage_id = verifier.journal_lineage_id
+        wal_generation_id = verifier.wal_generation_id
+        wal_record_id = verifier.wal_record_id
+        wal_record_hash = verifier.wal_record_hash
+        wal_snapshot_sequence = verifier.wal_snapshot_sequence
+        wal_snapshot_hash = verifier.wal_snapshot_hash
+        external_reconciliation_required = verifier.external_reconciliation_required
+        v2_seen = verifier.v2_seen
+        v3_seen = verifier.v3_seen
+        v3_migration_anchor_hash = verifier.v3_migration_anchor_hash
+        processing_event_id = verifier.processing_event_id
+        gate_clear_open = verifier.gate_clear_open
+        open_events = verifier.open_events
+        accepted_queue = verifier.accepted_queue
+        seen_event_ids = verifier.seen_event_ids
+        seen_record_ids = verifier.seen_record_ids
+        recovery_open = verifier.recovery_open
+        seen_recovery_ids = verifier.seen_recovery_ids
+        completed_recoveries = verifier.completed_recoveries
+        startup_open = verifier.startup_open
+        startup_seen_ids = verifier.startup_seen_ids
+        startup_seen_recovery_ids = verifier.startup_seen_recovery_ids
+        startup_completed = verifier.startup_completed
+        transactions = verifier.transactions
+        baseline_records_seen = verifier.baseline_records_seen
+        gate_records = verifier.gate_records
+        view_cache = verifier.transaction_views
+
+        for record in records[start:]:
             if record.record_id in seen_record_ids:
                 raise EventJournalIntegrityError("Record identifier is duplicated")
             seen_record_ids.add(record.record_id)
 
-        for index, record in enumerate(records[1:], start=1):
+        for index in range(max(start, 1), len(records)):
+            record = records[index]
+            if record.lifecycle in _GATE_LIFECYCLES:
+                gate_records.append(record)
+            if record.transaction_id is not None:
+                view_cache.pop(record.transaction_id, None)
             if record.schema_version == 3:
                 if not v3_seen and (
                     record.lifecycle is not EventLifecycle.CHECKPOINT
@@ -4085,24 +4156,44 @@ class EventJournal:
             else:
                 raise EventJournalIntegrityError("Lifecycle is impossible")
 
-        transaction_views = tuple(
-            EventJournalTransaction(
-                transaction_id=transaction_id,
-                event_id=value["event_id"],
-                event_type=value["event_type"],
-                source=value["source"],
-                processing_sequence=value["sequence"],
-                kind=value["kind"],
-                required_participants=value["required"],
-                participant_outcomes=tuple(sorted(value["outcomes"].items())),
-                abort_outcomes=tuple(sorted(value["abort_outcomes"].items())),
-                reconciliation_reason=value["reason"],
-                abort_reason=value["abort_reason"],
-                unresolved_participants=value["unresolved"],
-                terminal_lifecycle=value["terminal"],
-            )
-            for transaction_id, value in transactions.items()
-        )
+        verifier.high_water = high_water
+        verifier.snapshot_sequence = snapshot_sequence
+        verifier.snapshot_hash = snapshot_hash
+        verifier.journal_lineage_id = journal_lineage_id
+        verifier.wal_generation_id = wal_generation_id
+        verifier.wal_record_id = wal_record_id
+        verifier.wal_record_hash = wal_record_hash
+        verifier.wal_snapshot_sequence = wal_snapshot_sequence
+        verifier.wal_snapshot_hash = wal_snapshot_hash
+        verifier.external_reconciliation_required = external_reconciliation_required
+        verifier.v2_seen = v2_seen
+        verifier.v3_seen = v3_seen
+        verifier.v3_migration_anchor_hash = v3_migration_anchor_hash
+        verifier.processing_event_id = processing_event_id
+        verifier.gate_clear_open = gate_clear_open
+
+        views: list[EventJournalTransaction] = []
+        for transaction_id, value in transactions.items():
+            transaction_view = view_cache.get(transaction_id)
+            if transaction_view is None:
+                transaction_view = EventJournalTransaction(
+                    transaction_id=transaction_id,
+                    event_id=value["event_id"],
+                    event_type=value["event_type"],
+                    source=value["source"],
+                    processing_sequence=value["sequence"],
+                    kind=value["kind"],
+                    required_participants=value["required"],
+                    participant_outcomes=tuple(sorted(value["outcomes"].items())),
+                    abort_outcomes=tuple(sorted(value["abort_outcomes"].items())),
+                    reconciliation_reason=value["reason"],
+                    abort_reason=value["abort_reason"],
+                    unresolved_participants=value["unresolved"],
+                    terminal_lifecycle=value["terminal"],
+                )
+                view_cache[transaction_id] = transaction_view
+            views.append(transaction_view)
+        transaction_views = tuple(views)
         startup_views = tuple(
             EventJournalStartupReconciliation(
                 reconciliation_id=rid,
@@ -4135,7 +4226,7 @@ class EventJournal:
         )
         baseline_views: list[EventJournalParticipantBaseline] = []
         baseline_records: dict[str, EventJournalRecord] = {}
-        for record in records:
+        for record in gate_records:
             if record.lifecycle is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED:
                 assert record.baseline_id is not None
                 baseline_records[record.baseline_id] = record
@@ -4151,7 +4242,7 @@ class EventJournal:
                 ))
         open_gate: EventJournalGateClear | None = None
         terminal_gate: EventJournalGateClear | None = None
-        for record in records:
+        for record in gate_records:
             if record.lifecycle not in {
                 EventLifecycle.CLEAR_PREPARED, EventLifecycle.CLEARED
             }:
@@ -4224,7 +4315,7 @@ class EventJournal:
                 open_gate = None
         if terminal_gate is not None:
             external_reconciliation_required = False
-        return _VerifiedJournal(
+        result = _VerifiedJournal(
             records,
             high_water,
             snapshot_sequence,
@@ -4243,6 +4334,72 @@ class EventJournal:
             tuple(baseline_views),
             open_gate,
             terminal_gate,
+        )
+        verifier.records = records
+        verifier.result = result
+        return result, verifier
+
+    @staticmethod
+    def _initial_verifier_state(
+        records: tuple[EventJournalRecord, ...],
+    ) -> _VerifierState:
+        if (
+            not records
+            or records[0].lifecycle is not EventLifecycle.CHECKPOINT
+            or records[0].schema_version not in {1, 2, 3}
+        ):
+            raise EventJournalIntegrityError("EventJournal lacks checkpoint authority")
+        checkpoint = records[0]
+        assert checkpoint.processing_sequence is not None
+        assert checkpoint.snapshot_sequence is not None
+        assert checkpoint.snapshot_hash is not None
+        high_water = checkpoint.processing_sequence
+        snapshot_sequence = checkpoint.snapshot_sequence
+        snapshot_hash = checkpoint.snapshot_hash
+        if (
+            type(high_water) is not int
+            or type(snapshot_sequence) is not int
+            or high_water > MAX_PERSISTED_EVENT_SEQUENCE
+            or snapshot_sequence > MAX_PERSISTED_EVENT_SEQUENCE
+        ):
+            raise EventJournalIntegrityError(
+                "EventJournal processing sequence is outside its bound"
+            )
+        journal_lineage_id = checkpoint.journal_lineage_id
+        wal_generation_id = checkpoint.wal_generation_id
+        wal_record_id = checkpoint.wal_record_id
+        wal_record_hash = checkpoint.wal_record_hash
+        wal_snapshot_sequence = snapshot_sequence
+        wal_snapshot_hash = snapshot_hash
+        external_reconciliation_required = bool(
+            checkpoint.external_reconciliation_required
+        )
+        if checkpoint.schema_version >= 2 and (
+            checkpoint.wal_generation_id is None
+            or checkpoint.wal_record_id is None
+            or checkpoint.wal_record_hash is None
+            or checkpoint.journal_lineage_id is None
+            or checkpoint.migration_previous_v1_hash is not None
+            or checkpoint.migration_previous_v2_hash is not None
+        ):
+            raise EventJournalIntegrityError("WAL-bound checkpoint anchor is invalid")
+        if snapshot_sequence > high_water:
+            raise EventJournalIntegrityError("Checkpoint sequence is impossible")
+        return _VerifierState(
+            records=(),
+            high_water=high_water,
+            snapshot_sequence=snapshot_sequence,
+            snapshot_hash=snapshot_hash,
+            journal_lineage_id=journal_lineage_id,
+            wal_generation_id=wal_generation_id,
+            wal_record_id=wal_record_id,
+            wal_record_hash=wal_record_hash,
+            wal_snapshot_sequence=wal_snapshot_sequence,
+            wal_snapshot_hash=wal_snapshot_hash,
+            external_reconciliation_required=external_reconciliation_required,
+            v2_seen=checkpoint.schema_version == 2,
+            v3_seen=checkpoint.schema_version == 3,
+            v3_migration_anchor_hash=checkpoint.v3_migration_anchor_hash,
         )
 
     def _rotated_paths_unlocked(self) -> list[tuple[int, Path]]:
