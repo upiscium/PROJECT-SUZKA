@@ -334,7 +334,9 @@ def test_every_prefix_matches_fresh_verification(tmp_path: Path, build) -> None:
     value = build(tmp_path / "events.jsonl")
     records = value.records
     observer = _observer(value)
-    order = [*range(1, len(records) + 1), *range(len(records), 0, -1)]
+    count = len(records)
+    order = [*range(1, count + 1), *range(count, 0, -1), *range(1, count + 1, 3)]
+    order += [*range(2, count + 1, 4), count]
     for length in order:
         prefix = records[:length]
         cached = _outcome(lambda: observer._verify_records(prefix))
@@ -366,17 +368,24 @@ def test_verifier_processes_only_the_new_suffix(
 
 
 def test_rejected_candidate_clears_verifier_state(tmp_path: Path) -> None:
+    """A candidate that advances the state before failing must not leak it."""
     path = tmp_path / "events.jsonl"
     value = _journal(path)
     value.verify_and_reconcile(0, HASH_0)
     _populate(value, 1, 2)
-    records = value.records
+    _populate(value, 3, 1)
+    complete = value.records
+    records = complete[:-1]
+    real_next = complete[-1]
     value._verify_records(records)
-    duplicate = records[-1]
+    # A fresh record id passes the duplicate check (and is added to the seen
+    # ids) before the lifecycle check rejects a second completion.
+    bad = records[-1].model_copy(update={"record_id": real_next.record_id})
     with pytest.raises(EventJournalIntegrityError):
-        value._verify_records((*records, duplicate))
+        value._verify_records((*records, bad))
     assert value._verifier_state is None
     assert value._verify_records(records) == _fresh_verification(records)
+    assert value._verify_records((*records, real_next)) == _fresh_verification(complete)
     value.close()
 
 
@@ -422,3 +431,62 @@ def test_invalidation_also_drops_verifier_state(tmp_path: Path) -> None:
     value.invalidate_verification_cache()
     assert value._verifier_state is None
     value.close()
+
+
+def test_every_carried_scalar_is_saved_back_to_the_verifier_state() -> None:
+    """Structural guard: a scalar loaded from the state and reassigned in the
+    loop must be written back, or a later resumed call would see a stale value
+    (a missed save is not always observable through ordinary journals)."""
+    import ast
+    import inspect
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(EventJournal._verify_records_from))
+    function = ast.parse(source).body[0]
+    assert isinstance(function, ast.FunctionDef)
+    loaded: set[str] = set()
+    saved: set[str] = set()
+    loop: ast.For | None = None
+    for node in function.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Attribute)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "verifier"
+            and node.targets[0].id == node.value.attr
+        ):
+            loaded.add(node.targets[0].id)
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Attribute)
+            and isinstance(node.targets[0].value, ast.Name)
+            and node.targets[0].value.id == "verifier"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == node.targets[0].attr
+        ):
+            saved.add(node.targets[0].attr)
+        if (
+            isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Name)
+            and node.iter.func.id == "range"
+        ):
+            loop = node
+    assert loop is not None
+    reassigned = {
+        target.id
+        for statement in ast.walk(loop)
+        if isinstance(statement, (ast.Assign, ast.AugAssign, ast.AnnAssign))
+        for target in (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else [statement.target]
+        )
+        if isinstance(target, ast.Name)
+    }
+    carried = loaded & reassigned
+    assert carried, "the loop must carry scalar state"
+    assert carried <= saved, sorted(carried - saved)
