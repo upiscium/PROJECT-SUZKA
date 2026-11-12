@@ -881,6 +881,12 @@ class StateRecoveryCoordinator:
         )
         return self._finish_event_reconciliation(result)
 
+    def resolve_open_wal_rollover(self) -> None:
+        """Resolve a prepared, unresolved StateWAL rollover (startup only)."""
+
+        with self._lock:
+            self._resolve_open_wal_rollover()
+
     def _resolve_open_wal_rollover(self) -> None:
         """Roll forward a published rollover, otherwise abort it.
 

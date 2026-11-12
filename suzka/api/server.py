@@ -133,7 +133,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.state_wal,
                 rollover_policy,
             )
-            journal_schema = app.state.event_journal.inspect().schema_version
+            # Resolve an interrupted StateWAL rollover before any other startup
+            # step may append to the Journal (#382 D1 P1-2): roll forward if the
+            # manifest was published, otherwise quarantine and abort.
+            app.state.state_recovery.resolve_open_wal_rollover()
+            startup_journal = app.state.event_journal.inspect()
+            journal_schema = startup_journal.schema_version
+            if startup_journal.open_wal_rollover is not None:
+                raise StateRecoveryError("StateWAL rollover is unresolved")
             app.state.memory_system = getattr(
                 app.state, "memory_system", None
             ) or DualMemorySystem(app_settings)
