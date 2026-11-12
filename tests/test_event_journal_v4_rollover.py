@@ -367,9 +367,9 @@ def test_rotation_after_rollover_checkpoints_the_new_anchor(tmp_path: Path) -> N
     while not sorted(tmp_path.glob("events.jsonl.[0-9]*")):
         _commit(value, f"fill-{number}", number, HASH_1, HASH_1)
         number += 1
-    checkpoint = [
-        r for r in value.records if r.lifecycle is EventLifecycle.CHECKPOINT
-    ][-1]  # the head of the active segment
+    checkpoint = [r for r in value.records if r.lifecycle is EventLifecycle.CHECKPOINT][
+        -1
+    ]  # the head of the active segment
     assert checkpoint.wal_generation_id == fields["wal_generation_id"]
     assert checkpoint.wal_record_id == fields["wal_record_id"]
     reopened = _reopen(path, value, max_bytes=2_500, retained=50)
@@ -422,4 +422,160 @@ def test_every_prefix_of_a_rollover_journal_matches_fresh_verification(
         cached = _outcome(lambda: observer._verify_records(prefix))
         fresh = _outcome(lambda: EventJournal._verify_records_from(prefix, None)[0])
         assert cached == fresh, length
+    value.close()
+
+
+# --- independent review follow-ups ---------------------------------------------
+
+
+def test_event_cannot_bind_the_pre_rollover_generation(tmp_path: Path) -> None:
+    """Review P1-1: after a rollover, PREPARED must name the new generation."""
+    value = bootstrap_v4(tmp_path / "events.jsonl")
+    _commit(value, "e1", 1, HASH_0, HASH_1)
+    old_generation = value.inspect().wal_generation_id
+    fields = _prepare(value)
+    value.append_wal_rollover_completed(fields["rollover_id"])
+    item = event("stale", 2)
+    value.append_accepted(event("stale"))
+    value.append_started(item)
+    with pytest.raises(EventJournalAppendError):
+        value.append_prepared(item, HASH_1, HASH_2, old_generation)
+    value.append_prepared(item, HASH_1, HASH_2, fields["wal_generation_id"])
+    value.close()
+
+
+def test_rollover_cannot_return_to_an_earlier_generation(tmp_path: Path) -> None:
+    """Review P2-3: G0 -> G1 -> G0 is rejected."""
+    value = bootstrap_v4(tmp_path / "events.jsonl")
+    original = value.inspect().wal_generation_id
+    fields = _prepare(value)
+    value.append_wal_rollover_completed(fields["rollover_id"])
+    with pytest.raises(EventJournalAppendError):
+        _prepare(value, wal_generation_id=original)
+    value.close()
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "snapshot_hash",
+        "wal_generation_id",
+        "wal_record_id",
+        "wal_record_hash",
+        "wal_predecessor_generation_id",
+        "wal_predecessor_record_hash",
+        "journal_lineage_id",
+    ],
+)
+@pytest.mark.parametrize(
+    "lifecycle",
+    [
+        EventLifecycle.WAL_GENERATION_ROLLED_COMPLETED,
+        EventLifecycle.WAL_GENERATION_ROLLED_ABORTED,
+    ],
+    ids=["completed", "aborted"],
+)
+def test_resolution_must_match_its_preparation_field_by_field(
+    tmp_path: Path, field_name: str, lifecycle: EventLifecycle
+) -> None:
+    value = bootstrap_v4(tmp_path / "events.jsonl")
+    _prepare(value)
+    records = value.records
+    prepared = records[-1]
+    replacement = "d" * 64 if field_name.endswith("hash") else str(uuid4())
+    forged = prepared.model_copy(
+        update={
+            "record_id": str(uuid4()),
+            "lifecycle": lifecycle,
+            field_name: replacement,
+        }
+    )
+    with pytest.raises(EventJournalIntegrityError, match="resolution is invalid"):
+        EventJournal._verify_records_from((*records, forged), None)
+    value.close()
+
+
+def test_preparation_is_rejected_while_maintenance_is_open(tmp_path: Path) -> None:
+    from tests.test_event_journal import prepared_transaction
+
+    path = tmp_path / "events.jsonl"
+    value = bootstrap_v4(path)
+    prepared_transaction(value)
+    with value.wal_rollover_boundary() as boundary:
+        assert not boundary.clean
+        assert boundary.reason == "event_in_progress"
+    with pytest.raises(EventJournalAppendError):
+        _prepare(value)
+    value.close()
+
+
+def test_boundary_reports_an_open_rollover(tmp_path: Path) -> None:
+    value = bootstrap_v4(tmp_path / "events.jsonl")
+    _prepare(value)
+    with value.wal_rollover_boundary() as boundary:
+        assert not boundary.clean
+        assert boundary.reason == "wal_rollover_open"
+    value.close()
+
+
+def test_public_checkpoint_is_refused_while_a_rollover_is_open(tmp_path: Path) -> None:
+    value = bootstrap_v4(tmp_path / "events.jsonl")
+    _commit(value, "e1", 1, HASH_0, HASH_1)
+    current = value.inspect()
+    _prepare(value)
+    with pytest.raises(EventJournalIntegrityError):
+        value.append_v2_current_checkpoint(
+            current.snapshot_sequence,
+            current.snapshot_hash,
+            current.wal_generation_id,
+            current.wal_record_id,
+            current.wal_record_hash,
+        )
+    value.close()
+
+
+def test_v4_record_must_start_with_the_migration_checkpoint(tmp_path: Path) -> None:
+    value = bootstrap_v3(tmp_path / "events.jsonl")
+    _commit(value, "e1", 1, HASH_0, HASH_1)
+    records = value.records
+    accepted = next(r for r in records if r.lifecycle is EventLifecycle.ACCEPTED)
+    forged = accepted.model_copy(
+        update={"record_id": str(uuid4()), "schema_version": 4}
+    )
+    with pytest.raises(EventJournalIntegrityError, match="v4 migration boundary"):
+        EventJournal._verify_records_from((*records, forged), None)
+    value.close()
+
+
+def test_second_v4_migration_marker_is_rejected(tmp_path: Path) -> None:
+    value = bootstrap_v4(tmp_path / "events.jsonl")
+    records = value.records
+    migration = records[-1]
+    forged = migration.model_copy(update={"record_id": str(uuid4())})
+    with pytest.raises(EventJournalIntegrityError, match="v4 migration is duplicated"):
+        EventJournal._verify_records_from((*records, forged), None)
+    value.close()
+
+
+def test_v4_records_use_the_v4_hash_domain(tmp_path: Path) -> None:
+    import hashlib
+
+    value = bootstrap_v4(tmp_path / "events.jsonl")
+    record = value.records[-1]
+    canonical = json.dumps(
+        record.model_dump(
+            mode="json",
+            exclude={"record_hash", "adoption_epoch"}
+            if record.adoption_epoch is None
+            else {"record_hash"},
+        ),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    expected = hashlib.sha256(
+        b"PROJECT-SUZKA:event-journal:v4\0" + canonical
+    ).hexdigest()
+    assert record.record_hash == expected
     value.close()

@@ -3627,6 +3627,10 @@ class EventJournal:
                         or record.wal_predecessor_generation_id != wal_generation_id
                         or record.wal_predecessor_record_hash != wal_record_hash
                         or record.journal_lineage_id != journal_lineage_id
+                        or any(
+                            previous.wal_generation_id == record.wal_generation_id
+                            for previous in records[:index]
+                        )
                     ):
                         raise EventJournalIntegrityError(
                             "WAL rollover preparation is invalid"
@@ -4367,6 +4371,13 @@ class EventJournal:
                     or current.lifecycle is not EventLifecycle.STARTED
                     or record.processing_sequence != current.processing_sequence
                     or record.state_hash_before != snapshot_hash
+                    or (
+                        # Since a rollover moves the WAL anchor at ordinary
+                        # boundaries, a v4 event must bind the current
+                        # generation, never an older one (IP-3a review P1-1).
+                        record.schema_version >= 4
+                        and record.wal_generation_id != wal_generation_id
+                    )
                 ):
                     raise EventJournalIntegrityError("Prepared lifecycle is impossible")
                 if any(

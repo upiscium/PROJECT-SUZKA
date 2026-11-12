@@ -119,7 +119,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.event_journal,
                 app.state.state_wal,
             )
-            journal_schema = app.state.event_journal.inspect().schema_version
+            startup_journal = app.state.event_journal.inspect()
+            journal_schema = startup_journal.schema_version
+            if startup_journal.open_wal_rollover is not None:
+                # No startup step may append while a StateWAL rollover is
+                # prepared but unresolved (#382 D1 P1-2).
+                raise StateRecoveryError("StateWAL rollover is unresolved")
             app.state.memory_system = getattr(
                 app.state, "memory_system", None
             ) or DualMemorySystem(app_settings)
