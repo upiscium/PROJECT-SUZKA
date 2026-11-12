@@ -157,7 +157,13 @@ class AgentStateSettings(StrictBaseModel):
 class EventJournalSettings(StrictBaseModel):
     path: Path = Path(".suzka/event_journal.jsonl")
     max_bytes: int = Field(default=1_048_576, gt=0)
+    # Deprecated (#381 D2 P2): retention is by time and compaction. Kept for
+    # compatibility; it no longer deletes segments.
     retained_files: int = Field(default=4, ge=2)
+    # Segments whose last record is older than this are archived (H2: ~30 days).
+    retention_days: int = Field(default=30, ge=0, le=36_500)
+    # Defaults to "<path>-archive" beside the Journal.
+    archive_dir: Path | None = None
 
 
 class StateWALSettings(StrictBaseModel):

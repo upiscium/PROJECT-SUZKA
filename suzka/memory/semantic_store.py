@@ -397,6 +397,24 @@ class SemanticStore:
             },
         )
 
+    def receipt_transaction_ids(self) -> tuple[str, ...]:
+        """Transaction IDs of receipts still kept (read-only)."""
+
+        if not self._path_exists(self.receipts_root):
+            return ()
+        self._secure_parent(self.receipts_root, create=False)
+        try:
+            paths = tuple(self.receipts_root.iterdir())
+        except OSError as error:
+            raise SemanticStoreUnavailable("Semantic receipts are unavailable") from error
+        identifiers: list[str] = []
+        for path in paths:
+            if path.name == _COMPACTION_NAME or path.suffix != ".json":
+                raise SemanticStoreCorrupt("Semantic receipt file name is invalid")
+            self._validate_uuid(path.stem)
+            identifiers.append(path.stem)
+        return tuple(sorted(identifiers))
+
     def prune_receipts(self, safe_transaction_ids: Iterable[str] = ()) -> None:
         """Delete only receipts proven unnecessary by the Journal authority.
 

@@ -307,7 +307,11 @@ class StartupReconciliationCoordinator:
             "recovery snapshot sequence",
         )
         inspection = self.journal.inspect()
-        recovery_record = self._true_rollback_record(inspection.records)
+        # A compaction may have archived the true-rollback completion; it is
+        # then carried verbatim by the latest COMPACTION (#381 D1 P0-1).
+        recovery_record = self._true_rollback_record(
+            (*inspection.carried_records, *inspection.records)
+        )
         if recovery_record is None:
             raise StartupReconciliationError(
                 "External gate has no true rollback completion proof"

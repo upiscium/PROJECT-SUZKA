@@ -60,6 +60,10 @@ from suzka.runtime.agent_state import (
     _domain_value_system,
 )
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
+from suzka.runtime.journal_compaction import (
+    JournalCompactionCoordinator,
+    JournalCompactionPolicy,
+)
 from suzka.runtime.wal_rollover import (
     StateWALRolloverCoordinator,
     StateWALRolloverPolicy,
@@ -88,6 +92,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app_settings.event_journal.max_bytes,
                     app_settings.event_journal.retained_files,
                     lease=journal_lease,
+                    archive_dir=app_settings.event_journal.archive_dir,
                 )
             else:
                 if not existing_journal.has_exclusive_authority:
@@ -147,6 +152,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.semantic_store = app.state.memory_system.semantic_store
             app.state.semantic_receipt_retention = SemanticReceiptRetentionCoordinator(
                 app.state.event_journal, app.state.semantic_store
+            )
+            compaction_policy = getattr(app.state, "journal_compaction_policy", None)
+            if compaction_policy is None:
+                compaction_policy = JournalCompactionPolicy(
+                    app_settings.event_journal.retention_days
+                )
+            elif not isinstance(compaction_policy, JournalCompactionPolicy):
+                raise RuntimeError("Injected Journal compaction policy is invalid")
+            app.state.journal_compaction = JournalCompactionCoordinator(
+                app.state.event_journal,
+                compaction_policy,
+                app.state.semantic_receipt_retention,
             )
             injected_main_loop = getattr(app.state, "main_loop", None)
             if injected_main_loop is not None and not isinstance(
@@ -571,6 +588,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # P1-4). It never changes state; it only fails closed if a
                 # prepared rollover could not be resolved.
                 app.state.state_wal_rollover.maybe_rollover()
+                # Then, serially, the Journal compaction (#381 D2): archive
+                # segments older than the retention window. Never fails the
+                # committed turn.
+                app.state.journal_compaction.maybe_compact()
             except BaseException:
                 app.state.context_committed_reads.degrade()
                 raise

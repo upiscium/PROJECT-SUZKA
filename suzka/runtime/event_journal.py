@@ -5,9 +5,10 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import fcntl
+import gzip
 import hashlib
 import json
 import os
@@ -37,6 +38,8 @@ _HASH_DOMAIN_V1 = b"PROJECT-SUZKA:event-journal:v1\0"
 _HASH_DOMAIN_V2 = b"PROJECT-SUZKA:event-journal:v2\0"
 _HASH_DOMAIN_V3 = b"PROJECT-SUZKA:event-journal:v3\0"
 _HASH_DOMAIN_V4 = b"PROJECT-SUZKA:event-journal:v4\0"
+_ARCHIVE_ROOT_DOMAIN = b"SUZKA:R07:JOURNAL-ARCHIVE:V1\0"
+_ARCHIVE_NAME_PATTERN = re.compile(r"(\d+)-(\d+)-([0-9a-f-]{36})\.jsonl\.gz")
 # Fields introduced by schema 4. They are absent from (and excluded when
 # hashing or serialising) every record of an older schema, so v1-v3 record
 # hashes and bytes are unchanged.
@@ -46,6 +49,7 @@ _V4_FIELDS = (
     "rollover_id",
     "wal_predecessor_generation_id",
     "wal_predecessor_record_hash",
+    "compaction",
 )
 _STARTUP_AGGREGATE_DOMAIN = (
     b"PROJECT-SUZKA:R07:STARTUP-PARTICIPANT-AGGREGATE:V1\x00"
@@ -80,6 +84,9 @@ class EventLifecycle(str, Enum):
     WAL_GENERATION_ROLLED_PREPARED = "wal_generation_rolled_prepared"
     WAL_GENERATION_ROLLED_COMPLETED = "wal_generation_rolled_completed"
     WAL_GENERATION_ROLLED_ABORTED = "wal_generation_rolled_aborted"
+    # Old segments archived; declares the verifier state at the oldest
+    # retained checkpoint (#381 D1 P0-1, D2 P1-2).
+    COMPACTION = "compaction"
 
 
 _ROLLOVER_LIFECYCLES = frozenset(
@@ -210,6 +217,114 @@ class ParticipantRequirement(_JournalModel):
         return value
 
 
+class EventJournalCompaction(_JournalModel):
+    """What a COMPACTION record declares (#381 D1/D2).
+
+    The archived range is the oldest segments ending just before the
+    boundary checkpoint. The embedded records are the minimal carried state
+    that retained replay still needs; each is the original record verbatim,
+    so its identity is proven by recomputing its own record hash.
+    """
+
+    compaction_id: str
+    boundary_checkpoint_hash: str
+    archived_first_record_hash: str
+    archived_last_record_hash: str
+    archived_record_count: int = Field(ge=1)
+    archived_processing_floor: int = Field(ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE)
+    archived_processing_high_water: int = Field(
+        ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE
+    )
+    archived_first_timestamp: datetime
+    archived_last_timestamp: datetime
+    archived_root: str
+    archive_file: str
+    archive_sha256: str
+    archive_raw_sha256: str
+    archive_bytes: int = Field(ge=1)
+    retention_days: int = Field(ge=0, le=36_500)
+    as_of: datetime
+    previous_compaction_hash: str | None = None
+    baseline_record: EventJournalRecord | None = None
+    true_rollback_completed_record: EventJournalRecord | None = None
+    true_rollback_cleared_record: EventJournalRecord | None = None
+    carried_tail_record: EventJournalRecord | None = None
+
+    @model_validator(mode="after")
+    def validate_compaction(self) -> EventJournalCompaction:
+        try:
+            parsed = UUID(self.compaction_id)
+        except (TypeError, ValueError, AttributeError):
+            raise ValueError("compaction identifier is invalid") from None
+        if str(parsed) != self.compaction_id:
+            raise ValueError("compaction identifier is invalid")
+        for value in (
+            self.boundary_checkpoint_hash,
+            self.archived_first_record_hash,
+            self.archived_last_record_hash,
+            self.archived_root,
+            self.archive_sha256,
+            self.archive_raw_sha256,
+            self.previous_compaction_hash,
+        ):
+            if value is not None and _HASH_PATTERN.fullmatch(value) is None:
+                raise ValueError("compaction hash is invalid")
+        match = _ARCHIVE_NAME_PATTERN.fullmatch(self.archive_file)
+        if (
+            match is None
+            or match.group(3) != self.compaction_id
+            or int(match.group(1)) != self.archived_processing_floor
+            or int(match.group(2)) != self.archived_processing_high_water
+        ):
+            raise ValueError("compaction archive name is invalid")
+        if self.archived_processing_floor > self.archived_processing_high_water:
+            raise ValueError("compaction range is invalid")
+        for moment in (
+            self.archived_first_timestamp,
+            self.archived_last_timestamp,
+            self.as_of,
+        ):
+            if moment.tzinfo is None:
+                raise ValueError("compaction timestamps must be timezone-aware")
+        if self.archived_first_timestamp > self.archived_last_timestamp:
+            raise ValueError("compaction range is invalid")
+        if (
+            self.baseline_record is not None
+            and self.baseline_record.lifecycle
+            is not EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED
+        ) or (
+            self.true_rollback_completed_record is not None
+            and self.true_rollback_completed_record.lifecycle
+            is not EventLifecycle.RECOVERY_COMPLETED
+        ) or (
+            self.true_rollback_cleared_record is not None
+            and self.true_rollback_cleared_record.lifecycle
+            is not EventLifecycle.CLEARED
+        ):
+            raise ValueError("compaction carried record kind is invalid")
+        if (self.true_rollback_completed_record is None) != (
+            self.true_rollback_cleared_record is None
+        ):
+            raise ValueError("compaction true-rollback pair is incomplete")
+        for carried in self.carried_records:
+            if carried.lifecycle is EventLifecycle.COMPACTION:
+                raise ValueError("compaction cannot carry a compaction")
+        return self
+
+    @property
+    def carried_records(self) -> tuple[EventJournalRecord, ...]:
+        return tuple(
+            record
+            for record in (
+                self.baseline_record,
+                self.true_rollback_completed_record,
+                self.true_rollback_cleared_record,
+                self.carried_tail_record,
+            )
+            if record is not None
+        )
+
+
 class EventJournalRecord(_JournalModel):
     schema_version: Literal[1, 2, 3, 4]
     record_id: str = Field(min_length=1)
@@ -265,6 +380,7 @@ class EventJournalRecord(_JournalModel):
     rollover_id: str | None = None
     wal_predecessor_generation_id: str | None = None
     wal_predecessor_record_hash: str | None = None
+    compaction: EventJournalCompaction | None = None
 
     @field_validator(
         "processing_sequence",
@@ -647,6 +763,17 @@ class EventJournalRecord(_JournalModel):
                 "wal_record_id", "wal_record_hash", "journal_lineage_id",
             })
             return self
+        if self.lifecycle is EventLifecycle.COMPACTION:
+            if (
+                self.schema_version < 4
+                or not no_identity
+                or self.processing_sequence is not None
+                or self.compaction is None
+                or self.journal_lineage_id is None
+            ):
+                raise ValueError("compaction record is incomplete")
+            self._forbid_irrelevant_fields({"compaction", "journal_lineage_id"})
+            return self
         if self.lifecycle in _ROLLOVER_LIFECYCLES:
             if (
                 self.schema_version < 4
@@ -966,6 +1093,9 @@ class EventJournalAppendError(EventJournalError):
         )
 
 
+EventJournalCompaction.model_rebuild()
+
+
 @dataclass(frozen=True, slots=True)
 class EventJournalAdmissionStatus:
     """Bounded, read-only evidence for mutation admission."""
@@ -1129,6 +1259,8 @@ class _VerifiedJournal:
     open_gate_clear: EventJournalGateClear | None = None
     terminal_gate_clear: EventJournalGateClear | None = None
     open_wal_rollover: EventJournalWalRollover | None = None
+    latest_compaction: EventJournalCompaction | None = None
+    carried_records: tuple[EventJournalRecord, ...] = ()
 
 
 @dataclass(slots=True)
@@ -1158,6 +1290,9 @@ class _VerifierState:
     v4_seen: bool = False
     v4_migration_anchor_hash: str | None = None
     rollover_open: EventJournalRecord | None = None
+    last_compaction_hash: str | None = None
+    latest_compaction_hash: str | None = None
+    injected_compaction: EventJournalRecord | None = None
     processing_event_id: str | None = None
     gate_clear_open: bool = False
     open_events: dict[str, _EventState] = field(default_factory=dict)
@@ -1200,6 +1335,28 @@ _GATE_LIFECYCLES = frozenset(
         EventLifecycle.CLEARED,
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class EventJournalCompactionOutcome:
+    """Result of one compaction attempt."""
+
+    performed: bool
+    reason: str | None
+    archived_segments: int = 0
+    archived_records: int = 0
+    archive_file: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EventJournalArchiveAlert:
+    """A referenced archive that is missing or does not match (#381 D2 P2).
+
+    Archives are not authority: an alert is reported, never a fail-stop.
+    """
+
+    archive_file: str
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1284,6 +1441,11 @@ class EventJournalInspection:
     open_gate_clear: EventJournalGateClear | None = None
     terminal_gate_clear: EventJournalGateClear | None = None
     open_wal_rollover: EventJournalWalRollover | None = None
+    # Declared by the latest COMPACTION (#381): the archived range and the
+    # original records carried across it (baseline, true-rollback pair,
+    # Semantic checkpoint tail). They are not part of ``records``.
+    latest_compaction: EventJournalCompaction | None = None
+    carried_records: tuple[EventJournalRecord, ...] = ()
 
     @property
     def participant_baselines(self) -> tuple[EventJournalParticipantBaseline, ...]:
@@ -1408,6 +1570,7 @@ class EventJournal:
             Callable[[EventLifecycle, EventJournalAppendStage], None] | None
         ) = None,
         lease: EventJournalLease | None = None,
+        archive_dir: str | Path | None = None,
     ) -> None:
         if (
             isinstance(max_bytes, bool)
@@ -1423,7 +1586,16 @@ class EventJournal:
             raise ValueError("retained_files must be at least two")
         self.path = Path(path)
         self.max_bytes = max_bytes
+        # Deprecated: retention is by time and compaction (#381 D2 P2). Kept
+        # for configuration compatibility and admission status only.
         self.retained_files = retained_files
+        # Outside the rotated-segment glob ``<name>.<8 digits>``.
+        self.archive_dir = (
+            Path(archive_dir)
+            if archive_dir is not None
+            else self.path.with_name(f"{self.path.name}-archive")
+        )
+        self.archive_alerts: tuple[EventJournalArchiveAlert, ...] = ()
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._append_stage_hook = append_stage_hook
         self._lock = RLock()
@@ -1436,9 +1608,12 @@ class EventJournal:
         )
         with self._lock:
             try:
+                self._roll_forward_compaction_unlocked()
                 records = self._read_records_unlocked()
                 if records:
                     self._verify_records(records)
+                    self.archive_alerts = self._check_archives_unlocked(records)
+                self._quarantine_unreferenced_archives_unlocked(records)
             except BaseException:
                 self.close()
                 raise
@@ -1629,6 +1804,8 @@ class EventJournal:
                 open_gate_clear=verified.open_gate_clear,
                 terminal_gate_clear=verified.terminal_gate_clear,
                 open_wal_rollover=verified.open_wal_rollover,
+                latest_compaction=verified.latest_compaction,
+                carried_records=verified.carried_records,
             )
 
     def apply_planned_reconciliation(
@@ -1818,6 +1995,366 @@ class EventJournal:
             self._maybe_rotate_unlocked()
 
     migrate_v4 = append_v4_migration_checkpoint
+
+    # --- compaction and archive (#381 D1/D2, IP-4a) ---------------------------
+
+    def compaction_due(self, *, retention_days: int, now: datetime | None = None) -> bool:
+        """Cheap check: is the oldest rotated segment past the retention window?"""
+        with self._lock:
+            self._require_authority()
+            rotated = self._rotated_paths_unlocked()
+            if not rotated:
+                return False
+            segment, _ = self._read_verified_segment(rotated[0][1])
+            if not segment:
+                return False
+            cutoff = (now or self._clock()) - timedelta(days=retention_days)
+            return segment[-1].timestamp < cutoff
+
+    def compact(
+        self,
+        *,
+        retention_days: int,
+        now: datetime | None = None,
+        carried_tail: tuple[str, str] | None = None,
+        guard: Callable[[int], bool] | None = None,
+    ) -> EventJournalCompactionOutcome:
+        """Archive whole rotated segments older than the retention window.
+
+        At a clean boundary only. Steps (#381 D1 §3, D2 P1-2):
+        1. choose the oldest rotated segments whose last record is older than
+           ``now - retention_days`` (never the active segment);
+        2. write their bytes, gzip-compressed, to a temporary file, fsync,
+           rename, fsync the directory, chmod 0400; decompress and re-verify
+           record hashes, chain, count and root, or abort;
+        3. append COMPACTION declaring the archived range and the minimal
+           carried state at the new oldest checkpoint;
+        4. unlink the archived segments oldest first, fsyncing each.
+
+        ``carried_tail`` is the (record_id, record_hash) of the Semantic
+        checkpoint tail (C8): carried if it is archived now or was carried
+        before. ``guard`` receives the processing high-water of the range about
+        to be archived and returns True to defer (e.g. Semantic receipts that
+        still need that evidence, #381 D1 P0-2); it runs under the Journal
+        lock before anything is written.
+        """
+        if (
+            isinstance(retention_days, bool)
+            or not isinstance(retention_days, int)
+            or not 0 <= retention_days <= 36_500
+        ):
+            raise ValueError("retention_days is invalid")
+        with self._lock:
+            self._require_authority()
+            records = self._read_records_unlocked()
+            if not records or self._active_schema(records) < 4:
+                return EventJournalCompactionOutcome(False, "journal_schema_below_4")
+            verified = self._verify_records(records)
+            if (
+                verified.open_events
+                or verified.open_recoveries
+                or any(t.terminal_lifecycle is None for t in verified.transactions)
+                or any(not item.completed for item in verified.startup_reconciliations)
+                or verified.external_reconciliation_required
+                or verified.open_gate_clear is not None
+                or verified.open_wal_rollover is not None
+                or verified.journal_lineage_id is None
+            ):
+                return EventJournalCompactionOutcome(False, "boundary_not_clean")
+            as_of = now or self._clock()
+            cutoff = as_of - timedelta(days=retention_days)
+            if any(
+                later.timestamp < earlier.timestamp
+                for earlier, later in zip(records, records[1:])
+            ):
+                # The window is judged from record timestamps only; refuse when
+                # they are not monotonic (#381 §8, clock rollback).
+                return EventJournalCompactionOutcome(False, "clock_not_monotonic")
+            artifacts = self._journal_artifacts_unlocked()
+            archived_paths: list[Path] = []
+            archived_count = 0
+            for segment_index, segment_path in artifacts[:-1]:
+                if segment_index is None:
+                    break
+                segment, _ = self._read_verified_segment(segment_path)
+                if segment[-1].timestamp >= cutoff:
+                    break
+                archived_paths.append(segment_path)
+                archived_count += len(segment)
+            if not archived_paths:
+                return EventJournalCompactionOutcome(False, "nothing_due")
+            archived = records[:archived_count]
+            boundary_record = records[archived_count]
+            if (
+                boundary_record.lifecycle is not EventLifecycle.CHECKPOINT
+                or boundary_record.processing_sequence is None
+                or archived[0].processing_sequence is None
+            ):
+                raise EventJournalIntegrityError("compaction boundary is invalid")
+            if guard is not None and guard(boundary_record.processing_sequence):
+                return EventJournalCompactionOutcome(False, "deferred_semantic")
+            previous = next(
+                (
+                    record
+                    for record in reversed(records)
+                    if record.lifecycle is EventLifecycle.COMPACTION
+                ),
+                None,
+            )
+            injected = (
+                previous
+                if previous is not None
+                and previous.compaction is not None
+                and previous.compaction.boundary_checkpoint_hash
+                == records[0].record_hash
+                else None
+            )
+            baseline, rollback, cleared = self._declared_state_at(
+                records, archived_count, injected
+            )
+            tail_record: EventJournalRecord | None = None
+            if carried_tail is not None:
+                prior = (
+                    ()
+                    if injected is None or injected.compaction is None
+                    else injected.compaction.carried_records
+                )
+                tail_record = next(
+                    (
+                        record
+                        for record in (*archived, *prior)
+                        if (record.record_id, record.record_hash) == carried_tail
+                    ),
+                    None,
+                )
+            compaction_id = str(uuid4())
+            archive_name = (
+                f"{archived[0].processing_sequence}-"
+                f"{boundary_record.processing_sequence}-{compaction_id}.jsonl.gz"
+            )
+            raw = b"".join(path.read_bytes() for path in archived_paths)
+            archive_path, compressed = self._write_archive_unlocked(archive_name, raw)
+            try:
+                self._verify_archive_bytes(compressed, archived)
+            except Exception:
+                self._unlink_quietly(archive_path)
+                raise
+            declared = EventJournalCompaction(
+                compaction_id=compaction_id,
+                boundary_checkpoint_hash=boundary_record.record_hash,
+                archived_first_record_hash=archived[0].record_hash,
+                archived_last_record_hash=archived[-1].record_hash,
+                archived_record_count=len(archived),
+                archived_processing_floor=archived[0].processing_sequence,
+                archived_processing_high_water=boundary_record.processing_sequence,
+                archived_first_timestamp=archived[0].timestamp,
+                archived_last_timestamp=archived[-1].timestamp,
+                archived_root=self._archived_root(archived),
+                archive_file=archive_name,
+                archive_sha256=hashlib.sha256(compressed).hexdigest(),
+                archive_raw_sha256=hashlib.sha256(raw).hexdigest(),
+                archive_bytes=len(compressed),
+                retention_days=retention_days,
+                as_of=as_of,
+                previous_compaction_hash=(
+                    None if previous is None else previous.record_hash
+                ),
+                baseline_record=baseline,
+                true_rollback_completed_record=rollback,
+                true_rollback_cleared_record=cleared,
+                carried_tail_record=tail_record,
+            )
+            try:
+                record = self._make_record(
+                    EventLifecycle.COMPACTION,
+                    previous_hash=records[-1].record_hash,
+                    event=None,
+                    schema_version=self._active_schema(records),
+                    compaction=declared,
+                    journal_lineage_id=verified.journal_lineage_id,
+                )
+                self._verify_records((*records, record))
+            except EventJournalAppendError:
+                self._unlink_quietly(archive_path)
+                raise
+            except (ValidationError, ValueError, EventJournalIntegrityError):
+                self._unlink_quietly(archive_path)
+                raise EventJournalAppendError(
+                    EventJournalAppendStage.VALIDATE, published=False
+                ) from None
+            self._append_record_unlocked(record)
+            self._unlink_archived_segments_unlocked(archived_paths)
+            return EventJournalCompactionOutcome(
+                True,
+                None,
+                len(archived_paths),
+                len(archived),
+                archive_name,
+            )
+
+    def _write_archive_unlocked(self, name: str, raw: bytes) -> tuple[Path, bytes]:
+        compressed = gzip.compress(raw, compresslevel=9, mtime=0)
+        self.archive_dir.mkdir(mode=0o700, exist_ok=True)
+        temporary = self.archive_dir / f".compaction-{uuid4()}.tmp"
+        target = self.archive_dir / name
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(compressed)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, target)
+            self._fsync_directory(self.archive_dir)
+            # Guards against mistakes, not tampering (#381 D2 P2).
+            os.chmod(target, 0o400)
+        except BaseException:
+            self._unlink_quietly(temporary)
+            raise
+        return target, compressed
+
+    def _verify_archive_bytes(
+        self, compressed: bytes, expected: tuple[EventJournalRecord, ...]
+    ) -> None:
+        archived = self._parse_segment_bytes(gzip.decompress(compressed))
+        if len(archived) != len(expected):
+            raise EventJournalIntegrityError("archive record count differs")
+        self._verify_segment_records(archived, None)
+        if tuple(item.record_hash for item in archived) != tuple(
+            item.record_hash for item in expected
+        ):
+            raise EventJournalIntegrityError("archive records differ")
+
+    def _unlink_archived_segments_unlocked(self, paths: list[Path]) -> None:
+        for segment_path in paths:
+            segment_path.unlink()
+            self._fsync_parent()
+
+    def _roll_forward_compaction_unlocked(self) -> None:
+        """Finish an interrupted compaction before verification (#381 D1 P1-3).
+
+        If the latest COMPACTION's boundary is not the oldest record, the
+        archived segments are still present: unlink them oldest first, but
+        only after the archive is present and matches its declared digest.
+        """
+        records = self._read_records_unlocked()
+        latest = next(
+            (
+                record
+                for record in reversed(records)
+                if record.lifecycle is EventLifecycle.COMPACTION
+            ),
+            None,
+        )
+        if latest is None or latest.compaction is None:
+            return
+        declared = latest.compaction
+        if records[0].record_hash == declared.boundary_checkpoint_hash:
+            return
+        if self._archive_problem(declared) is not None:
+            # Keep every segment: nothing is lost, and the verifier replays the
+            # archived range normally until the archive is restored.
+            return
+        boundary_hash = declared.boundary_checkpoint_hash
+        doomed: list[Path] = []
+        for segment_index, segment_path in self._journal_artifacts_unlocked():
+            segment, _ = self._read_verified_segment(segment_path)
+            if segment[0].record_hash == boundary_hash:
+                break
+            if segment_index is None:
+                return
+            doomed.append(segment_path)
+        else:
+            return
+        self._unlink_archived_segments_unlocked(doomed)
+
+    def _archive_problem(self, declared: EventJournalCompaction) -> str | None:
+        archive = self.archive_dir / declared.archive_file
+        try:
+            data = archive.read_bytes()
+        except FileNotFoundError:
+            return "missing"
+        except OSError:
+            return "unreadable"
+        if len(data) != declared.archive_bytes:
+            return "size_mismatch"
+        if hashlib.sha256(data).hexdigest() != declared.archive_sha256:
+            return "digest_mismatch"
+        return None
+
+    def _check_archives_unlocked(
+        self, records: tuple[EventJournalRecord, ...]
+    ) -> tuple[EventJournalArchiveAlert, ...]:
+        """Light check of every retained COMPACTION's archive (no fail-stop)."""
+        alerts = []
+        for record in records:
+            if record.lifecycle is not EventLifecycle.COMPACTION:
+                continue
+            assert record.compaction is not None
+            problem = self._archive_problem(record.compaction)
+            if problem is not None:
+                alerts.append(
+                    EventJournalArchiveAlert(record.compaction.archive_file, problem)
+                )
+        return tuple(alerts)
+
+    def _quarantine_unreferenced_archives_unlocked(
+        self, records: tuple[EventJournalRecord, ...]
+    ) -> None:
+        """Move aside archives a crash left before their COMPACTION existed.
+
+        Such an archive covers a range beyond the latest compaction's
+        high-water. Older archives (referenced by already archived
+        compactions) are kept.
+        """
+        try:
+            entries = list(self.archive_dir.iterdir())
+        except FileNotFoundError:
+            return
+        latest = self._latest_compaction(records) if records else None
+        high_water = -1 if latest is None else latest.archived_processing_high_water
+        referenced = {
+            record.compaction.archive_file
+            for record in records
+            if record.lifecycle is EventLifecycle.COMPACTION
+            and record.compaction is not None
+        }
+        for entry in entries:
+            if entry.name.startswith(".compaction-") and entry.name.endswith(".tmp"):
+                self._unlink_quietly(entry)
+                continue
+            match = _ARCHIVE_NAME_PATTERN.fullmatch(entry.name)
+            if (
+                match is None
+                or entry.name in referenced
+                or int(match.group(2)) <= high_water
+            ):
+                continue
+            try:
+                os.replace(entry, entry.with_name(f".{entry.name}.unreferenced"))
+            except OSError:
+                continue
+
+    def _fsync_directory(self, directory: Path) -> None:
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _unlink_quietly(target: Path) -> None:
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+        try:
+            target.unlink()
+        except OSError:
+            pass
 
     @contextmanager
     def wal_rollover_boundary(self) -> Iterator[EventJournalWalRolloverBoundary]:
@@ -3099,10 +3636,9 @@ class EventJournal:
             or verified.open_gate_clear is not None
             or verified.open_wal_rollover is not None
         )
-        proof_blocked = bool(
-            (verified.transactions or verified.baselines)
-            and len(self._rotated_paths_unlocked()) + 1 >= self.retained_files
-        )
+        # Retention is by time and compaction (#381 D1 P1-4), never by a
+        # segment count: proof retention no longer blocks rotation.
+        proof_blocked = False
         anchor_blocked = verified.records[-1].schema_version >= 2 and not any(
             record.lifecycle in _WAL_ANCHOR_LIFECYCLES
             and record.schema_version >= 2
@@ -3194,11 +3730,6 @@ class EventJournal:
             self._fsync_parent()
             os.replace(temporary, self.path)
             self._fsync_parent()
-            rotated = self._rotated_paths_unlocked()
-            while len(rotated) + 1 > self.retained_files:
-                rotated[0][1].unlink()
-                self._fsync_parent()
-                rotated = rotated[1:]
         except Exception:
             failure = EventJournalAppendError(
                 EventJournalAppendStage.ROTATION, published=True
@@ -3231,6 +3762,17 @@ class EventJournal:
                 previous_tail is None
                 and segment_index is None
                 and segment[0].previous_record_hash is not None
+                and not any(
+                    # Every rotated segment was archived by a compaction that
+                    # names this checkpoint as its boundary (#381, IP-4a).
+                    record.lifecycle is EventLifecycle.COMPACTION
+                    and record.compaction is not None
+                    and record.compaction.boundary_checkpoint_hash
+                    == segment[0].record_hash
+                    and record.compaction.archived_last_record_hash
+                    == segment[0].previous_record_hash
+                    for record in segment
+                )
             ):
                 raise EventJournalIntegrityError(
                     "EventJournal rotated predecessor is missing"
@@ -3495,6 +4037,13 @@ class EventJournal:
         prefix = len(state.records)
         if len(records) < prefix or records[:prefix] != state.records:
             return None
+        if any(
+            record.lifecycle is EventLifecycle.COMPACTION
+            for record in records[prefix:]
+        ):
+            # A new COMPACTION changes which one is latest, which decides
+            # the injected initial state: verify from scratch.
+            return None
         return state
 
     @staticmethod
@@ -3523,6 +4072,9 @@ class EventJournal:
         v4_migration_anchor_hash = verifier.v4_migration_anchor_hash
         rollover_open = verifier.rollover_open
         seen_rollover_ids = verifier.seen_rollover_ids
+        last_compaction_hash = verifier.last_compaction_hash
+        latest_compaction_hash = verifier.latest_compaction_hash
+        injected_compaction = verifier.injected_compaction
         processing_event_id = verifier.processing_event_id
         gate_clear_open = verifier.gate_clear_open
         open_events = verifier.open_events
@@ -3653,6 +4205,57 @@ class EventJournal:
                     wal_record_id = record.wal_record_id
                     wal_record_hash = record.wal_record_hash
                 rollover_open = None
+                continue
+            if record.lifecycle is EventLifecycle.COMPACTION:
+                assert record.compaction is not None
+                declared = record.compaction
+                if (
+                    record.schema_version < 4
+                    or open_events
+                    or processing_event_id is not None
+                    or recovery_open
+                    or any(t["terminal"] is None for t in transactions.values())
+                    or startup_open
+                    or gate_clear_open
+                    or external_reconciliation_required
+                    or record.journal_lineage_id != journal_lineage_id
+                    or declared.previous_compaction_hash != last_compaction_hash
+                ):
+                    raise EventJournalIntegrityError("compaction is invalid")
+                for carried in declared.carried_records:
+                    if EventJournal._record_hash(carried) != carried.record_hash:
+                        raise EventJournalIntegrityError(
+                            "compaction carried record is not authentic"
+                        )
+                boundary = next(
+                    (
+                        position
+                        for position in range(index)
+                        if records[position].record_hash
+                        == declared.boundary_checkpoint_hash
+                    ),
+                    None,
+                )
+                if boundary is None:
+                    # Its boundary was archived by a later compaction; only the
+                    # latest one must still find its boundary.
+                    if record.record_hash == latest_compaction_hash:
+                        raise EventJournalIntegrityError(
+                            "compaction boundary is missing"
+                        )
+                elif boundary == 0:
+                    if (
+                        injected_compaction is None
+                        or injected_compaction.record_hash != record.record_hash
+                    ) and record.record_hash == latest_compaction_hash:
+                        raise EventJournalIntegrityError(
+                            "compaction state was not injected"
+                        )
+                else:
+                    EventJournal._verify_declared_compaction(
+                        records, boundary, declared, injected_compaction
+                    )
+                last_compaction_hash = record.record_hash
                 continue
             if record.lifecycle is EventLifecycle.CHECKPOINT:
                 if open_events:
@@ -4541,6 +5144,7 @@ class EventJournal:
         verifier.v4_seen = v4_seen
         verifier.v4_migration_anchor_hash = v4_migration_anchor_hash
         verifier.rollover_open = rollover_open
+        verifier.last_compaction_hash = last_compaction_hash
         verifier.processing_event_id = processing_event_id
         verifier.gate_clear_open = gate_clear_open
 
@@ -4711,6 +5315,13 @@ class EventJournal:
                 if rollover_open is None
                 else EventJournal._rollover_view(rollover_open)
             ),
+            EventJournal._latest_compaction(records),
+            (
+                ()
+                if injected_compaction is None
+                or injected_compaction.compaction is None
+                else injected_compaction.compaction.carried_records
+            ),
         )
         verifier.records = records
         verifier.result = result
@@ -4763,7 +5374,7 @@ class EventJournal:
             raise EventJournalIntegrityError("WAL-bound checkpoint anchor is invalid")
         if snapshot_sequence > high_water:
             raise EventJournalIntegrityError("Checkpoint sequence is impossible")
-        return _VerifierState(
+        state = _VerifierState(
             records=(),
             high_water=high_water,
             snapshot_sequence=snapshot_sequence,
@@ -4781,6 +5392,188 @@ class EventJournal:
             v4_seen=checkpoint.schema_version == 4,
             v4_migration_anchor_hash=checkpoint.v4_migration_anchor_hash,
         )
+        EventJournal._inject_compaction(records, state)
+        return state
+
+    @staticmethod
+    def _latest_compaction(
+        records: tuple[EventJournalRecord, ...],
+    ) -> EventJournalCompaction | None:
+        latest = next(
+            (
+                record
+                for record in reversed(records)
+                if record.lifecycle is EventLifecycle.COMPACTION
+            ),
+            None,
+        )
+        return None if latest is None else latest.compaction
+
+    @staticmethod
+    def _inject_compaction(
+        records: tuple[EventJournalRecord, ...], state: _VerifierState
+    ) -> None:
+        """Start replay from the state the latest COMPACTION declares.
+
+        Only when the oldest retained record is that compaction's boundary
+        checkpoint, i.e. the archived segments are gone. Before that (the
+        compaction is being appended, or its unlinks are pending) the archived
+        records are still present and are replayed normally.
+        """
+        latest = next(
+            (
+                record
+                for record in reversed(records)
+                if record.lifecycle is EventLifecycle.COMPACTION
+            ),
+            None,
+        )
+        if latest is None:
+            return
+        assert latest.compaction is not None
+        declared = latest.compaction
+        state.latest_compaction_hash = latest.record_hash
+        if records[0].record_hash != declared.boundary_checkpoint_hash:
+            return
+        # Chain connection (#381 D1 P1-2): the oldest retained checkpoint must
+        # continue exactly where the archived range ended.
+        if records[0].previous_record_hash != declared.archived_last_record_hash:
+            raise EventJournalIntegrityError("compaction chain is not connected")
+        for carried in declared.carried_records:
+            if EventJournal._record_hash(carried) != carried.record_hash:
+                raise EventJournalIntegrityError(
+                    "compaction carried record is not authentic"
+                )
+        state.injected_compaction = latest
+        if declared.baseline_record is not None:
+            state.baseline_records_seen.append(declared.baseline_record)
+            state.gate_records.append(declared.baseline_record)
+        retained_hashes = {
+            record.record_hash
+            for record in records
+            if record.lifecycle is EventLifecycle.COMPACTION
+        }
+        if declared.previous_compaction_hash not in retained_hashes:
+            state.last_compaction_hash = declared.previous_compaction_hash
+
+    @staticmethod
+    def _archived_root(records: tuple[EventJournalRecord, ...]) -> str:
+        digest = hashlib.sha256(_ARCHIVE_ROOT_DOMAIN)
+        for record in records:
+            digest.update(bytes.fromhex(record.record_hash))
+        return digest.hexdigest()
+
+    @staticmethod
+    def _declared_state_at(
+        records: tuple[EventJournalRecord, ...],
+        boundary: int,
+        injected: EventJournalRecord | None,
+    ) -> tuple[
+        EventJournalRecord | None,
+        EventJournalRecord | None,
+        EventJournalRecord | None,
+    ]:
+        """Latest baseline and true-rollback pair at ``records[boundary]``."""
+        prior = (
+            ()
+            if injected is None or injected.compaction is None
+            else injected.compaction.carried_records
+        )
+        baseline = next(
+            (
+                record
+                for record in reversed(records[:boundary])
+                if record.lifecycle
+                is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED
+            ),
+            next(
+                (
+                    record
+                    for record in prior
+                    if record.lifecycle
+                    is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED
+                ),
+                None,
+            ),
+        )
+        rollback: EventJournalRecord | None = None
+        cleared: EventJournalRecord | None = None
+        for position in range(boundary - 1, -1, -1):
+            candidate = records[position]
+            if (
+                candidate.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+                and candidate.recovery_category is EventRecoveryCategory.TRUE_ROLLBACK
+                and candidate.external_reconciliation_required is True
+            ):
+                rollback = candidate
+                cleared = next(
+                    (
+                        later
+                        for later in records[position + 1 : boundary]
+                        if later.lifecycle is EventLifecycle.CLEARED
+                    ),
+                    None,
+                )
+                break
+        if rollback is None:
+            rollback = next(
+                (
+                    record
+                    for record in prior
+                    if record.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+                ),
+                None,
+            )
+            cleared = next(
+                (record for record in prior if record.lifecycle is EventLifecycle.CLEARED),
+                None,
+            )
+        if rollback is None or cleared is None:
+            rollback = cleared = None
+        return baseline, rollback, cleared
+
+    @staticmethod
+    def _verify_declared_compaction(
+        records: tuple[EventJournalRecord, ...],
+        boundary: int,
+        declared: EventJournalCompaction,
+        injected: EventJournalRecord | None,
+    ) -> None:
+        """Check a compaction against the archived records still present."""
+        archived = records[:boundary]
+        boundary_record = records[boundary]
+        if (
+            boundary_record.lifecycle is not EventLifecycle.CHECKPOINT
+            or boundary_record.processing_sequence is None
+            or archived[0].processing_sequence is None
+            or declared.archived_first_record_hash != archived[0].record_hash
+            or declared.archived_last_record_hash != archived[-1].record_hash
+            or declared.archived_record_count != len(archived)
+            or declared.archived_root != EventJournal._archived_root(archived)
+            or declared.archived_processing_floor != archived[0].processing_sequence
+            or declared.archived_processing_high_water
+            != boundary_record.processing_sequence
+            or declared.archived_first_timestamp != archived[0].timestamp
+            or declared.archived_last_timestamp != archived[-1].timestamp
+        ):
+            raise EventJournalIntegrityError("compaction archived range is invalid")
+        baseline, rollback, cleared = EventJournal._declared_state_at(
+            records, boundary, injected
+        )
+        if (
+            declared.baseline_record != baseline
+            or declared.true_rollback_completed_record != rollback
+            or declared.true_rollback_cleared_record != cleared
+        ):
+            raise EventJournalIntegrityError("compaction declared state is invalid")
+        tail = declared.carried_tail_record
+        prior = (
+            ()
+            if injected is None or injected.compaction is None
+            else injected.compaction.carried_records
+        )
+        if tail is not None and tail not in archived and tail not in prior:
+            raise EventJournalIntegrityError("compaction carried tail is unknown")
 
     @staticmethod
     def _rollover_view(record: EventJournalRecord) -> EventJournalWalRollover:
