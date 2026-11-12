@@ -704,7 +704,9 @@ class StateWAL:
         )
         with self._lock:
             self._prepare_for_write()
-            current = self.inspect()
+            # Full, uncached verification: after this rollover the current
+            # generation is history that is not re-verified in process.
+            current = self._inspect_full()
             manifest = current.active_manifest
             if manifest is None or not current.records:
                 raise StateWALIntegrityError("rollover requires an active generation")
@@ -741,7 +743,11 @@ class StateWAL:
             return BaselineRecord.model_validate_json(_canonical(raw)), baseline_hash
 
     def publish_rollover_generation(
-        self, *, generation_id: UUID, baseline_record_hash: str
+        self,
+        *,
+        generation_id: UUID,
+        baseline_record_hash: str,
+        journal_processing_high_water: int,
     ) -> Manifest:
         """Atomically make a prepared rollover generation active."""
         with self._lock:
@@ -761,6 +767,8 @@ class StateWAL:
                 or baseline.baseline_snapshot_sequence
                 != current.latest_snapshot_sequence
                 or baseline.baseline_snapshot_hash != current.latest_snapshot_hash
+                or baseline.journal_processing_high_water
+                != journal_processing_high_water
             ):
                 raise StateWALConflictError("rollover generation does not chain")
             self._stage("rollover_publish")
@@ -771,8 +779,6 @@ class StateWAL:
     ) -> tuple[BaselineRecord, str] | None:
         """The unpublished-or-published single baseline of a generation, if valid."""
         with self._lock:
-            if not self._generation_path(generation_id).exists():
-                return None
             try:
                 return self._inspect_orphan_baseline(generation_id)
             except StateWALConflictError:
@@ -1590,6 +1596,34 @@ class StateWAL:
         journal_processing_high_water: int,
         journal_tail_record_id: UUID | None = None,
         journal_tail_record_hash: str | None = None,
+        journal_lineage_id: UUID,
+    ) -> BootAnchor:
+        # Under the WAL lock so that pruning's re-read of the boot anchor is
+        # serialised against its publication (IP-3b review P2-5).
+        with self._lock:
+            return self._publish_boot_anchor_locked(
+                snapshot_sequence=snapshot_sequence,
+                snapshot_hash=snapshot_hash,
+                generation_id=generation_id,
+                anchored_record_id=anchored_record_id,
+                anchored_record_hash=anchored_record_hash,
+                journal_processing_high_water=journal_processing_high_water,
+                journal_tail_record_id=journal_tail_record_id,
+                journal_tail_record_hash=journal_tail_record_hash,
+                journal_lineage_id=journal_lineage_id,
+            )
+
+    def _publish_boot_anchor_locked(
+        self,
+        *,
+        snapshot_sequence: int,
+        snapshot_hash: str,
+        generation_id: UUID,
+        anchored_record_id: UUID,
+        anchored_record_hash: str,
+        journal_processing_high_water: int,
+        journal_tail_record_id: UUID | None,
+        journal_tail_record_hash: str | None,
         journal_lineage_id: UUID,
     ) -> BootAnchor:
         _validate_sequence(snapshot_sequence, "snapshot sequence")

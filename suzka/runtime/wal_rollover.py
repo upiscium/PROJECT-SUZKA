@@ -76,12 +76,34 @@ class StateWALRolloverCoordinator:
     def maybe_rollover(self) -> StateWALRolloverOutcome:
         """Roll over if the boundary is clean and the generation is large enough.
 
-        Failures before the Journal preparation are skipped (nothing durable
-        refers to the new file; it is pruned later). Failures after it are
-        compensated by quarantining the file and recording ``ROLLED_ABORTED``;
-        if even that fails, ``StateWALRolloverError`` is raised so the caller
-        fails closed, and startup resolves the preparation.
+        Never fails a committed turn for an optional maintenance step: any
+        failure while no rollover is prepared in the Journal is logged and the
+        rollover is skipped (a written but unreferenced file is pruned later).
+        Only a prepared rollover that cannot be resolved (neither completed
+        nor aborted) raises ``StateWALRolloverError``; the Journal then admits
+        nothing else, so the runtime must fail closed and startup resolves it.
         """
+        try:
+            if not self._due():
+                return StateWALRolloverOutcome(False, "below_threshold")
+            return self._rollover()
+        except StateWALRolloverError:
+            raise
+        except Exception:
+            return self._recover_from_failure()
+
+    def _due(self) -> bool:
+        """Cheap pre-check on the cached WAL inspection (IP-3b review P2-6)."""
+        inspection = self.wal.inspect()
+        transitions = sum(
+            isinstance(record, TransitionRecord) for record in inspection.records
+        )
+        return (
+            transitions >= self.policy.max_transitions
+            or self.wal.generation_size() >= self.policy.max_bytes
+        )
+
+    def _rollover(self) -> StateWALRolloverOutcome:
         with self.journal.wal_rollover_boundary() as boundary:
             if not boundary.clean:
                 return StateWALRolloverOutcome(False, boundary.reason)
@@ -100,46 +122,35 @@ class StateWALRolloverCoordinator:
                 # The WAL tail is not exactly what the Journal anchors: this is
                 # not a clean boundary for a rollover.
                 return StateWALRolloverOutcome(False, "wal_tail_not_anchored")
-            transitions = sum(
-                isinstance(record, TransitionRecord) for record in inspection.records
-            )
-            if (
-                transitions < self.policy.max_transitions
-                and self.wal.generation_size() < self.policy.max_bytes
-            ):
-                return StateWALRolloverOutcome(False, "below_threshold")
-            generation_id = uuid4()
-            rollover_id = uuid4()
             assert boundary.wal_generation_id is not None
             assert boundary.wal_record_hash is not None
-            try:
-                baseline, baseline_hash = self.wal.prepare_rollover_generation(
-                    generation_id=generation_id,
-                    journal_processing_high_water=boundary.processing_high_water,
-                )
-                self.journal.append_wal_rollover_prepared(
-                    rollover_id=str(rollover_id),
-                    wal_generation_id=str(generation_id),
-                    wal_record_id=str(baseline.record_id),
-                    wal_record_hash=baseline_hash,
-                    wal_predecessor_generation_id=boundary.wal_generation_id,
-                    wal_predecessor_record_hash=boundary.wal_record_hash,
-                )
-            except Exception:
-                # Nothing durable refers to the new file yet; it is pruned by
-                # a later rollover. Whether PREPARED reached the Journal is
-                # decided from the Journal itself, never assumed.
-                if self.journal.inspect().open_wal_rollover is not None:
-                    self._abort(generation_id, rollover_id)
-                return StateWALRolloverOutcome(False, "prepare_failed")
+            generation_id = uuid4()
+            rollover_id = uuid4()
+            baseline, baseline_hash = self.wal.prepare_rollover_generation(
+                generation_id=generation_id,
+                journal_processing_high_water=boundary.processing_high_water,
+            )
+            self.journal.append_wal_rollover_prepared(
+                rollover_id=str(rollover_id),
+                wal_generation_id=str(generation_id),
+                wal_record_id=str(baseline.record_id),
+                wal_record_hash=baseline_hash,
+                wal_predecessor_generation_id=boundary.wal_generation_id,
+                wal_predecessor_record_hash=boundary.wal_record_hash,
+            )
             try:
                 self.wal.publish_rollover_generation(
-                    generation_id=generation_id, baseline_record_hash=baseline_hash
+                    generation_id=generation_id,
+                    baseline_record_hash=baseline_hash,
+                    journal_processing_high_water=boundary.processing_high_water,
                 )
             except Exception:
-                self._abort(generation_id, rollover_id)
+                self._resolve(generation_id, rollover_id)
                 return StateWALRolloverOutcome(False, "publish_failed")
-            self.journal.append_wal_rollover_completed(str(rollover_id))
+            try:
+                self.journal.append_wal_rollover_completed(str(rollover_id))
+            except Exception:
+                self._resolve(generation_id, rollover_id)
             try:
                 pruned = self.wal.prune_generations()
             except Exception:
@@ -148,11 +159,28 @@ class StateWALRolloverCoordinator:
                 pruned = ()
             return StateWALRolloverOutcome(True, None, generation_id, pruned)
 
-    def _abort(self, generation_id: UUID, rollover_id: UUID) -> None:
+    def _recover_from_failure(self) -> StateWALRolloverOutcome:
+        """Decide from the Journal itself whether a preparation is left open."""
         try:
+            pending = self.journal.inspect().open_wal_rollover
+        except Exception:
+            raise StateWALRolloverError(
+                "StateWAL rollover state cannot be determined"
+            ) from None
+        if pending is None:
+            LOGGER.warning("StateWAL rollover skipped after a failure")
+            return StateWALRolloverOutcome(False, "rollover_failed")
+        self._resolve(UUID(pending.wal_generation_id), UUID(pending.rollover_id))
+        return StateWALRolloverOutcome(False, "rollover_failed")
+
+    def _resolve(self, generation_id: UUID, rollover_id: UUID) -> None:
+        """Complete if the manifest names the generation, otherwise abort."""
+        try:
+            pending = self.journal.inspect().open_wal_rollover
+            if pending is None or pending.rollover_id != str(rollover_id):
+                return
             manifest = self.wal.read_manifest_optional()
             if manifest is not None and manifest.active_generation_id == generation_id:
-                # Published after all: roll forward instead of aborting.
                 self.journal.append_wal_rollover_completed(str(rollover_id))
                 return
             self.wal.quarantine_generation(generation_id, rollover_id)

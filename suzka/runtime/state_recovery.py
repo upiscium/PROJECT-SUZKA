@@ -41,6 +41,7 @@ from suzka.runtime.state_wal import (
     StateWAL,
     StateWALError,
     StateWALInspection,
+    StateWALIntegrityError,
     TransitionRecord,
 )
 
@@ -650,6 +651,14 @@ class StateRecoveryCoordinator:
         except StateWALError as error:
             wal_inspection = None
             wal_error = error
+        if wal_inspection is not None and self._active_generation_was_aborted(
+            wal_inspection
+        ):
+            # A published rollover generation whose rollover was aborted is
+            # not authoritative: classify it exactly like an invalid current
+            # WAL, so R06 repairs it from Journal-confirmed state.
+            wal_inspection = None
+            wal_error = StateWALIntegrityError("aborted rollover generation is active")
         try:
             anchor = self.wal.inspect_boot_anchor_optional()
         except StateWALError:
@@ -890,40 +899,69 @@ class StateRecoveryCoordinator:
     def _resolve_open_wal_rollover(self) -> None:
         """Roll forward a published rollover, otherwise abort it.
 
-        Roll forward only when the active manifest already names the prepared
-        generation and its single baseline is exactly the prepared one. In
-        every other case (unpublished, unreadable WAL, corrupt new generation)
-        the rollover is aborted: a rollover never changes state, and the
-        Journal anchor then still names the predecessor, which the retention
-        rule keeps (#382 D1 P1-c).
+        Decision table (#382 D1 P1-2/P1-c, IP-3b review P1-1):
+
+        - manifest unreadable: raise. Recording an abort is final, so it is
+          never decided from a read that might be transient; startup fails
+          and can be retried.
+        - manifest names another generation (the predecessor): never
+          published. Quarantine the prepared file and abort.
+        - manifest names the prepared generation and its single baseline is
+          exactly the prepared one: roll forward (COMPLETED).
+        - manifest names the prepared generation but it does not verify:
+          abort. A rollover never changes state; startup classification then
+          treats the active generation as invalid-current and repairs it from
+          Journal-confirmed state, with the predecessor retained.
         """
-        pending = self.journal.inspect().open_wal_rollover
+        journal = self.journal.inspect()
+        pending = journal.open_wal_rollover
         if pending is None:
             return
         generation_id = UUID(pending.wal_generation_id)
         try:
             manifest = self.wal.read_manifest_optional()
         except StateWALError:
-            manifest = None
+            raise StateRecoveryError(
+                "StateWAL manifest is unreadable during rollover resolution"
+            ) from None
+        if manifest is None or manifest.active_generation_id != generation_id:
+            if manifest is not None and str(manifest.active_generation_id) != (
+                pending.wal_predecessor_generation_id
+            ):
+                raise StateRecoveryError("StateWAL rollover predecessor is ambiguous")
+            self.wal.quarantine_generation(generation_id, UUID(pending.rollover_id))
+            self.journal.append_wal_rollover_aborted(pending.rollover_id)
+            return
         published = self.wal.inspect_rollover_generation(generation_id)
         if (
-            manifest is not None
-            and manifest.active_generation_id == generation_id
-            and published is not None
+            published is not None
             and str(manifest.active_baseline_record_id) == pending.wal_record_id
             and manifest.active_baseline_record_hash == pending.wal_record_hash
             and published[1] == pending.wal_record_hash
             and published[0].baseline_snapshot_sequence == pending.snapshot_sequence
             and published[0].baseline_snapshot_hash == pending.snapshot_hash
+            and published[0].journal_processing_high_water
+            == journal.processing_high_water
+            and str(published[0].predecessor_generation_id)
+            == pending.wal_predecessor_generation_id
+            and published[0].predecessor_generation_hash
+            == pending.wal_predecessor_record_hash
         ):
             self.journal.append_wal_rollover_completed(pending.rollover_id)
             return
-        if manifest is not None and manifest.active_generation_id != generation_id:
-            # Never published: move the prepared file aside. If the manifest
-            # names it (published but unusable) or cannot be read, the file is
-            # left for the existing R06 recovery to classify and repair.
-            self.wal.quarantine_generation(generation_id, UUID(pending.rollover_id))
         self.journal.append_wal_rollover_aborted(pending.rollover_id)
+
+    def _active_generation_was_aborted(self, wal: StateWALInspection) -> bool:
+        """The active manifest names a generation whose rollover was aborted."""
+        manifest = wal.active_manifest
+        if manifest is None:
+            return False
+        active = str(manifest.active_generation_id)
+        return any(
+            record.lifecycle is EventLifecycle.WAL_GENERATION_ROLLED_ABORTED
+            and record.wal_generation_id == active
+            for record in self.journal.records
+        )
 
     def _recover_journal_bound_current(
         self,
