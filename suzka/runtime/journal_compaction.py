@@ -87,7 +87,9 @@ class JournalCompactionCoordinator:
             )
         except Exception as error:
             LOGGER.warning(
-                "EventJournal compaction failed: %s", type(error).__name__
+                "EventJournal compaction failed: %s",
+                type(error).__name__,
+                exc_info=True,
             )
             return EventJournalCompactionOutcome(False, "compaction_failed")
 

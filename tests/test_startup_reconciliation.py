@@ -1121,3 +1121,53 @@ def test_gate_clear_resumes_from_prepared_record_before_wal_clear(
     assert sum(
         item.lifecycle is EventLifecycle.CLEARED for item in reopened.inspect().records
     ) == 1
+
+
+def test_true_rollback_over_an_archived_range_fails_closed(tmp_path: Path) -> None:
+    """IP-4a review P1-3/P1-B: archived transactions are never silently dropped.
+
+    The covered range (baseline high-water, recovery high-water] reaches into
+    the archived range, so the participant aggregate cannot be proven from
+    retained evidence: the gate stays set with a bounded reason until #376's
+    historical path exists.
+    """
+    from datetime import timedelta
+
+    memory, store, journal, wal, recovery = _graph(tmp_path)
+    boot = recovery.prepare_startup()
+    recovery.publish_boot_anchor(boot)
+    initial = store.load()
+    item = _event("archived-true-rollback")
+    participant = _participant(memory, PRIVATE)
+    transaction_coordinator = _prepared_transaction(journal, item, participant)
+    candidate = _snapshot(1)
+    evidence = recovery.commit_internal_candidate(item, initial, candidate)
+    transaction_coordinator.finalize_event(item, evidence)
+    recovery.complete_committed_event(item, evidence)
+    # Archive the segment holding that transaction.
+    journal.max_bytes = 1
+    journal.append_v4_migration_checkpoint()
+    journal.max_bytes = 100_000
+    outcome = journal.compact(retention_days=0, now=NOW + timedelta(days=1))
+    assert outcome.performed, outcome.reason
+    assert not journal.inspect().completed_transactions
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    lines = generation.read_bytes().splitlines(keepends=True)
+    transition = json.loads(lines[1])
+    transition["record_hash"] = "0" * 64
+    lines[1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    generation.write_bytes(b"".join(lines))
+    store.path.unlink()
+
+    rolled_back = StateRecoveryCoordinator(store, journal, wal).prepare_startup()
+    assert rolled_back.true_rollback_performed
+    assert rolled_back.external_reconciliation_required
+    result = StartupReconciliationCoordinator(
+        journal, recovery, memory
+    ).reconcile_recovery_gate(rolled_back)
+
+    assert not result.participants_consistent
+    assert result.degraded_reason == "participant_history_archived"
+    assert journal.inspect().external_reconciliation_required

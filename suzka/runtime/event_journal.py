@@ -1294,6 +1294,7 @@ class _VerifierState:
     rollover_open: EventJournalRecord | None = None
     last_compaction_hash: str | None = None
     injected_compaction: EventJournalRecord | None = None
+    injected_compaction_passed: bool = False
     processing_event_id: str | None = None
     gate_clear_open: bool = False
     open_events: dict[str, _EventState] = field(default_factory=dict)
@@ -2300,10 +2301,14 @@ class EventJournal:
         raw = b"".join(segment_path.read_bytes() for segment_path in doomed)
         if hashlib.sha256(raw).hexdigest() != declared.archive_raw_sha256:
             # The present segments are not exactly what was archived: keep them.
-            self.archive_alerts = (
-                *self.archive_alerts,
-                EventJournalArchiveAlert(declared.archive_file, "segments_differ"),
-            )
+            alert = EventJournalArchiveAlert(declared.archive_file, "segments_differ")
+            if alert not in self.archive_alerts:
+                self.archive_alerts = (*self.archive_alerts, alert)
+                LOGGER.warning(
+                    "EventJournal archive alert: %s %s",
+                    alert.archive_file,
+                    alert.reason,
+                )
             return
         self._unlink_archived_segments_unlocked(doomed)
 
@@ -4112,6 +4117,7 @@ class EventJournal:
         seen_rollover_ids = verifier.seen_rollover_ids
         last_compaction_hash = verifier.last_compaction_hash
         injected_compaction = verifier.injected_compaction
+        injected_compaction_passed = verifier.injected_compaction_passed
         processing_event_id = verifier.processing_event_id
         gate_clear_open = verifier.gate_clear_open
         open_events = verifier.open_events
@@ -4274,9 +4280,11 @@ class EventJournal:
                     None,
                 )
                 if boundary is None:
-                    # Its boundary was archived by a later compaction, which
-                    # must then be the one in effect (injected).
-                    if injected_compaction is None:
+                    # Only a compaction OLDER than the one in effect may have
+                    # lost its boundary (archived by that later compaction);
+                    # every one at or after it must find its boundary (IP-4a
+                    # review P1-A).
+                    if injected_compaction is None or injected_compaction_passed:
                         raise EventJournalIntegrityError(
                             "compaction boundary is missing"
                         )
@@ -4288,7 +4296,12 @@ class EventJournal:
                         raise EventJournalIntegrityError(
                             "compaction state was not injected"
                         )
+                    injected_compaction_passed = True
                 else:
+                    if injected_compaction is not None and not injected_compaction_passed:
+                        raise EventJournalIntegrityError(
+                            "compaction order is invalid"
+                        )
                     EventJournal._verify_declared_compaction(
                         records, boundary, declared, injected_compaction
                     )
@@ -5182,6 +5195,7 @@ class EventJournal:
         verifier.v4_migration_anchor_hash = v4_migration_anchor_hash
         verifier.rollover_open = rollover_open
         verifier.last_compaction_hash = last_compaction_hash
+        verifier.injected_compaction_passed = injected_compaction_passed
         verifier.processing_event_id = processing_event_id
         verifier.gate_clear_open = gate_clear_open
 

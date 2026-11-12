@@ -560,3 +560,35 @@ def test_pending_unlinks_are_finished_before_the_next_compaction(
     assert ranges[0][1] <= ranges[1][0], ranges
     value.close()
 
+
+def test_later_compaction_must_find_its_boundary(tmp_path: Path) -> None:
+    """Review P1-A: only compactions older than the one in effect may lack it."""
+    path = tmp_path / "events.jsonl"
+    clock = _Clock()
+    value = _journal(path, clock)
+    following = _fill(value, 1, 8)
+    clock.advance(days=31)
+    assert value.compact(retention_days=30).performed
+    _fill(value, following, 2)
+    records = value.records
+    effective = next(r for r in records if r.lifecycle is EventLifecycle.COMPACTION)
+    assert effective.compaction is not None
+    declared = effective.compaction.model_copy(
+        update={
+            "boundary_checkpoint_hash": "f" * 64,
+            "previous_compaction_hash": effective.record_hash,
+        }
+    )
+    forged = effective.model_copy(
+        update={
+            "compaction": declared,
+            "record_id": str(uuid4()),
+            "previous_record_hash": records[-1].record_hash,
+        }
+    )
+    forged = forged.model_copy(
+        update={"record_hash": EventJournal._record_hash(forged)}
+    )
+    with pytest.raises(EventJournalIntegrityError, match="boundary is missing"):
+        EventJournal._verify_records_from((*records, forged), None)
+    value.close()
