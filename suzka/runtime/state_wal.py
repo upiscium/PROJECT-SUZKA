@@ -778,13 +778,49 @@ class StateWAL:
             except StateWALConflictError:
                 return None
 
+    def read_manifest_optional(self) -> Manifest | None:
+        """The hash-verified manifest alone, without reading any generation.
+
+        ``None`` when there is no WAL or no manifest. Used where a decision
+        depends only on which generation is published, even if that
+        generation itself is unreadable.
+        """
+        with self._lock:
+            if not self._prepare_for_read():
+                return None
+            try:
+                manifest_raw = json.loads(
+                    self._read_regular(self.root / "manifest.json")
+                )
+            except StateWALMissing:
+                return None
+            except StateWALError:
+                raise
+            except Exception:
+                raise StateWALIntegrityError("WAL manifest is invalid") from None
+            try:
+                manifest = Manifest.model_validate_json(_canonical(manifest_raw))
+                expected = _domain_hash(
+                    "suzka.state-wal.manifest",
+                    {
+                        key: value
+                        for key, value in manifest_raw.items()
+                        if key != "manifest_hash"
+                    },
+                )
+                if manifest.manifest_hash != expected:
+                    raise ValueError
+            except Exception:
+                raise StateWALIntegrityError("WAL manifest is invalid") from None
+            return manifest
+
     def quarantine_generation(self, generation_id: UUID, reason_id: UUID) -> bool:
         """Move a never-published generation file aside (#382 D1 P2-4)."""
         with self._lock:
             path = self._generation_path(generation_id)
             if not path.exists():
                 return False
-            manifest = self.inspect_optional().active_manifest
+            manifest = self.read_manifest_optional()
             if manifest is not None and manifest.active_generation_id == generation_id:
                 raise StateWALConflictError("active generation cannot be quarantined")
             self._preserve_partial_generation(path, reason_id)

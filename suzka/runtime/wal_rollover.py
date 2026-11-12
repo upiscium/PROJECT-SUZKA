@@ -150,7 +150,7 @@ class StateWALRolloverCoordinator:
 
     def _abort(self, generation_id: UUID, rollover_id: UUID) -> None:
         try:
-            manifest = self.wal.inspect_optional().active_manifest
+            manifest = self.wal.read_manifest_optional()
             if manifest is not None and manifest.active_generation_id == generation_id:
                 # Published after all: roll forward instead of aborting.
                 self.journal.append_wal_rollover_completed(str(rollover_id))

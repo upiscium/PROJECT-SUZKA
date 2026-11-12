@@ -902,7 +902,7 @@ class StateRecoveryCoordinator:
             return
         generation_id = UUID(pending.wal_generation_id)
         try:
-            manifest = self.wal.inspect_optional().active_manifest
+            manifest = self.wal.read_manifest_optional()
         except StateWALError:
             manifest = None
         published = self.wal.inspect_rollover_generation(generation_id)
@@ -918,7 +918,10 @@ class StateRecoveryCoordinator:
         ):
             self.journal.append_wal_rollover_completed(pending.rollover_id)
             return
-        if manifest is None or manifest.active_generation_id != generation_id:
+        if manifest is not None and manifest.active_generation_id != generation_id:
+            # Never published: move the prepared file aside. If the manifest
+            # names it (published but unusable) or cannot be read, the file is
+            # left for the existing R06 recovery to classify and repair.
             self.wal.quarantine_generation(generation_id, UUID(pending.rollover_id))
         self.journal.append_wal_rollover_aborted(pending.rollover_id)
 

@@ -96,6 +96,10 @@ def test_chat_rolls_over_bounds_generations_and_survives_restart(
             assert f"{anchor.generation_id}.jsonl" in _generations(settings)
         # Restart right after a rollover: the Journal anchor is the ROLLED
         # record, which startup cross-authority validation must accept.
+        client.app.state.state_wal_rollover.policy = StateWALRolloverPolicy(
+            max_transitions=10_000
+        )
+        _chat(client, "one more turn without rollover")
         outcome = _force(client)
         assert outcome.performed
         before = _state(client)
