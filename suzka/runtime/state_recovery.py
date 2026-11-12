@@ -263,7 +263,8 @@ class StateRecoveryCoordinator:
                 for transaction in journal.open_transactions
             )
             if (
-                journal.schema_version != 3
+                journal.schema_version not in {3, 4}
+                or journal.open_wal_rollover is not None
                 or manifest is None
                 or manifest.external_reconciliation_required
                 or journal.external_reconciliation_required

@@ -161,7 +161,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.startup_reconciliation.resume_prepared_gate_clear()
             participants_consistent = True
             degraded_reason = None
-            if journal_schema == 3:
+            if journal_schema in {3, 4}:
                 participants_consistent, degraded_reason = (
                     app.state.startup_reconciliation.reconcile_open_transactions()
                 )
@@ -172,8 +172,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if journal_schema == 2:
                     app.state.event_journal.append_v3_migration_checkpoint()
                     journal_schema = app.state.event_journal.inspect().schema_version
-                if journal_schema != 3:
-                    raise StateRecoveryError("Runtime requires EventJournal schema 3")
+                if journal_schema == 3:
+                    # Lazy v3 -> v4 upgrade at the clean R07 boundary reached
+                    # by startup recovery (#382 D1 P1-d).
+                    app.state.event_journal.append_v4_migration_checkpoint()
+                    journal_schema = app.state.event_journal.inspect().schema_version
+                if journal_schema != 4:
+                    raise StateRecoveryError("Runtime requires EventJournal schema 4")
                 if recovery.external_reconciliation_required:
                     reconciliation = (
                         app.state.startup_reconciliation.reconcile_recovery_gate(
@@ -197,8 +202,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         degraded_reason = "semantic_receipt_retention_unavailable"
                 startup_state = recovery
             else:
-                if journal_schema != 3:
-                    raise StateRecoveryError("Degraded startup requires schema 3")
+                if journal_schema not in {3, 4}:
+                    raise StateRecoveryError("Degraded startup requires schema 3 or 4")
                 startup_state = app.state.state_recovery.inspect_degraded_startup()
             app.state.external_reconciliation_required = (
                 recovery.external_reconciliation_required if recovery else False

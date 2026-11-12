@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -30,11 +31,22 @@ from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE, MAX_PERSISTED_REVISION
 from suzka.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 
 
-CURRENT_EVENT_JOURNAL_SCHEMA_VERSION: Literal[3] = 3
+CURRENT_EVENT_JOURNAL_SCHEMA_VERSION: Literal[4] = 4
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _HASH_DOMAIN_V1 = b"PROJECT-SUZKA:event-journal:v1\0"
 _HASH_DOMAIN_V2 = b"PROJECT-SUZKA:event-journal:v2\0"
 _HASH_DOMAIN_V3 = b"PROJECT-SUZKA:event-journal:v3\0"
+_HASH_DOMAIN_V4 = b"PROJECT-SUZKA:event-journal:v4\0"
+# Fields introduced by schema 4. They are absent from (and excluded when
+# hashing or serialising) every record of an older schema, so v1-v3 record
+# hashes and bytes are unchanged.
+_V4_FIELDS = (
+    "migration_previous_v3_hash",
+    "v4_migration_anchor_hash",
+    "rollover_id",
+    "wal_predecessor_generation_id",
+    "wal_predecessor_record_hash",
+)
 _STARTUP_AGGREGATE_DOMAIN = (
     b"PROJECT-SUZKA:R07:STARTUP-PARTICIPANT-AGGREGATE:V1\x00"
 )
@@ -65,6 +77,29 @@ class EventLifecycle(str, Enum):
     PARTICIPANT_BASELINE_ESTABLISHED = "participant_baseline_established"
     CLEAR_PREPARED = "clear_prepared"
     CLEARED = "cleared"
+    WAL_GENERATION_ROLLED_PREPARED = "wal_generation_rolled_prepared"
+    WAL_GENERATION_ROLLED_COMPLETED = "wal_generation_rolled_completed"
+    WAL_GENERATION_ROLLED_ABORTED = "wal_generation_rolled_aborted"
+
+
+_ROLLOVER_LIFECYCLES = frozenset(
+    {
+        EventLifecycle.WAL_GENERATION_ROLLED_PREPARED,
+        EventLifecycle.WAL_GENERATION_ROLLED_COMPLETED,
+        EventLifecycle.WAL_GENERATION_ROLLED_ABORTED,
+    }
+)
+_ROLLOVER_FIELDS = (
+    "rollover_id",
+    "snapshot_sequence",
+    "snapshot_hash",
+    "wal_generation_id",
+    "wal_record_id",
+    "wal_record_hash",
+    "wal_predecessor_generation_id",
+    "wal_predecessor_record_hash",
+    "journal_lineage_id",
+)
 
 
 class TransactionKind(str, Enum):
@@ -176,7 +211,7 @@ class ParticipantRequirement(_JournalModel):
 
 
 class EventJournalRecord(_JournalModel):
-    schema_version: Literal[1, 2, 3]
+    schema_version: Literal[1, 2, 3, 4]
     record_id: str = Field(min_length=1)
     timestamp: datetime
     lifecycle: EventLifecycle
@@ -225,6 +260,11 @@ class EventJournalRecord(_JournalModel):
     adoption_epoch: int | None = Field(
         default=None, ge=0, le=MAX_PERSISTED_REVISION
     )
+    migration_previous_v3_hash: str | None = None
+    v4_migration_anchor_hash: str | None = None
+    rollover_id: str | None = None
+    wal_predecessor_generation_id: str | None = None
+    wal_predecessor_record_hash: str | None = None
 
     @field_validator(
         "processing_sequence",
@@ -285,6 +325,8 @@ class EventJournalRecord(_JournalModel):
             self.reconciliation_id,
             self.journal_lineage_id,
             self.baseline_id,
+            self.rollover_id,
+            self.wal_predecessor_generation_id,
         ):
             if value is not None:
                 try:
@@ -304,6 +346,9 @@ class EventJournalRecord(_JournalModel):
             self.operation_digest,
             self.migration_previous_v2_hash,
             self.v3_migration_anchor_hash,
+            self.migration_previous_v3_hash,
+            self.v4_migration_anchor_hash,
+            self.wal_predecessor_record_hash,
         ):
             if value is not None and _HASH_PATTERN.fullmatch(value) is None:
                 raise ValueError("hash must be lowercase SHA-256")
@@ -348,6 +393,15 @@ class EventJournalRecord(_JournalModel):
             value is not None for value in v3_fields
         ):
             raise ValueError("v3 fields require schema 3")
+        if self.schema_version < 4 and any(
+            getattr(self, name) is not None for name in _V4_FIELDS
+        ):
+            raise ValueError("v4 fields require schema 4")
+        if self.schema_version == 4 and (
+            self.migration_previous_v1_hash is not None
+            or self.migration_previous_v2_hash is not None
+        ):
+            raise ValueError("v4 records cannot carry older migrations")
         for value in (
             self.wal_record_hash,
             self.migration_previous_v1_hash,
@@ -382,7 +436,7 @@ class EventJournalRecord(_JournalModel):
         }
         if self.lifecycle in transaction_lifecycles:
             if (
-                self.schema_version != 3
+                self.schema_version < 3
                 or not has_identity
                 or self.processing_sequence is None
             ):
@@ -479,7 +533,7 @@ class EventJournalRecord(_JournalModel):
         }
         if self.lifecycle in startup_lifecycles:
             if (
-                self.schema_version != 3
+                self.schema_version < 3
                 or not no_identity
                 or self.processing_sequence is not None
                 or self.reconciliation_id is None
@@ -546,7 +600,7 @@ class EventJournalRecord(_JournalModel):
             return self
         if self.lifecycle is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED:
             if (
-                self.schema_version != 3
+                self.schema_version < 3
                 or not no_identity
                 or self.processing_sequence is not None
                 or self.baseline_id is None
@@ -571,7 +625,7 @@ class EventJournalRecord(_JournalModel):
             return self
         if self.lifecycle in {EventLifecycle.CLEAR_PREPARED, EventLifecycle.CLEARED}:
             if (
-                self.schema_version != 3
+                self.schema_version < 3
                 or not no_identity
                 or self.processing_sequence is not None
                 or self.baseline_id is None
@@ -593,6 +647,18 @@ class EventJournalRecord(_JournalModel):
                 "wal_record_id", "wal_record_hash", "journal_lineage_id",
             })
             return self
+        if self.lifecycle in _ROLLOVER_LIFECYCLES:
+            if (
+                self.schema_version < 4
+                or not no_identity
+                or self.processing_sequence is not None
+                or any(getattr(self, name) is None for name in _ROLLOVER_FIELDS)
+            ):
+                raise ValueError("WAL rollover binding is incomplete")
+            if self.wal_generation_id == self.wal_predecessor_generation_id:
+                raise ValueError("WAL rollover must change generation")
+            self._forbid_irrelevant_fields(set(_ROLLOVER_FIELDS))
+            return self
         if self.lifecycle is EventLifecycle.CHECKPOINT:
             if not no_identity or self.processing_sequence is None:
                 raise ValueError("checkpoint identity is invalid")
@@ -609,8 +675,10 @@ class EventJournalRecord(_JournalModel):
                 or self.external_reconciliation_required is None
             ):
                 raise ValueError("v2 checkpoint WAL identity is incomplete")
-            if self.schema_version == 3 and self.v3_migration_anchor_hash is None:
+            if self.schema_version >= 3 and self.v3_migration_anchor_hash is None:
                 raise ValueError("v3 checkpoint migration anchor is missing")
+            if self.schema_version >= 4 and self.v4_migration_anchor_hash is None:
+                raise ValueError("v4 checkpoint migration anchor is missing")
             self._forbid_irrelevant_fields(
                 {
                     "processing_sequence",
@@ -622,6 +690,8 @@ class EventJournalRecord(_JournalModel):
                     "migration_previous_v1_hash",
                     "migration_previous_v2_hash",
                     "v3_migration_anchor_hash",
+                    "migration_previous_v3_hash",
+                    "v4_migration_anchor_hash",
                     "journal_lineage_id",
                     "external_reconciliation_required",
                 }
@@ -835,6 +905,7 @@ class EventJournalRecord(_JournalModel):
             "baseline_id",
             "participant_registry",
             "adoption_epoch",
+            *_V4_FIELDS,
         )
         if any(
             getattr(self, field) is not None for field in fields if field not in allowed
@@ -1057,6 +1128,7 @@ class _VerifiedJournal:
     baselines: tuple[EventJournalParticipantBaseline, ...] = ()
     open_gate_clear: EventJournalGateClear | None = None
     terminal_gate_clear: EventJournalGateClear | None = None
+    open_wal_rollover: EventJournalWalRollover | None = None
 
 
 @dataclass(slots=True)
@@ -1083,6 +1155,9 @@ class _VerifierState:
     v2_seen: bool
     v3_seen: bool
     v3_migration_anchor_hash: str | None
+    v4_seen: bool = False
+    v4_migration_anchor_hash: str | None = None
+    rollover_open: EventJournalRecord | None = None
     processing_event_id: str | None = None
     gate_clear_open: bool = False
     open_events: dict[str, _EventState] = field(default_factory=dict)
@@ -1096,6 +1171,7 @@ class _VerifierState:
     startup_seen_ids: set[str] = field(default_factory=set)
     startup_seen_recovery_ids: set[str] = field(default_factory=set)
     startup_completed: list[dict[str, Any]] = field(default_factory=list)
+    seen_rollover_ids: set[str] = field(default_factory=set)
     transactions: dict[str, dict[str, Any]] = field(default_factory=dict)
     baseline_records_seen: list[EventJournalRecord] = field(default_factory=list)
     gate_records: list[EventJournalRecord] = field(default_factory=list)
@@ -1105,6 +1181,18 @@ class _VerifierState:
     result: _VerifiedJournal | None = None
 
 
+# Records that bind the Journal to the current StateWAL anchor. A completed
+# generation rollover moves that anchor to the new generation's baseline.
+_WAL_ANCHOR_LIFECYCLES = frozenset(
+    {
+        EventLifecycle.CHECKPOINT,
+        EventLifecycle.COMPLETED,
+        EventLifecycle.RECOVERY_COMPLETED,
+        EventLifecycle.WAL_GENERATION_ROLLED_COMPLETED,
+    }
+)
+
+
 _GATE_LIFECYCLES = frozenset(
     {
         EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED,
@@ -1112,6 +1200,34 @@ _GATE_LIFECYCLES = frozenset(
         EventLifecycle.CLEARED,
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class EventJournalWalRollover:
+    """A prepared, not yet completed or aborted, StateWAL generation rollover."""
+
+    rollover_id: str
+    snapshot_sequence: int
+    snapshot_hash: str
+    wal_generation_id: str
+    wal_record_id: str
+    wal_record_hash: str
+    wal_predecessor_generation_id: str
+    wal_predecessor_record_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class EventJournalWalRolloverBoundary:
+    """Evidence for deciding a rollover while the Journal lock is held."""
+
+    clean: bool
+    reason: str | None
+    processing_high_water: int
+    snapshot_sequence: int
+    snapshot_hash: str
+    wal_generation_id: str | None
+    wal_record_id: str | None
+    wal_record_hash: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1167,6 +1283,7 @@ class EventJournalInspection:
     baselines: tuple[EventJournalParticipantBaseline, ...] = ()
     open_gate_clear: EventJournalGateClear | None = None
     terminal_gate_clear: EventJournalGateClear | None = None
+    open_wal_rollover: EventJournalWalRollover | None = None
 
     @property
     def participant_baselines(self) -> tuple[EventJournalParticipantBaseline, ...]:
@@ -1511,6 +1628,7 @@ class EventJournal:
                 baselines=verified.baselines,
                 open_gate_clear=verified.open_gate_clear,
                 terminal_gate_clear=verified.terminal_gate_clear,
+                open_wal_rollover=verified.open_wal_rollover,
             )
 
     def apply_planned_reconciliation(
@@ -1659,13 +1777,193 @@ class EventJournal:
 
     migrate_v3 = append_v3_migration_checkpoint
 
+    def append_v4_migration_checkpoint(self) -> None:
+        """Lazily upgrade a closed v3 Journal to schema 4 (#382 D1 P1-d)."""
+        with self._lock:
+            self._require_authority()
+            records = self._read_records_unlocked()
+            if not records or self._active_schema(records) != 3:
+                raise EventJournalIntegrityError("v4 migration requires v3 history")
+            verified = self._verify_records(records)
+            if (
+                verified.open_events
+                or verified.open_recoveries
+                or any(t.terminal_lifecycle is None for t in verified.transactions)
+                or any(not item.completed for item in verified.startup_reconciliations)
+                or verified.open_gate_clear is not None
+            ):
+                raise EventJournalIntegrityError(
+                    "v4 migration requires a closed v3 journal"
+                )
+            prior = records[-1]
+            v3_migration_anchor_hash, _ = self._migration_anchors(records, 3)
+            checkpoint = self._make_record(
+                EventLifecycle.CHECKPOINT,
+                previous_hash=prior.record_hash,
+                processing_sequence=verified.processing_high_water,
+                snapshot_sequence=verified.snapshot_sequence,
+                snapshot_hash=verified.snapshot_hash,
+                schema_version=4,
+                migration_previous_v3_hash=prior.record_hash,
+                v3_migration_anchor_hash=v3_migration_anchor_hash,
+                v4_migration_anchor_hash=prior.record_hash,
+                wal_generation_id=verified.wal_generation_id,
+                wal_record_id=verified.wal_record_id,
+                wal_record_hash=verified.wal_record_hash,
+                journal_lineage_id=verified.journal_lineage_id,
+                external_reconciliation_required=verified.external_reconciliation_required,
+            )
+            self._verify_records((*records, checkpoint))
+            self._append_record_unlocked(checkpoint)
+            self._maybe_rotate_unlocked()
+
+    migrate_v4 = append_v4_migration_checkpoint
+
+    @contextmanager
+    def wal_rollover_boundary(self) -> Iterator[EventJournalWalRolloverBoundary]:
+        """Hold the Journal lock for a whole StateWAL rollover (#382 D1 P2).
+
+        Lock order is Journal -> WAL: the caller performs every WAL step of the
+        rollover inside this block. The yielded boundary says whether the
+        Journal is at a clean point. ACCEPTED-only events may be queued, since
+        they have not touched the WAL (#382 D1 P1-4).
+        """
+        with self._lock:
+            self._require_authority()
+            records = self._read_records_unlocked()
+            if not records:
+                raise EventJournalIntegrityError("WAL rollover requires history")
+            verified = self._verify_records(records)
+            reason: str | None = None
+            if self._active_schema(records) < 4:
+                reason = "journal_schema_below_4"
+            elif verified.open_wal_rollover is not None:
+                reason = "wal_rollover_open"
+            elif any(
+                item.lifecycle is not EventLifecycle.ACCEPTED
+                for item in verified.open_events
+            ):
+                reason = "event_in_progress"
+            elif (
+                verified.open_recoveries
+                or any(t.terminal_lifecycle is None for t in verified.transactions)
+                or any(not item.completed for item in verified.startup_reconciliations)
+                or verified.open_gate_clear is not None
+            ):
+                reason = "maintenance_open"
+            elif verified.external_reconciliation_required:
+                reason = "external_reconciliation_required"
+            elif (
+                verified.wal_generation_id is None
+                or verified.wal_snapshot_sequence != verified.snapshot_sequence
+                or verified.wal_snapshot_hash != verified.snapshot_hash
+            ):
+                reason = "wal_anchor_not_current"
+            yield EventJournalWalRolloverBoundary(
+                clean=reason is None,
+                reason=reason,
+                processing_high_water=verified.processing_high_water,
+                snapshot_sequence=verified.snapshot_sequence,
+                snapshot_hash=verified.snapshot_hash,
+                wal_generation_id=verified.wal_generation_id,
+                wal_record_id=verified.wal_record_id,
+                wal_record_hash=verified.wal_record_hash,
+            )
+
+    def append_wal_rollover_prepared(
+        self,
+        *,
+        rollover_id: str,
+        wal_generation_id: str,
+        wal_record_id: str,
+        wal_record_hash: str,
+        wal_predecessor_generation_id: str,
+        wal_predecessor_record_hash: str,
+    ) -> None:
+        """Announce a written, not yet published StateWAL generation."""
+        with self._lock:
+            self._require_authority()
+            records = self._read_records_unlocked()
+            if not records or self._active_schema(records) < 4:
+                raise EventJournalIntegrityError("WAL rollover requires schema 4")
+            verified = self._verify_records(records)
+            self._append_rollover_unlocked(
+                records,
+                EventLifecycle.WAL_GENERATION_ROLLED_PREPARED,
+                rollover_id=rollover_id,
+                snapshot_sequence=verified.snapshot_sequence,
+                snapshot_hash=verified.snapshot_hash,
+                wal_generation_id=wal_generation_id,
+                wal_record_id=wal_record_id,
+                wal_record_hash=wal_record_hash,
+                wal_predecessor_generation_id=wal_predecessor_generation_id,
+                wal_predecessor_record_hash=wal_predecessor_record_hash,
+                journal_lineage_id=verified.journal_lineage_id,
+            )
+
+    def append_wal_rollover_completed(self, rollover_id: str) -> None:
+        """Record that the prepared generation's manifest is published."""
+        self._resolve_rollover(
+            EventLifecycle.WAL_GENERATION_ROLLED_COMPLETED, rollover_id
+        )
+
+    def append_wal_rollover_aborted(self, rollover_id: str) -> None:
+        """Record that the prepared generation was never published."""
+        self._resolve_rollover(EventLifecycle.WAL_GENERATION_ROLLED_ABORTED, rollover_id)
+
+    def _resolve_rollover(self, lifecycle: EventLifecycle, rollover_id: str) -> None:
+        with self._lock:
+            self._require_authority()
+            records = self._read_records_unlocked()
+            if not records:
+                raise EventJournalIntegrityError("WAL rollover requires history")
+            verified = self._verify_records(records)
+            prepared = verified.open_wal_rollover
+            if prepared is None or prepared.rollover_id != rollover_id:
+                raise EventJournalIntegrityError("WAL rollover is not open")
+            self._append_rollover_unlocked(
+                records,
+                lifecycle,
+                rollover_id=prepared.rollover_id,
+                snapshot_sequence=prepared.snapshot_sequence,
+                snapshot_hash=prepared.snapshot_hash,
+                wal_generation_id=prepared.wal_generation_id,
+                wal_record_id=prepared.wal_record_id,
+                wal_record_hash=prepared.wal_record_hash,
+                wal_predecessor_generation_id=prepared.wal_predecessor_generation_id,
+                wal_predecessor_record_hash=prepared.wal_predecessor_record_hash,
+                journal_lineage_id=verified.journal_lineage_id,
+            )
+            self._maybe_rotate_unlocked()
+
+    def _append_rollover_unlocked(
+        self,
+        records: tuple[EventJournalRecord, ...],
+        lifecycle: EventLifecycle,
+        **fields: object,
+    ) -> None:
+        try:
+            record = self._make_record(
+                lifecycle,
+                previous_hash=records[-1].record_hash,
+                event=None,
+                schema_version=self._active_schema(records),
+                **fields,
+            )
+            self._verify_records((*records, record))
+        except (ValidationError, ValueError, EventJournalIntegrityError):
+            raise EventJournalAppendError(
+                EventJournalAppendStage.VALIDATE, published=False
+            ) from None
+        self._append_record_unlocked(record)
+
     def _append_transaction(
         self, lifecycle: EventLifecycle, event: AgentEvent, **fields: object
     ) -> None:
         with self._lock:
             self._require_authority()
             records = self._read_records_unlocked()
-            if not records or self._active_schema(records) != 3:
+            if not records or self._active_schema(records) < 3:
                 raise EventJournalIntegrityError(
                     "transaction evidence requires schema 3"
                 )
@@ -1675,7 +1973,7 @@ class EventJournal:
                     lifecycle,
                     previous_hash=records[-1].record_hash,
                     event=event,
-                    schema_version=3,
+                    schema_version=self._active_schema(records),
                     processing_sequence=event.processing_sequence,
                     **fields,
                 )
@@ -1795,7 +2093,7 @@ class EventJournal:
         with self._lock:
             self._require_authority()
             records = self._read_records_unlocked()
-            if not records or self._active_schema(records) != 3:
+            if not records or self._active_schema(records) < 3:
                 raise EventJournalIntegrityError(
                     "startup reconciliation evidence requires schema 3"
                 )
@@ -1815,7 +2113,7 @@ class EventJournal:
                 record = self._make_record(
                     lifecycle,
                     previous_hash=records[-1].record_hash,
-                    schema_version=3,
+                    schema_version=self._active_schema(records),
                     event=None,
                     **fields,
                 )
@@ -1918,12 +2216,13 @@ class EventJournal:
         with self._lock:
             self._require_authority()
             records = self._read_records_unlocked()
-            if not records or self._active_schema(records) != 3:
+            if not records or self._active_schema(records) < 3:
                 raise EventJournalIntegrityError("external gate requires schema 3")
             try:
                 record = self._make_record(
                     lifecycle, previous_hash=records[-1].record_hash,
-                    schema_version=3, event=None, **fields
+                    schema_version=self._active_schema(records),
+                    event=None, **fields
                 )
                 self._verify_records((*records, record))
             except (ValidationError, ValueError, EventJournalIntegrityError):
@@ -2114,22 +2413,9 @@ class EventJournal:
             ):
                 raise EventJournalIntegrityError("current checkpoint is inconsistent")
             schema_version = records[-1].schema_version
-            v3_migration_anchor_hash = (
-                next(
-                    (
-                        record.v3_migration_anchor_hash
-                        for record in reversed(records)
-                        if record.schema_version == 3
-                        and record.lifecycle is EventLifecycle.CHECKPOINT
-                        and record.v3_migration_anchor_hash is not None
-                    ),
-                    None,
-                )
-                if schema_version == 3
-                else None
+            v3_migration_anchor_hash, v4_migration_anchor_hash = (
+                self._migration_anchors(records, schema_version)
             )
-            if schema_version == 3 and v3_migration_anchor_hash is None:
-                raise EventJournalIntegrityError("v3 Journal lacks migration authority")
             checkpoint = self._make_record(
                 EventLifecycle.CHECKPOINT,
                 previous_hash=records[-1].record_hash,
@@ -2142,6 +2428,7 @@ class EventJournal:
                 wal_record_hash=wal_record_hash,
                 journal_lineage_id=verified.journal_lineage_id,
                 v3_migration_anchor_hash=v3_migration_anchor_hash,
+                v4_migration_anchor_hash=v4_migration_anchor_hash,
                 external_reconciliation_required=(
                     verified.external_reconciliation_required
                 ),
@@ -2587,6 +2874,8 @@ class EventJournal:
             if record.schema_version in {1, 2}
             else set()
         )
+        if record.schema_version < 4:
+            excluded.update(_V4_FIELDS)
         if record.adoption_epoch is None:
             excluded.add("adoption_epoch")
         canonical = json.dumps(
@@ -2602,6 +2891,8 @@ class EventJournal:
             else _HASH_DOMAIN_V2
             if record.schema_version == 2
             else _HASH_DOMAIN_V3
+            if record.schema_version == 3
+            else _HASH_DOMAIN_V4
         )
         return hashlib.sha256(domain + canonical).hexdigest()
 
@@ -2657,6 +2948,8 @@ class EventJournal:
             if record.schema_version in {1, 2}
             else set()
         )
+        if record.schema_version < 4:
+            excluded.update(_V4_FIELDS)
         if record.adoption_epoch is None:
             excluded.add("adoption_epoch")
         return (
@@ -2804,18 +3097,14 @@ class EventJournal:
             or any(not item.completed for item in verified.startup_reconciliations)
             or verified.external_reconciliation_required
             or verified.open_gate_clear is not None
+            or verified.open_wal_rollover is not None
         )
         proof_blocked = bool(
             (verified.transactions or verified.baselines)
             and len(self._rotated_paths_unlocked()) + 1 >= self.retained_files
         )
         anchor_blocked = verified.records[-1].schema_version >= 2 and not any(
-            record.lifecycle
-            in {
-                EventLifecycle.CHECKPOINT,
-                EventLifecycle.COMPLETED,
-                EventLifecycle.RECOVERY_COMPLETED,
-            }
+            record.lifecycle in _WAL_ANCHOR_LIFECYCLES
             and record.schema_version >= 2
             and record.snapshot_sequence == verified.snapshot_sequence
             and record.snapshot_hash == verified.snapshot_hash
@@ -2841,17 +3130,14 @@ class EventJournal:
             wal_record_hash: str | None = None
             journal_lineage_id: str | None = None
             v3_migration_anchor_hash: str | None = None
+            v4_migration_anchor_hash: str | None = None
             if verified.records[-1].schema_version >= 2:
                 anchor = next(
                     (
                         record
                         for record in reversed(verified.records)
                         if record.lifecycle
-                        in {
-                            EventLifecycle.CHECKPOINT,
-                            EventLifecycle.COMPLETED,
-                            EventLifecycle.RECOVERY_COMPLETED,
-                        }
+                        in _WAL_ANCHOR_LIFECYCLES
                         and record.schema_version >= 2
                         and record.wal_generation_id is not None
                         and record.wal_record_id is not None
@@ -2870,21 +3156,11 @@ class EventJournal:
                 wal_record_id = anchor.wal_record_id
                 wal_record_hash = anchor.wal_record_hash
                 journal_lineage_id = verified.journal_lineage_id
-                if verified.records[-1].schema_version == 3:
-                    v3_migration_anchor_hash = next(
-                        (
-                            record.v3_migration_anchor_hash
-                            for record in verified.records
-                            if record.schema_version == 3
-                            and record.lifecycle is EventLifecycle.CHECKPOINT
-                            and record.v3_migration_anchor_hash is not None
-                        ),
-                        None,
+                v3_migration_anchor_hash, v4_migration_anchor_hash = (
+                    self._migration_anchors(
+                        verified.records, verified.records[-1].schema_version
                     )
-                    if v3_migration_anchor_hash is None:
-                        raise EventJournalIntegrityError(
-                            "v3 Journal lacks migration authority"
-                        )
+                )
             checkpoint = self._make_record(
                 EventLifecycle.CHECKPOINT,
                 previous_hash=verified.records[-1].record_hash,
@@ -2897,6 +3173,7 @@ class EventJournal:
                 wal_record_hash=wal_record_hash,
                 journal_lineage_id=journal_lineage_id,
                 v3_migration_anchor_hash=v3_migration_anchor_hash,
+                v4_migration_anchor_hash=v4_migration_anchor_hash,
                 external_reconciliation_required=(
                     verified.external_reconciliation_required
                     if verified.records[-1].schema_version >= 2
@@ -3087,7 +3364,7 @@ class EventJournal:
                 if (
                     isinstance(version, int)
                     and not isinstance(version, bool)
-                    and version not in {1, 2, 3}
+                    and version not in {1, 2, 3, 4}
                 ):
                     raise UnsupportedEventJournalVersion(
                         "EventJournal schema version is unsupported"
@@ -3242,6 +3519,10 @@ class EventJournal:
         v2_seen = verifier.v2_seen
         v3_seen = verifier.v3_seen
         v3_migration_anchor_hash = verifier.v3_migration_anchor_hash
+        v4_seen = verifier.v4_seen
+        v4_migration_anchor_hash = verifier.v4_migration_anchor_hash
+        rollover_open = verifier.rollover_open
+        seen_rollover_ids = verifier.seen_rollover_ids
         processing_event_id = verifier.processing_event_id
         gate_clear_open = verifier.gate_clear_open
         open_events = verifier.open_events
@@ -3271,7 +3552,22 @@ class EventJournal:
                 gate_records.append(record)
             if record.transaction_id is not None:
                 view_cache.pop(record.transaction_id, None)
-            if record.schema_version == 3:
+            if record.schema_version == 4:
+                if not v4_seen and (
+                    record.lifecycle is not EventLifecycle.CHECKPOINT
+                    or record.migration_previous_v3_hash
+                    != records[index - 1].record_hash
+                    or records[index - 1].schema_version != 3
+                    or record.v4_migration_anchor_hash
+                    != record.migration_previous_v3_hash
+                ):
+                    raise EventJournalIntegrityError("v4 migration boundary is invalid")
+                if v4_seen and record.migration_previous_v3_hash is not None:
+                    raise EventJournalIntegrityError("v4 migration is duplicated")
+                v4_seen = True
+            elif record.schema_version == 3:
+                if v4_seen:
+                    raise EventJournalIntegrityError("schema downgrade is invalid")
                 if not v3_seen and (
                     record.lifecycle is not EventLifecycle.CHECKPOINT
                     or record.migration_previous_v2_hash
@@ -3299,6 +3595,61 @@ class EventJournal:
                 v2_seen = True
             elif v2_seen or v3_seen:
                 raise EventJournalIntegrityError("v1 record follows v2 migration")
+            if rollover_open is not None and record.lifecycle not in {
+                EventLifecycle.WAL_GENERATION_ROLLED_COMPLETED,
+                EventLifecycle.WAL_GENERATION_ROLLED_ABORTED,
+            }:
+                # Only the completion or abort of an open rollover may follow
+                # it: no event, checkpoint, baseline or recovery (#382 P1-b).
+                raise EventJournalIntegrityError("WAL rollover is open")
+            if record.lifecycle in _ROLLOVER_LIFECYCLES:
+                if record.schema_version < 4:
+                    raise EventJournalIntegrityError("WAL rollover requires schema 4")
+                if record.lifecycle is EventLifecycle.WAL_GENERATION_ROLLED_PREPARED:
+                    if record.rollover_id in seen_rollover_ids:
+                        raise EventJournalIntegrityError("WAL rollover is duplicated")
+                    if (
+                        any(
+                            item.lifecycle is not EventLifecycle.ACCEPTED
+                            for item in open_events.values()
+                        )
+                        or processing_event_id is not None
+                        or recovery_open
+                        or any(t["terminal"] is None for t in transactions.values())
+                        or startup_open
+                        or gate_clear_open
+                        or external_reconciliation_required
+                        or record.snapshot_sequence != snapshot_sequence
+                        or record.snapshot_hash != snapshot_hash
+                        or wal_snapshot_sequence != snapshot_sequence
+                        or wal_snapshot_hash != snapshot_hash
+                        or wal_generation_id is None
+                        or record.wal_predecessor_generation_id != wal_generation_id
+                        or record.wal_predecessor_record_hash != wal_record_hash
+                        or record.journal_lineage_id != journal_lineage_id
+                    ):
+                        raise EventJournalIntegrityError(
+                            "WAL rollover preparation is invalid"
+                        )
+                    assert record.rollover_id is not None
+                    seen_rollover_ids.add(record.rollover_id)
+                    rollover_open = record
+                    continue
+                if rollover_open is None or any(
+                    getattr(record, name) != getattr(rollover_open, name)
+                    for name in _ROLLOVER_FIELDS
+                ):
+                    raise EventJournalIntegrityError(
+                        "WAL rollover resolution is invalid"
+                    )
+                if record.lifecycle is EventLifecycle.WAL_GENERATION_ROLLED_COMPLETED:
+                    # State update rule (#382 D1 P1-a): the same snapshot now
+                    # has a new WAL anchor, the new generation's baseline.
+                    wal_generation_id = record.wal_generation_id
+                    wal_record_id = record.wal_record_id
+                    wal_record_hash = record.wal_record_hash
+                rollover_open = None
+                continue
             if record.lifecycle is EventLifecycle.CHECKPOINT:
                 if open_events:
                     raise EventJournalIntegrityError(
@@ -3332,15 +3683,22 @@ class EventJournal:
                     )
                 ):
                     raise EventJournalIntegrityError("v3 migration anchor is invalid")
-                if record.schema_version == 3:
+                if record.schema_version >= 3:
                     if v3_migration_anchor_hash is None:
                         v3_migration_anchor_hash = record.v3_migration_anchor_hash
                     elif record.v3_migration_anchor_hash != v3_migration_anchor_hash:
                         raise EventJournalIntegrityError(
                             "v3 migration authority changed"
                         )
+                if record.schema_version >= 4:
+                    if v4_migration_anchor_hash is None:
+                        v4_migration_anchor_hash = record.v4_migration_anchor_hash
+                    elif record.v4_migration_anchor_hash != v4_migration_anchor_hash:
+                        raise EventJournalIntegrityError(
+                            "v4 migration authority changed"
+                        )
                 if (
-                    record.schema_version in {2, 3}
+                    record.schema_version >= 2
                     and record.migration_previous_v1_hash is None
                     and record.snapshot_sequence == wal_snapshot_sequence
                     and record.snapshot_hash == wal_snapshot_hash
@@ -3381,7 +3739,7 @@ class EventJournal:
                 ):
                     raise EventJournalIntegrityError("v2 checkpoint anchor changed")
                 if (
-                    record.schema_version in {2, 3}
+                    record.schema_version >= 2
                     and record.migration_previous_v1_hash is not None
                 ):
                     if (
@@ -3395,7 +3753,7 @@ class EventJournal:
                         raise EventJournalIntegrityError(
                             "v2 migration anchor is invalid"
                         )
-                if record.schema_version in {2, 3}:
+                if record.schema_version >= 2:
                     if journal_lineage_id is None:
                         journal_lineage_id = record.journal_lineage_id
                     elif record.journal_lineage_id != journal_lineage_id:
@@ -3675,7 +4033,7 @@ class EventJournal:
                                 "participant baseline authority is invalid"
                             )
                     if (
-                        record.schema_version != 3
+                        record.schema_version < 3
                         or external_reconciliation_required
                         or open_events
                         or recovery_open
@@ -3714,7 +4072,7 @@ class EventJournal:
                 EventLifecycle.TRANSACTION_ABORTED,
             }:
                 if (
-                    record.schema_version != 3
+                    record.schema_version < 3
                     or record.event_id is None
                     or record.event_type is None
                     or record.source is None
@@ -4169,6 +4527,9 @@ class EventJournal:
         verifier.v2_seen = v2_seen
         verifier.v3_seen = v3_seen
         verifier.v3_migration_anchor_hash = v3_migration_anchor_hash
+        verifier.v4_seen = v4_seen
+        verifier.v4_migration_anchor_hash = v4_migration_anchor_hash
+        verifier.rollover_open = rollover_open
         verifier.processing_event_id = processing_event_id
         verifier.gate_clear_open = gate_clear_open
 
@@ -4334,6 +4695,11 @@ class EventJournal:
             tuple(baseline_views),
             open_gate,
             terminal_gate,
+            (
+                None
+                if rollover_open is None
+                else EventJournal._rollover_view(rollover_open)
+            ),
         )
         verifier.records = records
         verifier.result = result
@@ -4346,7 +4712,7 @@ class EventJournal:
         if (
             not records
             or records[0].lifecycle is not EventLifecycle.CHECKPOINT
-            or records[0].schema_version not in {1, 2, 3}
+            or records[0].schema_version not in {1, 2, 3, 4}
         ):
             raise EventJournalIntegrityError("EventJournal lacks checkpoint authority")
         checkpoint = records[0]
@@ -4381,6 +4747,7 @@ class EventJournal:
             or checkpoint.journal_lineage_id is None
             or checkpoint.migration_previous_v1_hash is not None
             or checkpoint.migration_previous_v2_hash is not None
+            or checkpoint.migration_previous_v3_hash is not None
         ):
             raise EventJournalIntegrityError("WAL-bound checkpoint anchor is invalid")
         if snapshot_sequence > high_water:
@@ -4398,9 +4765,67 @@ class EventJournal:
             wal_snapshot_hash=wal_snapshot_hash,
             external_reconciliation_required=external_reconciliation_required,
             v2_seen=checkpoint.schema_version == 2,
-            v3_seen=checkpoint.schema_version == 3,
+            v3_seen=checkpoint.schema_version >= 3,
             v3_migration_anchor_hash=checkpoint.v3_migration_anchor_hash,
+            v4_seen=checkpoint.schema_version == 4,
+            v4_migration_anchor_hash=checkpoint.v4_migration_anchor_hash,
         )
+
+    @staticmethod
+    def _rollover_view(record: EventJournalRecord) -> EventJournalWalRollover:
+        assert record.rollover_id is not None
+        assert record.snapshot_sequence is not None
+        assert record.snapshot_hash is not None
+        assert record.wal_generation_id is not None
+        assert record.wal_record_id is not None
+        assert record.wal_record_hash is not None
+        assert record.wal_predecessor_generation_id is not None
+        assert record.wal_predecessor_record_hash is not None
+        return EventJournalWalRollover(
+            rollover_id=record.rollover_id,
+            snapshot_sequence=record.snapshot_sequence,
+            snapshot_hash=record.snapshot_hash,
+            wal_generation_id=record.wal_generation_id,
+            wal_record_id=record.wal_record_id,
+            wal_record_hash=record.wal_record_hash,
+            wal_predecessor_generation_id=record.wal_predecessor_generation_id,
+            wal_predecessor_record_hash=record.wal_predecessor_record_hash,
+        )
+
+    @staticmethod
+    def _migration_anchors(
+        records: tuple[EventJournalRecord, ...], schema_version: int
+    ) -> tuple[str | None, str | None]:
+        """The v3 and v4 migration authorities a new checkpoint must carry."""
+        v3_anchor: str | None = None
+        v4_anchor: str | None = None
+        if schema_version >= 3:
+            v3_anchor = next(
+                (
+                    record.v3_migration_anchor_hash
+                    for record in reversed(records)
+                    if record.schema_version >= 3
+                    and record.lifecycle is EventLifecycle.CHECKPOINT
+                    and record.v3_migration_anchor_hash is not None
+                ),
+                None,
+            )
+            if v3_anchor is None:
+                raise EventJournalIntegrityError("v3 Journal lacks migration authority")
+        if schema_version >= 4:
+            v4_anchor = next(
+                (
+                    record.v4_migration_anchor_hash
+                    for record in reversed(records)
+                    if record.schema_version >= 4
+                    and record.lifecycle is EventLifecycle.CHECKPOINT
+                    and record.v4_migration_anchor_hash is not None
+                ),
+                None,
+            )
+            if v4_anchor is None:
+                raise EventJournalIntegrityError("v4 Journal lacks migration authority")
+        return v3_anchor, v4_anchor
 
     def _rotated_paths_unlocked(self) -> list[tuple[int, Path]]:
         return [

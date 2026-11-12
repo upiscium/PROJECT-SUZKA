@@ -1673,6 +1673,7 @@ def test_u1_f8_v3_history_rejects_canonically_hashed_v2_downgrade(
     [
         {"schema_version": 3},
         {"schema_version": 4},
+        {"schema_version": 5},
         {"schema_version": 3, "unexpected": PRIVATE_SENTINEL},
     ],
 )
@@ -1683,7 +1684,7 @@ def test_u1_f9_malformed_future_and_unexpected_v3_records_fail_closed(
     path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     error_type = (
         UnsupportedEventJournalVersion
-        if payload["schema_version"] == 4
+        if payload["schema_version"] == 5
         else EventJournalLoadError
     )
     with pytest.raises(error_type) as error:
