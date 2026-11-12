@@ -332,6 +332,17 @@ class StartupReconciliationCoordinator:
             return StartupReconciliationResult(
                 recovery, False, "participant_history_not_provable"
             )
+        archived = inspection.latest_compaction
+        if (
+            archived is not None
+            and baseline.processing_high_water < archived.archived_processing_high_water
+        ):
+            # Part of the covered range is archived: the aggregate would silently
+            # drop those transactions. Fail closed (IP-4a review P1-3); the
+            # historical path is #376 HISTORICAL.
+            return StartupReconciliationResult(
+                recovery, False, "participant_history_archived"
+            )
         transactions = tuple(
             sorted(
                 (

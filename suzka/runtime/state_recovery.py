@@ -533,6 +533,13 @@ class StateRecoveryCoordinator:
             }
             if required != baseline_participants:
                 raise StateRecoveryError("startup participant registry changed")
+            archived = journal.latest_compaction
+            if (
+                archived is not None
+                and baseline.processing_high_water
+                < archived.archived_processing_high_water
+            ):
+                raise StateRecoveryError("startup transaction coverage is archived")
             covered_transactions = tuple(
                 sorted(
                     (

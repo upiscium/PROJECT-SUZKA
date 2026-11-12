@@ -460,7 +460,10 @@ def test_chat_keeps_admitting_with_small_segments_and_compaction(
         inspection = journal.inspect()
         assert inspection.latest_compaction is not None
         archives = list(journal.archive_dir.glob("*.jsonl.gz"))
-        assert archives
+        # Compaction keeps working, not just once (IP-4a review P0-1): old
+        # segments do not pile up and archives keep being written.
+        assert len(archives) >= 3
+        assert len(_segments(journal.path)) <= 2
         high_water = inspection.processing_high_water
     with _client(tmp_path, settings=settings) as restarted:
         assert restarted.app.state.event_journal.archive_alerts == ()
@@ -472,3 +475,88 @@ def test_chat_keeps_admitting_with_small_segments_and_compaction(
             "/api/chat", json={"message": "after restart", "attachments": []}
         )
         assert response.status_code == 200, response.text
+
+
+# --- independent review follow-ups ---------------------------------------------
+
+
+def test_repeated_compactions_with_baseline_and_carried_tail(tmp_path: Path) -> None:
+    """Review P0-1: the state of the compaction IN EFFECT is the prior."""
+    from tests.test_event_journal import append_u5_baseline
+
+    path = tmp_path / "events.jsonl"
+    clock = _Clock()
+    value = _journal(path, clock)
+    append_u5_baseline(value)
+    baseline = value.inspect().baselines[-1]
+    following = _fill(value, 1, 8)
+    tail = next(r for r in value.records if r.lifecycle is EventLifecycle.COMPLETED)
+    for _ in range(3):
+        clock.advance(days=31)
+        outcome = value.compact(
+            retention_days=30, carried_tail=(tail.record_id, tail.record_hash)
+        )
+        assert outcome.performed, outcome.reason
+        inspection = value.inspect()
+        assert inspection.baselines[-1] == baseline
+        assert tail in inspection.carried_records
+        following = _fill(value, following, 8)
+    value.close()
+    reopened = _journal(path, clock)
+    inspection = reopened.inspect()
+    assert inspection.baselines[-1] == baseline
+    assert tail in inspection.carried_records
+    assert reopened.archive_alerts == ()
+    reopened.close()
+
+
+def test_chain_starts_at_the_oldest_retained_compaction(tmp_path: Path) -> None:
+    """Review P0-2: C0 archived, C1 retained, C2 in effect -> still opens."""
+    path = tmp_path / "events.jsonl"
+    clock = _Clock()
+    value = _journal(path, clock)
+    following = _fill(value, 1, 8)
+    clock.advance(days=31)
+    assert value.compact(retention_days=30).performed  # C0
+    following = _fill(value, following, 8)
+    clock.advance(days=31)
+    assert value.compact(retention_days=30).performed  # C1 archives C0's segment
+    following = _fill(value, following, 3)
+    clock.advance(days=31)
+    third = value.compact(retention_days=30)  # C2, while C1 may stay retained
+    assert third.performed, third.reason
+    compactions = [r for r in value.records if r.lifecycle is EventLifecycle.COMPACTION]
+    assert compactions
+    value.inspect()
+    _fill(value, following, 2)
+    value.close()
+    reopened = _journal(path, clock)
+    assert reopened.inspect().latest_compaction is not None
+    reopened.close()
+
+
+def test_pending_unlinks_are_finished_before_the_next_compaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review P2-3: never re-archive records already archived."""
+    path, clock, value, following = _compacted(tmp_path)
+
+    def crash(self, paths):  # type: ignore[no-untyped-def]
+        raise OSError("crash before unlink")
+
+    monkeypatch.setattr(EventJournal, "_unlink_archived_segments_unlocked", crash)
+    with pytest.raises(OSError):
+        value.compact(retention_days=30)
+    monkeypatch.undo()
+    following = _fill(value, following, 8)
+    clock.advance(days=31)
+    second = value.compact(retention_days=30)
+    assert second.performed, second.reason
+    ranges = sorted(
+        tuple(int(part) for part in archive.name.split("-")[:2])
+        for archive in value.archive_dir.glob("*.jsonl.gz")
+    )
+    assert len(ranges) == 2
+    assert ranges[0][1] <= ranges[1][0], ranges
+    value.close()
+

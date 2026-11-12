@@ -51,21 +51,44 @@ class JournalCompactionCoordinator:
         self.journal = journal
         self.policy = policy or JournalCompactionPolicy()
         self.semantic = semantic
+        # Visible until IP-4b's health limits exist (IP-4a review P1-4): a
+        # compaction that keeps failing or deferring must not be silent.
+        self.last_outcome: EventJournalCompactionOutcome | None = None
+        self.consecutive_unperformed = 0
 
     def maybe_compact(self) -> EventJournalCompactionOutcome:
+        outcome = self._attempt()
+        self.last_outcome = outcome
+        if outcome.performed or outcome.reason == "nothing_due":
+            self.consecutive_unperformed = 0
+        else:
+            self.consecutive_unperformed += 1
+            LOGGER.warning(
+                "EventJournal compaction due but not performed: %s (%d in a row)",
+                outcome.reason,
+                self.consecutive_unperformed,
+            )
+        return outcome
+
+    def _attempt(self) -> EventJournalCompactionOutcome:
         try:
             if not self.journal.compaction_due(
                 retention_days=self.policy.retention_days
             ):
                 return EventJournalCompactionOutcome(False, "nothing_due")
             semantic = self.semantic
+            # Lock order: Journal -> Semantic store. The guard prunes Semantic
+            # receipts while the Journal lock is held; safe because the runtime
+            # worker is serial and Semantic never takes the Journal lock first.
             return self.journal.compact(
                 retention_days=self.policy.retention_days,
                 carried_tail=None if semantic is None else semantic.carried_tail(),
                 guard=None if semantic is None else semantic.compaction_blocked,
             )
-        except Exception:
-            LOGGER.warning("EventJournal compaction skipped after a failure")
+        except Exception as error:
+            LOGGER.warning(
+                "EventJournal compaction failed: %s", type(error).__name__
+            )
             return EventJournalCompactionOutcome(False, "compaction_failed")
 
 
