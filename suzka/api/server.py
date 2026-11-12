@@ -60,6 +60,10 @@ from suzka.runtime.agent_state import (
     _domain_value_system,
 )
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
+from suzka.runtime.wal_rollover import (
+    StateWALRolloverCoordinator,
+    StateWALRolloverPolicy,
+)
 from suzka.runtime.semantic_receipt_retention import (
     SemanticReceiptRetentionCoordinator,
 )
@@ -118,6 +122,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.agent_state_store,
                 app.state.event_journal,
                 app.state.state_wal,
+            )
+            rollover_policy = getattr(app.state, "state_wal_rollover_policy", None)
+            if rollover_policy is not None and not isinstance(
+                rollover_policy, StateWALRolloverPolicy
+            ):
+                raise RuntimeError("Injected StateWAL rollover policy is invalid")
+            app.state.state_wal_rollover = StateWALRolloverCoordinator(
+                app.state.event_journal,
+                app.state.state_wal,
+                rollover_policy,
             )
             journal_schema = app.state.event_journal.inspect().schema_version
             app.state.memory_system = getattr(
@@ -545,6 +559,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     candidate=candidate,
                 )
                 committed_context_view = candidate
+                # Ordinary StateWAL rollover at the clean boundary right after
+                # terminal completion, in the serial runtime worker (#382 D1
+                # P1-4). It never changes state; it only fails closed if a
+                # prepared rollover could not be resolved.
+                app.state.state_wal_rollover.maybe_rollover()
             except BaseException:
                 app.state.context_committed_reads.degrade()
                 raise

@@ -61,6 +61,9 @@ class RecoveryReason(str, Enum):
     EXACT_CURRENT_REPAIR = "exact_current_repair"
     TRUE_ROLLBACK = "true_rollback"
     UNCOMMITTED_TAIL = "uncommitted_tail"
+    # Ordinary generation switch at a clean boundary (#382 A): the baseline is
+    # the latest committed snapshot, the state is unchanged.
+    ROLLOVER = "rollover"
 
 
 class _StrictModel(BaseModel):
@@ -645,6 +648,16 @@ class StateWAL:
             record_hash="0" * 64,
         )
         raw, baseline_hash = _record_json(baseline, "suzka.state-wal.baseline")
+        self._write_new_generation(path, raw)
+        if invalid_current_detected:
+            assert prepared_recovery_id is not None
+            self._preserve_invalid_manifest(prepared_recovery_id)
+        return self._publish_manifest(
+            baseline, baseline_hash, external_reconciliation_required
+        )
+
+    def _write_new_generation(self, path: Path, raw: dict[str, Any]) -> None:
+        """Create a generation file holding exactly one baseline, durably."""
         parent_descriptor = -1
         descriptor = -1
         try:
@@ -671,12 +684,165 @@ class StateWAL:
                 os.close(descriptor)
             if parent_descriptor >= 0:
                 os.close(parent_descriptor)
-        if invalid_current_detected:
-            assert prepared_recovery_id is not None
-            self._preserve_invalid_manifest(prepared_recovery_id)
-        return self._publish_manifest(
-            baseline, baseline_hash, external_reconciliation_required
+
+    # --- ordinary generation rollover (#382 A, IP-3b) --------------------------
+
+    def prepare_rollover_generation(
+        self,
+        *,
+        generation_id: UUID,
+        journal_processing_high_water: int,
+    ) -> tuple[BaselineRecord, str]:
+        """Write, but do not publish, a new generation for the same state.
+
+        The baseline is the latest verified snapshot of the active generation
+        and is chained to that generation's last record hash. The manifest is
+        unchanged until ``publish_rollover_generation``.
+        """
+        _validate_sequence(
+            journal_processing_high_water, "journal processing high-water"
         )
+        with self._lock:
+            self._prepare_for_write()
+            current = self.inspect()
+            manifest = current.active_manifest
+            if manifest is None or not current.records:
+                raise StateWALIntegrityError("rollover requires an active generation")
+            if manifest.external_reconciliation_required:
+                raise StateWALConflictError("rollover is forbidden while gated")
+            if generation_id == manifest.active_generation_id:
+                raise StateWALConflictError("rollover must change generation")
+            latest = current.records[-1]
+            snapshot = (
+                latest.baseline_snapshot
+                if isinstance(latest, BaselineRecord)
+                else latest.candidate_snapshot
+            )
+            assert current.latest_snapshot_hash is not None
+            baseline = BaselineRecord(
+                record_type="baseline",
+                schema_version=1,
+                command_version=1,
+                record_id=uuid4(),
+                generation_id=generation_id,
+                created_at=_now(),
+                baseline_snapshot_sequence=snapshot.last_processed_event_sequence,
+                baseline_snapshot_hash=current.latest_snapshot_hash,
+                baseline_snapshot=snapshot,
+                journal_processing_high_water=journal_processing_high_water,
+                predecessor_generation_id=manifest.active_generation_id,
+                predecessor_generation_hash=current.record_hashes[-1],
+                reason=RecoveryReason.ROLLOVER,
+                previous_record_hash=None,
+                record_hash="0" * 64,
+            )
+            raw, baseline_hash = _record_json(baseline, "suzka.state-wal.baseline")
+            self._write_new_generation(self._generation_path(generation_id), raw)
+            return BaselineRecord.model_validate_json(_canonical(raw)), baseline_hash
+
+    def publish_rollover_generation(
+        self, *, generation_id: UUID, baseline_record_hash: str
+    ) -> Manifest:
+        """Atomically make a prepared rollover generation active."""
+        with self._lock:
+            self._prepare_for_write()
+            current = self.inspect()
+            manifest = current.active_manifest
+            if manifest is None or not current.records:
+                raise StateWALIntegrityError("rollover requires an active generation")
+            if manifest.external_reconciliation_required:
+                raise StateWALConflictError("rollover is forbidden while gated")
+            baseline, baseline_hash = self._inspect_orphan_baseline(generation_id)
+            if (
+                baseline_hash != baseline_record_hash
+                or baseline.reason is not RecoveryReason.ROLLOVER
+                or baseline.predecessor_generation_id != manifest.active_generation_id
+                or baseline.predecessor_generation_hash != current.record_hashes[-1]
+                or baseline.baseline_snapshot_sequence
+                != current.latest_snapshot_sequence
+                or baseline.baseline_snapshot_hash != current.latest_snapshot_hash
+            ):
+                raise StateWALConflictError("rollover generation does not chain")
+            self._stage("rollover_publish")
+            return self._publish_manifest(baseline, baseline_hash, False)
+
+    def inspect_rollover_generation(
+        self, generation_id: UUID
+    ) -> tuple[BaselineRecord, str] | None:
+        """The unpublished-or-published single baseline of a generation, if valid."""
+        with self._lock:
+            if not self._generation_path(generation_id).exists():
+                return None
+            try:
+                return self._inspect_orphan_baseline(generation_id)
+            except StateWALConflictError:
+                return None
+
+    def quarantine_generation(self, generation_id: UUID, reason_id: UUID) -> bool:
+        """Move a never-published generation file aside (#382 D1 P2-4)."""
+        with self._lock:
+            path = self._generation_path(generation_id)
+            if not path.exists():
+                return False
+            manifest = self.inspect_optional().active_manifest
+            if manifest is not None and manifest.active_generation_id == generation_id:
+                raise StateWALConflictError("active generation cannot be quarantined")
+            self._preserve_partial_generation(path, reason_id)
+            return True
+
+    def prune_generations(self) -> tuple[UUID, ...]:
+        """Delete generations other than active, its predecessor and boot anchor.
+
+        Retains at most three generations (#382 D1 P0, Human decision). The
+        boot anchor is re-read under the lock immediately before unlinking.
+        Unparseable names and preserved ``.invalid`` files are left alone.
+        """
+        with self._lock:
+            self._prepare_for_write()
+            manifest = self.inspect().active_manifest
+            if manifest is None:
+                raise StateWALIntegrityError("pruning requires an active generation")
+            keep = {manifest.active_generation_id}
+            if manifest.predecessor_generation_id is not None:
+                keep.add(manifest.predecessor_generation_id)
+            anchor = self.inspect_boot_anchor_optional()
+            if anchor is not None:
+                keep.add(anchor.generation_id)
+            removed: list[UUID] = []
+            directory = self.root / "generations"
+            parent_descriptor = -1
+            try:
+                parent_descriptor = self._open_private_dir(directory)
+                for name in sorted(os.listdir(parent_descriptor)):
+                    if not name.endswith(".jsonl"):
+                        continue
+                    try:
+                        generation = UUID(name[: -len(".jsonl")])
+                    except ValueError:
+                        continue
+                    if str(generation) != name[: -len(".jsonl")] or generation in keep:
+                        continue
+                    self._stage("generation_prune")
+                    os.unlink(name, dir_fd=parent_descriptor)
+                    removed.append(generation)
+                if removed:
+                    os.fsync(parent_descriptor)
+            except StateWALError:
+                raise
+            except Exception:
+                raise StateWALError("WAL generation pruning failed") from None
+            finally:
+                if parent_descriptor >= 0:
+                    os.close(parent_descriptor)
+            return tuple(removed)
+
+    def generation_size(self) -> int:
+        """Bytes of the active generation file."""
+        with self._lock:
+            manifest = self.inspect().active_manifest
+            if manifest is None:
+                raise StateWALIntegrityError("no active generation")
+            return self._generation_path(manifest.active_generation_id).stat().st_size
 
     def _preserve_partial_generation(self, path: Path, recovery_id: UUID) -> None:
         preserved = path.with_name(f".{path.name}.{recovery_id}.{uuid4()}.invalid")

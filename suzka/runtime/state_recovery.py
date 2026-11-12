@@ -111,6 +111,16 @@ class DegradedStartupInspection:
     manifest: Manifest
 
 
+# Journal records that bind the current StateWAL anchor (kept in step with the
+# Journal verifier: a completed rollover moves the anchor to the new baseline).
+_WAL_ANCHOR_LIFECYCLES = frozenset(
+    {
+        EventLifecycle.CHECKPOINT,
+        EventLifecycle.COMPLETED,
+        EventLifecycle.RECOVERY_COMPLETED,
+        EventLifecycle.WAL_GENERATION_ROLLED_COMPLETED,
+    }
+)
 _PARTICIPANT_BASELINE_NAMESPACE = UUID(
     "f0ee9f9a-c256-5ec8-8f02-c245f9e8db04"
 )
@@ -629,6 +639,9 @@ class StateRecoveryCoordinator:
 
     def _prepare_startup(self) -> StateRecoveryResult:
 
+        # A prepared, unresolved StateWAL rollover is resolved before any other
+        # classification (#382 D1 P1-2), so recovery never sees it open.
+        self._resolve_open_wal_rollover()
         journal_inspection = self.journal.inspect()
         snapshot, snapshot_error = self._inspect_snapshot()
         try:
@@ -867,6 +880,41 @@ class StateRecoveryCoordinator:
             external=journal_inspection.external_reconciliation_required,
         )
         return self._finish_event_reconciliation(result)
+
+    def _resolve_open_wal_rollover(self) -> None:
+        """Roll forward a published rollover, otherwise abort it.
+
+        Roll forward only when the active manifest already names the prepared
+        generation and its single baseline is exactly the prepared one. In
+        every other case (unpublished, unreadable WAL, corrupt new generation)
+        the rollover is aborted: a rollover never changes state, and the
+        Journal anchor then still names the predecessor, which the retention
+        rule keeps (#382 D1 P1-c).
+        """
+        pending = self.journal.inspect().open_wal_rollover
+        if pending is None:
+            return
+        generation_id = UUID(pending.wal_generation_id)
+        try:
+            manifest = self.wal.inspect_optional().active_manifest
+        except StateWALError:
+            manifest = None
+        published = self.wal.inspect_rollover_generation(generation_id)
+        if (
+            manifest is not None
+            and manifest.active_generation_id == generation_id
+            and published is not None
+            and str(manifest.active_baseline_record_id) == pending.wal_record_id
+            and manifest.active_baseline_record_hash == pending.wal_record_hash
+            and published[1] == pending.wal_record_hash
+            and published[0].baseline_snapshot_sequence == pending.snapshot_sequence
+            and published[0].baseline_snapshot_hash == pending.snapshot_hash
+        ):
+            self.journal.append_wal_rollover_completed(pending.rollover_id)
+            return
+        if manifest is None or manifest.active_generation_id != generation_id:
+            self.wal.quarantine_generation(generation_id, UUID(pending.rollover_id))
+        self.journal.append_wal_rollover_aborted(pending.rollover_id)
 
     def _recover_journal_bound_current(
         self,
@@ -1789,12 +1837,7 @@ class StateRecoveryCoordinator:
         for journal_index, evidence in enumerate(journal.records):
             if (
                 evidence.schema_version < 2
-                or evidence.lifecycle
-                not in {
-                    EventLifecycle.CHECKPOINT,
-                    EventLifecycle.COMPLETED,
-                    EventLifecycle.RECOVERY_COMPLETED,
-                }
+                or evidence.lifecycle not in _WAL_ANCHOR_LIFECYCLES
                 or evidence.wal_generation_id != str(manifest.active_generation_id)
                 or evidence.wal_record_id is None
                 or evidence.wal_record_hash is None
@@ -1839,11 +1882,19 @@ class StateRecoveryCoordinator:
             )
         }
         anchor_evidence = journal.records[journal_index]
-        prior_processing = (
-            anchor_evidence.recovery_processing_high_water
-            if anchor_evidence.lifecycle is EventLifecycle.RECOVERY_COMPLETED
-            else anchor_evidence.processing_sequence
-        )
+        if anchor_evidence.lifecycle is EventLifecycle.WAL_GENERATION_ROLLED_COMPLETED:
+            # A rollover anchors the new generation's baseline; its processing
+            # high-water is the one recorded in that baseline.
+            rolled_baseline = wal.records[wal_index]
+            if not isinstance(rolled_baseline, BaselineRecord):
+                raise StateRecoveryError("Rolled WAL anchor is not a baseline")
+            prior_processing: int | None = rolled_baseline.journal_processing_high_water
+        else:
+            prior_processing = (
+                anchor_evidence.recovery_processing_high_water
+                if anchor_evidence.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+                else anchor_evidence.processing_sequence
+            )
         if prior_processing is None:
             raise StateRecoveryError("Retained Journal WAL anchor is incomplete")
         for index, record in enumerate(
@@ -1906,12 +1957,7 @@ class StateRecoveryCoordinator:
             if (
                 record.schema_version >= 2
                 and record.wal_generation_id is not None
-                and record.lifecycle
-                in {
-                    EventLifecycle.CHECKPOINT,
-                    EventLifecycle.COMPLETED,
-                    EventLifecycle.RECOVERY_COMPLETED,
-                }
+                and record.lifecycle in _WAL_ANCHOR_LIFECYCLES
             ):
                 return record.wal_generation_id
         return None
