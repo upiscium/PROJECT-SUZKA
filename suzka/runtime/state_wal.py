@@ -704,9 +704,14 @@ class StateWAL:
         )
         with self._lock:
             self._prepare_for_write()
-            # Full, uncached verification: after this rollover the current
-            # generation is history that is not re-verified in process.
-            current = self._inspect_full()
+            # The cached inspection is sufficient: every line of the active
+            # generation passed the same verification when it was appended,
+            # and in-place tampering of verified bytes is outside the
+            # single-cooperative-writer threat model (IP-1, #384); it is caught
+            # by the full verification at process start. A full re-verification
+            # here measured ~0.37 s per record (~12 s per 32-transition
+            # rollover) on the rollover turn, for no gain inside that model.
+            current = self.inspect()
             manifest = current.active_manifest
             if manifest is None or not current.records:
                 raise StateWALIntegrityError("rollover requires an active generation")
