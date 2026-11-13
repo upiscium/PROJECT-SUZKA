@@ -98,6 +98,13 @@ event_journal:
 state_wal:
   directory: .suzka/private/state_wal
 
+# IP-9 (#376): the subject.history R07 participant. Enabling it adopts a
+# five-participant baseline at the next clean startup; adoption is one-way.
+subject_history:
+  enabled: false
+  path: .suzka/private/subject_history/subject_history.sqlite3
+  max_page_count: 16384  # 64 MiB at 4 KiB pages (provisional, #376 D1-9)
+
 values:
   seeds:
     - value_id: care

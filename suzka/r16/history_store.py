@@ -811,6 +811,11 @@ class SubjectHistoryStore:
         )
         return _row_operation(rows[0]) if rows else None
 
+    def has_operations(self) -> bool:
+        """Whether any operation row exists in any incarnation."""
+
+        return bool(self._read("SELECT 1 FROM history_operations LIMIT 1"))
+
     def operations(self, incarnation_id: str) -> tuple[HistoryOperationRow, ...]:
         rows = self._read(
             f"SELECT {_OPERATION_COLUMNS} FROM history_operations "

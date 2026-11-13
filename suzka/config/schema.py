@@ -9,6 +9,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictFloat,
     StrictInt,
     StrictStr,
@@ -182,6 +183,21 @@ class EventJournalSettings(StrictBaseModel):
         elif self.soft_band_bytes >= self.max_total_bytes:
             raise ValueError("soft_band_bytes must be below max_total_bytes")
         return self
+
+
+class SubjectHistorySettings(StrictBaseModel):
+    """IP-9 U4-3 (#376 §A): the ``subject.history`` R07 participant.
+
+    Enabling adopts a strictly larger R07 participant baseline at the next
+    clean startup.  Adoption is one-way: once adopted, disabling the store
+    makes startup fail closed rather than silently dropping a participant.
+    """
+
+    enabled: StrictBool = False
+    path: Path = Path(".suzka/private/subject_history/subject_history.sqlite3")
+    # SQLite page cap (4 KiB pages by default: 16384 pages = 64 MiB).  The
+    # numeric bound is provisional pending the #376 D1-9 Human gate.
+    max_page_count: StrictInt = Field(default=16_384, ge=64, le=2_147_483_646)
 
 
 class StateWALSettings(StrictBaseModel):
@@ -360,4 +376,7 @@ class Settings(StrictBaseModel):
     agent_state: AgentStateSettings = Field(default_factory=AgentStateSettings)
     event_journal: EventJournalSettings = Field(default_factory=EventJournalSettings)
     state_wal: StateWALSettings = Field(default_factory=StateWALSettings)
+    subject_history: SubjectHistorySettings = Field(
+        default_factory=SubjectHistorySettings
+    )
     values: ValueSystemSettings = Field(default_factory=ValueSystemSettings)

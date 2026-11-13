@@ -41,6 +41,7 @@ PATH_FIELDS = (
     ("agent_state", "path"),
     ("event_journal", "path"),
     ("state_wal", "directory"),
+    ("subject_history", "path"),
 )
 
 
@@ -48,7 +49,7 @@ def _example() -> dict:
     return yaml.safe_load(CONFIG_EXAMPLE.read_text(encoding="utf-8"))
 
 
-def test_example_preserves_base_settings_and_uses_nine_absolute_paths() -> None:
+def test_example_preserves_base_settings_and_uses_ten_absolute_paths() -> None:
     example = _example()
     original = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
     changed = deepcopy(example)
@@ -65,6 +66,9 @@ def test_example_preserves_base_settings_and_uses_nine_absolute_paths() -> None:
     assert typed.memory.persist_directory == STATE_ROOT / "chroma"
     assert typed.event_journal.path == STATE_ROOT / "journal/event_journal.jsonl"
     assert typed.state_wal.directory == STATE_ROOT / "state_wal"
+    assert typed.subject_history.path == (
+        STATE_ROOT / "subject_history/subject_history.sqlite3"
+    )
     assert typed.agent_state.path == STATE_ROOT / "agent_state.json"
     assert typed.adapter_registry.eval_sets == [READ_ONLY_EVAL]
     assert typed.sleep.dream_dataset_path == STATE_ROOT / "dreams/dream_dataset.jsonl"
