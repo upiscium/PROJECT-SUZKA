@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import OrderedDict
+from copy import deepcopy
 from datetime import datetime
 import json
 from threading import Lock
@@ -438,7 +439,9 @@ def _canonical_ascii_string_size(value: str) -> int:
 # memoized by the exact canonical JSON text of that value. A hit requires
 # byte-identical canonical content made only of exact JSON literal types;
 # anything else, including a tampered typed value whose canonical projection
-# changed, misses and is validated in full. Results are immutable and shared.
+# changed, misses and is validated in full. Every call still returns its own
+# detached copy: the memoized original never leaves this module, so tampering
+# with one returned value (object.__setattr__) cannot reach any other.
 _VALIDATED_MEMO_SIZE = 8
 _validated_memo: OrderedDict[str, AttentionContinuity] = OrderedDict()
 _validated_memo_lock = Lock()
@@ -449,10 +452,12 @@ def _exact_json_literals(value: object) -> bool:
 
     This makes the canonical JSON text determine the Python structure, so a
     memoized validation applies exactly (no tuple, subclass or float input
-    can alias a validated value).
+    can alias a validated value). A container reached twice is not a JSON
+    tree, which full validation refuses, so it is never memoized either.
     """
 
     stack = [value]
+    containers: set[int] = set()
     nodes = 0
     while stack:
         item = stack.pop()
@@ -460,6 +465,10 @@ def _exact_json_literals(value: object) -> bool:
         if nodes > _MAX_CANONICAL_TREE_NODES:
             return False
         kind = type(item)
+        if kind is dict or kind is list:
+            if id(item) in containers:
+                return False
+            containers.add(id(item))
         if kind is dict:
             for key, child in cast(dict[object, object], item).items():
                 if type(key) is not str:
@@ -503,7 +512,8 @@ def validated_attention_continuity(value: object) -> AttentionContinuity:
             memoized = _validated_memo.get(key)
             if memoized is not None:
                 _validated_memo.move_to_end(key)
-                return memoized
+        if memoized is not None:
+            return deepcopy(memoized)
     if type(value) is dict:
         _preflight_mapping(value)
     result = AttentionContinuity.from_canonical_value(canonical)
@@ -518,7 +528,7 @@ def validated_attention_continuity(value: object) -> AttentionContinuity:
             key = None
     if key is not None:
         with _validated_memo_lock:
-            _validated_memo[key] = result
+            _validated_memo[key] = deepcopy(result)
             _validated_memo.move_to_end(key)
             while len(_validated_memo) > _VALIDATED_MEMO_SIZE:
                 _validated_memo.popitem(last=False)

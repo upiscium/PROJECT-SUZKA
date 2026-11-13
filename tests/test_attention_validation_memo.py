@@ -54,8 +54,9 @@ def test_repeated_validation_is_served_from_the_memo(
     again = validated_attention_continuity(deepcopy(canonical))
     typed = validated_attention_continuity(first)
     assert calls[0] == 1
-    assert again is first and typed is first
-    assert first == continuity
+    assert again == first and typed == first == continuity
+    # Every call gets its own detached value, never the memoized original.
+    assert again is not first and typed is not first and typed is not again
 
 
 def test_the_memo_never_accepts_what_full_validation_rejects(
@@ -114,3 +115,30 @@ def test_the_memo_is_bounded(continuity: AttentionContinuity) -> None:
     validated_attention_continuity(continuity.canonical_value())
     assert len(codec._validated_memo) == codec._VALIDATED_MEMO_SIZE
     assert json.dumps({"probe": 0}) not in codec._validated_memo
+
+
+def test_a_shared_container_is_refused_even_after_a_hit(
+    continuity: AttentionContinuity,
+) -> None:
+    """Same JSON text, but not a JSON tree: full validation refuses it."""
+    canonical = continuity.canonical_value()
+    validated_attention_continuity(canonical)
+    shared = deepcopy(canonical)
+    receipt = shared["receipts"][-1]  # type: ignore[index]
+    assert receipt["event"] == shared["last_event"]
+    receipt["event"] = shared["last_event"]
+    assert json.dumps(shared, sort_keys=True) == json.dumps(canonical, sort_keys=True)
+    assert codec._memo_key(shared) is None
+    with pytest.raises(ValueError):
+        validated_attention_continuity(shared)
+
+
+def test_tampering_with_a_returned_value_does_not_reach_later_hits(
+    continuity: AttentionContinuity,
+) -> None:
+    canonical = continuity.canonical_value()
+    first = validated_attention_continuity(canonical)
+    object.__setattr__(first, "focused_ids", ("forged-id",))
+    later = validated_attention_continuity(deepcopy(canonical))
+    assert later == continuity
+    assert later.focused_ids != ("forged-id",)
