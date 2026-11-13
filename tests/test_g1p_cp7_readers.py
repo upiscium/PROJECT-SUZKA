@@ -442,4 +442,7 @@ def test_cp7_registered_http_get_routes_match_source_audited_inventory(
             "/api/state/emotion",
             "/api/adapters",
             "/health",
+            # IP-6b (#370 D1 2-2, D2 P1-4): reads only the R16 driver's
+            # settled in-memory ticket results; no committed or live state.
+            "/api/chat/commands/{ticket_id}",
         }

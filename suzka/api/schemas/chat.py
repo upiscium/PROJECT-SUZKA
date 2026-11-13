@@ -42,6 +42,12 @@ class ModelSchema(BaseModel):
     adapter_id: str | None = None
 
 
+class CommandTicketSchema(BaseModel):
+    ticket_id: str
+    kind: str
+    status: str
+
+
 class ChatResponse(BaseModel):
     episode_id: str
     response: str
@@ -50,3 +56,13 @@ class ChatResponse(BaseModel):
     # DRV-3 (#370): the turn's Experience, so the Chat screen can offer
     # "review this" / "commit to review this"; None when none was created.
     experience_id: str | None = None
+    # IP-6b (#370 D1 2-1): a command turn's ticket, and the server
+    # incarnation, so the screen can tell that earlier turns predate a
+    # restart (D2 addendum P2-3). Both None while the driver is inactive.
+    command_ticket: CommandTicketSchema | None = None
+    incarnation: str | None = None
+
+
+class CommandTicketStatusResponse(BaseModel):
+    status: str
+    reason: str | None = None
