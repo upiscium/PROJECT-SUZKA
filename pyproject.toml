@@ -20,7 +20,7 @@ dependencies = [
     "sentence-transformers",
     "torch",
     "torchvision",
-    "transformers",
+    "transformers>=5.10",
     "trl",
     "uvicorn",
 ]
