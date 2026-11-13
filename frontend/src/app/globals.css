@@ -82,6 +82,10 @@ button, input, textarea { font: inherit; }
 .chat-bubble.assistant { justify-self: start; background: rgba(30, 41, 59, 0.7); }
 .chat-bubble p, .record p { white-space: pre-wrap; }
 .composer { display: grid; gap: 0.75rem; }
+/* IP-7: system notices are not the subject's speech (#370 D1 2-4). */
+.system-notice { justify-self: center; max-width: 90%; padding: 0.5rem 0.85rem; border: 1px dashed var(--border); border-radius: 0.5rem; color: var(--muted); font-size: 0.9rem; }
+.system-notice p { margin: 0.25rem 0 0; }
+.review-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 0.5rem; }
 .record { border-top: 1px solid var(--border); padding-top: 0.8rem; }
 .record:first-of-type { border-top: 0; padding-top: 0; }
 pre { background: rgba(2, 6, 23, 0.8); border: 1px solid var(--border); border-radius: 0.85rem; overflow: auto; padding: 0.85rem; white-space: pre-wrap; }
