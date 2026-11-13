@@ -12,6 +12,12 @@ from suzka.config import Settings
 
 
 LOADABLE_ADAPTER_STATES = {"trial_active", "approved", "active"}
+# Completion cue that ends PromptBuilder output; the chat template supplies its own turn start.
+PLAIN_ASSISTANT_CUE = "\nAssistant:"
+# Gemma 4 thought channel markers: <|channel>thought\n ... <channel|>answer
+THOUGHT_CHANNEL_OPEN = "<|channel>"
+THOUGHT_CHANNEL_CLOSE = "<channel|>"
+PLAIN_THOUGHT_ECHO = "thought\n"
 
 
 class TransformersProvider:
@@ -32,7 +38,7 @@ class TransformersProvider:
             self.attach_adapter(adapter_path)
 
     def generate(self, prompt: str) -> str:
-        inputs = self.processor(text=prompt, return_tensors="pt")
+        inputs = self._generation_inputs(prompt)
         inputs = self._move_inputs_to_model_device(inputs)
         generation_kwargs: dict[str, Any] = {
             "max_new_tokens": self.settings.generation.max_new_tokens,
@@ -44,7 +50,7 @@ class TransformersProvider:
         output_ids = self.model.generate(**inputs, **generation_kwargs)
         input_length = inputs["input_ids"].shape[-1]
         generated_ids = output_ids[0][input_length:]
-        return self.processor.decode(generated_ids, skip_special_tokens=True)
+        return self._decode_generated(generated_ids, chat=self._uses_chat_template())
 
     def calculate_loss(self, context_text: str, target_text: str) -> float:
         if not target_text:
@@ -88,6 +94,68 @@ class TransformersProvider:
                 bnb_4bit_use_double_quant=True,
             )
         return AutoModelForImageTextToText.from_pretrained(model_id, **load_kwargs)
+
+    def _generation_inputs(self, prompt: str) -> dict[str, torch.Tensor]:
+        """Tokenize a generation prompt, using the chat template when available.
+
+        Instruction-tuned checkpoints ship a chat template and expect their
+        turn markup; feeding them the plain completion prompt makes them echo
+        prompt sections. Plain checkpoints keep the completion prompt as-is.
+        """
+
+        if not self._uses_chat_template():
+            return self._tokenize(prompt)
+        user_text = prompt.removesuffix(PLAIN_ASSISTANT_CUE).rstrip()
+        messages = [{"role": "user", "content": [{"type": "text", "text": user_text}]}]
+        encoded = self.processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            enable_thinking=False,
+        )
+        return {key: value for key, value in encoded.items() if isinstance(value, torch.Tensor)}
+
+    def _decode_generated(self, generated_ids: torch.Tensor, *, chat: bool = False) -> str:
+        """Decode new tokens, mapping a model thought channel onto <think> tags.
+
+        Gemma 4 can emit ``<|channel>thought\\n...<channel|>`` before the answer,
+        even with thinking disabled. Skipping special tokens alone would leak
+        the channel name and thought text, so the channel is rewritten into the
+        <think> contract that ResponsePostprocessor keeps private. With the chat
+        template the generation prompt already closes an empty thought channel,
+        yet the model sometimes still writes the channel name as plain text;
+        that leading "thought" line is dropped.
+        """
+
+        open_id = self._special_token_id(THOUGHT_CHANNEL_OPEN)
+        close_id = self._special_token_id(THOUGHT_CHANNEL_CLOSE)
+        ids = generated_ids.tolist()
+        if open_id is None or close_id is None or open_id not in ids:
+            text = self.processor.decode(generated_ids, skip_special_tokens=True)
+            if chat and text.startswith(PLAIN_THOUGHT_ECHO):
+                return text.removeprefix(PLAIN_THOUGHT_ECHO).lstrip()
+            return text
+        start = ids.index(open_id) + 1
+        prefix = self.processor.decode(generated_ids[: start - 1], skip_special_tokens=True)
+        if close_id not in ids[start:]:
+            thought = self.processor.decode(generated_ids[start:], skip_special_tokens=True)
+            return f"{prefix}<think>{_strip_channel_name(thought)}"
+        end = ids.index(close_id, start)
+        thought = self.processor.decode(generated_ids[start:end], skip_special_tokens=True)
+        answer = self.processor.decode(generated_ids[end + 1 :], skip_special_tokens=True)
+        return f"{prefix}<think>{_strip_channel_name(thought)}</think>{answer}"
+
+    def _uses_chat_template(self) -> bool:
+        return bool(getattr(self.processor, "chat_template", None))
+
+    def _special_token_id(self, token: str) -> int | None:
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if tokenizer is None or token not in getattr(tokenizer, "all_special_tokens", ()):
+            return None
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        return token_id if isinstance(token_id, int) else None
 
     def _tokenize(self, text: str) -> dict[str, torch.Tensor]:
         encoded = self.processor(text=text, return_tensors="pt")
@@ -133,3 +201,7 @@ def _iter_registry_entries(registry_data: Any) -> list[dict[str, Any]]:
             if isinstance(path, str) and isinstance(state, str)
         ]
     return []
+
+
+def _strip_channel_name(thought: str) -> str:
+    return thought.removeprefix("thought").strip()
