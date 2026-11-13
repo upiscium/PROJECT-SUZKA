@@ -157,7 +157,7 @@ def test_hard_band_refuses_every_new_event(tmp_path: Path) -> None:
     status = value.admission_status()
     assert status.band is EventJournalAdmissionBand.HARD
     assert not status.available
-    assert status.reason == "event_journal_retention_exhausted"
+    assert status.reason == "journal_hard_limit"
     before = value.records
     for item in AgentEventType:
         assert not status.admits(item)
@@ -206,6 +206,23 @@ def test_compaction_returns_the_journal_to_the_normal_band(tmp_path: Path) -> No
     value.close()
 
 
+def test_band_boundaries_belong_to_the_lower_band(tmp_path: Path) -> None:
+    path, clock, value, _following = _at_band(tmp_path, EventJournalAdmissionBand.NORMAL)
+    live = _live_bytes(path)
+    value.close()
+    for limits, band in (
+        ({"max_total_bytes": live + 100, "soft_band_bytes": 100}, "normal"),
+        ({"max_total_bytes": live + 99, "soft_band_bytes": 100}, "soft"),
+        ({"max_total_bytes": live, "soft_band_bytes": 100}, "soft"),
+        ({"max_total_bytes": live, "soft_band_bytes": 0}, "normal"),
+        ({"max_total_bytes": live - 1, "soft_band_bytes": 0}, "hard"),
+    ):
+        limited = _journal(path, clock, **limits)  # type: ignore[arg-type]
+        status = limited.admission_status()
+        limited.close()
+        assert status.band.value == band, limits
+
+
 def test_no_total_limit_keeps_the_previous_behaviour(tmp_path: Path) -> None:
     _path, _clock, value, _following = _at_band(tmp_path, EventJournalAdmissionBand.NORMAL)
     value.close()
@@ -246,3 +263,8 @@ def test_settings_defaults_and_validation() -> None:
         EventJournalSettings(max_total_bytes=100, soft_band_bytes=100)
     with pytest.raises(ValueError):
         EventJournalSettings(max_total_bytes=None, soft_band_bytes=1)
+    with pytest.raises(ValueError):
+        EventJournalSettings(soft_band_bytes=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        # null removes both limits: the default soft band must be zeroed too.
+        EventJournalSettings(max_total_bytes=None)

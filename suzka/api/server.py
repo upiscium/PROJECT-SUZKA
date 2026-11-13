@@ -78,12 +78,12 @@ def _sleep_learning_gate(journal: EventJournal) -> Callable[[], str | None]:
     """Veto Sleep training outside the normal Journal band (IP-4b)."""
 
     def gate() -> str | None:
-        band = journal.admission_status().band
-        if band is EventJournalAdmissionBand.NORMAL:
+        status = journal.admission_status()
+        if not status.available:
+            return status.reason or "event_journal_admission_unavailable"
+        if status.band is EventJournalAdmissionBand.NORMAL:
             return None
-        return "journal_soft_limit" if band is EventJournalAdmissionBand.SOFT else (
-            "event_journal_retention_exhausted"
-        )
+        return status.reason or "journal_soft_limit"
 
     return gate
 
@@ -869,10 +869,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             not retention_available
             or not app.state.startup_retention_admission_available
         ):
+            hard = retention_band is EventJournalAdmissionBand.HARD or (
+                app.state.startup_retention_reason == "journal_hard_limit"
+            )
             return {
                 "status": "degraded",
                 "project": app_settings.project.name,
-                "reason": "event_journal_retention_exhausted",
+                "reason": "journal_hard_limit"
+                if hard
+                else "event_journal_retention_exhausted",
             }
         if app.state.agent_runtime.status is not AgentRuntimeStatus.ACCEPTING:
             return {

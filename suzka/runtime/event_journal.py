@@ -3715,8 +3715,10 @@ class EventJournal:
         reason = status.reason
         if band is EventJournalAdmissionBand.HARD and available:
             # Hard limit: fail-stop for new admission, as before (#381 §6).
+            # Its own reason, because it is the one the Human acts on (raise
+            # max_total_bytes or shorten retention_days; #381 D2 P2).
             available = False
-            reason = "event_journal_retention_exhausted"
+            reason = "journal_hard_limit"
         elif band is EventJournalAdmissionBand.SOFT and available:
             reason = "journal_soft_limit"
         return replace(
