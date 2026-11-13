@@ -249,6 +249,21 @@ WHEN NEW.phase = 'FINALIZED' AND (
     )
 )
 BEGIN SELECT RAISE(ABORT, 'history FINALIZE is incomplete'); END""",
+    """CREATE TRIGGER history_operations_abort_clean
+BEFORE UPDATE OF phase ON history_operations
+WHEN NEW.phase = 'ABORTED' AND (
+    EXISTS (
+        SELECT 1 FROM history_postcommit_receipts r
+        WHERE r.incarnation_id = OLD.incarnation_id
+            AND r.transaction_id = OLD.transaction_id
+    )
+    OR EXISTS (
+        SELECT 1 FROM history_decisions d
+        WHERE d.incarnation_id = OLD.incarnation_id
+            AND d.transaction_id = OLD.transaction_id
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'an operation with finalize rows cannot abort'); END""",
     """CREATE TRIGGER history_operations_no_delete BEFORE DELETE ON history_operations
 BEGIN SELECT RAISE(ABORT, 'history operations are immutable'); END""",
     # Decision, source and receipt rows are written only inside the FINALIZE
@@ -573,6 +588,10 @@ class SubjectHistoryStore:
         _check_private_directory(path.parent)
         before = _check_private_file(path, required=True)
         _check_private_file(_sidecar(path), required=False)
+        # The store runs in rollback-journal mode only: WAL sidecars are foreign.
+        for suffix in ("-wal", "-shm"):
+            if os.path.lexists(path.with_name(path.name + suffix)):
+                raise HistoryStoreCorrupt("SubjectHistory has an unexpected WAL sidecar")
         try:
             connection = cls._connect(path, max_page_count)
         except sqlite3.Error as error:
@@ -615,6 +634,13 @@ class SubjectHistoryStore:
                 ("cell_size_check = ON", "cell_size_check", 1),
                 (f"max_page_count = {max_page_count}", "max_page_count", max_page_count),
             )
+            page_count = connection.execute("PRAGMA page_count").fetchone()
+            if page_count is not None and page_count[0] > max_page_count:
+                # A grown file under a smaller cap is a capacity/configuration
+                # condition, not corruption (review P2-2).
+                raise HistoryStoreCapacityError(
+                    "SubjectHistory is larger than its configured max_page_count"
+                )
             for assignment, name, value in expected:
                 connection.execute(f"PRAGMA {assignment}").fetchall()
                 actual = connection.execute(f"PRAGMA {name}").fetchone()

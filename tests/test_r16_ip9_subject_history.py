@@ -391,8 +391,8 @@ def test_tampered_schema_or_pragmas_fail_closed(tmp_path: Path) -> None:
     fresh = _store(tmp_path / "second")
     fresh_path = fresh.path
     fresh.close()
-    # A page cap below the current size cannot be enforced (#376 D1-9).
-    with pytest.raises(HistoryStoreCorrupt, match="max_page_count"):
+    # A page cap below the current size is a capacity condition (#376 D1-9).
+    with pytest.raises(HistoryStoreCapacityError, match="max_page_count"):
         SubjectHistoryStore.open(fresh_path, max_page_count=16)
 
 
@@ -776,4 +776,48 @@ def test_startup_fails_closed_on_lost_pending_or_ambiguous_proof(tmp_path: Path)
     with pytest.raises(StartupReconciliationError, match="ambiguous"):
         _startup(journal, recovery, memory, store).reconcile_open_transactions()
     row = store.operation(INCARNATION, journal.inspect().open_transactions[0].transaction_id)
+    assert row is not None and row.phase is HistoryPhase.PREPARED
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_foreign_wal_sidecars_are_refused(tmp_path: Path, suffix: str) -> None:
+    store = _store(tmp_path)
+    path = store.path
+    store.close()
+    sidecar = path.with_name(path.name + suffix)
+    sidecar.write_bytes(b"")
+    sidecar.chmod(0o600)
+    with pytest.raises(HistoryStoreCorrupt, match="WAL"):
+        SubjectHistoryStore.open(path, max_page_count=PAGES)
+
+
+def test_operation_with_finalize_rows_cannot_be_aborted(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    event = _event("abort-with-rows")
+    decision = _committed(event)
+    binding = _binding(event, decision)
+    SubjectHistoryParticipant(store, INCARNATION, decision, FakeProof()).prepare(binding)
+    raw = sqlite3.connect(store.path)
+    raw.execute("PRAGMA foreign_keys = ON")
+    # A direct writer plants a decision row outside any FINALIZE (review P2-1).
+    raw.execute(
+        "INSERT INTO history_decisions (decision_id, incarnation_id, transaction_id, "
+        "lineage_scope, review_intent_key, predecessor_key, predecessor_digest, "
+        "issuer_event_id, issuer_sequence, decision_bytes, decision_digest, "
+        "committed_bytes, committed_digest, policy_kind, policy_row, "
+        "policy_input_bytes, policy_input_digest) "
+        "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            decision.decision_id, INCARNATION, binding.transaction_id,
+            decision.lineage_scope, decision.review_intent_key, GENESIS,
+            event.event_id, 1, decision.decision_bytes, "0" * 64,
+            decision.canonical_bytes(), "0" * 64, decision.policy_kind.value,
+            decision.policy_row.value, decision.policy_input_bytes, "0" * 64,
+        ),
+    )
+    raw.commit()
+    raw.close()
+    with pytest.raises(ParticipantDivergedError):
+        SubjectHistoryParticipant.abort_pending(store, INCARNATION, binding)
+    row = store.operation(INCARNATION, binding.transaction_id)
     assert row is not None and row.phase is HistoryPhase.PREPARED
