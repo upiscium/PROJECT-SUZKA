@@ -285,3 +285,26 @@ def test_thought_channel_never_reaches_visible_response() -> None:
 
     assert processed.visible_response == "hello"
     assert processed.hidden_thought == "pondering"
+
+
+class FakeEchoProcessor(FakeChatProcessor):
+    def decode(self, output_ids: torch.Tensor, skip_special_tokens: bool) -> str:
+        return "thought\nhello there"
+
+
+def test_chat_generation_drops_plain_thought_channel_echo() -> None:
+    settings = load_settings(CONFIG_PATH)
+    provider = TransformersProvider(settings, model=FakeModel(), processor=FakeEchoProcessor())
+
+    assert provider.generate("hi") == "hello there"
+
+
+def test_plain_generation_keeps_leading_thought_text() -> None:
+    class PlainEchoProcessor(FakeProcessor):
+        def decode(self, output_ids: torch.Tensor, skip_special_tokens: bool) -> str:
+            return "thought\nhello there"
+
+    settings = load_settings(CONFIG_PATH)
+    provider = TransformersProvider(settings, model=FakeModel(), processor=PlainEchoProcessor())
+
+    assert provider.generate("hi") == "thought\nhello there"
