@@ -12,6 +12,8 @@ from suzka.config import Settings
 
 
 LOADABLE_ADAPTER_STATES = {"trial_active", "approved", "active"}
+# Completion cue that ends PromptBuilder output; the chat template supplies its own turn start.
+PLAIN_ASSISTANT_CUE = "\nAssistant:"
 
 
 class TransformersProvider:
@@ -32,7 +34,7 @@ class TransformersProvider:
             self.attach_adapter(adapter_path)
 
     def generate(self, prompt: str) -> str:
-        inputs = self.processor(text=prompt, return_tensors="pt")
+        inputs = self._generation_inputs(prompt)
         inputs = self._move_inputs_to_model_device(inputs)
         generation_kwargs: dict[str, Any] = {
             "max_new_tokens": self.settings.generation.max_new_tokens,
@@ -88,6 +90,28 @@ class TransformersProvider:
                 bnb_4bit_use_double_quant=True,
             )
         return AutoModelForImageTextToText.from_pretrained(model_id, **load_kwargs)
+
+    def _generation_inputs(self, prompt: str) -> dict[str, torch.Tensor]:
+        """Tokenize a generation prompt, using the chat template when available.
+
+        Instruction-tuned checkpoints ship a chat template and expect their
+        turn markup; feeding them the plain completion prompt makes them echo
+        prompt sections. Plain checkpoints keep the completion prompt as-is.
+        """
+
+        if not getattr(self.processor, "chat_template", None):
+            return self._tokenize(prompt)
+        user_text = prompt.removesuffix(PLAIN_ASSISTANT_CUE).rstrip()
+        messages = [{"role": "user", "content": [{"type": "text", "text": user_text}]}]
+        encoded = self.processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            enable_thinking=False,
+        )
+        return {key: value for key, value in encoded.items() if isinstance(value, torch.Tensor)}
 
     def _tokenize(self, text: str) -> dict[str, torch.Tensor]:
         encoded = self.processor(text=text, return_tensors="pt")

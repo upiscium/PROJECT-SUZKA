@@ -123,6 +123,54 @@ def test_transformers_generate_decodes_only_new_tokens() -> None:
     assert generated == "4 5"
 
 
+class FakeChatProcessor(FakeProcessor):
+    chat_template = "{{ messages }}"
+
+    def __init__(self) -> None:
+        self.chat_calls: list[tuple[list[dict], dict]] = []
+        self.plain_calls: list[str] = []
+
+    def __call__(self, *, text: str, return_tensors: str) -> dict[str, torch.Tensor]:
+        self.plain_calls.append(text)
+        return super().__call__(text=text, return_tensors=return_tensors)
+
+    def apply_chat_template(self, messages: list[dict], **kwargs) -> dict[str, torch.Tensor]:
+        self.chat_calls.append((messages, kwargs))
+        return {"input_ids": torch.tensor([[1, 2, 3]]), "attention_mask": torch.tensor([[1, 1, 1]])}
+
+
+def test_transformers_generate_uses_chat_template_for_instruction_models() -> None:
+    fake_model = FakeModel()
+    processor = FakeChatProcessor()
+    settings = load_settings(CONFIG_PATH)
+    provider = TransformersProvider(settings, model=fake_model, processor=processor)
+
+    generated = provider.generate("Context: private\n\nUser: hello\nAssistant:")
+
+    assert generated == "4 5"
+    assert processor.plain_calls == []
+    [(messages, kwargs)] = processor.chat_calls
+    assert messages == [
+        {"role": "user", "content": [{"type": "text", "text": "Context: private\n\nUser: hello"}]}
+    ]
+    assert kwargs["add_generation_prompt"] is True
+    assert kwargs["enable_thinking"] is False
+    assert fake_model.generate_kwargs is not None
+    assert "attention_mask" in fake_model.generate_kwargs
+
+
+def test_transformers_loss_keeps_plain_text_with_chat_template() -> None:
+    fake_model = FakeModel()
+    processor = FakeChatProcessor()
+    settings = load_settings(CONFIG_PATH)
+    provider = TransformersProvider(settings, model=fake_model, processor=processor)
+
+    provider.calculate_loss("context words", " target")
+
+    assert processor.chat_calls == []
+    assert processor.plain_calls == ["context words target", "context words"]
+
+
 def test_transformers_generate_omits_sampling_kwargs_when_not_sampling() -> None:
     fake_model = FakeModel()
     settings = load_settings(CONFIG_PATH)
