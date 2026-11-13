@@ -52,7 +52,7 @@ import re
 import secrets
 from threading import Event, Lock, Thread, current_thread
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from suzka.r16.commitment_owner import _CommitmentSourceSelection
 from suzka.r16.goal_owner import _GoalSourceSelection
@@ -256,8 +256,9 @@ class R16Driver:
         self._u2a: dict[str, _U2a] = {}
         self._retries: list[_Retry] = []
         self._adopted_goal: dict[str, str] = {}
-        self._previewed: set[tuple[str, str]] = set()
-        self._reviewed: set[str] = set()
+        # Insertion-ordered, so bounding evicts the oldest (P2-b).
+        self._previewed: dict[tuple[str, str], None] = {}
+        self._reviewed: dict[str, None] = {}
         self._u2a_hooks: list[Callable[[_MotivationSourceRef, object], None]] = []
         # Results of the driver's own submissions (IP-6b review P1-1): never
         # dropped, so a stage can never be left without its result.
@@ -440,7 +441,13 @@ class R16Driver:
                 with self._tickets_lock:
                     finished, self._done = self._done, []
                 for result in finished:
-                    self._on_done(result)
+                    # One failing result must not lose the rest (P2-a).
+                    try:
+                        self._on_done(result)
+                    except _DriverStopped:
+                        raise
+                    except Exception:  # pragma: no cover - defensive
+                        LOGGER.exception("R16 driver result handling failed")
                 self._service_waiting()
             except _DriverStopped:
                 break
@@ -652,7 +659,7 @@ class R16Driver:
                 else _Stage.COMMITMENT_REVIEW
             )
             if item.stage is _Stage.GOAL_PROPOSAL:
-                self._reviewed.add(value.subject_id)
+                self._reviewed[value.subject_id] = None
                 _bound(self._reviewed)
             self._submit(stage, (command, value.subject_id))
             return
@@ -697,7 +704,7 @@ class R16Driver:
         key = (goal_id, trigger)
         if key in self._previewed:
             return
-        self._previewed.add(key)
+        self._previewed[key] = None
         _bound(self._previewed)
         self._submit(_Stage.PLAN_PREVIEW, goal_id)
 
@@ -706,16 +713,17 @@ class R16Driver:
 
         for goal_id in item.goal_ids:
             if goal_id not in self._reviewed:
-                self._reviewed.add(goal_id)
+                self._reviewed[goal_id] = None
+                _bound(self._reviewed)
                 self._submit(_Stage.GOAL_REVIEW, (None, goal_id))
         for commitment_id in item.commitment_ids:
             self._submit(_Stage.COMMITMENT_REVIEW, (None, commitment_id))
 
 
-def _bound(values: set[object] | set[str] | set[tuple[str, str]]) -> None:
-    """Keep incarnation-scoped sets bounded (review P2-9)."""
+def _bound(values: dict[Any, None]) -> None:
+    """Keep incarnation-scoped sets bounded, evicting the oldest (P2-9/P2-b)."""
     while len(values) > OBSERVED_CAPACITY:
-        values.pop()
+        del values[next(iter(values))]
 
 
 def _result_code(value: object) -> str:
