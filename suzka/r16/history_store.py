@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import sys
 from threading import Lock
 from typing import Final
 from uuid import uuid4
@@ -626,10 +627,9 @@ class SubjectHistoryStore:
         try:
             # Connection.setconfig exists from Python 3.12; on 3.11 the
             # trusted_schema PRAGMA below is still enforced and read back.
-            setconfig = getattr(connection, "setconfig", None)
-            if setconfig is not None:
-                setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
-                setconfig(sqlite3.SQLITE_DBCONFIG_TRUSTED_SCHEMA, False)
+            if sys.version_info >= (3, 12):
+                connection.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
+                connection.setconfig(sqlite3.SQLITE_DBCONFIG_TRUSTED_SCHEMA, False)
             expected = (
                 ("journal_mode = DELETE", "journal_mode", "delete"),
                 ("synchronous = EXTRA", "synchronous", 3),
