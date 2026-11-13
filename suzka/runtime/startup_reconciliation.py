@@ -33,6 +33,12 @@ from suzka.memory.semantic_participant import (
     MemorySemanticParticipant,
 )
 from suzka.memory.semantic_store import SemanticStore, SemanticStoreError
+from suzka.r16.history_codec import SUBJECT_HISTORY_PARTICIPANT_ID
+from suzka.r16.history_participant import (
+    JournalCommitProofSource,
+    SubjectHistoryParticipant,
+)
+from suzka.r16.history_store import SubjectHistoryStore
 from suzka.runtime.agent_runtime import AgentEvent
 from suzka.runtime.event_journal import (
     EventJournal,
@@ -127,6 +133,8 @@ class StartupReconciliationCoordinator:
         semantic_store: SemanticStore | None = None,
         semantic_checkpoint_covers: Callable[[EventJournalTransaction], bool]
         | None = None,
+        history_store: SubjectHistoryStore | None = None,
+        history_incarnation: Callable[[], str] | None = None,
     ) -> None:
         self.journal = journal
         self.state_recovery = state_recovery
@@ -138,6 +146,11 @@ class StartupReconciliationCoordinator:
             memory.settings.memory.persist_directory
         )
         self.semantic_checkpoint_covers = semantic_checkpoint_covers
+        # #376 U4-2: the fifth resolver.  Absent until the U4-3 baseline
+        # registers ``subject.history``; a transaction naming it then fails
+        # closed as an unregistered participant.
+        self.history_store = history_store
+        self.history_incarnation = history_incarnation
 
     def reconcile_open_transactions(self) -> tuple[bool, str | None]:
         """Resolve Path A without replaying an event handler or model call."""
@@ -462,6 +475,11 @@ class StartupReconciliationCoordinator:
                 )
             elif requirement.participant_id == SESSION_TURN_PARTICIPANT_ID:
                 outcome = AbortOutcome.ALREADY_ABSENT
+            elif requirement.participant_id == SUBJECT_HISTORY_PARTICIPANT_ID:
+                store, incarnation = self._history_authority()
+                outcome = SubjectHistoryParticipant.abort_pending(
+                    store, incarnation, binding
+                )
             else:
                 raise UnsupportedParticipantReconciliationError(
                     "Participant abort resolver is not registered"
@@ -510,6 +528,10 @@ class StartupReconciliationCoordinator:
                     requirement.operation_digest,
                 )
                 outcome = ParticipantOutcome.ALREADY_CONSISTENT
+            elif requirement.participant_id == SUBJECT_HISTORY_PARTICIPANT_ID:
+                outcome = self._history_participant(
+                    transaction, requirement
+                ).finalize(self._binding(transaction, requirement))
             else:
                 raise UnsupportedParticipantReconciliationError(
                     "Participant resolver is not registered"
@@ -663,6 +685,8 @@ class StartupReconciliationCoordinator:
                 participant = self._experience_participant(transaction, requirement)
             elif participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID:
                 participant = self._semantic_participant(transaction, requirement)
+            elif participant_id == SUBJECT_HISTORY_PARTICIPANT_ID:
+                participant = self._history_participant(transaction, requirement)
             else:
                 raise UnsupportedParticipantReconciliationError(
                     "Participant resolver is not registered"
@@ -773,6 +797,36 @@ class StartupReconciliationCoordinator:
             requirement.operation_digest,
             event_id=transaction.event_id,
             processing_sequence=transaction.processing_sequence,
+        )
+
+    def _history_authority(self) -> tuple[SubjectHistoryStore, str]:
+        if self.history_store is None or self.history_incarnation is None:
+            raise UnsupportedParticipantReconciliationError(
+                "SubjectHistory resolver is not registered"
+            )
+        try:
+            incarnation = self.history_incarnation()
+        except Exception:
+            raise ParticipantUnavailableError(
+                "SubjectHistory incarnation is unavailable"
+            ) from None
+        return self.history_store, incarnation
+
+    def _history_participant(
+        self,
+        transaction: EventJournalTransaction,
+        requirement: ParticipantRequirement,
+    ) -> SubjectHistoryParticipant:
+        if requirement.participant_id != SUBJECT_HISTORY_PARTICIPANT_ID:
+            raise UnsupportedParticipantReconciliationError(
+                "SubjectHistory participant resolver is not registered"
+            )
+        store, incarnation = self._history_authority()
+        return SubjectHistoryParticipant.from_pending(
+            store,
+            incarnation,
+            JournalCommitProofSource(self.journal, self.state_recovery),
+            self._binding(transaction, requirement),
         )
 
     @staticmethod
