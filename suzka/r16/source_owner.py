@@ -403,26 +403,30 @@ class _MotivationSourceOwner:
         its sequence; once the event is archived, the sequence is found by
         probing ``experience_id_for_event(event_id, s)`` for ``after < s <
         before``, bounds taken from committed owner state. The Experience it
-        finds names the event and sequence itself, so a probe can only
-        succeed for the real source. The probe is bounded; past the bound the
-        source is treated as missing (fail closed).
+        finds names the event and sequence itself, and event ids are unique
+        in the Journal, so a probe can only succeed for the real source.
+
+        The probe runs downward from ``before``: the request is the turn that
+        prompted the owner event, so it normally sits just below it. It is
+        bounded; past the bound the source is treated as missing (fail
+        closed).
         """
-        if (
-            type(after) is not int
-            or type(before) is not int
-            or after < 0
-            or before - after - 1 > _ARCHIVED_SEQUENCE_PROBE_LIMIT
-        ):
+        if type(after) is not int or type(before) is not int or after < 0:
             raise _MotivationSourceUnavailable(
                 "archived source sequence unbounded",
                 reason=JournalSourceReason.SOURCE_MISSING,
             )
-        root = self._experience.records_root
-        for candidate in range(after + 1, before):
+        lowest = max(after + 1, before - _ARCHIVED_SEQUENCE_PROBE_LIMIT)
+        for candidate in range(before - 1, lowest - 1, -1):
             experience_id = experience_id_for_event(event_id, candidate)
-            if not (root / experience_id).is_dir():
+            try:
+                if self._experience.load_current(experience_id) is None:
+                    continue
+                record = self._experience.load_committed_current(experience_id).record
+            except ExperienceStoreError:
+                # Damaged candidates are skipped; the real source, if
+                # damaged, is then missing (fail closed).
                 continue
-            record = self._experience.load_committed_current(experience_id).record
             if (
                 record.source_event_id == event_id
                 and record.source_event_sequence == candidate

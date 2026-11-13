@@ -148,6 +148,59 @@ def test_adopted_goal_continues_after_its_sources_are_archived(
         )
 
 
+def test_proposed_goal_is_adopted_after_its_sources_are_archived(app) -> None:
+    """Adoption is continuation: X, P and the proposal event archived."""
+    with TestClient(app) as client:
+        state = client.app.state
+        x = chat(state, "source experience; fixture")
+        preexisting_interest(state, x)
+        p = chat(state, f"REVIEW_EXPERIENCE:{x_id(x)}")
+        owner = state._goal_source_owner
+        proposed = owner._submit_proposal(_GoalSourceSelection(p, x)).result(
+            timeout=30
+        )
+        genesis = state.main_loop._goal_system.get(proposed.value).revision_history[0]
+        _archive(
+            state,
+            x,
+            p,
+            _MotivationSourceRef(genesis.event_id, genesis.event_sequence, x.episode_id),
+        )
+        assert owner._submit_review(proposed.value).result(timeout=30).value == (
+            "adopted"
+        )
+
+
+def test_archived_request_sequence_probe_is_bounded(app, monkeypatch) -> None:
+    """Past the probe bound an archived request is missing (fail closed)."""
+    import suzka.r16.source_owner as source_module
+
+    with TestClient(app) as client:
+        state = client.app.state
+        x = chat(state, "source experience; fixture")
+        preexisting_interest(state, x)
+        p = chat(state, f"REVIEW_EXPERIENCE:{x_id(x)}")
+        owner = state._goal_source_owner
+        proposed = owner._submit_proposal(_GoalSourceSelection(p, x)).result(
+            timeout=30
+        )
+        genesis = state.main_loop._goal_system.get(proposed.value).revision_history[0]
+        _archive(state, x, p)
+        source = state._motivation_source_owner
+        assert source._archived_source_sequence(
+            p.event_id, x.event_sequence, genesis.event_sequence
+        ) == p.event_sequence
+        gap = genesis.event_sequence - p.event_sequence
+        monkeypatch.setattr(source_module, "_ARCHIVED_SEQUENCE_PROBE_LIMIT", gap - 1)
+        with pytest.raises(_MotivationSourceUnavailable) as refused:
+            source._archived_source_sequence(
+                p.event_id, x.event_sequence, genesis.event_sequence
+            )
+        assert refused.value.reason is JournalSourceReason.SOURCE_MISSING
+        # The adoption review then holds instead of adopting.
+        assert owner._submit_review(proposed.value).result(timeout=30).value == "hold"
+
+
 def test_new_source_past_retention_is_refused_with_its_own_reason(app) -> None:
     with TestClient(app) as client:
         state = client.app.state
