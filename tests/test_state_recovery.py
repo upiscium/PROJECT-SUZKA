@@ -29,6 +29,7 @@ from suzka.models import ModelProvider
 from suzka.persona.prompt_builder import PromptBuilder
 from suzka.runtime.agent_runtime import AgentEvent, AgentEventSource, AgentEventType
 from suzka.runtime.agent_state import (
+    AgentStateLoadError,
     AgentStateSaveError,
     AgentStateSaveStage,
     AgentStateSnapshotV4,
@@ -961,6 +962,51 @@ def test_completion_rejects_stale_canonical_snapshot(tmp_path: Path) -> None:
 
     with pytest.raises(StateRecoveryError):
         recovery.complete_committed_event(item, evidence)
+
+
+def test_completion_checks_the_published_bytes_without_reloading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """IP-1b: completion hashes the published file's bytes instead of
+    loading, validating and re-canonicalizing the snapshot."""
+    recovery, store, journal, _wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event("published-bytes-proof", 1)
+    start_event(journal, item)
+    evidence = recovery.commit_internal_candidate(item, initial, candidate)
+    assert store.published_snapshot_hash() == evidence.snapshot_hash
+    assert store.published_snapshot_hash() == store.snapshot_hash(candidate)
+    monkeypatch.setattr(store, "load", lambda: pytest.fail("reloaded snapshot"))
+    recovery.complete_committed_event(item, evidence)
+
+
+@pytest.mark.parametrize("damage", ["reformatted", "missing", "symlink"])
+def test_completion_rejects_changed_published_bytes(
+    tmp_path: Path, damage: str
+) -> None:
+    recovery, store, journal, _wal = coordinator(tmp_path)
+    initial = recovery.prepare_startup().snapshot
+    candidate = snapshot(1, 0.4)
+    item = event(f"published-bytes-{damage}", 1)
+    start_event(journal, item)
+    evidence = recovery.commit_internal_candidate(item, initial, candidate)
+    payload = store.path.read_bytes()
+    if damage == "reformatted":
+        # Same JSON value, different bytes: no longer the committed bytes.
+        store.path.write_bytes(payload + b"\n")
+    elif damage == "missing":
+        store.path.unlink()
+    else:
+        target = store.path.with_name("elsewhere.json")
+        target.write_bytes(payload)
+        store.path.unlink()
+        store.path.symlink_to(target)
+    before = journal.path.read_bytes()
+    expected = AgentStateLoadError if damage == "symlink" else StateRecoveryError
+    with pytest.raises(expected):
+        recovery.complete_committed_event(item, evidence)
+    assert journal.path.read_bytes() == before
 
 
 def test_completion_rejects_stale_journal_prepared_proof(

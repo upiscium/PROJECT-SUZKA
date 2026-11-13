@@ -8,7 +8,10 @@ owners can call the raw preflight before materializing their enclosing JSON.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import OrderedDict
 from datetime import datetime
+import json
+from threading import Lock
 from typing import Final, cast
 
 from suzka.attention.bounds import (
@@ -429,20 +432,96 @@ def _canonical_ascii_string_size(value: str) -> int:
     return size
 
 
+# IP-1b: one AgentState commit validates the same Attention continuity about a
+# hundred times (every snapshot dump, validate, hash and WAL check). The
+# validation is a pure function of the canonical value, so its result is
+# memoized by the exact canonical JSON text of that value. A hit requires
+# byte-identical canonical content made only of exact JSON literal types;
+# anything else, including a tampered typed value whose canonical projection
+# changed, misses and is validated in full. Results are immutable and shared.
+_VALIDATED_MEMO_SIZE = 8
+_validated_memo: OrderedDict[str, AttentionContinuity] = OrderedDict()
+_validated_memo_lock = Lock()
+
+
+def _exact_json_literals(value: object) -> bool:
+    """Whether ``value`` is built only from exact JSON literal types.
+
+    This makes the canonical JSON text determine the Python structure, so a
+    memoized validation applies exactly (no tuple, subclass or float input
+    can alias a validated value).
+    """
+
+    stack = [value]
+    nodes = 0
+    while stack:
+        item = stack.pop()
+        nodes += 1
+        if nodes > _MAX_CANONICAL_TREE_NODES:
+            return False
+        kind = type(item)
+        if kind is dict:
+            for key, child in cast(dict[object, object], item).items():
+                if type(key) is not str:
+                    return False
+                stack.append(child)
+        elif kind is list:
+            stack.extend(cast(list[object], item))
+        elif not (kind is str or kind is int or kind is bool or item is None):
+            return False
+    return True
+
+
+def _memo_key(canonical: object) -> str | None:
+    if not _exact_json_literals(canonical):
+        return None
+    try:
+        return json.dumps(
+            canonical,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
 def validated_attention_continuity(value: object) -> AttentionContinuity:
     """Return a detached U1 value after resource preflight and checksum checks."""
 
     if type(value) is AttentionContinuity:
         _preflight_typed(value)
-        canonical = value.canonical_value()
+        canonical: object = value.canonical_value()
     elif type(value) is dict:
-        _preflight_mapping(value)
         canonical = value
     else:
         raise TypeError("Attention state must be an exact continuity value or canonical dict")
+    key = _memo_key(canonical)
+    if key is not None:
+        with _validated_memo_lock:
+            memoized = _validated_memo.get(key)
+            if memoized is not None:
+                _validated_memo.move_to_end(key)
+                return memoized
+    if type(value) is dict:
+        _preflight_mapping(value)
     result = AttentionContinuity.from_canonical_value(canonical)
     if len(result.canonical_bytes()) > AGENT_STATE_ATTENTION_MAX_SERIALIZED_BYTES:
         raise ValueError("Attention continuity exceeds its AgentState field byte bound")
+    if key is not None and type(value) is AttentionContinuity:
+        # Only memoize what the dict path would also accept, so a later hit
+        # for the same canonical dict never skips a check it would fail.
+        try:
+            _preflight_mapping(cast(dict[str, object], canonical))
+        except (TypeError, ValueError):
+            key = None
+    if key is not None:
+        with _validated_memo_lock:
+            _validated_memo[key] = result
+            _validated_memo.move_to_end(key)
+            while len(_validated_memo) > _VALIDATED_MEMO_SIZE:
+                _validated_memo.popitem(last=False)
     return result
 
 
