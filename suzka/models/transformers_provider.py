@@ -14,6 +14,9 @@ from suzka.config import Settings
 LOADABLE_ADAPTER_STATES = {"trial_active", "approved", "active"}
 # Completion cue that ends PromptBuilder output; the chat template supplies its own turn start.
 PLAIN_ASSISTANT_CUE = "\nAssistant:"
+# Gemma 4 thought channel markers: <|channel>thought\n ... <channel|>answer
+THOUGHT_CHANNEL_OPEN = "<|channel>"
+THOUGHT_CHANNEL_CLOSE = "<channel|>"
 
 
 class TransformersProvider:
@@ -46,7 +49,7 @@ class TransformersProvider:
         output_ids = self.model.generate(**inputs, **generation_kwargs)
         input_length = inputs["input_ids"].shape[-1]
         generated_ids = output_ids[0][input_length:]
-        return self.processor.decode(generated_ids, skip_special_tokens=True)
+        return self._decode_generated(generated_ids)
 
     def calculate_loss(self, context_text: str, target_text: str) -> float:
         if not target_text:
@@ -113,6 +116,37 @@ class TransformersProvider:
         )
         return {key: value for key, value in encoded.items() if isinstance(value, torch.Tensor)}
 
+    def _decode_generated(self, generated_ids: torch.Tensor) -> str:
+        """Decode new tokens, mapping a model thought channel onto <think> tags.
+
+        Gemma 4 can emit ``<|channel>thought\\n...<channel|>`` before the answer,
+        even with thinking disabled. Skipping special tokens alone would leak
+        the channel name and thought text, so the channel is rewritten into the
+        <think> contract that ResponsePostprocessor keeps private.
+        """
+
+        open_id = self._special_token_id(THOUGHT_CHANNEL_OPEN)
+        close_id = self._special_token_id(THOUGHT_CHANNEL_CLOSE)
+        ids = generated_ids.tolist()
+        if open_id is None or close_id is None or open_id not in ids:
+            return self.processor.decode(generated_ids, skip_special_tokens=True)
+        start = ids.index(open_id) + 1
+        prefix = self.processor.decode(generated_ids[: start - 1], skip_special_tokens=True)
+        if close_id not in ids[start:]:
+            thought = self.processor.decode(generated_ids[start:], skip_special_tokens=True)
+            return f"{prefix}<think>{_strip_channel_name(thought)}"
+        end = ids.index(close_id, start)
+        thought = self.processor.decode(generated_ids[start:end], skip_special_tokens=True)
+        answer = self.processor.decode(generated_ids[end + 1 :], skip_special_tokens=True)
+        return f"{prefix}<think>{_strip_channel_name(thought)}</think>{answer}"
+
+    def _special_token_id(self, token: str) -> int | None:
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if tokenizer is None or token not in getattr(tokenizer, "all_special_tokens", ()):
+            return None
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        return token_id if isinstance(token_id, int) else None
+
     def _tokenize(self, text: str) -> dict[str, torch.Tensor]:
         encoded = self.processor(text=text, return_tensors="pt")
         return {key: value for key, value in encoded.items() if isinstance(value, torch.Tensor)}
@@ -157,3 +191,7 @@ def _iter_registry_entries(registry_data: Any) -> list[dict[str, Any]]:
             if isinstance(path, str) and isinstance(state, str)
         ]
     return []
+
+
+def _strip_channel_name(thought: str) -> str:
+    return thought.removeprefix("thought").strip()

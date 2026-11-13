@@ -222,3 +222,66 @@ def test_adapter_paths_must_be_approved_by_registry(tmp_path: Path) -> None:
 
     assert is_registry_approved_adapter(settings, adapter_path)
     assert not is_registry_approved_adapter(settings, tmp_path / "unregistered")
+
+
+class FakeChannelTokenizer:
+    all_special_tokens = ["<|channel>", "<channel|>"]
+    ids = {"<|channel>": 100, "<channel|>": 101}
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return self.ids[token]
+
+
+class FakeChannelProcessor(FakeProcessor):
+    tokenizer = FakeChannelTokenizer()
+    vocab = {100: "<|channel>", 101: "<channel|>", 7: "thought", 8: "pondering", 9: "hello"}
+
+    def decode(self, output_ids: torch.Tensor, skip_special_tokens: bool) -> str:
+        words = [self.vocab[token_id] for token_id in output_ids.tolist()]
+        if skip_special_tokens:
+            words = [word for word in words if word not in FakeChannelTokenizer.ids]
+        return " ".join(words)
+
+
+class FakeChannelModel(FakeModel):
+    def __init__(self, new_tokens: list[int]) -> None:
+        super().__init__()
+        self.new_tokens = new_tokens
+
+    def generate(self, **kwargs) -> torch.Tensor:
+        self.generate_kwargs = kwargs
+        return torch.tensor([kwargs["input_ids"][0].tolist() + self.new_tokens])
+
+
+@pytest.mark.parametrize(
+    ("new_tokens", "expected"),
+    [
+        ([100, 7, 101, 9], "<think></think>hello"),
+        ([100, 7, 8, 101, 9], "<think>pondering</think>hello"),
+        ([100, 7, 8], "<think>pondering"),
+        ([9], "hello"),
+    ],
+)
+def test_transformers_generate_maps_thought_channel_to_think_tags(
+    new_tokens: list[int], expected: str
+) -> None:
+    settings = load_settings(CONFIG_PATH)
+    provider = TransformersProvider(
+        settings, model=FakeChannelModel(new_tokens), processor=FakeChannelProcessor()
+    )
+
+    assert provider.generate("hi") == expected
+
+
+def test_thought_channel_never_reaches_visible_response() -> None:
+    from suzka.persona.response_postprocessor import ResponsePostprocessor
+
+    settings = load_settings(CONFIG_PATH)
+    provider = TransformersProvider(
+        settings, model=FakeChannelModel([100, 7, 8, 101, 9]), processor=FakeChannelProcessor()
+    )
+
+    processed = ResponsePostprocessor().process(provider.generate("hi"))
+
+    assert processed.visible_response == "hello"
+    assert processed.hidden_thought == "pondering"
