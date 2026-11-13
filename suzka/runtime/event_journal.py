@@ -1029,6 +1029,15 @@ class EventJournalGateClear:
 
 
 @dataclass(frozen=True, slots=True)
+class _CachedSegment:
+    """In-process record of a parsed, hash-verified segment prefix (not durable)."""
+
+    length: int
+    last_line: bytes
+    records: tuple[EventJournalRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _VerifiedJournal:
     records: tuple[EventJournalRecord, ...]
     processing_high_water: int
@@ -1246,6 +1255,7 @@ class EventJournal:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._append_stage_hook = append_stage_hook
         self._lock = RLock()
+        self._segment_cache: dict[tuple[int, int], _CachedSegment] = {}
         if lease is not None and (lease.path != self.path or not lease.held):
             raise ValueError("EventJournal lease does not match configured path")
         self._lease = (
@@ -2869,8 +2879,10 @@ class EventJournal:
             return ()
         records: list[EventJournalRecord] = []
         previous_tail: str | None = None
+        live_keys: set[tuple[int, int]] = set()
         for segment_index, path in artifacts:
-            segment = self._read_segment(path)
+            segment, key = self._read_verified_segment(path)
+            live_keys.add(key)
             if not segment:
                 raise EventJournalLoadError("EventJournal segment is empty")
             if segment[0].lifecycle is not EventLifecycle.CHECKPOINT:
@@ -2894,23 +2906,55 @@ class EventJournal:
                 raise EventJournalIntegrityError(
                     "EventJournal segment identity is invalid"
                 )
-            for index, record in enumerate(segment):
-                if self._record_hash(record) != record.record_hash:
-                    raise EventJournalIntegrityError(
-                        "EventJournal record hash mismatch"
-                    )
-                if (
-                    index > 0
-                    and record.previous_record_hash != segment[index - 1].record_hash
-                ):
-                    raise EventJournalIntegrityError(
-                        "EventJournal record chain is broken"
-                    )
             records.extend(segment)
             previous_tail = segment[-1].record_hash
+        for stale in set(self._segment_cache) - live_keys:
+            del self._segment_cache[stale]
         return tuple(records)
 
-    def _read_segment(self, path: Path) -> tuple[EventJournalRecord, ...]:
+    def invalidate_verification_cache(self) -> None:
+        """Forget cached segment parses; the next read verifies everything.
+
+        Used by tests and available to diagnostics/repair tooling that wants a
+        full re-verification without restarting the process.
+        """
+        with self._lock:
+            self._segment_cache.clear()
+
+    def _verify_segment_records(
+        self,
+        segment: tuple[EventJournalRecord, ...],
+        previous: EventJournalRecord | None,
+    ) -> None:
+        """Check record hashes and the intra-segment chain of ``segment``."""
+        for index, record in enumerate(segment):
+            if self._record_hash(record) != record.record_hash:
+                raise EventJournalIntegrityError("EventJournal record hash mismatch")
+            predecessor = segment[index - 1] if index > 0 else previous
+            if (
+                predecessor is not None
+                and record.previous_record_hash != predecessor.record_hash
+            ):
+                raise EventJournalIntegrityError("EventJournal record chain is broken")
+
+    def _read_verified_segment(
+        self, path: Path
+    ) -> tuple[tuple[EventJournalRecord, ...], tuple[int, int]]:
+        """Read, parse and hash-verify one segment, reusing a verified prefix.
+
+        Segments are only ever appended to or renamed (rotation), never
+        rewritten in place, so an in-process cache keyed by (dev, inode) is
+        reused when the file has not shrunk and the last verified line is
+        still byte-identical at its verified position; only the appended
+        lines are then parsed and verified.  Any other situation re-reads the
+        whole segment.  The cache is never persisted and a new EventJournal
+        (every process start) verifies everything.
+
+        Threat model: single cooperative writer under the Journal lease.  A
+        same-size in-place rewrite of an earlier verified line that keeps the
+        last line intact is detected only by a full verification (process
+        start or ``invalidate_verification_cache``).
+        """
         read_failure: EventJournalLoadError | None = None
         descriptor: int | None = None
         try:
@@ -2918,11 +2962,22 @@ class EventJournal:
             if not stat.S_ISREG(status.st_mode):
                 raise OSError("journal segment is not regular")
             descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
                 raise OSError("journal segment is not regular")
+            key = (opened.st_dev, opened.st_ino)
+            cached = self._segment_cache.get(key)
             with os.fdopen(descriptor, "rb") as segment_file:
                 descriptor = None
-                raw = segment_file.read()
+                suffix: bytes | None = None
+                if cached is not None and opened.st_size >= cached.length:
+                    segment_file.seek(cached.length - len(cached.last_line))
+                    data = segment_file.read()
+                    if data.startswith(cached.last_line):
+                        suffix = data[len(cached.last_line) :]
+                    else:
+                        segment_file.seek(0)
+                raw = segment_file.read() if suffix is None else b""
         except OSError:
             if descriptor is not None:
                 try:
@@ -2932,9 +2987,31 @@ class EventJournal:
             read_failure = EventJournalLoadError("EventJournal segment cannot be read")
         if read_failure is not None:
             raise read_failure
-        if not raw or not raw.endswith(b"\n"):
-            raise EventJournalLoadError("EventJournal contains a partial record")
+        self._segment_cache.pop(key, None)
+        if suffix is not None:
+            assert cached is not None
+            if suffix and not suffix.endswith(b"\n"):
+                raise EventJournalLoadError("EventJournal contains a partial record")
+            appended = self._parse_segment_bytes(suffix) if suffix else ()
+            self._verify_segment_records(appended, cached.records[-1])
+            records = cached.records + appended
+            length = cached.length + len(suffix)
+            last_line = (
+                suffix.splitlines(keepends=True)[-1] if suffix else cached.last_line
+            )
+        else:
+            if not raw or not raw.endswith(b"\n"):
+                raise EventJournalLoadError("EventJournal contains a partial record")
+            records = self._parse_segment_bytes(raw)
+            self._verify_segment_records(records, None)
+            length = len(raw)
+            last_line = raw.splitlines(keepends=True)[-1]
+        self._segment_cache[key] = _CachedSegment(
+            length=length, last_line=last_line, records=records
+        )
+        return records, key
 
+    def _parse_segment_bytes(self, raw: bytes) -> tuple[EventJournalRecord, ...]:
         records: list[EventJournalRecord] = []
         parse_failure: EventJournalLoadError | None = None
         for line in raw.splitlines():
