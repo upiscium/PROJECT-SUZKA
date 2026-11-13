@@ -1,7 +1,7 @@
 """Deterministic startup and mutation tests for StateRecoveryCoordinator."""
 
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -1682,6 +1682,18 @@ def test_corrupt_journal_never_authorizes_snapshot_or_wal_rewrite(
     assert anchor_path.read_bytes() == anchor_before
 
 
+def _archive_old_segments(journal: EventJournal) -> None:
+    """IP-4a: old records leave the retained range only by compaction.
+
+    (Rotation used to delete segments by count.) Upgrade to v4 at this clean
+    boundary and archive every rotated segment.
+    """
+    journal.append_v3_migration_checkpoint()
+    journal.append_v4_migration_checkpoint()
+    outcome = journal.compact(retention_days=0, now=NOW + timedelta(days=1))
+    assert outcome.performed, outcome.reason
+
+
 def test_boot_anchor_survives_rotation_of_its_original_journal_record(
     tmp_path: Path,
 ) -> None:
@@ -1700,6 +1712,7 @@ def test_boot_anchor_survives_rotation_of_its_original_journal_record(
         item = event(f"rotated-failure-{sequence}", sequence)
         start_event(journal, item)
         journal.append_failed(item, 0, result.snapshot_hash)
+    _archive_old_segments(journal)
 
     assert all(
         record.record_id != str(anchor.journal_tail_record_id)
@@ -1743,6 +1756,7 @@ def test_retained_checkpoint_replaces_old_lifecycle_cross_validation(
         item = event(f"retained-later-{sequence}", sequence)
         start_event(journal, item)
         journal.append_failed(item, 2, store.snapshot_hash(committed))
+    _archive_old_segments(journal)
 
     retained = journal.inspect()
     assert all(record.event_id != failed.event_id for record in retained.records)
@@ -1753,7 +1767,7 @@ def test_retained_checkpoint_replaces_old_lifecycle_cross_validation(
         record
         for record in retained.records
         if record.lifecycle is EventLifecycle.CHECKPOINT
-        and record.schema_version == 2
+        and record.schema_version >= 2
         and record.snapshot_sequence == 2
     )
     transition = wal.inspect().records[-1]

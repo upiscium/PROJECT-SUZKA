@@ -1929,7 +1929,9 @@ def test_v3_rotation_preserves_transaction_authority_before_first_baseline(
 
     value.close()
     rotated = sorted(tmp_path.glob("bounded-v3.jsonl.[0-9]*"))
-    assert len(rotated) == 1
+    # IP-4a (#381 D1 P1-4): rotation never deletes by segment count; old
+    # segments leave only through compaction, so every rotation is retained.
+    assert len(rotated) == 4
     retained_root = EventJournalRecord.model_validate_json(
         rotated[0].read_bytes().splitlines()[0]
     )
@@ -2625,7 +2627,8 @@ def test_u5_rotation_preserves_baseline_and_clear_evidence(
 
     rotated = list(tmp_path.glob("u5-rotation.jsonl.[0-9]*"))
     assert rotated
-    assert len(rotated) + 1 <= value.retained_files
+    # IP-4a: no count-based deletion; the evidence stays retained.
+    assert len(rotated) == 9
     reopened = EventJournal(path, 1, 4, clock=lambda: NOW)
     inspection = reopened.inspect()
     assert inspection.baselines[0].baseline_id == U5_BASELINE_ID
@@ -2662,9 +2665,12 @@ def test_retention_admission_temporarily_blocks_then_recovers_after_rotation(
     value.append_accepted(event("retention-after-rotation", 2))
 
 
-def test_retained_u5_proof_saturates_admission_without_pruning(
+def test_retained_u5_proof_no_longer_saturates_admission(
     tmp_path: Path,
 ) -> None:
+    """IP-4a (#381 D1 P1-4): retained proof used to stop admission for good
+    (``proof_blocked``, the ~340-turn stall). Rotation now continues and the
+    proof stays retained until a compaction archives it."""
     path = tmp_path / "retention-proof.jsonl"
     value = EventJournal(path, 100_000, 2, clock=lambda: NOW)
     generation = str(uuid5(NAMESPACE_URL, "retention-proof-generation"))
@@ -2691,16 +2697,15 @@ def test_retained_u5_proof_saturates_admission_without_pruning(
     saturated = value.admission_status()
     rotated = tuple(tmp_path.glob("retention-proof.jsonl.[0-9]*"))
 
-    assert not saturated.available
-    assert saturated.proof_retention_blocks_safe_pruning
+    assert saturated.available
+    assert not saturated.proof_retention_blocks_safe_pruning
     assert not saturated.lifecycle_blocks_rotation
-    assert saturated.rotated_segment_count == 1
-    assert len(rotated) == 1
+    assert len(rotated) >= 2
     baseline = value.inspect().baselines[0]
     max_bytes = value.max_bytes
     value.close()
 
     reopened = EventJournal(path, max_bytes, 2, clock=lambda: NOW)
-    assert not reopened.admission_status().available
+    assert reopened.admission_status().available
     assert reopened.inspect().baselines == (baseline,)
     assert tuple(tmp_path.glob("retention-proof.jsonl.[0-9]*")) == rotated

@@ -32,10 +32,13 @@ class SemanticReceiptRetentionCoordinator:
         lineage = getattr(inspection, "journal_lineage_id", None)
         processing_high_water = getattr(inspection, "processing_high_water", None)
         records = getattr(inspection, "records", ())
+        # After a compaction the tail may have been archived; the COMPACTION
+        # then carries it verbatim (C8, #381 D1 P0-1).
+        carried = getattr(inspection, "carried_records", ())
         tail_record = next(
             (
                 record
-                for record in records
+                for record in (*records, *carried)
                 if record.record_id == checkpoint.journal_tail_record_id
                 and record.record_hash == checkpoint.journal_tail_record_hash
             ),
@@ -150,6 +153,44 @@ class SemanticReceiptRetentionCoordinator:
             if receipt is not None and receipt.get("operation_digest") != operation_digest:
                 raise SemanticStoreConflict("Semantic receipt proof conflicts")
         self.store.prune_receipts(proofs)
+
+    def carried_tail(self) -> tuple[str, str] | None:
+        """The Journal record the Semantic checkpoint names (C8), if any."""
+
+        checkpoint = self.store.load_checkpoint()
+        if checkpoint is None:
+            return None
+        return checkpoint.journal_tail_record_id, checkpoint.journal_tail_record_hash
+
+    def compaction_blocked(self, archived_high_water: int) -> bool:
+        """Retire receipts first; block if one still needs archived evidence.
+
+        A receipt is retired only from Journal transaction evidence, which a
+        compaction moves to the archive. So receipts for transactions at or
+        below the archived high-water must be gone first (#381 D1 P0-2).
+        """
+
+        try:
+            self.before_prepare()
+            remaining = set(self.store.receipt_transaction_ids())
+        except SemanticStoreError:
+            return True
+        if not remaining:
+            return False
+        inspection = self.journal.inspect()
+        transactions = (
+            *inspection.open_transactions,
+            *inspection.reconciliation_required_transactions,
+            *inspection.completed_transactions,
+            *inspection.reconciled_transactions,
+            *inspection.abort_required_transactions,
+            *inspection.aborted_transactions,
+        )
+        return any(
+            transaction.transaction_id in remaining
+            and transaction.processing_sequence <= archived_high_water
+            for transaction in transactions
+        )
 
     def after_participant_finalized(self) -> None:
         """Best-effort cleanup after the Journal outcome is durable."""

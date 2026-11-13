@@ -203,8 +203,14 @@ def test_health_reports_ok_after_normal_startup(tmp_path: Path) -> None:
 
 
 def test_retention_exhaustion_blocks_mutation_but_keeps_read_only_health(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Admission refusal is side-effect free and keeps read-only health.
+
+    IP-4a removed the count-based trigger (proof retention blocking rotation,
+    the ~340-turn stall); IP-4b adds the hard size limit. The refusal path is
+    exercised here by making rotation impossible on a real oversized Journal.
+    """
     settings = _settings(tmp_path)
     max_bytes: int
     with _client(tmp_path, settings=settings) as client:
@@ -217,9 +223,16 @@ def test_retention_exhaustion_blocks_mutation_but_keeps_read_only_health(
                 "/api/chat", json={"message": message, "attachments": []}
             )
             assert response.status_code == 200
+        monkeypatch.setattr(
+            EventJournal,
+            "_rotation_decision_unlocked",
+            lambda self: (False, False, True),
+        )
+        max_bytes = journal.path.stat().st_size - 1
+        journal.max_bytes = max_bytes
         saturated = journal.admission_status()
         assert not saturated.available
-        assert saturated.proof_retention_blocks_safe_pruning
+        assert saturated.reason == "event_journal_retention_exhausted"
         before_records = journal.records
         before_high_water = journal.inspect().processing_high_water
         before_snapshot = settings.agent_state.path.read_bytes()

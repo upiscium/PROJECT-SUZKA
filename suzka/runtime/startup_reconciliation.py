@@ -307,7 +307,11 @@ class StartupReconciliationCoordinator:
             "recovery snapshot sequence",
         )
         inspection = self.journal.inspect()
-        recovery_record = self._true_rollback_record(inspection.records)
+        # A compaction may have archived the true-rollback completion; it is
+        # then carried verbatim by the latest COMPACTION (#381 D1 P0-1).
+        recovery_record = self._true_rollback_record(
+            (*inspection.carried_records, *inspection.records)
+        )
         if recovery_record is None:
             raise StartupReconciliationError(
                 "External gate has no true rollback completion proof"
@@ -327,6 +331,17 @@ class StartupReconciliationCoordinator:
         ):
             return StartupReconciliationResult(
                 recovery, False, "participant_history_not_provable"
+            )
+        archived = inspection.latest_compaction
+        if (
+            archived is not None
+            and baseline.processing_high_water < archived.archived_processing_high_water
+        ):
+            # Part of the covered range is archived: the aggregate would silently
+            # drop those transactions. Fail closed (IP-4a review P1-3); the
+            # historical path is #376 HISTORICAL.
+            return StartupReconciliationResult(
+                recovery, False, "participant_history_archived"
             )
         transactions = tuple(
             sorted(
