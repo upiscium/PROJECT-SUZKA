@@ -74,6 +74,7 @@ from suzka.runtime.agent_runtime import (
 )
 from suzka.runtime.context import ContextStatus
 from suzka.runtime.event_journal import EventJournal, EventLifecycle
+from suzka.r16.outcomes import R16OwnerReason, owner_reason
 from suzka.runtime.journal_source import (
     JournalSourceReason,
     JournalSourceStage,
@@ -167,10 +168,15 @@ class _PlanPreviewResult:
     decision: DecisionRecord | None
     hold: HoldAssessment | None
     witness: _PlanPolicyWitness | None
+    # IP-5: the owner's closed reason for a HOLD (the U1 HoldAssessment keeps
+    # its own two-valued contract reason and canonical bytes unchanged).
+    owner_reason: R16OwnerReason | None = None
 
     def __post_init__(self) -> None:
         if (self.decision is None) == (self.hold is None):
             raise ValueError("a preview must be either a decision value or HOLD")
+        if (self.hold is None) != (self.owner_reason is None):
+            raise ValueError("exactly a HOLD preview carries an owner reason")
         if (self.decision is None) != (self.witness is None):
             raise ValueError("only qualified positive preview may have policy witness")
 
@@ -339,7 +345,10 @@ class _PlanPreviewOwner:
             or len(goal.revision_history) != 2
             or goal.revision_history[-1].operation is not GoalRevisionOperation.ADOPT
         ):
-            raise _PlanSourceUnavailable("Goal is not first-review adopted")
+            raise _PlanSourceUnavailable(
+                "Goal is not first-review adopted",
+                reason=R16OwnerReason.GOAL_NOT_ADOPTED,
+            )
         self._goal._require_real_proposal_review(goal)
         selection = self._goal._selection_from_goal(goal)
         qualified = self._goal._qualify(selection, event, continuation=True)
@@ -488,7 +497,9 @@ class _PlanPreviewOwner:
         self._check_binding()
         goal = self._loop._goal_system.get(goal_id)
         if goal is None:
-            raise _PlanSourceUnavailable("no source-qualified Goal")
+            raise _PlanSourceUnavailable(
+                "no source-qualified Goal", reason=R16OwnerReason.GOAL_NOT_ADOPTED
+            )
         try:
             q_goal = self._require_adopted_goal(goal, event)
             admission = goal.subject_admission
@@ -689,9 +700,14 @@ class _PlanPreviewOwner:
         return _PlanPreviewResult(decision, None, witness)
 
     @staticmethod
-    def _hold(reason: ReasonCode) -> _PlanPreviewResult:
+    def _hold(
+        reason: ReasonCode, owner: R16OwnerReason = R16OwnerReason.SOURCE_UNAVAILABLE
+    ) -> _PlanPreviewResult:
         return _PlanPreviewResult(
-            None, HoldAssessment(SCHEMA_VERSION, reason, UNCERTAINTY_SCALE), None
+            None,
+            HoldAssessment(SCHEMA_VERSION, reason, UNCERTAINTY_SCALE),
+            None,
+            owner,
         )
 
     def _state_snapshot(
@@ -719,9 +735,11 @@ class _PlanPreviewOwner:
             if after != before or self._state_snapshot() != initial:
                 raise _PlanSourceUnavailable("Plan preview source changed")
         except _PlanSourceConflict:
-            value = self._hold(ReasonCode.CONFLICTING_EVIDENCE)
-        except _PlanSourceUnavailable:
-            value = self._hold(ReasonCode.INSUFFICIENT_EVIDENCE)
+            value = self._hold(
+                ReasonCode.CONFLICTING_EVIDENCE, R16OwnerReason.PLAN_SOURCE_CONFLICT
+            )
+        except _PlanSourceUnavailable as error:
+            value = self._hold(ReasonCode.INSUFFICIENT_EVIDENCE, owner_reason(error))
         self._pending = _PendingPreview(event, value, *initial)
         return value
 

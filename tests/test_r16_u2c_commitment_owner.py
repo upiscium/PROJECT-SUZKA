@@ -13,6 +13,7 @@ import pytest
 import suzka.r16.commitment_owner as commitment_owner_module
 from suzka.motivation.common import R13Reference, R13ReferenceKind
 from suzka.motivation.commitment import CommitmentLifecycle
+from suzka.r16.outcomes import R16OwnerReason, R16OwnerStatus
 from suzka.r16.commitment_owner import (
     _CommitmentSourceOwner,
     _CommitmentSourceSelection,
@@ -23,7 +24,6 @@ from suzka.memory.experience_participant import experience_id_for_event
 from suzka.runtime.agent_runtime import (
     AgentEventSource,
     AgentEventType,
-    AgentRuntimeExecutionError,
 )
 from suzka.runtime.chat_context import ChatContextSelectors
 from suzka.runtime.context import ContextStatus
@@ -91,7 +91,8 @@ def test_real_source_separate_responsibility_accept_recovery_and_no_goal_adoptio
         calls = state.model_provider.calls
         selected = _selector(p, x)
         proposal = owner._submit_proposal(selected).result(timeout=30)
-        commitment_id = proposal.value
+        assert proposal.value.status is R16OwnerStatus.PROPOSED
+        commitment_id = proposal.value.subject_id
         commitment = state.main_loop._commitment_system.get(commitment_id)
         assert commitment is not None
         assert commitment.lifecycle is CommitmentLifecycle.PROPOSED
@@ -120,7 +121,7 @@ def test_real_source_separate_responsibility_accept_recovery_and_no_goal_adoptio
         assert state.main_loop.export_goal_state() == previous_goals
         assert state.model_provider.calls == calls
         review = owner._submit_review(commitment_id).result(timeout=30)
-        assert review.value == "accepted"
+        assert review.value.status is R16OwnerStatus.ACCEPTED
         accepted = state.main_loop._commitment_system.get(commitment_id)
         assert accepted is not None and accepted.lifecycle is CommitmentLifecycle.ACTIVE
         assert accepted.subject_admission is not None
@@ -145,7 +146,7 @@ def test_real_source_separate_responsibility_accept_recovery_and_no_goal_adoptio
         result = state._commitment_source_owner._submit_review(commitment_id).result(
             timeout=30
         )
-        assert result.value == "hold"
+        assert result.value.status is R16OwnerStatus.HOLD
         assert state.main_loop._commitment_system.get(commitment_id) == accepted
         assert state.model_provider.calls == calls
 
@@ -184,10 +185,16 @@ def test_wrong_or_unqualified_source_fails_closed_without_commitment(app, case):
         else:
             target = x
         snapshot = state.main_loop.export_commitment_state()
-        with pytest.raises(AgentRuntimeExecutionError):
-            state._commitment_source_owner._submit_proposal(
-                _selector(p, target)
-            ).result(timeout=30)
+        # IP-5: a HOLD with a closed reason, not a FAILED event.
+        held = state._commitment_source_owner._submit_proposal(
+            _selector(p, target)
+        ).result(timeout=30)
+        assert held.value.status is R16OwnerStatus.HOLD
+        assert held.value.reason is (
+            R16OwnerReason.MOTIVATION_UNAVAILABLE
+            if case == "missing_motivation"
+            else R16OwnerReason.SOURCE_UNAVAILABLE
+        )
         assert state.main_loop.export_commitment_state() == snapshot
         assert state._commitment_source_owner._pending is None
 
@@ -224,7 +231,7 @@ def test_pre_deadline_queued_review_holds_when_runtime_clock_has_expired(
         state = client.app.state
         x, _, p = _sources(state)
         owner = state._commitment_source_owner
-        cid = owner._submit_proposal(_selector(p, x)).result(timeout=30).value
+        cid = owner._submit_proposal(_selector(p, x)).result(timeout=30).value.subject_id
         initial = state.main_loop.export_commitment_state()
         due = state.main_loop._commitment_system.get(cid).deadline.at
         assert due is not None
@@ -238,7 +245,7 @@ def test_pre_deadline_queued_review_holds_when_runtime_clock_has_expired(
             )
             outcome = owner._submit_review(cid).result(timeout=30)
         assert outcome.event.requested_at < due
-        assert outcome.value == "hold"
+        assert outcome.value.status is R16OwnerStatus.HOLD
         assert state.main_loop.export_commitment_state() == initial
         assert state.main_loop._commitment_system.get(cid).lifecycle is (
             CommitmentLifecycle.PROPOSED
@@ -251,7 +258,7 @@ def test_deadline_crosses_between_subject_review_and_pre_wal(app, monkeypatch):
         state = client.app.state
         x, _, p = _sources(state)
         owner = state._commitment_source_owner
-        cid = owner._submit_proposal(_selector(p, x)).result(timeout=30).value
+        cid = owner._submit_proposal(_selector(p, x)).result(timeout=30).value.subject_id
         initial = state.main_loop.export_commitment_state()
         due = state.main_loop._commitment_system.get(cid).deadline.at
         assert due is not None
@@ -280,7 +287,7 @@ def test_review_holds_on_current_context_loss(app, monkeypatch):
         state = client.app.state
         x, _, p = _sources(state)
         owner = state._commitment_source_owner
-        cid = owner._submit_proposal(_selector(p, x)).result(timeout=30).value
+        cid = owner._submit_proposal(_selector(p, x)).result(timeout=30).value.subject_id
         snapshot = state.main_loop.export_commitment_state()
         context = state.main_loop.context_registry
         get_context = context.get
@@ -291,7 +298,7 @@ def test_review_holds_on_current_context_loss(app, monkeypatch):
                 lambda key: replace(get_context(key), status=ContextStatus.SUSPENDED),
             )
             outcome = owner._submit_review(cid).result(timeout=30)
-            assert outcome.value == "hold"
+            assert outcome.value.status is R16OwnerStatus.HOLD
         assert state.main_loop.export_commitment_state() == snapshot
         assert owner._pending is None
 
@@ -301,11 +308,13 @@ def test_same_experience_cannot_create_second_responsibility(app):
         state = client.app.state
         x, _, p = _sources(state)
         owner = state._commitment_source_owner
-        cid = owner._submit_proposal(_selector(p, x)).result(timeout=30).value
+        cid = owner._submit_proposal(_selector(p, x)).result(timeout=30).value.subject_id
         before = state.main_loop.export_commitment_state()
         p2 = _chat(state, f"COMMIT_REVIEW_EXPERIENCE:1:{_experience_id(x)}")
-        with pytest.raises(AgentRuntimeExecutionError):
-            owner._submit_proposal(_selector(p2, x)).result(timeout=30)
+        # IP-5: HOLD(COMMITMENT_ALREADY_EXISTS), not a FAILED event.
+        held = owner._submit_proposal(_selector(p2, x)).result(timeout=30)
+        assert held.value.status is R16OwnerStatus.HOLD
+        assert held.value.reason is R16OwnerReason.COMMITMENT_ALREADY_EXISTS
         assert state.main_loop.export_commitment_state() == before
         assert state.main_loop._commitment_system.get(cid) is not None
 

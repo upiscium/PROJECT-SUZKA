@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from suzka.motivation.goal import GoalLifecycle
+from suzka.r16.outcomes import R16OwnerStatus
 from suzka.r16.commitment_owner import _CommitmentSourceSelection
 from suzka.r16.contracts import (
     CandidateKind,
@@ -51,9 +52,9 @@ def _qualified_goal(state, *, adopt: bool = True):
     owner = state._goal_source_owner
     proposed = owner._submit_proposal(_GoalSourceSelection(p, x)).result(timeout=30)
     if adopt:
-        adopted = owner._submit_review(proposed.value).result(timeout=30)
-        assert adopted.value == "adopted"
-    return x, proposed.value
+        adopted = owner._submit_review(proposed.value.subject_id).result(timeout=30)
+        assert adopted.value.status is R16OwnerStatus.ADOPTED
+    return x, proposed.value.subject_id
 
 
 def _qualified_commitment(state, x):
@@ -62,9 +63,9 @@ def _qualified_commitment(state, x):
     proposal = owner._submit_proposal(_CommitmentSourceSelection(p, x)).result(
         timeout=30
     )
-    accepted = owner._submit_review(proposal.value).result(timeout=30)
-    assert accepted.value == "accepted"
-    return proposal.value
+    accepted = owner._submit_review(proposal.value.subject_id).result(timeout=30)
+    assert accepted.value.status is R16OwnerStatus.ACCEPTED
+    return proposal.value.subject_id
 
 
 @pytest.mark.parametrize("with_commitment", (False, True))

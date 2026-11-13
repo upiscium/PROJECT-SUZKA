@@ -8,6 +8,7 @@ import pytest
 from suzka.memory.experience_participant import experience_id_for_event
 from suzka.motivation.common import R13ReferenceKind
 from suzka.motivation.goal import GoalLifecycle
+from suzka.r16.outcomes import R16OwnerReason, R16OwnerStatus
 from suzka.r16.goal_owner import (
     _GoalSourceOwner,
     _GoalSourceSelection,
@@ -17,7 +18,6 @@ from suzka.r16.source_owner import _MotivationSourceRef
 from suzka.runtime.agent_runtime import (
     AgentEventSource,
     AgentEventType,
-    AgentRuntimeExecutionError,
 )
 from suzka.runtime.context import ContextStatus
 
@@ -91,7 +91,8 @@ def test_real_serialized_proposal_adoption_persisted_without_cognition_replay(ap
         proposed = state._goal_source_owner._submit_proposal(selection).result(
             timeout=30
         )
-        goal_id = proposed.value
+        assert proposed.value.status is R16OwnerStatus.PROPOSED
+        goal_id = proposed.value.subject_id
         first_goal = state.main_loop._goal_system.get(goal_id)
         assert first_goal is not None
         assert first_goal.lifecycle is GoalLifecycle.PROPOSED
@@ -116,7 +117,7 @@ def test_real_serialized_proposal_adoption_persisted_without_cognition_replay(ap
         assert state.model_provider.calls == model_calls
         assert state.main_loop.export_commitment_state() == before_commitments
         review = state._goal_source_owner._submit_review(goal_id).result(timeout=30)
-        assert review.value == "adopted"
+        assert review.value.status is R16OwnerStatus.ADOPTED
         adopted = state.main_loop._goal_system.get(goal_id)
         assert adopted is not None and adopted.lifecycle is GoalLifecycle.ADOPTED
         assert adopted.subject_admission is not None
@@ -136,7 +137,7 @@ def test_real_serialized_proposal_adoption_persisted_without_cognition_replay(ap
         assert state._goal_source_owner._pending is None
         model_calls = state.model_provider.calls
         replay = state._goal_source_owner._submit_review(goal_id).result(timeout=30)
-        assert replay.value == "hold"
+        assert replay.value.status is R16OwnerStatus.HOLD
         assert state.main_loop._goal_system.get(goal_id) == adopted
         assert state.model_provider.calls == model_calls
 
@@ -159,8 +160,16 @@ def test_source_unqualified_fails_before_proposal(app, case):
             other = chat(state, "unrelated separate target")
             selector = _GoalSourceSelection(p, other)
         before = state.main_loop.export_goal_state()
-        with pytest.raises(AgentRuntimeExecutionError):
-            state._goal_source_owner._submit_proposal(selector).result(timeout=30)
+        # IP-5: an unqualified proposal is a HOLD with a closed reason, not a
+        # FAILED event (was: AgentRuntimeExecutionError).
+        held = state._goal_source_owner._submit_proposal(selector).result(timeout=30)
+        assert held.value.status is R16OwnerStatus.HOLD
+        assert held.value.reason is {
+            "no_motivation": R16OwnerReason.MOTIVATION_UNAVAILABLE,
+            "bad_grammar": R16OwnerReason.SOURCE_UNAVAILABLE,
+            "wrong_target": R16OwnerReason.SOURCE_UNAVAILABLE,
+        }[case]
+        assert held.value.subject_id is None
         assert state.main_loop.export_goal_state() == before
         assert state._goal_source_owner._pending is None
 
@@ -172,7 +181,7 @@ def test_independent_review_holds_after_source_context_loss(app, monkeypatch):
         goal_id = (
             state._goal_source_owner._submit_proposal(_GoalSourceSelection(p, x))
             .result(timeout=30)
-            .value
+            .value.subject_id
         )
         goal = state.main_loop._goal_system.get(goal_id)
         registry = state.main_loop.context_registry
@@ -184,7 +193,7 @@ def test_independent_review_holds_after_source_context_loss(app, monkeypatch):
                 lambda key: replace(original(key), status=ContextStatus.SUSPENDED),
             )
             result = state._goal_source_owner._submit_review(goal_id).result(timeout=30)
-            assert result.value == "hold"
+            assert result.value.status is R16OwnerStatus.HOLD
         assert state.main_loop._goal_system.get(goal_id) == goal
         assert state._goal_source_owner._pending is None
 

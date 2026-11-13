@@ -70,16 +70,18 @@ def locate_journal_source(
 
 
 class SourceUnavailable(ValueError):
-    """Base of the owners' coarse refusals; may carry a closed reason."""
+    """Base of the owners' coarse refusals; may carry a closed reason.
 
-    def __init__(
-        self, message: str = "", *, reason: JournalSourceReason | None = None
-    ) -> None:
+    The reason is a closed enum value: ``JournalSourceReason`` here, or an
+    owner's own vocabulary (``suzka.r16.outcomes.R16OwnerReason``).
+    """
+
+    def __init__(self, message: str = "", *, reason: Enum | None = None) -> None:
         super().__init__(message)
         self.reason = reason
 
 
-def reason_of(error: BaseException) -> JournalSourceReason | None:
+def reason_of(error: BaseException) -> Enum | None:
     """Carry a refusal reason across an owner's wrapping refusal."""
 
     return error.reason if isinstance(error, SourceUnavailable) else None

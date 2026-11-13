@@ -21,6 +21,7 @@ from suzka.r15.qualified_proposal import (
     QualifiedProposalUnavailable,
     QualifiedTurnRef,
 )
+from suzka.r16.outcomes import R16OwnerStatus
 from suzka.r16.commitment_owner import _CommitmentSourceSelection
 from suzka.r16.goal_owner import _GoalSourceSelection, _GoalSourceUnavailable
 from suzka.r16.source_owner import _MotivationSourceRef, _MotivationSourceUnavailable
@@ -109,10 +110,10 @@ def test_adopted_goal_continues_after_its_sources_are_archived(
         proposed = owner._submit_proposal(_GoalSourceSelection(p, x)).result(
             timeout=30
         )
-        assert owner._submit_review(proposed.value).result(timeout=30).value == (
-            "adopted"
+        assert owner._submit_review(proposed.value.subject_id).result(timeout=30).value.status is (
+            R16OwnerStatus.ADOPTED
         )
-        goal = state.main_loop._goal_system.get(proposed.value)
+        goal = state.main_loop._goal_system.get(proposed.value.subject_id)
         admission = goal.subject_admission
         late = [admission]
         if with_commitment:
@@ -121,9 +122,9 @@ def test_adopted_goal_continues_after_its_sources_are_archived(
             proposal = commitments._submit_proposal(
                 _CommitmentSourceSelection(request, x)
             ).result(timeout=30)
-            accepted = commitments._submit_review(proposal.value).result(timeout=30)
-            assert accepted.value == "accepted"
-            record = state.main_loop._commitment_system.get(proposal.value)
+            accepted = commitments._submit_review(proposal.value.subject_id).result(timeout=30)
+            assert accepted.value.status is R16OwnerStatus.ACCEPTED
+            record = state.main_loop._commitment_system.get(proposal.value.subject_id)
             late.append(record.subject_admission)
             _archive(state, request)
         _archive(state, x, p)
@@ -138,7 +139,7 @@ def test_adopted_goal_continues_after_its_sources_are_archived(
         assert inspection.latest_compaction is not None
         assert not any(row.event_id == p.event_id for row in inspection.records)
 
-        preview = state._plan_preview_owner._submit_preview(proposed.value).result(
+        preview = state._plan_preview_owner._submit_preview(proposed.value.subject_id).result(
             timeout=30
         )
         assert preview.value.hold is None
@@ -159,15 +160,15 @@ def test_proposed_goal_is_adopted_after_its_sources_are_archived(app) -> None:
         proposed = owner._submit_proposal(_GoalSourceSelection(p, x)).result(
             timeout=30
         )
-        genesis = state.main_loop._goal_system.get(proposed.value).revision_history[0]
+        genesis = state.main_loop._goal_system.get(proposed.value.subject_id).revision_history[0]
         _archive(
             state,
             x,
             p,
             _MotivationSourceRef(genesis.event_id, genesis.event_sequence, x.episode_id),
         )
-        assert owner._submit_review(proposed.value).result(timeout=30).value == (
-            "adopted"
+        assert owner._submit_review(proposed.value.subject_id).result(timeout=30).value.status is (
+            R16OwnerStatus.ADOPTED
         )
 
 
@@ -184,7 +185,7 @@ def test_archived_request_sequence_probe_is_bounded(app, monkeypatch) -> None:
         proposed = owner._submit_proposal(_GoalSourceSelection(p, x)).result(
             timeout=30
         )
-        genesis = state.main_loop._goal_system.get(proposed.value).revision_history[0]
+        genesis = state.main_loop._goal_system.get(proposed.value.subject_id).revision_history[0]
         _archive(state, x, p)
         source = state._motivation_source_owner
         assert source._archived_source_sequence(
@@ -198,7 +199,7 @@ def test_archived_request_sequence_probe_is_bounded(app, monkeypatch) -> None:
             )
         assert refused.value.reason is JournalSourceReason.SOURCE_MISSING
         # The adoption review then holds instead of adopting.
-        assert owner._submit_review(proposed.value).result(timeout=30).value == "hold"
+        assert owner._submit_review(proposed.value.subject_id).result(timeout=30).value.status is R16OwnerStatus.HOLD
 
 
 def test_new_source_past_retention_is_refused_with_its_own_reason(app) -> None:
