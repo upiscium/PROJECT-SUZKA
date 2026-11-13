@@ -254,5 +254,239 @@ def test_random_appends_and_rotations_match_fresh_verification(
         with value._lock:
             fresh = observer._read_records_unlocked()
         assert cached == fresh
+        assert value._verify_records(cached) == _fresh_verification(fresh)
     assert sorted(tmp_path.glob("events.jsonl.[0-9]*"))
     value.close()
+
+
+# --- IP-2b: resumable _verify_records state -------------------------------
+
+
+def _fresh_verification(records):  # type: ignore[no-untyped-def]
+    """The reference: a full verification with no cached verifier state."""
+    return EventJournal._verify_records_from(records, None)[0]
+
+
+def _outcome(call):  # type: ignore[no-untyped-def]
+    try:
+        return ("ok", call())
+    except EventJournalIntegrityError as error:
+        return ("error", str(error))
+
+
+def _observer(value: EventJournal) -> EventJournal:
+    observer = EventJournal.__new__(EventJournal)
+    observer._lock = value._lock
+    observer._verifier_state = None
+    return observer
+
+
+def _transaction_journal(path: Path) -> EventJournal:
+    from tests.test_event_journal import (
+        HASH_2,
+        PARTICIPANTS,
+        TX_ID,
+        bootstrap_v3,
+        prepared_transaction,
+    )
+    from suzka.runtime.event_journal import ParticipantOutcome
+
+    value = bootstrap_v3(path)
+    item = prepared_transaction(value)
+    value.append_participant_finalized(
+        item, TX_ID, PARTICIPANTS[0], HASH_1, ParticipantOutcome.FINALIZED
+    )
+    value.append_participant_finalized(
+        item, TX_ID, PARTICIPANTS[1], HASH_2, ParticipantOutcome.ALREADY_CONSISTENT
+    )
+    value.append_transaction_completed(item, TX_ID)
+    anchor = value.records[0]
+    value.append_completed(
+        item,
+        1,
+        HASH_1,
+        anchor.wal_generation_id,
+        anchor.wal_record_id,
+        anchor.wal_record_hash,
+    )
+    return value
+
+
+def _gate_clear_journal(path: Path) -> EventJournal:
+    from tests.test_event_journal import (
+        append_u5_clear,
+        append_u5_reconciliation,
+        startup_reconciliation_journal,
+    )
+
+    value = startup_reconciliation_journal(path)
+    append_u5_reconciliation(value)
+    append_u5_clear(value)
+    append_u5_clear(value, terminal=True)
+    return value
+
+
+@pytest.mark.parametrize(
+    "build", [_transaction_journal, _gate_clear_journal], ids=["tx", "gate"]
+)
+def test_every_prefix_matches_fresh_verification(tmp_path: Path, build) -> None:  # type: ignore[no-untyped-def]
+    """Walk prefixes in order, then backwards: each result equals a full one."""
+    value = build(tmp_path / "events.jsonl")
+    records = value.records
+    observer = _observer(value)
+    count = len(records)
+    order = [*range(1, count + 1), *range(count, 0, -1), *range(1, count + 1, 3)]
+    order += [*range(2, count + 1, 4), count]
+    for length in order:
+        prefix = records[:length]
+        cached = _outcome(lambda: observer._verify_records(prefix))
+        assert cached == _outcome(lambda: _fresh_verification(prefix)), length
+    value.close()
+
+
+def test_verifier_processes_only_the_new_suffix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "events.jsonl"
+    value = _journal(path)
+    value.verify_and_reconcile(0, HASH_0)
+    _populate(value, 1, 5)
+    value._verify_records(value.records)
+    started: list[int] = []
+    original = EventJournal._initial_verifier_state
+
+    def counting(records):  # type: ignore[no-untyped-def]
+        started.append(len(records))
+        return original(records)
+
+    monkeypatch.setattr(EventJournal, "_initial_verifier_state", staticmethod(counting))
+    _populate(value, 6, 3)
+    result = value._verify_records(value.records)
+    assert started == []
+    assert result == _fresh_verification(value.records)
+    value.close()
+
+
+def test_rejected_candidate_clears_verifier_state(tmp_path: Path) -> None:
+    """A candidate that advances the state before failing must not leak it."""
+    path = tmp_path / "events.jsonl"
+    value = _journal(path)
+    value.verify_and_reconcile(0, HASH_0)
+    _populate(value, 1, 2)
+    _populate(value, 3, 1)
+    complete = value.records
+    records = complete[:-1]
+    real_next = complete[-1]
+    value._verify_records(records)
+    # A fresh record id passes the duplicate check (and is added to the seen
+    # ids) before the lifecycle check rejects a second completion.
+    bad = records[-1].model_copy(update={"record_id": real_next.record_id})
+    with pytest.raises(EventJournalIntegrityError):
+        value._verify_records((*records, bad))
+    assert value._verifier_state is None
+    assert value._verify_records(records) == _fresh_verification(records)
+    assert value._verify_records((*records, real_next)) == _fresh_verification(complete)
+    value.close()
+
+
+def test_shorter_or_divergent_input_never_reuses_a_longer_state(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    value = _journal(path)
+    value.verify_and_reconcile(0, HASH_0)
+    _populate(value, 1, 3)
+    records = value.records
+    full = value._verify_records(records)
+    shorter = records[:-2]
+    assert value._verify_records(shorter) == _fresh_verification(shorter)
+    assert value._verify_records(shorter) != full
+    divergent = (*records[:-1], records[-1].model_copy(update={"record_id": "x"}))
+    assert _outcome(lambda: value._verify_records(divergent)) == _outcome(
+        lambda: _fresh_verification(divergent)
+    )
+    value.close()
+
+
+def test_earlier_results_are_not_mutated_by_later_verification(
+    tmp_path: Path,
+) -> None:
+    value = _transaction_journal(tmp_path / "events.jsonl")
+    records = value.records
+    observer = _observer(value)
+    early = observer._verify_records(records[:-2])
+    snapshot = _fresh_verification(records[:-2])
+    observer._verify_records(records)
+    assert early == snapshot
+    value.close()
+
+
+def test_invalidation_also_drops_verifier_state(tmp_path: Path) -> None:
+    path = tmp_path / "events.jsonl"
+    value = _journal(path)
+    value.verify_and_reconcile(0, HASH_0)
+    _populate(value, 1, 2)
+    value._verify_records(value.records)
+    assert value._verifier_state is not None
+    value.invalidate_verification_cache()
+    assert value._verifier_state is None
+    value.close()
+
+
+def test_every_carried_scalar_is_saved_back_to_the_verifier_state() -> None:
+    """Structural guard: a scalar loaded from the state and reassigned in the
+    loop must be written back, or a later resumed call would see a stale value
+    (a missed save is not always observable through ordinary journals)."""
+    import ast
+    import inspect
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(EventJournal._verify_records_from))
+    function = ast.parse(source).body[0]
+    assert isinstance(function, ast.FunctionDef)
+    loaded: set[str] = set()
+    saved: set[str] = set()
+    loop: ast.For | None = None
+    for node in function.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Attribute)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "verifier"
+            and node.targets[0].id == node.value.attr
+        ):
+            loaded.add(node.targets[0].id)
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Attribute)
+            and isinstance(node.targets[0].value, ast.Name)
+            and node.targets[0].value.id == "verifier"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == node.targets[0].attr
+        ):
+            saved.add(node.targets[0].attr)
+        if (
+            isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Name)
+            and node.iter.func.id == "range"
+        ):
+            loop = node
+    assert loop is not None
+    reassigned = {
+        target.id
+        for statement in ast.walk(loop)
+        if isinstance(statement, (ast.Assign, ast.AugAssign, ast.AnnAssign))
+        for target in (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else [statement.target]
+        )
+        if isinstance(target, ast.Name)
+    }
+    carried = loaded & reassigned
+    assert carried, "the loop must carry scalar state"
+    assert carried <= saved, sorted(carried - saved)
