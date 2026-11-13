@@ -97,12 +97,15 @@ def _at_band(
 def test_soft_band_allow_list_matches_the_design_table() -> None:
     """#381 D2 P1-4: 13 cognitive types admitted, the other 3 refused."""
     refused = set(AgentEventType) - SOFT_BAND_ADMITTED_EVENT_TYPES
+    # Types added after the table (IP-6: the operator's R16 driver
+    # activation) are refused by default, as #381 D2 P1-4 requires.
     assert refused == {
         AgentEventType.DEBUG_CHAT,
         AgentEventType.ADAPTER_EVALUATE,
         AgentEventType.ADAPTER_UPDATE,
+        AgentEventType.R16_DRIVER_ACTIVATION,
     }
-    assert len(AgentEventType) == 16
+    assert len(AgentEventType) == 17
     assert SOFT_BAND_ADMITTED_EVENT_TYPES <= set(AgentEventType)
 
 

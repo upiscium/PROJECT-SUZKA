@@ -452,7 +452,13 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
         )
         assert response.status_code == 200
         data = response.json()
-        assert set(data) == {"episode_id", "response", "emotion", "model"}
+        assert set(data) == {
+            "episode_id",
+            "response",
+            "emotion",
+            "model",
+            "experience_id",
+        }
         assert data["response"] == "Visible API answer."
         assert "hidden_thought" not in data
         assert "prompt" not in data

@@ -7,6 +7,7 @@ from fastapi import HTTPException, status
 
 from suzka.identity import ValueDomainError, ValueNotFound
 from suzka.runtime import (
+    AgentEventOutcome,
     AgentEventSource,
     AgentEventType,
     AgentRuntime,
@@ -53,8 +54,23 @@ def execute(
 ) -> object:
     """Submit one request handler, translating only runtime-boundary failures."""
 
+    return execute_with_event(runtime, event_type, source, handler).value
+
+
+def execute_with_event(
+    runtime: AgentRuntime,
+    event_type: AgentEventType,
+    source: AgentEventSource,
+    handler: Callable[[], object],
+) -> AgentEventOutcome[object]:
+    """Like ``execute``, but also return the admitted event (#370 D0 §1).
+
+    The R16 driver needs the CHAT event's id and processing sequence to
+    name the turn as a source; the HTTP error mapping is identical.
+    """
+
     try:
-        return runtime.submit(event_type, source, handler).result().value
+        return runtime.submit(event_type, source, handler).result()
     except (
         AgentRuntimeAdmissionBlocked,
         AgentRuntimeQueueFull,

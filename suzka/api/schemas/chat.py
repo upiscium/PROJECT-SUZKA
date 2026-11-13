@@ -47,3 +47,6 @@ class ChatResponse(BaseModel):
     response: str
     emotion: EmotionSchema
     model: ModelSchema
+    # DRV-3 (#370): the turn's Experience, so the Chat screen can offer
+    # "review this" / "commit to review this"; None when none was created.
+    experience_id: str | None = None

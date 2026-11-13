@@ -31,6 +31,8 @@ class AgentEventType(str, Enum):
     COMMITMENT_PROPOSAL_REVIEW = "commitment_proposal_review"
     COMMITMENT_ACCEPTANCE_REVIEW = "commitment_acceptance_review"
     PLAN_PREVIEW_REVIEW = "plan_preview_review"
+    # #370 D0 §6 / IP-6: the operator's one-time, unique R16 driver activation.
+    R16_DRIVER_ACTIVATION = "r16_driver_activation"
 
 
 class AgentEventSource(str, Enum):
@@ -62,6 +64,7 @@ class AgentEventSource(str, Enum):
     RUNTIME_COMMITMENT_PROPOSAL_REVIEW = "runtime.commitment_proposal_review"
     RUNTIME_COMMITMENT_ACCEPTANCE_REVIEW = "runtime.commitment_acceptance_review"
     RUNTIME_PLAN_PREVIEW_REVIEW = "runtime.plan_preview_review"
+    API_R16_DRIVER_ACTIVATE = "api.r16.driver.activate"
 
 
 class AgentRuntimeStatus(str, Enum):
@@ -223,6 +226,16 @@ class AgentRuntime:
     def status(self) -> AgentRuntimeStatus:
         with self._condition:
             return self._status
+
+    def pending_count(self) -> int:
+        """Admitted events waiting for the worker; read-only (#370 D1 E).
+
+        The R16 driver uses this only to defer U2a while other work is
+        queued. It never changes runtime state.
+        """
+
+        with self._condition:
+            return len(self._pending)
 
     def current_event(self) -> AgentEvent | None:
         """Return the event only while its handler runs on the worker thread."""

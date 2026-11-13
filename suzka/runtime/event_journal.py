@@ -17,15 +17,17 @@ from pathlib import Path
 import re
 import stat
 from threading import RLock
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     ValidationError,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -251,6 +253,20 @@ class EventJournalCompaction(_JournalModel):
     true_rollback_completed_record: EventJournalRecord | None = None
     true_rollback_cleared_record: EventJournalRecord | None = None
     carried_tail_record: EventJournalRecord | None = None
+    # C9 (IP-6, Human decision 2026-11-13): the R16 driver activation, a
+    # unique operator event, so the driver stays active once it is archived.
+    # Omitted from serialization when absent, so COMPACTION records written
+    # before C9 keep their exact bytes and hashes.
+    driver_activation_record: EventJournalRecord | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_activation(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        data = cast(dict[str, object], handler(self))
+        if self.driver_activation_record is None:
+            data.pop("driver_activation_record", None)
+        return data
 
     @model_validator(mode="after")
     def validate_compaction(self) -> EventJournalCompaction:
@@ -308,6 +324,12 @@ class EventJournalCompaction(_JournalModel):
             self.true_rollback_cleared_record is None
         ):
             raise ValueError("compaction true-rollback pair is incomplete")
+        if self.driver_activation_record is not None and (
+            self.driver_activation_record.lifecycle is not EventLifecycle.COMPLETED
+            or self.driver_activation_record.event_type
+            is not AgentEventType.R16_DRIVER_ACTIVATION
+        ):
+            raise ValueError("compaction carried activation is invalid")
         for carried in self.carried_records:
             if carried.lifecycle is EventLifecycle.COMPACTION:
                 raise ValueError("compaction cannot carry a compaction")
@@ -322,6 +344,7 @@ class EventJournalCompaction(_JournalModel):
                 self.true_rollback_completed_record,
                 self.true_rollback_cleared_record,
                 self.carried_tail_record,
+                self.driver_activation_record,
             )
             if record is not None
         )
@@ -2268,6 +2291,9 @@ class EventJournal:
                 true_rollback_completed_record=rollback,
                 true_rollback_cleared_record=cleared,
                 carried_tail_record=tail_record,
+                driver_activation_record=self._declared_activation_at(
+                    records, archived_count, injected
+                ),
             )
             try:
                 record = self._make_record(
@@ -5717,6 +5743,32 @@ class EventJournal:
         return baseline, rollback, cleared
 
     @staticmethod
+    def _declared_activation_at(
+        records: tuple[EventJournalRecord, ...],
+        boundary: int,
+        injected: EventJournalRecord | None,
+    ) -> EventJournalRecord | None:
+        """The R16 driver activation to carry at ``records[boundary]`` (C9).
+
+        The latest completed activation in the archived range, or else the
+        one the compaction in effect already carries.
+        """
+        prior = (
+            ()
+            if injected is None or injected.compaction is None
+            else injected.compaction.carried_records
+        )
+        return next(
+            (
+                record
+                for record in (*reversed(records[:boundary]), *prior)
+                if record.lifecycle is EventLifecycle.COMPLETED
+                and record.event_type is AgentEventType.R16_DRIVER_ACTIVATION
+            ),
+            None,
+        )
+
+    @staticmethod
     def _verify_declared_compaction(
         records: tuple[EventJournalRecord, ...],
         boundary: int,
@@ -5750,6 +5802,10 @@ class EventJournal:
             or declared.true_rollback_cleared_record != cleared
         ):
             raise EventJournalIntegrityError("compaction declared state is invalid")
+        if declared.driver_activation_record != EventJournal._declared_activation_at(
+            records, boundary, injected
+        ):
+            raise EventJournalIntegrityError("compaction carried activation is invalid")
         tail = declared.carried_tail_record
         prior = (
             ()

@@ -13,7 +13,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from suzka.api.routes import adapters, chat, contexts, debug, memory, sleep, values
+from suzka.api.routes import (
+    adapters,
+    chat,
+    contexts,
+    debug,
+    memory,
+    r16,
+    sleep,
+    values,
+)
 from suzka.api.context_read_model import (
     CommittedContextReadModel,
     PublishedContextView,
@@ -902,6 +911,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(sleep.router)
     app.include_router(adapters.router)
     app.include_router(values.router)
+    app.include_router(r16.router)
 
     return app
 

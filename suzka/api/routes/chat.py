@@ -57,4 +57,5 @@ def chat_response_from_result(result: ChatResult) -> ChatResponse:
             optimal_loss=result.optimal_loss,
         ),
         model=ModelSchema(model_id=result.model_id, adapter_id=result.adapter_id),
+        experience_id=result.experience_id,
     )
