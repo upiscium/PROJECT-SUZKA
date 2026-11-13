@@ -2,7 +2,6 @@
 
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-import os
 from pathlib import Path
 from typing import cast
 
@@ -1000,10 +999,10 @@ def _open_subject_history(
         path = Path.cwd() / path
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        directory = Path(os.path.realpath(path.parent))
+        # No realpath: the store refuses a symlinked parent itself (P2-2).
         return open_or_create_store(
             journal,
-            directory / path.name,
+            path.parent.absolute() / path.name,
             subject_id=app_settings.project.name,
             max_page_count=settings.max_page_count,
         )

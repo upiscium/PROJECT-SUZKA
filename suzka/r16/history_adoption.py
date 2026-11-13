@@ -157,11 +157,23 @@ def open_or_create_store(
         raise HistoryAdoptionError("Journal lineage is unavailable")
     adopted = adopted_history_baseline(inspection)
     try:
-        return SubjectHistoryStore.open(path, max_page_count=max_page_count)
+        store = SubjectHistoryStore.open(path, max_page_count=max_page_count)
     except HistoryStoreUnavailable as error:
         if adopted is not None or path.exists() or path.is_symlink():
             # After adoption a missing store is lost authority, never recreated.
             raise HistoryAdoptionError("SubjectHistory store is unavailable") from error
+    except (HistoryStoreConflict, HistoryStoreCorrupt) as error:
+        raise HistoryAdoptionError("SubjectHistory store is not trusted") from error
+    else:
+        try:
+            if store.meta().subject_id != subject_id:
+                raise HistoryAdoptionError("SubjectHistory store belongs to another subject")
+            if adopted is None:
+                require_adoptable(store, inspection)
+        except BaseException:
+            store.close()
+            raise
+        return store
     try:
         return SubjectHistoryStore.create(
             path,
@@ -171,6 +183,25 @@ def open_or_create_store(
         )
     except (HistoryStoreConflict, HistoryStoreCorrupt, HistoryStoreUnavailable) as error:
         raise HistoryAdoptionError("SubjectHistory store creation failed") from error
+
+
+def require_adoptable(
+    store: SubjectHistoryStore, inspection: EventJournalInspection
+) -> None:
+    """Before the one-way R07 adoption: a clean PROVISIONAL store of this Journal.
+
+    Checked before ``establish_participant_baseline`` publishes the five
+    participant baseline, so a foreign, stale or used store fails closed
+    without any Journal write (#376 §A; IP-9 U4-3 review P1-1).
+    """
+
+    meta = store.meta()
+    if meta.phase is not HistoryMetaPhase.PROVISIONAL:
+        raise HistoryAdoptionError("an ACTIVE SubjectHistory store has no adoption")
+    if meta.journal_lineage_id != inspection.journal_lineage_id:
+        raise HistoryAdoptionError("SubjectHistory store belongs to another Journal")
+    if store.has_operations():
+        raise HistoryAdoptionError("a PROVISIONAL SubjectHistory store has rows")
 
 
 def activate_adopted_store(
@@ -252,5 +283,6 @@ __all__ = [
     "history_registry",
     "open_or_create_store",
     "registers_history",
+    "require_adoptable",
     "rollback_incarnation_id",
 ]

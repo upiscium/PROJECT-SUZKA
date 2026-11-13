@@ -36,8 +36,10 @@ from suzka.memory.semantic_store import SemanticStore, SemanticStoreError
 from suzka.r16.history_adoption import (
     HistoryAdoptionError,
     activate_adopted_store,
+    adopted_history_baseline,
     current_incarnation,
     history_registry,
+    require_adoptable,
 )
 from suzka.r16.history_codec import SUBJECT_HISTORY_PARTICIPANT_ID
 from suzka.r16.history_participant import (
@@ -261,6 +263,14 @@ class StartupReconciliationCoordinator:
     ) -> EventJournalParticipantBaseline:
         """Establish the fixed participant epoch before normal admission."""
 
+        if self.history_store is not None:
+            inspection = self.journal.inspect()
+            if adopted_history_baseline(inspection) is None:
+                # Prove the store adoptable before the irreversible R07 step.
+                try:
+                    require_adoptable(self.history_store, inspection)
+                except HistoryAdoptionError as error:
+                    raise StartupReconciliationError(str(error)) from error
         baseline = self.state_recovery.establish_participant_baseline(
             recovery, self.participant_registry
         )

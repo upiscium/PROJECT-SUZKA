@@ -274,3 +274,64 @@ def test_server_opens_creates_and_refuses_disabling(tmp_path: Path) -> None:
         _open_subject_history(settings, journal)
     reopened = _open_subject_history(enabled, journal)
     assert reopened is not None and reopened.meta().phase is HistoryMetaPhase.ACTIVE
+
+
+@pytest.mark.parametrize("case", ["foreign_lineage", "active_without_adoption", "subject"])
+def test_unadoptable_store_fails_before_any_journal_write(
+    tmp_path: Path, case: str
+) -> None:
+    memory, _state, journal, _wal, recovery = _graph(tmp_path)
+    path = _history_path(tmp_path)
+    lineage = journal.inspect().journal_lineage_id
+    assert lineage is not None
+    store = SubjectHistoryStore.create(
+        path,
+        subject_id="suzka",
+        journal_lineage_id="another-lineage" if case == "foreign_lineage" else lineage,
+        max_page_count=PAGES,
+    )
+    if case == "active_without_adoption":
+        store.activate(
+            adopted_baseline_id="baseline-elsewhere",
+            adopted_baseline_hash="9" * 64,
+            genesis_incarnation_id="1" * 64,
+        )
+    store.close()
+    before = journal.path.read_bytes()
+
+    subject = "someone-else" if case == "subject" else "suzka"
+    with pytest.raises(HistoryAdoptionError):
+        open_or_create_store(journal, path, subject_id=subject, max_page_count=PAGES)
+    # An injected store is checked again right before the R07 adoption.
+    if case != "subject":
+        injected = SubjectHistoryStore.open(path, max_page_count=PAGES)
+        with pytest.raises(StartupReconciliationError):
+            StartupReconciliationCoordinator(
+                journal, recovery, memory, history_store=injected
+            ).ensure_adoption_baseline(recovery.prepare_startup())
+    assert journal.path.read_bytes() == before
+    assert adopted_history_baseline(journal.inspect()) is None
+
+
+def test_server_refuses_a_symlinked_store_directory(tmp_path: Path) -> None:
+    from suzka.api.server import _open_subject_history
+    from suzka.config.schema import SubjectHistorySettings
+    from suzka.runtime.state_recovery import StateRecoveryError
+    from test_startup_reconciliation import _settings
+
+    _memory, _state, journal, _wal, _recovery = _graph(tmp_path)
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    (tmp_path / "linked").symlink_to(real, target_is_directory=True)
+    settings = _settings(tmp_path).model_copy(
+        update={
+            "subject_history": SubjectHistorySettings(
+                enabled=True,
+                path=tmp_path / "linked" / "subject_history.sqlite3",
+                max_page_count=PAGES,
+            )
+        }
+    )
+    with pytest.raises(StateRecoveryError, match="unavailable"):
+        _open_subject_history(settings, journal)
+    assert list(real.iterdir()) == []
