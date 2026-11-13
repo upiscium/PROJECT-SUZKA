@@ -242,15 +242,22 @@ def activate_adopted_store(
     return genesis
 
 
-def current_incarnation(journal: EventJournal, store: SubjectHistoryStore) -> str:
-    """#376 D1-4: the incarnation from proven Journal facts only."""
+def resolve_incarnation(
+    inspection: EventJournalInspection, store: SubjectHistoryStore
+) -> tuple[str, int]:
+    """#376 D1-4: (incarnation, processing horizon) from one Journal inspection.
 
-    inspection = journal.inspect()
+    The horizon is the processing high-water of the latest qualified
+    true-rollback clear (0 for GENESIS): only R07 transactions after it belong
+    to the current incarnation.
+    """
+
     adopted = adopted_history_baseline(inspection)
     meta = store.meta()
     if (
         adopted is None
         or meta.phase is not HistoryMetaPhase.ACTIVE
+        or meta.genesis_incarnation_id is None
         or meta.journal_lineage_id != inspection.journal_lineage_id
         or meta.adopted_baseline_id != adopted.baseline_id
         or meta.adopted_baseline_hash != baseline_digest(adopted)
@@ -261,15 +268,21 @@ def current_incarnation(journal: EventJournal, store: SubjectHistoryStore) -> st
         raise HistoryAdoptionError("a true-rollback gate clear is still open")
     clear = inspection.terminal_gate_clear
     if clear is None:
-        return meta.genesis_incarnation_id
+        return meta.genesis_incarnation_id, 0
     baselines = {item.baseline_id: item for item in inspection.baselines}
     clear_baseline = baselines.get(clear.baseline_id)
     if clear_baseline is None or clear.journal_lineage_id != inspection.journal_lineage_id:
         raise HistoryAdoptionError("true-rollback clear evidence is incomplete")
     if not registers_history(clear_baseline):
         # A rollback before adoption does not change the GENESIS incarnation.
-        return meta.genesis_incarnation_id
-    return rollback_incarnation_id(clear)
+        return meta.genesis_incarnation_id, 0
+    return rollback_incarnation_id(clear), clear.processing_high_water
+
+
+def current_incarnation(journal: EventJournal, store: SubjectHistoryStore) -> str:
+    """#376 D1-4: the incarnation from proven Journal facts only."""
+
+    return resolve_incarnation(journal.inspect(), store)[0]
 
 
 __all__ = [
@@ -284,5 +297,6 @@ __all__ = [
     "open_or_create_store",
     "registers_history",
     "require_adoptable",
+    "resolve_incarnation",
     "rollback_incarnation_id",
 ]
