@@ -3276,28 +3276,7 @@ class AgentStateStore:
 
         read_failure: AgentStateLoadError | None = None
         try:
-            descriptor = os.open(
-                self.path,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            )
-            try:
-                file_stat = os.fstat(descriptor)
-                if not stat.S_ISREG(file_stat.st_mode):
-                    raise OSError("snapshot is not a regular file")
-                if file_stat.st_size > AGENT_STATE_MAX_SERIALIZED_BYTES:
-                    raise AgentStateLoadError(
-                        "AgentState snapshot exceeds its serialized byte bound"
-                    )
-                with os.fdopen(descriptor, "rb") as snapshot_file:
-                    descriptor = -1
-                    raw_bytes = snapshot_file.read(AGENT_STATE_MAX_SERIALIZED_BYTES + 1)
-                    if len(raw_bytes) > AGENT_STATE_MAX_SERIALIZED_BYTES:
-                        raise AgentStateLoadError(
-                            "AgentState snapshot exceeds its serialized byte bound"
-                        )
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
+            raw_bytes = self._read_published_bytes()
             preflight_attention_json(raw_bytes)
             raw = json.loads(
                 raw_bytes.decode("utf-8"),
@@ -3506,6 +3485,57 @@ class AgentStateStore:
                 raise AgentStateConfigurationDrift(
                     "Persisted system Value seed declaration has drifted"
                 )
+
+    def _read_published_bytes(self) -> bytes:
+        """Read the published snapshot file: regular, no symlink, bounded."""
+
+        descriptor = os.open(
+            self.path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise OSError("snapshot is not a regular file")
+            if file_stat.st_size > AGENT_STATE_MAX_SERIALIZED_BYTES:
+                raise AgentStateLoadError(
+                    "AgentState snapshot exceeds its serialized byte bound"
+                )
+            with os.fdopen(descriptor, "rb") as snapshot_file:
+                descriptor = -1
+                raw_bytes = snapshot_file.read(AGENT_STATE_MAX_SERIALIZED_BYTES + 1)
+                if len(raw_bytes) > AGENT_STATE_MAX_SERIALIZED_BYTES:
+                    raise AgentStateLoadError(
+                        "AgentState snapshot exceeds its serialized byte bound"
+                    )
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        return raw_bytes
+
+    def published_snapshot_hash(self) -> str | None:
+        """Hash the published file's exact bytes, without decoding them (IP-1b).
+
+        ``save`` publishes exactly ``canonical_bytes(snapshot)``, so a match
+        with a hash of canonical bytes proves the file is that very snapshot.
+        A commit check that already holds such a hash needs no parse and no
+        re-canonicalization. A missing file has no hash (``None``); any other
+        read failure is ``AgentStateLoadError``, as from ``load``.
+        """
+
+        try:
+            status = self.path.lstat()
+            if not stat.S_ISREG(status.st_mode):
+                raise OSError("snapshot is not a regular file")
+            return hashlib.sha256(self._read_published_bytes()).hexdigest()
+        except FileNotFoundError:
+            return None
+        except AgentStateLoadError:
+            raise
+        except OSError as error:
+            raise AgentStateLoadError(
+                "AgentState snapshot cannot be inspected"
+            ) from error
 
     def save(self, snapshot: CompatibleAgentStateSnapshot) -> None:
         stage = AgentStateSaveStage.TEMP_WRITE

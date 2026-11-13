@@ -1256,11 +1256,11 @@ class StateRecoveryCoordinator:
         ):
             raise StateRecoveryError("Internal commit event identity is invalid")
 
-        canonical = self.state_store.load()
-        if (
-            canonical.last_processed_event_sequence != evidence.snapshot_sequence
-            or self.state_store.snapshot_hash(canonical) != evidence.snapshot_hash
-        ):
+        # IP-1b: the published file must be exactly the committed canonical
+        # bytes. Their hash binds the snapshot (sequence included) that was
+        # validated and hashed at commit, so no parse or re-validation runs.
+        published_hash = self.state_store.published_snapshot_hash()
+        if published_hash != evidence.snapshot_hash:
             raise StateRecoveryError("Canonical internal commit evidence is stale")
 
         journal = self.journal.inspect()
