@@ -6,6 +6,8 @@ from pathlib import Path
 import shutil
 import sys
 
+import pytest
+
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -50,8 +52,11 @@ class _World:
         self.sequence = 0
 
     def reader(self, incarnation: str | None = None) -> SubjectHistoryReader:
-        value = incarnation or self.incarnation
-        return SubjectHistoryReader(self.journal, self.store, lambda: value)
+        if incarnation is None:
+            return SubjectHistoryReader(self.journal, self.store)
+        return SubjectHistoryReader(
+            self.journal, self.store, lambda _inspection: (incarnation, 0)
+        )
 
     def decision(self, name: str, *, intent: str, parent=None):
         self.sequence += 1
@@ -164,10 +169,10 @@ def test_lineage_gap_and_other_incarnations_are_not_sources(tmp_path: Path) -> N
     head = world.reader().head(SCOPE)
     assert (head.status, head.reason) == (HeadStatus.BLOCKED, HeadBlockReason.LINEAGE_GAP)
 
-    # A rolled-back (other) incarnation never contributes a current head.
-    assert world.reader(OTHER_INCARNATION).head(SCOPE).status is HeadStatus.EMPTY
+    # Rows of the current incarnation are never read as another incarnation's.
+    assert world.reader(OTHER_INCARNATION).head(SCOPE).reason is HeadBlockReason.DIVERGED
 
-    def unavailable() -> str:
+    def unavailable(_inspection) -> tuple[str, int]:
         raise RuntimeError("gate clear open")
 
     blocked = SubjectHistoryReader(world.journal, world.store, unavailable).head(SCOPE)
@@ -208,12 +213,79 @@ def test_projection_is_public_safe(tmp_path: Path) -> None:
         for item in root.source_refs
     ]
     rendered = repr(value)
-    assert "policy_input" not in rendered and '"row"' not in rendered
+    assert "policy_input" not in rendered and "'row'" not in rendered
     assert "assess" not in rendered  # plan steps are never projected
 
     blocked = project_head(
-        SubjectHistoryReader(world.journal, world.store, lambda: OTHER_INCARNATION).head(
-            "x"
-        )
+        SubjectHistoryReader(
+            world.journal, world.store, lambda _inspection: (OTHER_INCARNATION, 0)
+        ).head("x")
     )
     assert blocked.decision_id is None and blocked.source_refs == ()
+
+
+def test_startup_roll_forward_terminal_is_adopted(tmp_path: Path) -> None:
+    """Review P1-1: a crash before the event COMPLETED record still adopts."""
+
+    world = _World(tmp_path)
+    event, decision = world.decision("rolled-forward", intent="a" * 64)
+    coordinator = _prepared(world.journal, event, world.participant(decision))
+    evidence = world.recovery.commit_internal_candidate(
+        event, world.state.load(), _snapshot(world.sequence)
+    )
+    coordinator.finalize_event(event, evidence)
+    # Crash before complete_committed_event; startup classifies the event.
+    world.recovery.prepare_startup()
+    terminals = [
+        record.lifecycle.value
+        for record in world.journal.inspect().records
+        if record.event_id == event.event_id
+    ]
+    assert "recovery_classified" in terminals and "completed" not in terminals
+    head = world.reader().head(SCOPE)
+    assert (head.status, head.decision) == (HeadStatus.ADOPTED, decision)
+
+
+def test_store_restored_to_an_older_copy_blocks_every_scope(tmp_path: Path) -> None:
+    """Review P1-2(a): missing rows are found from the Journal side."""
+
+    world = _World(tmp_path)
+    _event1, root = world.commit("root", intent="a" * 64)
+    backup = tmp_path / "older.sqlite3"
+    shutil.copyfile(world.store.path, backup)
+    world.commit("child", intent="b" * 64, parent=root)
+    path = world.store.path
+    world.store.close()
+    shutil.copyfile(backup, path)
+    world.store = SubjectHistoryStore.open(path, max_page_count=PAGES)
+
+    for scope in (SCOPE, "another-lineage"):
+        head = world.reader().head(scope)
+        assert (head.status, head.reason) == (HeadStatus.BLOCKED, HeadBlockReason.DIVERGED)
+
+
+def test_open_transaction_without_a_row_blocks(tmp_path: Path) -> None:
+    """Review P1-2(b): TRANSACTION_PREPARED before the SQLite PREPARE."""
+
+    world = _World(tmp_path)
+    world.commit("root", intent="a" * 64)
+    event, decision = world.decision("no-row", intent="b" * 64)
+
+    class Refusing(SubjectHistoryParticipant):
+        def prepare(self, binding) -> None:  # crash before the SQLite row
+            raise KeyboardInterrupt
+
+    participant = Refusing(
+        world.store,
+        world.incarnation,
+        decision,
+        JournalCommitProofSource(world.journal, world.recovery),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        _prepared(world.journal, event, participant)
+    assert world.journal.inspect().open_transactions
+    head = world.reader().head(SCOPE)
+    assert (head.status, head.reason) == (
+        HeadStatus.BLOCKED,
+        HeadBlockReason.UNRESOLVED_OPERATION,
+    )

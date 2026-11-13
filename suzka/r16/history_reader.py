@@ -1,22 +1,28 @@
 """R16 U4-4: SubjectHistory lineage head reader and public-safe projection.
 
-#376 §C and D2-5.  A FINALIZED SQLite row is *not* by itself an adopted
-Decision.  A node counts only when, in the current incarnation:
+#376 §C, D1-4, D2-2(B) and D2-5.  A FINALIZED SQLite row is *not* by itself
+an adopted Decision.  From one Journal inspection the reader first checks the
+whole current incarnation, in both directions:
 
-- its R07 transaction is retained as COMPLETED or RECONCILED with the exact
-  binding and a ``subject.history`` FINALIZED/ALREADY_CONSISTENT outcome;
-- its event has a retained committed terminal (COMPLETED / RECOVERY_COMPLETED)
-  whose snapshot and WAL identity equal the stored postcommit receipt;
-- the stored canonical bytes decode to the same CommittedDecisionV1.
+- no open R07 gate clear or recovery;
+- every current-incarnation R07 transaction that requires ``subject.history``
+  maps one-to-one to an operation row of this incarnation (committed ->
+  FINALIZED, aborted -> ABORTED, open -> unresolved), and every row maps back
+  to a retained R07 transaction.  A missing, extra or mismatched row blocks
+  *every* scope: the scope of a missing row is unknowable, so there is no
+  fallback to an older head.
 
-The head is the tip of the single predecessor chain from GENESIS.  A gap, a
-duplicate child, an unresolved newer PREPARED operation, missing Journal
-proof or any conflicting evidence makes the *whole scope* BLOCKED; there is
-no fallback to an older head.  Only the current incarnation is read: a
-rollback-cleared incarnation is never a current source.
+A node of the requested scope then counts only when its transaction is
+COMPLETED/RECONCILED with a ``subject.history`` FINALIZED/ALREADY_CONSISTENT
+outcome, the event has exactly one committed terminal matching the stored
+postcommit receipt (COMPLETED with the same snapshot and WAL identity, or a
+startup RECOVERY_CLASSIFIED COMMITTED_BEFORE_CRASH with the same snapshot),
+and the stored row columns and bytes decode to the same CommittedDecisionV1.
 
-This is historical existence only (#376 D2-3): the R16/R18 owners must
-separately requalify current Goal/Value/Context before any new action.
+The head is the tip of the single predecessor chain from GENESIS; a gap,
+duplicate child or digest mismatch blocks the scope.  This is historical
+existence only (#376 D2-3): R16/R18 owners separately requalify current
+Goal/Value/Context before any new action.
 """
 
 from __future__ import annotations
@@ -26,12 +32,14 @@ from dataclasses import dataclass
 from enum import Enum
 
 from suzka.r16.contracts import CandidateKind
+from suzka.r16.history_adoption import resolve_incarnation
 from suzka.r16.history_codec import (
     GENESIS,
     SUBJECT_HISTORY_PARTICIPANT_ID,
     CommittedDecisionV1,
     PolicyKind,
     PolicyRow,
+    PostcommitReceiptV1,
     history_operation_digest,
 )
 from suzka.r16.history_store import (
@@ -42,6 +50,7 @@ from suzka.r16.history_store import (
     SubjectHistoryStore,
 )
 from suzka.runtime.event_journal import (
+    EventFailureCategory,
     EventJournal,
     EventJournalInspection,
     EventJournalRecord,
@@ -60,6 +69,7 @@ class HeadStatus(str, Enum):
 class HeadBlockReason(str, Enum):
     INCARNATION_UNAVAILABLE = "INCARNATION_UNAVAILABLE"
     STORE_UNAVAILABLE = "STORE_UNAVAILABLE"
+    JOURNAL_UNAVAILABLE = "JOURNAL_UNAVAILABLE"
     UNRESOLVED_OPERATION = "UNRESOLVED_OPERATION"
     MISSING_JOURNAL_PROOF = "MISSING_JOURNAL_PROOF"
     DIVERGED = "DIVERGED"
@@ -87,8 +97,17 @@ _ADOPTED_OUTCOMES = frozenset(
     {ParticipantOutcome.FINALIZED, ParticipantOutcome.ALREADY_CONSISTENT}
 )
 _EVENT_TERMINALS = frozenset(
-    {EventLifecycle.COMPLETED, EventLifecycle.RECOVERY_COMPLETED}
+    {EventLifecycle.COMPLETED, EventLifecycle.FAILED, EventLifecycle.RECOVERY_CLASSIFIED}
 )
+
+IncarnationResolver = Callable[[EventJournalInspection], tuple[str, int]]
+
+
+def _requires_history(transaction: EventJournalTransaction) -> bool:
+    return any(
+        item.participant_id == SUBJECT_HISTORY_PARTICIPANT_ID
+        for item in transaction.required_participants
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,9 +118,16 @@ class _JournalView:
     event_terminals: dict[tuple[str, int], tuple[EventJournalRecord, ...]]
 
     @classmethod
-    def of(cls, inspection: EventJournalInspection) -> _JournalView:
-        def index(items: tuple[EventJournalTransaction, ...]) -> dict[str, EventJournalTransaction]:
-            return {item.transaction_id: item for item in items}
+    def of(cls, inspection: EventJournalInspection, horizon: int) -> _JournalView:
+        def index(
+            items: tuple[EventJournalTransaction, ...],
+        ) -> dict[str, EventJournalTransaction]:
+            # Only current-incarnation transactions that require history.
+            return {
+                item.transaction_id: item
+                for item in items
+                if _requires_history(item) and item.processing_sequence > horizon
+            }
 
         terminals: dict[tuple[str, int], list[EventJournalRecord]] = {}
         for record in (*inspection.carried_records, *inspection.records):
@@ -160,67 +186,93 @@ class SubjectHistoryReader:
         self,
         journal: EventJournal,
         store: SubjectHistoryStore,
-        incarnation: Callable[[], str],
+        incarnation: IncarnationResolver | None = None,
     ) -> None:
         self.journal = journal
         self.store = store
-        self.incarnation = incarnation
+        self.incarnation: IncarnationResolver = incarnation or (
+            lambda inspection: resolve_incarnation(inspection, store)
+        )
 
     def head(self, lineage_scope: str) -> HistoryHead:
         try:
             return self._head(lineage_scope)
         except _Blocked as blocked:
             return HistoryHead(lineage_scope, HeadStatus.BLOCKED, blocked.reason)
+        except HistoryStoreError:
+            return HistoryHead(
+                lineage_scope, HeadStatus.BLOCKED, HeadBlockReason.STORE_UNAVAILABLE
+            )
+        except (TypeError, ValueError):
+            return HistoryHead(lineage_scope, HeadStatus.BLOCKED, HeadBlockReason.DIVERGED)
 
     def _head(self, lineage_scope: str) -> HistoryHead:
         try:
-            incarnation = self.incarnation()
+            inspection = self.journal.inspect()
+        except Exception:
+            raise _Blocked(HeadBlockReason.JOURNAL_UNAVAILABLE) from None
+        # One inspection for both the incarnation and the evidence (no TOCTOU).
+        try:
+            incarnation, horizon = self.incarnation(inspection)
+        except HistoryStoreError:
+            raise
         except Exception:
             raise _Blocked(HeadBlockReason.INCARNATION_UNAVAILABLE) from None
-        try:
-            inspection = self.journal.inspect()
-            rows = self.store.operations(incarnation)
-        except HistoryStoreError:
-            raise _Blocked(HeadBlockReason.STORE_UNAVAILABLE) from None
-        except Exception:
-            raise _Blocked(HeadBlockReason.MISSING_JOURNAL_PROOF) from None
-        view = _JournalView.of(inspection)
+        if inspection.open_gate_clear is not None or inspection.open_recoveries:
+            raise _Blocked(HeadBlockReason.UNRESOLVED_OPERATION)
+        view = _JournalView.of(inspection, horizon)
+        rows = self.store.operations(incarnation)
+        self._reconcile_all(rows, view)
         nodes: list[tuple[CommittedDecisionV1, str]] = []
         for row in rows:
-            if row.operation_kind is not HistoryOperationKind.R16_DECISION_ISSUE:
-                continue
-            if row.lineage_scope != lineage_scope:
-                continue
-            node = self._node(incarnation, row, view)
-            if node is not None:
-                nodes.append(node)
+            if (
+                row.operation_kind is HistoryOperationKind.R16_DECISION_ISSUE
+                and row.lineage_scope == lineage_scope
+            ):
+                node = self._node(incarnation, row, view)
+                if node is not None:
+                    nodes.append(node)
         return self._chain(lineage_scope, nodes)
+
+    @staticmethod
+    def _reconcile_all(
+        rows: tuple[HistoryOperationRow, ...], view: _JournalView
+    ) -> None:
+        """Both directions over the whole incarnation (review P1-2)."""
+
+        by_transaction = {row.transaction_id: row for row in rows}
+        if len(by_transaction) != len(rows):
+            raise _Blocked(HeadBlockReason.DIVERGED)
+        for transaction_id in view.open:
+            if transaction_id not in by_transaction:
+                # TRANSACTION_PREPARED with no SQLite row yet: unresolved.
+                raise _Blocked(HeadBlockReason.UNRESOLVED_OPERATION)
+        for transaction_id in (*view.committed, *view.aborted):
+            if transaction_id not in by_transaction:
+                raise _Blocked(HeadBlockReason.DIVERGED)
+        for row in rows:
+            transaction = view.transaction(row)
+            if transaction is None:
+                # Every row needs retained R07 proof, tombstones included.
+                raise _Blocked(HeadBlockReason.MISSING_JOURNAL_PROOF)
+            if row.transaction_id in view.open:
+                continue
+            expected = (
+                HistoryPhase.FINALIZED
+                if row.transaction_id in view.committed
+                else HistoryPhase.ABORTED
+            )
+            if row.phase is not expected:
+                raise _Blocked(HeadBlockReason.DIVERGED)
 
     def _node(
         self, incarnation: str, row: HistoryOperationRow, view: _JournalView
     ) -> tuple[CommittedDecisionV1, str] | None:
-        transaction = view.transaction(row)
-        is_open = transaction is not None and row.transaction_id in view.open
-        is_committed = transaction is not None and row.transaction_id in view.committed
-        if row.phase is HistoryPhase.PREPARED:
-            # An unresolved operation blocks; a PREPARED row under a terminal or
-            # missing transaction means the store was rolled back (P2-5).
-            if is_open:
-                raise _Blocked(HeadBlockReason.UNRESOLVED_OPERATION)
-            raise _Blocked(HeadBlockReason.DIVERGED)
-        if row.phase is HistoryPhase.ABORTED:
-            if is_committed:
-                raise _Blocked(HeadBlockReason.DIVERGED)
-            if is_open:
-                raise _Blocked(HeadBlockReason.UNRESOLVED_OPERATION)
-            return None
-        # FINALIZED: adopted only with exact retained Journal terminals.
-        if transaction is None:
-            raise _Blocked(HeadBlockReason.MISSING_JOURNAL_PROOF)
-        if is_open:
+        if row.transaction_id in view.open:
             raise _Blocked(HeadBlockReason.UNRESOLVED_OPERATION)
-        if not is_committed:
-            raise _Blocked(HeadBlockReason.DIVERGED)
+        if row.phase is HistoryPhase.ABORTED:
+            return None
+        transaction = view.committed[row.transaction_id]
         outcomes = [
             outcome
             for participant, outcome in transaction.participant_outcomes
@@ -228,22 +280,21 @@ class SubjectHistoryReader:
         ]
         if len(outcomes) != 1 or outcomes[0] not in _ADOPTED_OUTCOMES:
             raise _Blocked(HeadBlockReason.DIVERGED)
-        try:
-            finalized = self.store.finalized_decision(incarnation, row.transaction_id)
-        except HistoryStoreError:
-            raise _Blocked(HeadBlockReason.STORE_UNAVAILABLE) from None
+        finalized = self.store.finalized_decision(incarnation, row.transaction_id)
         if finalized is None or row.pending_bytes != finalized.committed_bytes:
             raise _Blocked(HeadBlockReason.DIVERGED)
-        try:
-            decision = CommittedDecisionV1.from_json(finalized.committed_bytes)
-        except (TypeError, ValueError):
-            raise _Blocked(HeadBlockReason.DIVERGED) from None
+        decision = CommittedDecisionV1.from_json(finalized.committed_bytes)
         receipt = finalized.receipt
         if (
             decision.decision_id != finalized.decision_id
             or decision.content_digest != finalized.committed_digest
             or decision.incarnation_id != incarnation
             or history_operation_digest(decision) != row.operation_digest
+            or decision.lineage_scope != row.lineage_scope
+            or decision.review_intent_key != row.review_intent_key
+            or decision.predecessor_key != row.predecessor_key
+            or decision.issuer_event_id != row.event_id
+            or decision.issuer_sequence != row.processing_sequence
             or finalized.receipt_digest != receipt.receipt_digest
             or receipt.event_id != row.event_id
             or receipt.processing_sequence != row.processing_sequence
@@ -252,11 +303,7 @@ class SubjectHistoryReader:
         terminals = view.event_terminals.get((row.event_id, row.processing_sequence), ())
         if not terminals:
             raise _Blocked(HeadBlockReason.MISSING_JOURNAL_PROOF)
-        if len(terminals) != 1 or (
-            terminals[0].snapshot_hash,
-            terminals[0].wal_record_id,
-            terminals[0].wal_record_hash,
-        ) != (receipt.snapshot_hash, receipt.wal_record_id, receipt.wal_record_hash):
+        if len(terminals) != 1 or not _terminal_matches(terminals[0], receipt):
             raise _Blocked(HeadBlockReason.DIVERGED)
         return decision, row.transaction_id
 
@@ -293,6 +340,32 @@ class SubjectHistoryReader:
             transaction_id=tip[1],
             depth=depth,
         )
+
+
+def _terminal_matches(record: EventJournalRecord, receipt: PostcommitReceiptV1) -> bool:
+    if record.lifecycle is EventLifecycle.COMPLETED:
+        return (
+            record.snapshot_sequence,
+            record.snapshot_hash,
+            record.wal_record_id,
+            record.wal_record_hash,
+        ) == (
+            receipt.snapshot_sequence,
+            receipt.snapshot_hash,
+            receipt.wal_record_id,
+            receipt.wal_record_hash,
+        )
+    if record.lifecycle is EventLifecycle.RECOVERY_CLASSIFIED:
+        # Startup classification of a pre-crash commit carries no WAL identity;
+        # the stored receipt plus the R07 terminal cover that part (P1-1).
+        return (
+            record.failure_category is EventFailureCategory.COMMITTED_BEFORE_CRASH
+            and record.snapshot_sequence == receipt.snapshot_sequence
+            and record.snapshot_hash == receipt.snapshot_hash
+        )
+    return False  # FAILED or any other terminal is not a committed event
+
+
 
 
 @dataclass(frozen=True, slots=True)
