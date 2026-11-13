@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 import hashlib
@@ -278,6 +279,43 @@ def _snapshot_sequence(snapshot: CompatibleAgentStateSnapshot) -> int:
     return _validate_sequence(value, "snapshot sequence")
 
 
+@dataclass(slots=True)
+class _GenerationScan:
+    """Verifier state carried from one verified WAL line to the next."""
+
+    records: list[BaselineRecord | TransitionRecord] = field(default_factory=list)
+    hashes: list[str] = field(default_factory=list)
+    ids: set[UUID] = field(default_factory=set)
+    events: set[UUID] = field(default_factory=set)
+    state_sequence: int | None = None
+    state_hash: str | None = None
+    processing_sequence: int | None = None
+
+    def copy(self) -> _GenerationScan:
+        return _GenerationScan(
+            records=list(self.records),
+            hashes=list(self.hashes),
+            ids=set(self.ids),
+            events=set(self.events),
+            state_sequence=self.state_sequence,
+            state_hash=self.state_hash,
+            processing_sequence=self.processing_sequence,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedGeneration:
+    """In-process record of a fully verified generation prefix (not durable)."""
+
+    manifest_hash: str
+    generation_id: UUID
+    device: int
+    inode: int
+    length: int
+    last_line: bytes
+    scan: _GenerationScan
+
+
 class StateWAL:
     """A durable WAL that has no authority to publish canonical state."""
 
@@ -294,6 +332,7 @@ class StateWAL:
         self._snapshot_hash = snapshot_hash
         self._failure_hook = failure_hook
         self._lock = RLock()
+        self._verified: _VerifiedGeneration | None = None
 
     def _stage(self, stage: str) -> None:
         if self._failure_hook is not None:
@@ -859,6 +898,20 @@ class StateWAL:
             return False
 
     def inspect_optional(self) -> StateWALInspection:
+        return self._inspect_optional(full_verification=False)
+
+    def _inspect_full(self) -> StateWALInspection:
+        """Inspect with a full verification that bypasses the in-process cache.
+
+        Recovery-facing reads (``reconstruct``) use this so that they never
+        depend on the cooperative-writer assumption of the cached path.
+        """
+        inspection = self._inspect_optional(full_verification=True)
+        if not inspection.exists:
+            raise StateWALMissing("WAL is absent")
+        return inspection
+
+    def _inspect_optional(self, *, full_verification: bool) -> StateWALInspection:
         if not self._prepare_for_read():
             return StateWALInspection(
                 exists=False,
@@ -899,19 +952,29 @@ class StateWAL:
             )
             if manifest.manifest_hash != expected:
                 raise ValueError
-            records, hashes = self._read_generation(manifest)
+            scan = (
+                self._read_generation(manifest)
+                if full_verification
+                else self._read_generation_cached(manifest)
+            )
         except StateWALMissing:
             raise StateWALIntegrityError("active WAL generation is absent") from None
         except StateWALError:
             raise
         except Exception:
             raise StateWALIntegrityError("WAL manifest is invalid") from None
+        records = scan.records
+        hashes = scan.hashes
         latest = records[-1]
         snapshot = (
             latest.baseline_snapshot
             if isinstance(latest, BaselineRecord)
             else latest.candidate_snapshot
         )
+        # ``scan.state_hash`` is the verified snapshot hash of ``latest``: the
+        # line verifier recomputed it from the snapshot before accepting the
+        # record, so it need not be recomputed for every inspection.
+        assert scan.state_hash is not None
         return StateWALInspection(
             exists=True,
             active_manifest=manifest,
@@ -920,7 +983,7 @@ class StateWAL:
             baseline_record_id=records[0].record_id,
             baseline_record_hash=hashes[0],
             latest_snapshot_sequence=snapshot.last_processed_event_sequence,
-            latest_snapshot_hash=self._snapshot_hash_value(snapshot),
+            latest_snapshot_hash=scan.state_hash,
         )
 
     def inspect(self) -> StateWALInspection:
@@ -978,19 +1041,161 @@ class StateWAL:
 
     clear_gate_if_matches = clear_external_reconciliation_gate
 
-    def _read_generation(
-        self, manifest: Manifest
-    ) -> tuple[list[BaselineRecord | TransitionRecord], list[str]]:
+    @staticmethod
+    def _read_generation_bytes(
+        path: Path, cached: _VerifiedGeneration | None
+    ) -> tuple[bytes, bool, int, int]:
+        """Read a generation like ``_read_regular``.
+
+        When ``cached`` describes the same file (dev/inode), the file has not
+        shrunk, and the last verified line is still byte-identical at its
+        verified position, only the bytes after the verified prefix are read
+        and ``(suffix, True, dev, inode)`` is returned.  Otherwise the whole
+        file is read and ``(content, False, dev, inode)`` is returned.
+        """
+        parent_descriptor = -1
+        descriptor = -1
+        try:
+            parent_descriptor = StateWAL._open_private_dir(path.parent)
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=parent_descriptor,
+            )
+            StateWAL._validate_descriptor(descriptor)
+            status = os.fstat(descriptor)
+            with os.fdopen(descriptor, "rb") as source:
+                descriptor = -1
+                if (
+                    cached is not None
+                    and cached.device == status.st_dev
+                    and cached.inode == status.st_ino
+                    and status.st_size >= cached.length
+                ):
+                    tail_start = cached.length - len(cached.last_line)
+                    source.seek(tail_start)
+                    data = source.read()
+                    if data.startswith(cached.last_line):
+                        return (
+                            data[len(cached.last_line) :],
+                            True,
+                            status.st_dev,
+                            status.st_ino,
+                        )
+                    source.seek(0)
+                return source.read(), False, status.st_dev, status.st_ino
+        except FileNotFoundError:
+            raise StateWALMissing("WAL artifact is absent") from None
+        except Exception:
+            raise StateWALFormatError("WAL artifact is invalid") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if parent_descriptor >= 0:
+                os.close(parent_descriptor)
+
+    def invalidate_verification_cache(self) -> None:
+        """Forget the in-process verified prefix; the next read verifies all."""
+        with self._lock:
+            self._verified = None
+
+    def _read_generation_cached(self, manifest: Manifest) -> _GenerationScan:
+        """Verify the active generation, re-verifying only appended lines.
+
+        The cache is an in-process optimisation, never an authority.  It is
+        used only for the same manifest and the same file (dev/inode) that has
+        not shrunk and whose last verified line is still byte-identical at
+        its verified position; then only appended lines are verified.
+        Otherwise, or after any failure, the whole generation is verified
+        again.  A fresh instance (every process start) has no cache, so
+        startup always performs a full verification.
+
+        Threat model: the WAL has a single cooperative writer (this process,
+        under the Journal lease).  An in-place rewrite of an earlier,
+        already-verified line that preserves the file size and the last line
+        is not detected by the cached path; it is detected by the next full
+        verification (process start, ``invalidate_verification_cache`` or the
+        recovery-facing ``reconstruct``, which always verifies fully).
+
+        Costs and sharing: the cache retains the verified records of the
+        active generation for the process lifetime, so memory is proportional
+        to the generation size (bounded once generations roll over, #382).
+        Returned inspections share the same frozen record objects; callers
+        must not mutate nested snapshot containers.  The whole read-verify
+        step runs under ``self._lock`` and is therefore serialised with
+        appends.
+        """
+        with self._lock:
+            cached = self._verified
+            if cached is not None and (
+                cached.manifest_hash != manifest.manifest_hash
+                or cached.generation_id != manifest.active_generation_id
+            ):
+                cached = None
+            data, incremental, device, inode = self._read_generation_bytes(
+                self._generation_path(manifest.active_generation_id), cached
+            )
+            scan: _GenerationScan
+            if incremental:
+                assert cached is not None
+                scan = cached.scan.copy()
+                base_length = cached.length
+                previous_last_line = cached.last_line
+            else:
+                scan = _GenerationScan()
+                base_length = 0
+                previous_last_line = b""
+            self._verified = None
+            lines = data.splitlines(keepends=True)
+            self._verify_generation_lines(manifest, lines, scan)
+            if (
+                not scan.records
+                or scan.records[0].record_id != manifest.active_baseline_record_id
+                or scan.hashes[0] != manifest.active_baseline_record_hash
+            ):
+                raise StateWALIntegrityError("WAL manifest does not anchor generation")
+            self._verified = _VerifiedGeneration(
+                manifest_hash=manifest.manifest_hash,
+                generation_id=manifest.active_generation_id,
+                device=device,
+                inode=inode,
+                length=base_length + len(data),
+                last_line=lines[-1] if lines else previous_last_line,
+                scan=scan.copy(),
+            )
+            return scan
+
+    def _read_generation(self, manifest: Manifest) -> _GenerationScan:
+        """Fully verify the active generation without using or updating the cache."""
         raw_lines = self._read_regular(
             self._generation_path(manifest.active_generation_id)
         ).splitlines(keepends=True)
-        records: list[BaselineRecord | TransitionRecord] = []
-        hashes: list[str] = []
-        ids: set[UUID] = set()
-        events: set[UUID] = set()
-        state_sequence: int | None = None
-        state_hash: str | None = None
-        processing_sequence: int | None = None
+        scan = _GenerationScan()
+        self._verify_generation_lines(manifest, raw_lines, scan)
+        if (
+            not scan.records
+            or scan.records[0].record_id != manifest.active_baseline_record_id
+            or scan.hashes[0] != manifest.active_baseline_record_hash
+        ):
+            raise StateWALIntegrityError("WAL manifest does not anchor generation")
+        return scan
+
+    def _verify_generation_lines(
+        self,
+        manifest: Manifest,
+        raw_lines: list[bytes],
+        scan: _GenerationScan,
+    ) -> None:
+        records = scan.records
+        hashes = scan.hashes
+        ids = scan.ids
+        events = scan.events
+        state_sequence = scan.state_sequence
+        state_hash = scan.state_hash
+        processing_sequence = scan.processing_sequence
         for line in raw_lines:
             try:
                 if not line.endswith(b"\n"):
@@ -1037,7 +1242,6 @@ class StateWAL:
                         raise ValueError
                     if record.candidate_snapshot_sequence <= state_sequence:
                         raise ValueError
-                    events.add(record.event_id)
                 else:
                     if records or record.previous_record_hash is not None:
                         raise ValueError
@@ -1060,20 +1264,19 @@ class StateWAL:
                     processing_sequence = record.journal_processing_high_water
                 if record.generation_id != manifest.active_generation_id:
                     raise ValueError
+                # ``scan`` is mutated only after the line passed every check.
                 ids.add(record.record_id)
+                if isinstance(record, TransitionRecord):
+                    events.add(record.event_id)
                 records.append(record)
                 hashes.append(record.record_hash)
+                scan.state_sequence = state_sequence
+                scan.state_hash = state_hash
+                scan.processing_sequence = processing_sequence
             except RecursionError:
                 raise StateWALIntegrityError("WAL generation is invalid") from None
             except Exception:
                 raise StateWALIntegrityError("WAL generation is invalid") from None
-        if (
-            not records
-            or records[0].record_id != manifest.active_baseline_record_id
-            or hashes[0] != manifest.active_baseline_record_hash
-        ):
-            raise StateWALIntegrityError("WAL manifest does not anchor generation")
-        return records, hashes
 
     def _append_transition(
         self,
@@ -1407,7 +1610,7 @@ class StateWAL:
     ) -> CompatibleAgentStateSnapshot:
         if sequence is not None:
             _validate_sequence(sequence, "snapshot sequence")
-        inspection = self.inspect()
+        inspection = self._inspect_full()
         found: CompatibleAgentStateSnapshot | None = None
         for record in inspection.records:
             snapshot = (
