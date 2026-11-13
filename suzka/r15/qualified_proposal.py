@@ -222,6 +222,13 @@ def _parse_candidate(value: str, phase: str) -> TypedCandidate:
     )
 
 
+def prior_referents(response: str) -> set[str]:
+    """Distinct prior-choice referents named by a first-person answer."""
+
+    text = response.replace("*", "")
+    return {selected for pattern in _PRIOR for selected in pattern.findall(text)}
+
+
 def check_registered_requests(observed: tuple[_ObservedTurn, ...]) -> None:
     """Regenerate-and-compare: S1/S2 requests must be registered templates.
 
@@ -500,11 +507,7 @@ def proposal_from_observed(
             "original bounded option set unavailable"
         )
     # The initial response must demonstrably refer to one chosen option.
-    original_matches = {
-        selected
-        for pattern in _PRIOR
-        for selected in pattern.findall(first.response.replace("*", ""))
-    }
+    original_matches = prior_referents(first.response)
     if len(original_matches) != 1:
         raise QualifiedProposalUnavailable("original answer has no single referent")
     original = original_matches.pop()

@@ -36,8 +36,8 @@ from suzka.r15.qualified_proposal import (
     QualifiedNarrativeSourceGate,
     QualifiedProposalUnavailable,
     QualifiedTurnRef,
-    _PRIOR,
     _SETUP,
+    prior_referents,
 )
 from suzka.runtime.agent_runtime import AgentEventType
 from suzka.runtime.agent_state import (
@@ -67,8 +67,10 @@ class R15InterpretationRead:
 
     def __post_init__(self) -> None:
         valid = (
-            (self.outcome is InterpretationOutcome.EPISODE)
+            type(self.outcome) is InterpretationOutcome
+            and (self.outcome is InterpretationOutcome.EPISODE)
             == (self.stage in ("S1", "S2"))
+            and self.stage in ("NONE", "S1", "S2")
             and (self.stage == "NONE") == (self.status is None)
             and self.status
             in (None, "PRESENT", "CONTESTED", "CONTRADICTORY", "UNKNOWN")
@@ -104,9 +106,22 @@ def _turn_ref(
     return QualifiedTurnRef(event_id, event_sequence, record.source_episode_id)
 
 
-def _prior_matches(response: str) -> int:
-    text = response.replace("*", "")
-    return sum(len(pattern.findall(text)) for pattern in _PRIOR)
+def _light_turn(
+    gate: QualifiedNarrativeSourceGate, event_id: str, event_sequence: int
+) -> tuple[str | None, str | None]:
+    """(context_id, response) via committed Experience -> DB1 only.
+
+    Cheap and retention-independent, used for the shape and Context filters
+    before any full qualification (review P2-1/P2-2).  Not authority.
+    """
+
+    record = gate._experience.load_committed_current(
+        experience_id_for_event(event_id, event_sequence)
+    ).record
+    committed = gate._memory.get_committed_episodic(record.source_episode_id)
+    if committed is None:
+        return record.context_id, None
+    return record.context_id, committed.record.response
 
 
 def read_interpretation(
@@ -146,11 +161,20 @@ def read_interpretation(
                 "S2" if root.revision == 2 else "S1",
                 meaning.status_class,
             )
-        x = gate._read(_turn_ref(gate, x_event_id, x_event_sequence))
-        if x.event.event_sequence >= event_sequence:
+        if x_event_sequence >= event_sequence:
             return UNAVAILABLE
-        if _prior_matches(x.response) != 1:
+        # Condition 2 first, with the admission predicate (exactly one distinct
+        # referent, review P1-1), from Experience/DB1 only: an ordinary X never
+        # needs a retained Journal or a full source qualification (P2-1).
+        context_id, response = _light_turn(gate, x_event_id, x_event_sequence)
+        if response is None or context_id is None:
+            return UNAVAILABLE
+        if len(prior_referents(response)) != 1:
             return NOT_ELIGIBLE
+        # R15-shaped: qualify X fully before using it.
+        x = gate._read(_turn_ref(gate, x_event_id, x_event_sequence))
+        if x.context_id != context_id:
+            return UNAVAILABLE
         return _predecessor_shape(gate, x.context_id, x_event_sequence)
     except _READ_ERRORS:
         return UNAVAILABLE
@@ -175,12 +199,17 @@ def _predecessor_shape(
         reverse=True,
     )
     for sequence, event_id in candidates:
-        # The same qualification as admission (_read): ACCEPTED, COMPLETED and
-        # TRANSACTION_COMPLETED once each, no FAILED, API_CHAT.  A turn of
-        # another Context that cannot be read is UNAVAILABLE (fail-closed).
+        # Cheap Context filter first (Experience only, P2-2); an Experience
+        # that cannot be read is UNAVAILABLE (fail-closed).
+        candidate_context, _response = _light_turn(gate, event_id, sequence)
+        if candidate_context != context_id:
+            continue
+        # The nearest same-Context turn gets the admission qualification
+        # (_read): ACCEPTED, COMPLETED and TRANSACTION_COMPLETED once each,
+        # no FAILED, API_CHAT.
         turn = gate._read(_turn_ref(gate, event_id, sequence))
         if turn.context_id != context_id:
-            continue
+            return UNAVAILABLE
         return UNAVAILABLE if _SETUP.fullmatch(turn.request) else NOT_ELIGIBLE
     # No predecessor in the retained window, Context start unprovable.
     return UNAVAILABLE

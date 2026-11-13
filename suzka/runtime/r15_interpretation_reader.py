@@ -38,7 +38,11 @@ class R15InterpretationReader:
     def read(
         self, event: AgentEvent, x_event_id: str, x_event_sequence: int
     ) -> R15InterpretationEvidence:
-        result = self._port.read_interpretation(event, x_event_id, x_event_sequence)
+        try:
+            result = self._port.read_interpretation(event, x_event_id, x_event_sequence)
+        except Exception:
+            # Any unexpected owner failure is UNAVAILABLE, never raised into R16.
+            return _UNAVAILABLE
         if type(result) is not R15InterpretationRead:
             return _UNAVAILABLE
         return R15InterpretationEvidence(

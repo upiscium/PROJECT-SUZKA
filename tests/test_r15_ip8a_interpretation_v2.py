@@ -443,7 +443,22 @@ def test_r16_read_is_not_eligible_for_ordinary_turns_and_event_bound(
         break
 
 
-def test_r15_shaped_turn_without_episode_is_unavailable(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("predecessor", "answer", "outcome"),
+    [
+        ("setup", "暫定的に案Bを選びます", "UNAVAILABLE"),
+        # Review P1-1: two hits, one distinct referent -> still R15-shaped.
+        ("setup", "暫定的に案Bを暫定的に選びます", "UNAVAILABLE"),
+        ("setup", "暫定的に前の案（案B）を選びます", "UNAVAILABLE"),
+        # Two distinct referents: not R15-shaped.
+        ("setup", "暫定的に案Aと案Bを選びます。案Aを暫定的に選びます、前の案（案B）", "NOT_ELIGIBLE"),
+        # R15-shaped answer but the predecessor is not a setup turn.
+        ("plain", "暫定的に案Bを選びます", "NOT_ELIGIBLE"),
+    ],
+)
+def test_r15_shaped_turn_without_episode(
+    tmp_path: Path, predecessor: str, answer: str, outcome: str
+) -> None:
     """D5 §3: R15-shaped answer after a _SETUP turn but no episode -> UNAVAILABLE."""
 
     for client, _refs in _run(
@@ -454,10 +469,11 @@ def test_r15_shaped_turn_without_episode_is_unavailable(tmp_path: Path) -> None:
             "比較用の案は3つです。案Aは「甲」、案Bは「乙」、新案Cは「丙」です。"
             "分類はまだしないでください。"
         )
-        assert client.post("/api/chat", json={"message": setup, "attachments": []}).status_code == 200
-        provider.generate = lambda _prompt: "暫定的に案Bを選びます"  # type: ignore[method-assign]
+        message = setup if predecessor == "setup" else "今日はいい天気ですね"
+        assert client.post("/api/chat", json={"message": message, "attachments": []}).status_code == 200
+        provider.generate = lambda _prompt: answer  # type: ignore[method-assign]
         response = client.post("/api/chat", json={"message": "どれにしますか", "attachments": []})
         assert response.status_code == 200
         x = _source_ref(client, response.json()["episode_id"])
-        assert _r16_read(client, x).outcome == "UNAVAILABLE"
+        assert _r16_read(client, x).outcome == outcome
         break
