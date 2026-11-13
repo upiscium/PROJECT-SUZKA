@@ -151,6 +151,14 @@ class ChatResult:
     optimal_loss: float
     model_id: str
     adapter_id: str | None
+    # IP-6 (#370 D2 P0-1, DRV-3): facts about the committed turn, so the R16
+    # driver never has to read a store. ``experience_id`` is None when no
+    # Experience was created; ``eligible_for_u2a`` is False for a neutral
+    # appraisal (the same condition U2a re-checks); ``context_id`` is the
+    # Context of that Experience (None without one). None is authority.
+    experience_id: str | None = None
+    eligible_for_u2a: bool = False
+    context_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1742,6 +1750,16 @@ class SuzkaMainLoop:
         )
 
     def _chat_result(self, computed: _ComputedChat, transaction_id: str) -> ChatResult:
+        from suzka.memory.experience_participant import ExperienceCreateIntent
+
+        experience = computed.experience_participant
+        record = (
+            experience.operation.record
+            if experience is not None
+            and isinstance(experience.operation, ExperienceCreateIntent)
+            else None
+        )
+        appraisal = None if record is None else record.appraisal
         return ChatResult(
             episode_id=computed.memory_participant.episode_id(transaction_id),
             response=computed.response,
@@ -1751,6 +1769,14 @@ class SuzkaMainLoop:
             optimal_loss=computed.optimal_loss,
             model_id=self.settings.model.primary_id,
             adapter_id=self.adapter_id,
+            experience_id=None if record is None else record.experience_id,
+            eligible_for_u2a=appraisal is not None
+            and (
+                appraisal.novelty_valid
+                or appraisal.goal_progress is not None
+                or appraisal.threat is not None
+            ),
+            context_id=None if record is None else record.context_id,
         )
 
     @staticmethod
