@@ -2173,7 +2173,7 @@ def test_snapshot_restore_precedes_runtime_acceptance(tmp_path: Path) -> None:
         assert checkpoint.snapshot_sequence == 7
         assert checkpoint.snapshot_hash == store.snapshot_hash(store.load())
         inspection = client.app.state.event_journal.inspect()
-        assert inspection.schema_version == 3
+        assert inspection.schema_version == 4
         assert inspection.processing_high_water == 7
 
 
@@ -2383,7 +2383,7 @@ def test_true_rollback_reconciles_external_state_before_runtime_acceptance(
         assert runtime.status is AgentRuntimeStatus.ACCEPTING
         assert reconciled.app.state.external_reconciliation_required is False
         inspection = reconciled.app.state.event_journal.inspect()
-        assert inspection.schema_version == 3
+        assert inspection.schema_version == 4
         assert inspection.terminal_gate_clear is not None
         assert reconciled.app.state.state_wal.inspect().active_manifest is not None
         active_manifest = reconciled.app.state.state_wal.inspect().active_manifest
@@ -2404,7 +2404,7 @@ def test_true_rollback_reconciles_external_state_before_runtime_acceptance(
     second_runtime = RecordingRuntime()
     with _client(tmp_path, settings=settings, runtime=second_runtime) as restarted:
         assert second_runtime.status is AgentRuntimeStatus.ACCEPTING
-        assert restarted.app.state.event_journal.inspect().schema_version == 3
+        assert restarted.app.state.event_journal.inspect().schema_version == 4
         manifest = restarted.app.state.state_wal.inspect().active_manifest
         assert manifest is not None
         assert not manifest.external_reconciliation_required
@@ -3150,6 +3150,7 @@ def test_accepted_append_failure_returns_bounded_503_without_handler(
         ] == [
             EventLifecycle.CHECKPOINT,
             EventLifecycle.CHECKPOINT,
+            EventLifecycle.CHECKPOINT,  # v3 -> v4 migration at startup (IP-3a)
             EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED,
         ]
         assert client.app.state.main_loop.session_state.turns == []
