@@ -22,6 +22,7 @@ from enum import Enum
 from hashlib import sha256
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 import sys
@@ -475,6 +476,46 @@ def _blob(value: object) -> bytes:
     return value
 
 
+def _finish_interrupted_create(path: Path) -> None:
+    """Complete a ``create`` that crashed between ``link`` and ``unlink``.
+
+    The published file then has two links: itself and exactly one private
+    ``.<name>.<hex>.creating`` staging name in the same directory with the
+    same inode.  Only that exact shape is repaired (the staging name is
+    removed); anything else is left for the custody check to refuse.
+    """
+
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 2:
+        return
+    # Exactly the staging names create() writes: ".<name>.<uuid4 hex>.creating".
+    pattern = re.compile(rf"\.{re.escape(path.name)}\.[0-9a-f]{{32}}\.creating")
+    try:
+        names = [name for name in os.listdir(path.parent) if pattern.fullmatch(name)]
+    except OSError:
+        return
+    matches = []
+    for name in names:
+        try:
+            other = os.lstat(path.parent / name)
+        except OSError:
+            continue
+        if (other.st_dev, other.st_ino) == (info.st_dev, info.st_ino):
+            matches.append(name)
+    if len(matches) != 1:
+        return
+    # Assumes the private (owner-only, checked) directory: no other uid can
+    # rename a file into the matched name between lstat and unlink.
+    try:
+        os.unlink(path.parent / matches[0])
+        _fsync_directory(path.parent)
+    except OSError:
+        return
+
+
 def _row_operation(row: tuple[object, ...]) -> HistoryOperationRow:
     try:
         return HistoryOperationRow(
@@ -587,6 +628,7 @@ class SubjectHistoryStore:
 
         path = _trusted_path(path)
         _check_private_directory(path.parent)
+        _finish_interrupted_create(path)
         before = _check_private_file(path, required=True)
         _check_private_file(_sidecar(path), required=False)
         # The store runs in rollback-journal mode only: WAL sidecars are foreign.
