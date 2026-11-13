@@ -37,7 +37,11 @@ from suzka.motivation.commitment_system import (
 from suzka.motivation.common import Deadline, R13Reference, R13ReferenceKind
 from suzka.motivation.motivation import MotivationKind, MotivationLifecycle
 from suzka.motivation.system import MotivationEventOperation
-from suzka.r16.source_owner import _MotivationSourceOwner, _MotivationSourceRef
+from suzka.r16.source_owner import (
+    _MotivationSourceOwner,
+    _MotivationSourceRef,
+    _MotivationSourceUnavailable,
+)
 from suzka.runtime.agent_runtime import (
     AgentEvent,
     AgentEventOutcome,
@@ -46,6 +50,12 @@ from suzka.runtime.agent_runtime import (
     AgentRuntime,
 )
 from suzka.runtime.event_journal import EventJournal, EventJournalError, EventLifecycle
+from suzka.r16.outcomes import (
+    R16OwnerOutcome,
+    R16OwnerReason,
+    R16OwnerStatus,
+    owner_reason,
+)
 from suzka.runtime.journal_source import (
     JournalSourceReason,
     JournalSourceStage,
@@ -182,24 +192,24 @@ class _CommitmentSourceOwner:
 
     def _submit_proposal(
         self, selection: _CommitmentSourceSelection
-    ) -> Future[AgentEventOutcome[str]]:
+    ) -> Future[AgentEventOutcome[R16OwnerOutcome]]:
         if type(selection) is not _CommitmentSourceSelection:
             raise _CommitmentSourceUnavailable("not a closed source selector")
         selection.__post_init__()
         return self._submit("proposal", selection)
 
-    def _submit_review(self, commitment_id: str) -> Future[AgentEventOutcome[str]]:
+    def _submit_review(self, commitment_id: str) -> Future[AgentEventOutcome[R16OwnerOutcome]]:
         validate_identifier(commitment_id)
         return self._submit("review", commitment_id)
 
-    def _submit(self, action: str, subject: object) -> Future[AgentEventOutcome[str]]:
+    def _submit(self, action: str, subject: object) -> Future[AgentEventOutcome[R16OwnerOutcome]]:
         self._check_binding()
         if action not in ("proposal", "review"):
             raise _CommitmentSourceUnavailable("invalid private operation")
         nonce = object()
         kind, origin = self._event_kind(action)
 
-        def handle() -> str:
+        def handle() -> R16OwnerOutcome:
             if self._pending is not None or self._inflight is not None:
                 raise _CommitmentSourceUnavailable("Commitment event already pending")
             self._inflight = (nonce, action, subject)
@@ -264,12 +274,23 @@ class _CommitmentSourceOwner:
         if p.event_id == x.event_id or p.event_sequence <= x.event_sequence:
             raise _CommitmentSourceUnavailable("invalid source chronology")
         try:
-            x_record, x_source = self._source._read(
-                x, event, continuation=continuation
-            )
+            # The request P is read first, so its outcome never depends on
+            # the requester-named target X (IP-5 review P2-a).
             p_record, p_source = self._source._read(
                 p, event, continuation=continuation
             )
+            try:
+                x_record, x_source = self._source._read(
+                    x, event, continuation=continuation
+                )
+            except _MotivationSourceUnavailable as error:
+                # A target-only reason is released only within P's Context.
+                raise _CommitmentSourceUnavailable(
+                    "target source unavailable",
+                    reason=self._source._scoped_target_reason(
+                        error, x, p, event, continuation=continuation
+                    ),
+                ) from error
             p_db1 = self._source._memory.get_committed_episodic(p.episode_id)
             if (
                 p_db1 is None
@@ -287,7 +308,10 @@ class _CommitmentSourceOwner:
             # check the trusted current UTC clock *both* in the handler and in
             # this same qualifier at pre-WAL validation. Do not rewrite R07 time.
             if event.requested_at >= due or _utcnow() >= due:
-                raise _CommitmentSourceUnavailable("obligation deadline elapsed")
+                raise _CommitmentSourceUnavailable(
+                    "obligation deadline elapsed",
+                    reason=R16OwnerReason.DEADLINE_ELAPSED,
+                )
 
             target = R13Reference(R13ReferenceKind.EXPERIENCE, x_record.experience_id)
             snap = self._loop._motivation_system.snapshot()
@@ -297,7 +321,10 @@ class _CommitmentSourceOwner:
                 if m.kind is MotivationKind.INTEREST and m.target == target
             )
             if len(interest) != 1:
-                raise _CommitmentSourceUnavailable("independent INTEREST absent")
+                raise _CommitmentSourceUnavailable(
+                    "independent INTEREST absent",
+                    reason=R16OwnerReason.MOTIVATION_UNAVAILABLE,
+                )
             motivation = interest[0]
             if (
                 motivation.lifecycle is not MotivationLifecycle.ACTIVE
@@ -306,14 +333,20 @@ class _CommitmentSourceOwner:
                 or motivation.revision != 0
                 or len(motivation.revision_history) != 1
             ):
-                raise _CommitmentSourceUnavailable("Motivation changed or conflicted")
+                raise _CommitmentSourceUnavailable(
+                    "Motivation changed or conflicted",
+                    reason=R16OwnerReason.MOTIVATION_UNAVAILABLE,
+                )
             if any(
                 other.kind is MotivationKind.AVERSION
                 and other.target == target
                 and other.lifecycle is MotivationLifecycle.ACTIVE
                 for other in snap.records
             ):
-                raise _CommitmentSourceUnavailable("counter-Motivation active")
+                raise _CommitmentSourceUnavailable(
+                    "counter-Motivation active",
+                    reason=R16OwnerReason.COUNTER_MOTIVATION,
+                )
             revision = motivation.revision_history[0]
             entries = tuple(
                 e
@@ -572,15 +605,25 @@ class _CommitmentSourceOwner:
             for record in self._loop._commitment_system.records
         )
 
-    def _propose(self, loop: SuzkaMainLoop, nonce: object) -> str:
+    def _propose(self, loop: SuzkaMainLoop, nonce: object) -> R16OwnerOutcome:
         event = self._event(loop, nonce, "proposal")
         assert self._inflight is not None
         selection = self._inflight[2]
         if type(selection) is not _CommitmentSourceSelection:
             raise _CommitmentSourceUnavailable("invalid Commitment source selection")
-        q = self._qualify(selection, event)
-        if self._other_responsibility_exists(q):
-            raise _CommitmentSourceUnavailable("duplicate responsibility")
+        before = loop._commitment_system.snapshot()
+        try:
+            q = self._qualify(selection, event)
+            if self._other_responsibility_exists(q):
+                raise _CommitmentSourceUnavailable(
+                    "duplicate responsibility",
+                    reason=R16OwnerReason.COMMITMENT_ALREADY_EXISTS,
+                )
+        except _CommitmentSourceUnavailable as error:
+            # IP-5: an unqualified proposal is a HOLD with a closed reason,
+            # not a FAILED event. Nothing was mutated.
+            self._pending = _PendingCommitment(event, "hold", None, None, None, before)
+            return R16OwnerOutcome.hold(owner_reason(error))
         evidence = q.evidence
         commitment_id = commitment_id_for_fields(
             subject=_SUBJECT,
@@ -625,9 +668,9 @@ class _CommitmentSourceOwner:
             proposal.commitment_id,
             loop._commitment_system.snapshot(),
         )
-        return proposal.commitment_id
+        return R16OwnerOutcome(R16OwnerStatus.PROPOSED, proposal.commitment_id)
 
-    def _review(self, loop: SuzkaMainLoop, nonce: object) -> str:
+    def _review(self, loop: SuzkaMainLoop, nonce: object) -> R16OwnerOutcome:
         event = self._event(loop, nonce, "review")
         assert self._inflight is not None
         identifier = self._inflight[2]
@@ -640,19 +683,22 @@ class _CommitmentSourceOwner:
             or commitment.lifecycle is not CommitmentLifecycle.PROPOSED
         ):
             self._pending = _PendingCommitment(event, "hold", None, None, None, before)
-            return "hold"
+            return R16OwnerOutcome.hold(R16OwnerReason.NOT_PENDING_REVIEW)
         try:
             selection = self._selection_from_record(commitment)
             q = self._qualify(selection, event, continuation=True)
             self._assert_contract(commitment, q)
             self._assert_original_proposal(commitment)
             if self._other_responsibility_exists(q, excluding=commitment.commitment_id):
-                raise _CommitmentSourceUnavailable("responsibility already exists")
-        except _CommitmentSourceUnavailable:
+                raise _CommitmentSourceUnavailable(
+                    "responsibility already exists",
+                    reason=R16OwnerReason.COMMITMENT_ALREADY_EXISTS,
+                )
+        except _CommitmentSourceUnavailable as error:
             self._pending = _PendingCommitment(
                 event, "hold", None, None, identifier, before
             )
-            return "hold"
+            return R16OwnerOutcome.hold(owner_reason(error), identifier)
         assert event.processing_sequence is not None
         admission = CommitmentSubjectAdmission(
             commitment_id=commitment.commitment_id,
@@ -685,7 +731,7 @@ class _CommitmentSourceOwner:
             identifier,
             loop._commitment_system.snapshot(),
         )
-        return "accepted"
+        return R16OwnerOutcome(R16OwnerStatus.ACCEPTED, identifier)
 
     def _validate_commit(self, event: AgentEvent) -> None:
         pending = self._pending

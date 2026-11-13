@@ -34,7 +34,11 @@ from suzka.motivation.goal_system import (
 )
 from suzka.motivation.motivation import MotivationKind, MotivationLifecycle
 from suzka.motivation.system import MotivationEventOperation
-from suzka.r16.source_owner import _MotivationSourceOwner, _MotivationSourceRef
+from suzka.r16.source_owner import (
+    _MotivationSourceOwner,
+    _MotivationSourceRef,
+    _MotivationSourceUnavailable,
+)
 from suzka.runtime.agent_runtime import (
     AgentEvent,
     AgentEventOutcome,
@@ -43,6 +47,12 @@ from suzka.runtime.agent_runtime import (
     AgentRuntime,
 )
 from suzka.runtime.event_journal import EventJournal, EventJournalError, EventLifecycle
+from suzka.r16.outcomes import (
+    R16OwnerOutcome,
+    R16OwnerReason,
+    R16OwnerStatus,
+    owner_reason,
+)
 from suzka.runtime.journal_source import (
     JournalSourceReason,
     JournalSourceStage,
@@ -161,17 +171,17 @@ class _GoalSourceOwner:
 
     def _submit_proposal(
         self, selection: _GoalSourceSelection
-    ) -> Future[AgentEventOutcome[str]]:
+    ) -> Future[AgentEventOutcome[R16OwnerOutcome]]:
         if type(selection) is not _GoalSourceSelection:
             raise _GoalSourceUnavailable("source selector must be exact")
         selection.__post_init__()
         return self._submit("proposal", selection)
 
-    def _submit_review(self, goal_id: str) -> Future[AgentEventOutcome[str]]:
+    def _submit_review(self, goal_id: str) -> Future[AgentEventOutcome[R16OwnerOutcome]]:
         validate_identifier(goal_id)
         return self._submit("review", goal_id)
 
-    def _submit(self, action: str, selection: object) -> Future[AgentEventOutcome[str]]:
+    def _submit(self, action: str, selection: object) -> Future[AgentEventOutcome[R16OwnerOutcome]]:
         self._check_binding()
         nonce = object()
         event_type, event_source = (
@@ -186,7 +196,7 @@ class _GoalSourceOwner:
             )
         )
 
-        def handle() -> str:
+        def handle() -> R16OwnerOutcome:
             if self._inflight is not None or self._pending is not None:
                 raise _GoalSourceUnavailable("Goal source already pending")
             self._inflight = (nonce, action, selection)
@@ -250,12 +260,23 @@ class _GoalSourceOwner:
         if p.event_id == x.event_id or p.event_sequence <= x.event_sequence:
             raise _GoalSourceUnavailable("Goal source chronology invalid")
         try:
-            x_record, x_source = self._source._read(
-                x, event, continuation=continuation
-            )
+            # The request P is read first, so its outcome never depends on
+            # the requester-named target X (IP-5 review P2-a).
             p_record, p_source = self._source._read(
                 p, event, continuation=continuation
             )
+            try:
+                x_record, x_source = self._source._read(
+                    x, event, continuation=continuation
+                )
+            except _MotivationSourceUnavailable as error:
+                # A target-only reason is released only within P's Context.
+                raise _GoalSourceUnavailable(
+                    "target source unavailable",
+                    reason=self._source._scoped_target_reason(
+                        error, x, p, event, continuation=continuation
+                    ),
+                ) from error
             db1_p = self._source._memory.get_committed_episodic(p.episode_id)
             if (
                 db1_p is None
@@ -275,7 +296,10 @@ class _GoalSourceOwner:
                 if m.kind is MotivationKind.INTEREST and m.target == target
             )
             if len(matches) != 1:
-                raise _GoalSourceUnavailable("independent Motivation absent")
+                raise _GoalSourceUnavailable(
+                    "independent Motivation absent",
+                    reason=R16OwnerReason.MOTIVATION_UNAVAILABLE,
+                )
             m = matches[0]
             if (
                 m.lifecycle is not MotivationLifecycle.ACTIVE
@@ -285,14 +309,20 @@ class _GoalSourceOwner:
                 or m.revision != 0
                 or m.revision_history[-1].event_id is None
             ):
-                raise _GoalSourceUnavailable("Motivation unqualified or changed")
+                raise _GoalSourceUnavailable(
+                    "Motivation unqualified or changed",
+                    reason=R16OwnerReason.MOTIVATION_UNAVAILABLE,
+                )
             if any(
                 other.kind is MotivationKind.AVERSION
                 and other.target == target
                 and other.lifecycle is MotivationLifecycle.ACTIVE
                 for other in motivation.records
             ):
-                raise _GoalSourceUnavailable("explicit counter-Motivation")
+                raise _GoalSourceUnavailable(
+                    "explicit counter-Motivation",
+                    reason=R16OwnerReason.COUNTER_MOTIVATION,
+                )
             revision = m.revision_history[-1]
             rows = tuple(
                 entry
@@ -535,17 +565,33 @@ class _GoalSourceOwner:
         if any(row.lifecycle is EventLifecycle.FAILED for row in records):
             raise _GoalSourceUnavailable("Goal proposal event failed")
 
-    def _propose(self, loop: SuzkaMainLoop, nonce: object) -> str:
+    def _propose(self, loop: SuzkaMainLoop, nonce: object) -> R16OwnerOutcome:
         event = self._current_event(loop, nonce, "proposal")
         assert self._inflight is not None
         selection = self._inflight[2]
         if type(selection) is not _GoalSourceSelection:
             raise _GoalSourceUnavailable("invalid Goal source selector")
-        q = self._qualify(selection, event)
-        target = q.target
-        goal_id = goal_id_for_target(target)
-        if loop._goal_system.get(goal_id) is not None:
-            raise _GoalSourceUnavailable("Goal already proposed for target")
+        before = loop._goal_system.snapshot()
+        try:
+            q = self._qualify(selection, event)
+            target = q.target
+            goal_id = goal_id_for_target(target)
+            existing = loop._goal_system.get(goal_id)
+            if existing is not None:
+                raise _GoalSourceUnavailable(
+                    "Goal already proposed for target",
+                    reason=R16OwnerReason.GOAL_ALREADY_EXISTS
+                    if any(
+                        ref.kind is R13ReferenceKind.USER_REQUEST
+                        for ref in existing.origin_refs
+                    )
+                    else R16OwnerReason.SELF_GOAL_OCCUPIES_TARGET,
+                )
+        except _GoalSourceUnavailable as error:
+            # IP-5: an unqualified proposal is a HOLD with a closed reason,
+            # not a FAILED event. Nothing was mutated.
+            self._pending = _PendingGoal(event, "hold", None, None, None, before)
+            return R16OwnerOutcome.hold(owner_reason(error))
         evidence = q.evidence
         assert event.processing_sequence is not None
         proposal_digest = goal_proposal_digest(
@@ -587,9 +633,9 @@ class _GoalSourceOwner:
         self._pending = _PendingGoal(
             event, "proposal", selection, q, goal_id, loop._goal_system.snapshot()
         )
-        return goal_id
+        return R16OwnerOutcome(R16OwnerStatus.PROPOSED, goal_id)
 
-    def _review(self, loop: SuzkaMainLoop, nonce: object) -> str:
+    def _review(self, loop: SuzkaMainLoop, nonce: object) -> R16OwnerOutcome:
         event = self._current_event(loop, nonce, "review")
         assert self._inflight is not None
         goal_id = self._inflight[2]
@@ -599,7 +645,7 @@ class _GoalSourceOwner:
         before = loop._goal_system.snapshot()
         if goal is None or goal.lifecycle is not GoalLifecycle.PROPOSED:
             self._pending = _PendingGoal(event, "hold", None, None, None, before)
-            return "hold"
+            return R16OwnerOutcome.hold(R16OwnerReason.NOT_PENDING_REVIEW)
         try:
             selection = self._selection_from_goal(goal)
             q = self._qualify(selection, event, continuation=True)
@@ -614,10 +660,13 @@ class _GoalSourceOwner:
                 for other in self._loop._goal_system.records
                 if other.goal_id != goal_id
             ):
-                raise _GoalSourceUnavailable("an adopted Goal conflicts")
-        except _GoalSourceUnavailable:
+                raise _GoalSourceUnavailable(
+                    "an adopted Goal conflicts",
+                    reason=R16OwnerReason.CONFLICTING_GOAL,
+                )
+        except _GoalSourceUnavailable as error:
             self._pending = _PendingGoal(event, "hold", None, None, goal_id, before)
-            return "hold"
+            return R16OwnerOutcome.hold(owner_reason(error), goal_id)
         assert event.processing_sequence is not None
         proof = GoalSubjectAdmission(
             goal_id=goal.goal_id,
@@ -640,7 +689,7 @@ class _GoalSourceOwner:
         self._pending = _PendingGoal(
             event, "adopt", selection, q, goal_id, loop._goal_system.snapshot()
         )
-        return "adopted"
+        return R16OwnerOutcome(R16OwnerStatus.ADOPTED, goal_id)
 
     def _validate_commit(self, event: AgentEvent) -> None:
         pending = self._pending

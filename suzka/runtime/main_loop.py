@@ -128,6 +128,7 @@ if TYPE_CHECKING:
     from suzka.r16.goal_owner import _GoalSourceOwner
     from suzka.r16.commitment_owner import _CommitmentSourceOwner
     from suzka.r16.plan_preview import _PlanPreviewOwner, _PlanPreviewResult
+    from suzka.r16.outcomes import R16OwnerOutcome
     from suzka.r15.state_port import R15StatePort
     from suzka.memory.episodic_participant import MemoryEpisodicParticipant
     from suzka.memory.experience_participant import MemoryExperienceParticipant
@@ -621,12 +622,16 @@ class SuzkaMainLoop:
             raise RuntimeError("Goal Source owner already bound")
         self._goal_source_owner = owner
 
-    def _propose_goal_source(self, owner: _GoalSourceOwner, nonce: object) -> str:
+    def _propose_goal_source(
+        self, owner: _GoalSourceOwner, nonce: object
+    ) -> R16OwnerOutcome:
         if owner is not self._goal_source_owner or owner is None:
             raise RuntimeError("unbound Goal proposal owner")
         return owner._propose(self, nonce)
 
-    def _review_goal_source(self, owner: _GoalSourceOwner, nonce: object) -> str:
+    def _review_goal_source(
+        self, owner: _GoalSourceOwner, nonce: object
+    ) -> R16OwnerOutcome:
         if owner is not self._goal_source_owner or owner is None:
             raise RuntimeError("unbound Goal review owner")
         return owner._review(self, nonce)
@@ -652,14 +657,14 @@ class SuzkaMainLoop:
 
     def _propose_commitment_source(
         self, owner: _CommitmentSourceOwner, nonce: object
-    ) -> str:
+    ) -> R16OwnerOutcome:
         if owner is not self._commitment_source_owner or owner is None:
             raise RuntimeError("unbound Commitment proposal owner")
         return owner._propose(self, nonce)
 
     def _review_commitment_source(
         self, owner: _CommitmentSourceOwner, nonce: object
-    ) -> str:
+    ) -> R16OwnerOutcome:
         if owner is not self._commitment_source_owner or owner is None:
             raise RuntimeError("unbound Commitment acceptance owner")
         return owner._review(self, nonce)
