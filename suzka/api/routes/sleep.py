@@ -43,4 +43,5 @@ def run_sleep(
         dry_run=None
         if result.training_result is None
         else result.training_result.dry_run,
+        learning_skipped_reason=result.learning_skipped_reason,
     )

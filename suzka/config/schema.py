@@ -164,6 +164,22 @@ class EventJournalSettings(StrictBaseModel):
     retention_days: int = Field(default=30, ge=0, le=36_500)
     # Defaults to "<path>-archive" beside the Journal.
     archive_dir: Path | None = None
+    # IP-4b (#381 §6): limits over live bytes (active + rotated segments;
+    # archives are not counted). Above ``max_total_bytes - soft_band_bytes``
+    # only cognition is admitted; above ``max_total_bytes`` no new event is
+    # admitted. Defaults follow the #381 capacity table for ~100 turns/day
+    # (72 MiB) with a soft band of more than 7 days of cognition (16 MiB).
+    max_total_bytes: int | None = Field(default=75_497_472, gt=0)
+    soft_band_bytes: int = Field(default=16_777_216, ge=0)
+
+    @model_validator(mode="after")
+    def validate_capacity_bands(self) -> "EventJournalSettings":
+        if self.max_total_bytes is None:
+            if self.soft_band_bytes != 0:
+                raise ValueError("soft_band_bytes requires max_total_bytes")
+        elif self.soft_band_bytes >= self.max_total_bytes:
+            raise ValueError("soft_band_bytes must be below max_total_bytes")
+        return self
 
 
 class StateWALSettings(StrictBaseModel):

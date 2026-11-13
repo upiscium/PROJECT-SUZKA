@@ -40,6 +40,7 @@ from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 from suzka.models import DummyProvider
 from suzka.persona import PromptBuilder
 from suzka.runtime import (
+    EventJournalAdmissionBand,
     AbortOutcome,
     AgentEvent,
     AgentEventOutcome,
@@ -208,8 +209,9 @@ def test_retention_exhaustion_blocks_mutation_but_keeps_read_only_health(
     """Admission refusal is side-effect free and keeps read-only health.
 
     IP-4a removed the count-based trigger (proof retention blocking rotation,
-    the ~340-turn stall); IP-4b adds the hard size limit. The refusal path is
-    exercised here by making rotation impossible on a real oversized Journal.
+    the ~340-turn stall). The hard limit over live bytes (IP-4b) is covered by
+    ``test_journal_hard_limit_refuses_new_events_across_restart``; this test
+    exercises the impossible-rotation refusal on a real oversized Journal.
     """
     settings = _settings(tmp_path)
     max_bytes: int
@@ -300,6 +302,103 @@ def test_retention_exhaustion_blocks_mutation_but_keeps_read_only_health(
             headers=admin_headers(),
             params={"query": "fill"},
         ).status_code == 200
+        assert restarted.post(
+            "/api/chat", json={"message": "blocked", "attachments": []}
+        ).status_code == 503
+
+
+def _journal_live_bytes(journal: EventJournal) -> int:
+    return journal.path.stat().st_size + sum(
+        item.stat().st_size
+        for item in journal.path.parent.glob(f"{journal.path.name}.[0-9]*")
+    )
+
+
+def test_journal_soft_band_keeps_cognition_and_refuses_debug_chat(
+    tmp_path: Path,
+) -> None:
+    """IP-4b (#381 D2 P1-4): above the soft limit, Chat continues while
+    DEBUG_CHAT is refused without side effects, Sleep training is vetoed,
+    and health reports ``journal_soft_limit``."""
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        journal: EventJournal = client.app.state.event_journal
+        assert client.post(
+            "/api/chat", json={"message": "before", "attachments": []}
+        ).status_code == 200
+        assert client.app.state.sleep_cycle_manager._learning_gate() is None
+        live = _journal_live_bytes(journal)
+        journal.max_total_bytes = live + 1_000_000
+        journal.soft_band_bytes = 1_000_000 + 1
+        assert journal.admission_status().band is EventJournalAdmissionBand.SOFT
+
+        assert client.get("/health").json() == {
+            "status": "degraded",
+            "project": settings.project.name,
+            "reason": "journal_soft_limit",
+        }
+        before_records = journal.records
+        refused = client.post(
+            "/api/chat/debug",
+            headers=admin_headers(),
+            json={"message": PRIVATE_SENTINEL, "attachments": [], "debug": True},
+        )
+        assert refused.status_code == 503
+        assert PRIVATE_SENTINEL not in refused.text
+        assert journal.records == before_records
+        assert client.app.state.sleep_cycle_manager._learning_gate() == (
+            "journal_soft_limit"
+        )
+
+        response = client.post(
+            "/api/chat", json={"message": "during soft band", "attachments": []}
+        )
+        assert response.status_code == 200
+        assert len(journal.records) > len(before_records)
+        assert client.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+
+
+def test_journal_hard_limit_refuses_new_events_across_restart(
+    tmp_path: Path,
+) -> None:
+    """IP-4b: the hard limit over live bytes is the existing fail-stop for
+    new admission; restart attempts a compaction and stays stopped if none
+    is due (#381 D2 P2: the window is never shrunk automatically)."""
+    settings = _settings(tmp_path)
+    with _client(tmp_path, settings=settings) as client:
+        journal: EventJournal = client.app.state.event_journal
+        assert client.post(
+            "/api/chat", json={"message": "fill", "attachments": []}
+        ).status_code == 200
+        hard_limit = _journal_live_bytes(journal) - 1
+        journal.max_total_bytes = hard_limit
+        journal.soft_band_bytes = 0
+        status = journal.admission_status()
+        assert status.band is EventJournalAdmissionBand.HARD
+        assert not status.available
+        before_records = journal.records
+        response = client.post(
+            "/api/chat", json={"message": PRIVATE_SENTINEL, "attachments": []}
+        )
+        assert response.status_code == 503
+        assert journal.records == before_records
+        assert client.get("/health").json()["reason"] == (
+            "event_journal_retention_exhausted"
+        )
+
+    constrained = settings.model_copy(
+        update={
+            "event_journal": settings.event_journal.model_copy(
+                update={"max_total_bytes": hard_limit, "soft_band_bytes": 0}
+            )
+        }
+    )
+    with _client(tmp_path, settings=constrained) as restarted:
+        assert restarted.app.state.agent_runtime.status is AgentRuntimeStatus.CREATED
+        assert restarted.app.state.journal_compaction.last_outcome is not None
+        assert restarted.get("/health").json()["reason"] == (
+            "event_journal_retention_exhausted"
+        )
         assert restarted.post(
             "/api/chat", json={"message": "blocked", "attachments": []}
         ).status_code == 503

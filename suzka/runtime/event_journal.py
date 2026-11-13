@@ -1098,9 +1098,53 @@ class EventJournalAppendError(EventJournalError):
 EventJournalCompaction.model_rebuild()
 
 
+class EventJournalAdmissionBand(str, Enum):
+    """Capacity band of the live Journal (#381 §6, D2 P1-4; IP-4b).
+
+    Live bytes are the active segment plus the rotated segments; archives
+    are not counted. ``SOFT`` admits only ``SOFT_BAND_ADMITTED_EVENT_TYPES``;
+    ``HARD`` admits no new event. Neither band ever blocks the lifecycle of
+    an already admitted event, recovery, reconciliation, rollover or
+    COMPACTION: only new ``ACCEPTED`` records are gated.
+    """
+
+    NORMAL = "normal"
+    SOFT = "soft"
+    HARD = "hard"
+
+
+# #381 D2 P1-4: the soft band is an allow-list over all 16 AgentEventTypes.
+# Cognition continues; DEBUG_CHAT, ADAPTER_EVALUATE and ADAPTER_UPDATE (Human
+# decision 2026-11-10) are refused, and so is every type not listed here,
+# including any type added later (R18/R19 external effects).
+SOFT_BAND_ADMITTED_EVENT_TYPES: frozenset[AgentEventType] = frozenset(
+    {
+        AgentEventType.CHAT,
+        AgentEventType.SLEEP,
+        AgentEventType.CONTEXT_UPDATE,
+        AgentEventType.EMOTION_TICK,
+        AgentEventType.VALUE_GOVERNANCE,
+        AgentEventType.NARRATIVE_REVIEW,
+        AgentEventType.SELF_ATTEMPT_REVIEW,
+        AgentEventType.MOTIVATION_SOURCE_REVIEW,
+        AgentEventType.GOAL_PROPOSAL_REVIEW,
+        AgentEventType.GOAL_ADOPTION_REVIEW,
+        AgentEventType.COMMITMENT_PROPOSAL_REVIEW,
+        AgentEventType.COMMITMENT_ACCEPTANCE_REVIEW,
+        AgentEventType.PLAN_PREVIEW_REVIEW,
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class EventJournalAdmissionStatus:
-    """Bounded, read-only evidence for mutation admission."""
+    """Bounded, read-only evidence for mutation admission.
+
+    ``available`` is False only when no new event may be admitted at all
+    (hard limit, exhausted sequence, or an impossible rotation). In the soft
+    band it stays True with ``reason="journal_soft_limit"``; whether a given
+    event type is admitted is ``admits()``.
+    """
 
     available: bool
     reason: str | None
@@ -1111,6 +1155,17 @@ class EventJournalAdmissionStatus:
     safe_rotation_possible: bool
     lifecycle_blocks_rotation: bool
     proof_retention_blocks_safe_pruning: bool
+    band: EventJournalAdmissionBand = EventJournalAdmissionBand.NORMAL
+    live_bytes: int = 0
+    max_total_bytes: int | None = None
+    soft_limit_bytes: int | None = None
+
+    def admits(self, event_type: AgentEventType) -> bool:
+        if not self.available:
+            return False
+        if self.band is EventJournalAdmissionBand.SOFT:
+            return event_type in SOFT_BAND_ADMITTED_EVENT_TYPES
+        return self.band is EventJournalAdmissionBand.NORMAL
 
 
 @dataclass(frozen=True, slots=True)
@@ -1573,7 +1628,26 @@ class EventJournal:
         ) = None,
         lease: EventJournalLease | None = None,
         archive_dir: str | Path | None = None,
+        max_total_bytes: int | None = None,
+        soft_band_bytes: int = 0,
     ) -> None:
+        if max_total_bytes is not None and (
+            isinstance(max_total_bytes, bool)
+            or not isinstance(max_total_bytes, int)
+            or max_total_bytes <= 0
+        ):
+            raise ValueError("max_total_bytes must be a positive integer")
+        if (
+            isinstance(soft_band_bytes, bool)
+            or not isinstance(soft_band_bytes, int)
+            or soft_band_bytes < 0
+            or (max_total_bytes is None and soft_band_bytes != 0)
+            or (max_total_bytes is not None and soft_band_bytes >= max_total_bytes)
+        ):
+            raise ValueError(
+                "soft_band_bytes must be non-negative, below max_total_bytes, "
+                "and requires max_total_bytes"
+            )
         if (
             isinstance(max_bytes, bool)
             or not isinstance(max_bytes, int)
@@ -1591,6 +1665,11 @@ class EventJournal:
         # Deprecated: retention is by time and compaction (#381 D2 P2). Kept
         # for configuration compatibility and admission status only.
         self.retained_files = retained_files
+        # IP-4b: live bytes (active + rotated, never archives). None keeps
+        # the pre-IP-4b behaviour of no total limit.
+        self.max_total_bytes = max_total_bytes
+        self.soft_band_bytes = soft_band_bytes
+        self._last_band = EventJournalAdmissionBand.NORMAL
         # Outside the rotated-segment glob ``<name>.<8 digits>``.
         self.archive_dir = (
             Path(archive_dir)
@@ -1668,7 +1747,7 @@ class EventJournal:
 
         with self._lock:
             self._require_authority()
-            if not self._admission_status_unlocked().available:
+            if not self._admission_status_unlocked().admits(event.event_type):
                 return False
             self.append_accepted(event)
             return True
@@ -3604,6 +3683,53 @@ class EventJournal:
         self._rotate_unlocked(verified)
 
     def _admission_status_unlocked(self) -> EventJournalAdmissionStatus:
+        status = self._segment_admission_status_unlocked()
+        try:
+            live_bytes = status.active_file_bytes + sum(
+                path.stat().st_size for _index, path in self._rotated_paths_unlocked()
+            )
+        except OSError as error:
+            raise EventJournalLoadError(
+                "EventJournal size cannot be inspected"
+            ) from error
+        band = EventJournalAdmissionBand.NORMAL
+        soft_limit: int | None = None
+        if self.max_total_bytes is not None:
+            soft_limit = self.max_total_bytes - self.soft_band_bytes
+            if live_bytes > self.max_total_bytes:
+                band = EventJournalAdmissionBand.HARD
+            elif live_bytes > soft_limit:
+                band = EventJournalAdmissionBand.SOFT
+        if band is not self._last_band:
+            LOGGER.warning(
+                "EventJournal capacity band %s -> %s (live %d bytes, "
+                "soft limit %s, hard limit %s)",
+                self._last_band.value,
+                band.value,
+                live_bytes,
+                soft_limit,
+                self.max_total_bytes,
+            )
+            self._last_band = band
+        available = status.available
+        reason = status.reason
+        if band is EventJournalAdmissionBand.HARD and available:
+            # Hard limit: fail-stop for new admission, as before (#381 §6).
+            available = False
+            reason = "event_journal_retention_exhausted"
+        elif band is EventJournalAdmissionBand.SOFT and available:
+            reason = "journal_soft_limit"
+        return replace(
+            status,
+            available=available,
+            reason=reason,
+            band=band,
+            live_bytes=live_bytes,
+            max_total_bytes=self.max_total_bytes,
+            soft_limit_bytes=soft_limit,
+        )
+
+    def _segment_admission_status_unlocked(self) -> EventJournalAdmissionStatus:
         try:
             active_bytes = self.path.stat().st_size
         except OSError as error:

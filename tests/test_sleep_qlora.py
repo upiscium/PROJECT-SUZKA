@@ -12,6 +12,7 @@ from suzka.learning import (
     DreamDatasetRecord,
     QloraTrainer,
     SleepCycleManager,
+    SleepCycleResult,
     format_training_text,
 )
 from suzka.memory import DualMemorySystem
@@ -215,3 +216,72 @@ def _settings_for_sleep(tmp_path: Path) -> Settings:
             ),
         }
     )
+
+
+def test_sleep_learning_gate_skips_training_but_keeps_consolidation(
+    tmp_path: Path,
+) -> None:
+    """IP-4b (#381 D2 P2 SLEEP): in the Journal soft band, Sleep is admitted
+    and consolidates memory, but trains no adapter and registers no candidate."""
+    settings = _settings_for_sleep(tmp_path)
+    memory = DualMemorySystem(settings)
+    registry = AdapterRegistry(settings)
+    memory.save_episodic("sleep input", "sleep output", emotion_arousal=0.9)
+    manager = SleepCycleManager(settings, memory, DummyProvider(), registry)
+    event = AgentEvent(
+        event_id="22222222-2222-4222-8222-222222222222",
+        event_type=AgentEventType.SLEEP,
+        source=AgentEventSource.API_SLEEP_RUN,
+        requested_at=datetime.now(UTC),
+        processing_sequence=1,
+    )
+
+    class FakeRuntime:
+        def current_event(self) -> AgentEvent:
+            return event
+
+    manager.bind_runtime(FakeRuntime())  # type: ignore[arg-type]
+    manager.bind_learning_gate(lambda: "journal_soft_limit")
+    result = manager.run()
+    assert isinstance(result, CoordinatedResult)
+    participant = result.participants[0]
+    transaction_id = TransactionCoordinator.derive_transaction_id(
+        event, TransactionKind.EVENT_MUTATION
+    )
+    binding = TransactionBinding(
+        transaction_id,
+        event.event_id,
+        event.processing_sequence,
+        participant.participant_id,
+        participant.operation_digest,
+        TransactionKind.EVENT_MUTATION,
+    )
+    participant.prepare(binding)
+    participant.finalize(binding)
+    assert hasattr(result.value, "materialize")
+    result_value = manager.complete_post_commit(
+        result.value.materialize(transaction_id)
+    )
+
+    assert len(result_value.semantic_memory_ids) == 1
+    assert result_value.learning_skipped_reason == "journal_soft_limit"
+    assert result_value.training_result is None
+    assert result_value.adapter_entry is None
+    assert not settings.sleep.dream_dataset_path.exists()
+    assert registry.list() == []
+
+
+def test_sleep_learning_gate_failure_skips_training(tmp_path: Path) -> None:
+    settings = _settings_for_sleep(tmp_path)
+    manager = SleepCycleManager(
+        settings, DualMemorySystem(settings), DummyProvider(), AdapterRegistry(settings)
+    )
+
+    def broken() -> str | None:
+        raise RuntimeError("band unavailable")
+
+    manager.bind_learning_gate(broken)
+    result = SleepCycleResult(["episode"], ["semantic"], None, None, None)
+    skipped = manager.complete_post_commit(result)
+    assert skipped.learning_skipped_reason == "learning_gate_unavailable"
+    assert skipped.training_result is None
