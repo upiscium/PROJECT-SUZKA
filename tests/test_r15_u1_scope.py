@@ -50,6 +50,9 @@ def test_r15_u1_pure_modules_are_not_runtime_producers() -> None:
                 "QualifiedNarrativeSourceGate", "QualifiedProposalUnavailable",
             },
         },
+        ROOT / "suzka" / "runtime" / "r15_interpretation_reader.py": {
+            "suzka.r15.state_port": {"R15StatePort", "R15InterpretationRead"},
+        },
         ROOT / "suzka" / "runtime" / "main_loop.py": {
             "suzka.r15.state_port": {"R15StatePort"},
             "suzka.r15.scoped_interaction": {"neutral_prompt_line"},

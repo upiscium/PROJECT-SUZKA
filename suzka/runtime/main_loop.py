@@ -139,6 +139,12 @@ if TYPE_CHECKING:
     )
 
 
+# Closed R15 status classes the private projection may carry (IP-8a).
+_PRIVATE_STATUS_CLASSES = frozenset(
+    {"PRESENT", "CONTESTED", "CONTRADICTORY", "UNKNOWN"}
+)
+
+
 @dataclass(frozen=True)
 class ChatResult:
     """Visible/structured result safe to pass to ordinary callers."""
@@ -1354,6 +1360,7 @@ class SuzkaMainLoop:
                     proposed.current_referent,
                     proposed.revision,
                     proposed.later_user_reported,
+                    proposed.status_class,
                 )
 
         raw_response = self.agent.generate(prompt)
@@ -1668,26 +1675,44 @@ class SuzkaMainLoop:
         current: str | None,
         revision: int | None,
         later_reported: bool,
+        status_class: str | None,
     ) -> str:
-        """Finite public-safe semantics only; never append owner Source text."""
+        """Finite public-safe semantics only; never append owner Source text.
+
+        IP-8a (#374 D3 §2, D4 §6): an UNKNOWN class hides both options and
+        states only that the interpretation is undetermined; CONTESTED and
+        CONTRADICTORY add one fixed disagreement line.  No rationale.
+        """
         if (
             type(revision) is not int
             or revision not in (1, 2)
             or type(original) is not str
             or original not in ("A", "B")
             or type(current) is not str
-            or current not in ("A", "B")
+            or current not in ("A", "B", "UNKNOWN")
             or type(later_reported) is not bool
             or later_reported != (revision == 2)
+            or status_class not in _PRIVATE_STATUS_CLASSES
+            or (current == "UNKNOWN") != (revision == 2 and status_class == "UNKNOWN")
         ):
             raise ValueError("unqualified private interpretation cannot be used")
         report = "yes" if later_reported else "no"
+        if status_class == "UNKNOWN":
+            options = "- Current interpretation: undetermined.\n"
+        else:
+            options = (
+                f"- My earlier tentative option: {original}\n"
+                f"- My current tentative option: {current}\n"
+            )
+            if status_class in ("CONTESTED", "CONTRADICTORY"):
+                options += (
+                    "- The earlier interpretation and the later report disagree.\n"
+                )
         return (
             "Internal bounded first-person provisional interpretation, "
             "for the user's explicit request about the preceding exercise ONLY:\n"
-            f"- My earlier tentative option: {original}\n"
-            f"- My current tentative option: {current}\n"
-            f"- Later user-reported correction exists: {report}\n"
+            + options
+            + f"- Later user-reported correction exists: {report}\n"
             "The user's later report is not independently verified human intent. "
             "Do not claim competence, personal identity, trust, objective success, "
             "or certainty. No hidden history or Source IDs are available. "

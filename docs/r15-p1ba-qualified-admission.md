@@ -50,10 +50,27 @@ subject-event RevisionProof (revision 1). This is not an operator setter.
 (2) After independently terminal E2 and S2 Chat events, another
 dedicated Runtime event reads all five sources again. The user E2
 statement may establish what the user *said*, not the real-world intent.
-If the source-backed referent differs from the S1 choice and the
-provisional S2 model candidate agrees with the observed user
-statement, the owner creates a CONTESTED S2 revision (revision 2)
-linked to the unchanged S1 and retains E as counterevidence.
+If the observed user statement names a referent that differs from the
+original choice, the owner creates an S2 revision (revision 2) linked to
+the unchanged S1. Since IP-8a (#374 F1 D2/D3/D4/D5) the S2 candidate may
+adopt the report, keep the original, or answer UNKNOWN; its typed
+self-assessment (assessment, uncertainty, referent relation) is retained and
+`interpretation_status_v2` fixes the status:
+
+- ADOPTS_REPORT: PRESENT (MAY_HAVE_MISREAD with LOW/MEDIUM uncertainty) or
+  CONTESTED, supported by E2; CONTESTED keeps E as counterevidence.
+- KEEPS_ORIGINAL: CONTRADICTORY (LIKELY_ALIGNED) or CONTESTED, supported by E
+  and opposed by the reported E2.
+- UNKNOWN: UNKNOWN, with no support or counter. Its RevisionReason is
+  CONTRARY_EVIDENCE even though support and counter are empty: the reason
+  records that a contrary report was reviewed, not that it was adopted.
+
+S1 is PRESENT only for LIKELY_ALIGNED with LOW/MEDIUM uncertainty and is
+otherwise UNKNOWN; an S1 that names another referent (or UNKNOWN) is still
+refused. The S1/S2 requests must regenerate byte for byte from one registered
+template (`suzka/r15/request_templates.py`, NEUTRAL only), so a framing cannot
+dictate the label. Roots admitted under the earlier table are not migrated:
+they restore, but every private read re-derives both episodes and is HOLD.
 
 (3) No later E2: no S2 revision. Duplicate qualified source references
 are rechecked and do not create a new revision. Missing source,

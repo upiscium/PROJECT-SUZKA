@@ -21,11 +21,9 @@ from suzka.r15.common import (
     Concept,
     EventRef,
     Interpretation,
-    InterpretationStatus,
     Accessibility,
     Inertia,
     RevisionProof,
-    RevisionReason,
     SourceDisposition,
     SourceWitness,
     checksum,
@@ -43,9 +41,16 @@ from suzka.r15.contracts import (
     current_semantic_producer,
 )
 from suzka.r15.continuity_state import NarrativeContinuation, ContinuityInvalid
+from suzka.r15.interpretation_status import (
+    ReferentRelation,
+    StatusRow,
+    Witness,
+    interpretation_status_v2,
+)
 from suzka.r15.qualified_proposal import (
     QualifiedNarrativeSourceGate,
     QualifiedProposalUnavailable,
+    QualifiedReferentProposal,
     QualifiedTurnRef,
     scoped_option_key,
     restore_scoped_option,
@@ -296,6 +301,63 @@ def _source_episode_digest(episode: NarrativeEpisode) -> str:
     return checksum(_NARRATIVE_CHANGE_DOMAIN, encode(episode))
 
 
+def _witness(role: Witness, proposal: QualifiedReferentProposal) -> SourceWitness:
+    item = proposal.first if role is Witness.FIRST else proposal.later
+    if item is None:
+        raise QualifiedProposalUnavailable("status row names an absent witness")
+    return item
+
+
+def derive_episode(
+    proposal: QualifiedReferentProposal, stage: str
+) -> tuple[NarrativeEpisode, StatusRow]:
+    """IP-8a: the exact episode a qualified proposal yields (#374 D2 §2, D3 §1).
+
+    Pure: re-derivation at private re-validation must produce the identical
+    episode, so its digest proves the stored root used the v2 table.
+    """
+
+    scope = proposal.source_scope
+    if stage == "S1":
+        # S1 always keeps the original referent (an S1 that does not is refused).
+        row = interpretation_status_v2(
+            "S1",
+            ReferentRelation.KEEPS_ORIGINAL,
+            proposal.s1.assessment,
+            proposal.s1.uncertainty,
+        )
+        selected = proposal.original_choice
+        inertia = Inertia.TENTATIVE
+        links: tuple[NarrativeLink, ...] = ()
+    else:
+        if proposal.stage != "S2" or proposal.s2 is None:
+            raise QualifiedProposalUnavailable("S2 episode needs an S2 proposal")
+        row = interpretation_status_v2(
+            "S2", proposal.relation, proposal.s2.assessment, proposal.s2.uncertainty
+        )
+        selected = proposal.selected
+        inertia = Inertia.REVISABLE
+        links = (
+            NarrativeLink(NarrativeLinkKind.EPISODE, _source_episode_id(scope, "S1")),
+        )
+    episode = NarrativeEpisode(
+        _source_episode_id(scope, stage),
+        _witness(row.experience, proposal),
+        Interpretation(
+            scoped_option_key(scope, selected),
+            row.status,
+            row.estimate,
+            row.confidence,
+            tuple(_witness(item, proposal) for item in row.support),
+            tuple(_witness(item, proposal) for item in row.counter),
+            Accessibility.CURRENT,
+            inertia,
+        ),
+        links,
+    )
+    return episode, row
+
+
 class NarrativeSelfSystem:
     """U3 owner: no general setter; narrowly-qualified internal P1b-A review."""
 
@@ -454,6 +516,7 @@ class NarrativeSelfSystem:
                     raise NarrativeEventConflict(
                         "old initial experience cannot replace revision"
                     )
+                self._require_stored(current, proposal, "S1")
                 return NarrativeQualifiedResult(
                     _copy_root(current),
                     review_event,
@@ -473,6 +536,9 @@ class NarrativeSelfSystem:
                         raise NarrativeEventConflict(
                             "second reinterpretation needs a new stage"
                         )
+                    # D4 §7 P2-6: a replay must re-derive the stored episodes.
+                    self._require_stored(current, proposal, "S1")
+                    self._require_stored(current, proposal, "S2")
                     return NarrativeQualifiedResult(
                         _copy_root(current),
                         review_event,
@@ -490,33 +556,11 @@ class NarrativeSelfSystem:
                     "reinterpretation requires one prior revision"
                 )
 
-            episode_id = _source_episode_id(proposal.source_scope, stage)
-            primary = proposal.source
-            other = proposal.contrary
-            episode = NarrativeEpisode(
-                episode_id,
-                primary,
-                Interpretation(
-                    scoped_option_key(proposal.source_scope, proposal.selected),
-                    InterpretationStatus.PRESENT
-                    if stage == "S1"
-                    else InterpretationStatus.CONTESTED,
-                    500_000,
-                    250_000,
-                    (primary,),
-                    () if other is None else (other,),
-                    Accessibility.CURRENT,
-                    Inertia.TENTATIVE if stage == "S1" else Inertia.REVISABLE,
-                ),
-                ()
-                if stage == "S1"
-                else (
-                    NarrativeLink(
-                        NarrativeLinkKind.EPISODE,
-                        _source_episode_id(proposal.source_scope, "S1"),
-                    ),
-                ),
-            )
+            if stage == "S2":
+                # D5 §1: an S2 is admitted only over an S1 that the v2 table
+                # re-derives exactly, so no mixed v1/v2 root is created.
+                self._require_stored(current, proposal, "S1")
+            episode, row = derive_episode(proposal, stage)
             old_proof = (
                 current.revision_history[-1] if current.revision_history else None
             )
@@ -533,11 +577,9 @@ class NarrativeSelfSystem:
                 _source_episode_id(proposal.source_scope, "TARGET"),
                 previous_digest,
                 current_digest,
-                (primary.source_digest,),
-                () if other is None else (other.source_digest,),
-                RevisionReason.INITIAL_INTERPRETATION
-                if stage == "S1"
-                else RevisionReason.QUALIFIED_REINTERPRETATION,
+                tuple(item.source_digest for item in episode.interpretation.support),
+                tuple(item.source_digest for item in episode.interpretation.counter),
+                row.reason,
                 None if old_proof is None else old_proof.record_digest,
             )
             candidate = NarrativeSelfState(
@@ -574,6 +616,21 @@ class NarrativeSelfSystem:
                 proposal.selected,
                 True,
                 proposal.source_scope,
+            )
+
+    @staticmethod
+    def _require_stored(
+        root: NarrativeSelfState, proposal: QualifiedReferentProposal, stage: str
+    ) -> None:
+        expected, _row = derive_episode(proposal, stage)
+        stored = tuple(
+            item for item in root.episodes if item.episode_id == expected.episode_id
+        )
+        if len(stored) != 1 or _source_episode_digest(stored[0]) != _source_episode_digest(
+            expected
+        ):
+            raise NarrativeEventConflict(
+                "stored interpretation differs from its re-derivation"
             )
 
     def review_boundary(

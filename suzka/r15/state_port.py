@@ -19,6 +19,11 @@ from suzka.r15.private_projection import (
     PrivateNarrativeProjection,
     read_private_committed_narrative,
 )
+from suzka.r15.interpretation_reader import (
+    UNAVAILABLE as INTERPRETATION_UNAVAILABLE,
+    R15InterpretationRead,
+    read_interpretation,
+)
 from suzka.r15.qualified_proposal import QualifiedNarrativeSourceGate
 from suzka.r15.common import (
     ClaimedOrigin,
@@ -293,6 +298,43 @@ class R15StatePort:
                 self,
                 gate,
                 context_id=context_id,
+                event_sequence=event.processing_sequence,
+            )
+
+    def read_interpretation(
+        self, event: AgentEvent, x_event_id: str, x_event_sequence: int
+    ) -> R15InterpretationRead:
+        """IP-8a R15 -> R16 read: closed values only, read-only.
+
+        Allowed only inside the actual serialized R16 plan-preview review
+        event, before that event opens its R07 transaction (#374 D5 §3, P2-2).
+        Any other caller or failure is UNAVAILABLE.
+        """
+        with self._owner_lock:
+            runtime = self._private_read_runtime
+            store = self._private_read_store
+            gate = self.narrative._source_gate
+            if (
+                type(event) is not AgentEvent
+                or runtime is None
+                or store is None
+                or type(gate) is not QualifiedNarrativeSourceGate
+                or gate._runtime is not runtime
+                or runtime.current_event() is not event
+                or event.event_type is not AgentEventType.PLAN_PREVIEW_REVIEW
+                or event.source is not AgentEventSource.RUNTIME_PLAN_PREVIEW_REVIEW
+                or type(event.processing_sequence) is not int
+                or type(x_event_id) is not str
+                or type(x_event_sequence) is not int
+                or x_event_sequence < 1
+            ):
+                return INTERPRETATION_UNAVAILABLE
+            return read_interpretation(
+                store,
+                self,
+                gate,
+                x_event_id=x_event_id,
+                x_event_sequence=x_event_sequence,
                 event_sequence=event.processing_sequence,
             )
 
