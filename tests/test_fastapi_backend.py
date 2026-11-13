@@ -458,6 +458,8 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
             "emotion",
             "model",
             "experience_id",
+            "command_ticket",
+            "incarnation",
         }
         assert data["response"] == "Visible API answer."
         assert "hidden_thought" not in data
@@ -1006,7 +1008,15 @@ def test_chat_session_selector_reuses_one_durable_context_without_response_metad
 
         assert first.status_code == second.status_code == 200
         # experience_id is approved (DRV-3); no Context metadata is returned.
-        keys = {"episode_id", "response", "emotion", "model", "experience_id"}
+        keys = {
+            "episode_id",
+            "response",
+            "emotion",
+            "model",
+            "experience_id",
+            "command_ticket",
+            "incarnation",
+        }
         assert set(first.json()) == keys
         assert set(second.json()) == keys
         frames = client.app.state.main_loop.context_registry.state.frames
@@ -3694,6 +3704,8 @@ def test_chat_commits_post_chat_working_memory_in_agent_state_v9(
             "emotion",
             "model",
             "experience_id",
+            "command_ticket",
+            "incarnation",
         }
         snapshot = client.app.state.agent_state_store.load()
         authoritative_items = client.app.state.main_loop.working_memory.items

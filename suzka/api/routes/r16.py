@@ -38,4 +38,7 @@ def activate_driver(
             status_code=status.HTTP_409_CONFLICT,
             detail="R16 driver is already activated",
         ) from exc
+    driver = getattr(request.app.state, "r16_driver", None)
+    if driver is not None:
+        driver.activate()
     return R16DriverActivationResponse(active=True, activation_sequence=sequence)

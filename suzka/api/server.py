@@ -68,6 +68,8 @@ from suzka.runtime.agent_state import (
     _domain_belief_system,
     _domain_value_system,
 )
+from suzka.r16.activation import driver_activation
+from suzka.r16.driver import R16Driver, rescan_from
 from suzka.runtime.event_journal import EventJournalAdmissionBand
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
 from suzka.runtime.journal_compaction import (
@@ -750,6 +752,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             except _PlanSourceUnavailable:
                 app.state._plan_preview_owner = None
+            # IP-6b (#370 R20-DRV): the R16 driver exists only with every
+            # owner bound; it runs only after the unique activation event.
+            preview_owner = app.state._plan_preview_owner
+            if preview_owner is None:
+                app.state.r16_driver = None
+            else:
+                app.state.r16_driver = R16Driver(
+                    app.state.agent_runtime,
+                    app.state._motivation_source_owner,
+                    app.state._goal_source_owner,
+                    app.state._commitment_source_owner,
+                    preview_owner,
+                    active=driver_activation(app.state.event_journal.inspect())
+                    is not None,
+                )
             try:
                 narrative_reader = QualifiedNarrativeSourceGate(
                     app.state.agent_runtime,
@@ -802,7 +819,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.state_recovery.publish_boot_anchor(recovery)
                 if app_settings.emotion.timer_enabled:
                     app.state.emotion_timer.start()
+                if app.state.r16_driver is not None:
+                    app.state.r16_driver.start(
+                        rescan_from(
+                            app.state.main_loop.export_goal_state(),
+                            app.state.main_loop.export_commitment_state(),
+                        )
+                    )
             except BaseException:
+                if getattr(app.state, "r16_driver", None) is not None:
+                    app.state.r16_driver.stop()
                 app.state.emotion_timer.stop()
                 app.state.agent_runtime.shutdown()
                 app.state.event_journal.close()
@@ -810,6 +836,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            # The driver stops and joins before the runtime (#370 D2 P2-3).
+            if getattr(app.state, "r16_driver", None) is not None:
+                app.state.r16_driver.stop()
             app.state.emotion_timer.stop()
             app.state.agent_runtime.shutdown()
             app.state.event_journal.close()
