@@ -46,12 +46,20 @@ from suzka.runtime.agent_runtime import (
     AgentRuntime,
 )
 from suzka.runtime.event_journal import EventJournal, EventJournalError, EventLifecycle
+from suzka.runtime.journal_source import (
+    JournalSourceReason,
+    JournalSourceStage,
+    SourceUnavailable,
+    archived_high_water,
+    reason_of as _reason_of,
+    locate_journal_source,
+)
 
 if TYPE_CHECKING:
     from suzka.runtime.main_loop import SuzkaMainLoop
 
 
-class _CommitmentSourceUnavailable(ValueError):
+class _CommitmentSourceUnavailable(SourceUnavailable):
     """Private, source-redacted refusal with no caller-provided evidence."""
 
 
@@ -239,16 +247,29 @@ class _CommitmentSourceOwner:
         return event
 
     def _qualify(
-        self, selection: _CommitmentSourceSelection, event: AgentEvent
+        self,
+        selection: _CommitmentSourceSelection,
+        event: AgentEvent,
+        *,
+        continuation: bool = False,
     ) -> _QualifiedCommitment:
-        """Require actual earlier X, independently created U2a M, and later P."""
+        """Require actual earlier X, independently created U2a M, and later P.
+
+        A proposal admits new sources, which must be retained; acceptance
+        review and Plan continue an admitted Commitment, so archived sources
+        are accepted on committed owner evidence (IP-4c).
+        """
         self._check_binding()
         p, x = selection.proposal, selection.target
         if p.event_id == x.event_id or p.event_sequence <= x.event_sequence:
             raise _CommitmentSourceUnavailable("invalid source chronology")
         try:
-            x_record, x_source = self._source._read(x, event)
-            p_record, p_source = self._source._read(p, event)
+            x_record, x_source = self._source._read(
+                x, event, continuation=continuation
+            )
+            p_record, p_source = self._source._read(
+                p, event, continuation=continuation
+            )
             p_db1 = self._source._memory.get_committed_episodic(p.episode_id)
             if (
                 p_db1 is None
@@ -339,10 +360,24 @@ class _CommitmentSourceOwner:
                 or inspection.reconciliation_required_transactions
             ):
                 raise _CommitmentSourceUnavailable("Journal unresolved")
-            u2a = tuple(
-                row for row in inspection.records if row.event_id == entry.event_id
+            stage, u2a = locate_journal_source(
+                inspection, entry.event_id, entry.event_sequence
             )
-            for lifecycle in (EventLifecycle.ACCEPTED, EventLifecycle.COMPLETED):
+            if stage is JournalSourceStage.MISSING or (
+                stage is JournalSourceStage.ARCHIVED and not continuation
+            ):
+                raise _CommitmentSourceUnavailable(
+                    "U2a event not retained",
+                    reason=JournalSourceReason.SOURCE_MISSING
+                    if stage is JournalSourceStage.MISSING
+                    else JournalSourceReason.SOURCE_PAST_RETENTION,
+                )
+            # An archived U2a event is backed by the R13 receipt checked above.
+            for lifecycle in (
+                ()
+                if stage is JournalSourceStage.ARCHIVED
+                else (EventLifecycle.ACCEPTED, EventLifecycle.COMPLETED)
+            ):
                 rows = tuple(row for row in u2a if row.lifecycle is lifecycle)
                 if (
                     len(rows) != 1
@@ -383,7 +418,7 @@ class _CommitmentSourceOwner:
             EventJournalError,
         ) as error:
             raise _CommitmentSourceUnavailable(
-                "Commitment source unavailable"
+                "Commitment source unavailable", reason=_reason_of(error)
             ) from error
 
     @staticmethod
@@ -423,19 +458,36 @@ class _CommitmentSourceOwner:
             raise _CommitmentSourceUnavailable("Commitment target unavailable")
         try:
             inspection = self._journal.inspect()
-            completed = tuple(
-                row
-                for row in inspection.records
-                if row.event_id == p_id and row.lifecycle is EventLifecycle.COMPLETED
-            )
-            if len(completed) != 1 or completed[0].processing_sequence is None:
-                raise _CommitmentSourceUnavailable("request not terminal")
-            p_seq = completed[0].processing_sequence
-            p_record = self._source._experience.load_committed_current(
-                experience_id_for_event(p_id, p_seq)
-            ).record
             x_record = self._source._experience.load_committed_current(
                 x_refs[0].reference
+            ).record
+            relevant = tuple(row for row in inspection.records if row.event_id == p_id)
+            if relevant:
+                completed = tuple(
+                    row
+                    for row in relevant
+                    if row.lifecycle is EventLifecycle.COMPLETED
+                )
+                if len(completed) != 1 or completed[0].processing_sequence is None:
+                    raise _CommitmentSourceUnavailable("request not terminal")
+                p_seq = completed[0].processing_sequence
+            else:
+                # IP-4c continuation: the archived request lies after the
+                # target and inside the archived range, before the genesis.
+                genesis = record.revision_history[0]
+                high_water = archived_high_water(inspection)
+                if genesis.event_sequence is None or high_water < 1:
+                    raise _CommitmentSourceUnavailable(
+                        "request not terminal",
+                        reason=JournalSourceReason.SOURCE_MISSING,
+                    )
+                p_seq = self._source._archived_source_sequence(
+                    p_id,
+                    x_record.source_event_sequence,
+                    min(genesis.event_sequence, high_water + 1),
+                )
+            p_record = self._source._experience.load_committed_current(
+                experience_id_for_event(p_id, p_seq)
             ).record
             return _CommitmentSourceSelection(
                 _MotivationSourceRef(p_id, p_seq, p_record.source_episode_id),
@@ -455,7 +507,7 @@ class _CommitmentSourceOwner:
             EventJournalError,
         ) as error:
             raise _CommitmentSourceUnavailable(
-                "Committed proposal source missing"
+                "Committed proposal source missing", reason=_reason_of(error)
             ) from error
 
     def _assert_original_proposal(self, record: CommitmentRecord) -> None:
@@ -478,12 +530,20 @@ class _CommitmentSourceOwner:
             or receipt.proposal_genesis != genesis
         ):
             raise _CommitmentSourceUnavailable("Commitment proposal receipt mismatched")
-        relevant = tuple(
-            row
-            for row in self._journal.inspect().records
-            if row.event_id == genesis.event_id
+        stage, relevant = locate_journal_source(
+            self._journal.inspect(), genesis.event_id, genesis.event_sequence
         )
-        for lifecycle in (EventLifecycle.ACCEPTED, EventLifecycle.COMPLETED):
+        if stage is JournalSourceStage.MISSING:
+            raise _CommitmentSourceUnavailable(
+                "Commitment proposal event missing",
+                reason=JournalSourceReason.SOURCE_MISSING,
+            )
+        # An archived proposal event is backed by the bound receipt above.
+        for lifecycle in (
+            ()
+            if stage is JournalSourceStage.ARCHIVED
+            else (EventLifecycle.ACCEPTED, EventLifecycle.COMPLETED)
+        ):
             rows = tuple(row for row in relevant if row.lifecycle is lifecycle)
             if (
                 len(rows) != 1
@@ -583,7 +643,7 @@ class _CommitmentSourceOwner:
             return "hold"
         try:
             selection = self._selection_from_record(commitment)
-            q = self._qualify(selection, event)
+            q = self._qualify(selection, event, continuation=True)
             self._assert_contract(commitment, q)
             self._assert_original_proposal(commitment)
             if self._other_responsibility_exists(q, excluding=commitment.commitment_id):
@@ -644,7 +704,11 @@ class _CommitmentSourceOwner:
             return
         if pending.selection is None or pending.qualification is None:
             raise _CommitmentSourceUnavailable("qualified responsibility absent")
-        current = self._qualify(pending.selection, event)
+        current = (
+            self._qualify(pending.selection, event, continuation=True)
+            if pending.action == "accept"
+            else self._qualify(pending.selection, event)
+        )
         if current != pending.qualification:
             raise _CommitmentSourceUnavailable("Commitment source changed pre-WAL")
         commitment = self._loop._commitment_system.get(pending.commitment_id or "")

@@ -49,12 +49,22 @@ from suzka.runtime.context import (
     ContextStatus,
 )
 from suzka.runtime.event_journal import EventJournal, EventJournalError, EventLifecycle
+from suzka.runtime.journal_source import (
+    JournalSourceReason,
+    JournalSourceStage,
+    SourceUnavailable,
+    locate_journal_source,
+)
 
 if TYPE_CHECKING:
     from suzka.runtime.main_loop import SuzkaMainLoop
 
 
-class _MotivationSourceUnavailable(ValueError):
+# Bound on probing committed Experience ids for an archived request (IP-4c).
+_ARCHIVED_SEQUENCE_PROBE_LIMIT = 65_536
+
+
+class _MotivationSourceUnavailable(SourceUnavailable):
     """Coarse private refusal; never includes source text or metadata."""
 
 
@@ -250,8 +260,20 @@ class _MotivationSourceOwner:
         return "motivation_evidence_applied"
 
     def _read(
-        self, source: _MotivationSourceRef, event: AgentEvent
+        self,
+        source: _MotivationSourceRef,
+        event: AgentEvent,
+        *,
+        continuation: bool = False,
     ) -> tuple[ExperienceRecord, _PendingSource]:
+        """Read one CHAT source through R07, R12, DB1 and Context.
+
+        IP-4c: when the CHAT event is no longer retained, ``continuation``
+        decides. Admission (False) refuses it as ``SOURCE_PAST_RETENTION``
+        when the committed Experience proves it existed and as
+        ``SOURCE_MISSING`` otherwise. Continuation (True) accepts it on the
+        committed Experience, which was checked against R07 at admission.
+        """
         self._check_binding()
         sequence = event.processing_sequence
         if type(sequence) is not int or source.event_sequence >= sequence:
@@ -264,14 +286,20 @@ class _MotivationSourceOwner:
                 or inspected.reconciliation_required_transactions
             ):
                 raise _MotivationSourceUnavailable("Journal source is in recovery")
-            relevant = tuple(
-                row for row in inspected.records if row.event_id == source.event_id
+            stage, relevant = locate_journal_source(
+                inspected, source.event_id, source.event_sequence
             )
+            if stage is JournalSourceStage.MISSING:
+                raise _MotivationSourceUnavailable(
+                    "R07 source missing", reason=JournalSourceReason.SOURCE_MISSING
+                )
             for lifecycle in (
                 EventLifecycle.ACCEPTED,
                 EventLifecycle.COMPLETED,
                 EventLifecycle.TRANSACTION_COMPLETED,
             ):
+                if stage is not JournalSourceStage.RETAINED:
+                    break
                 rows = tuple(row for row in relevant if row.lifecycle is lifecycle)
                 if (
                     len(rows) != 1
@@ -289,7 +317,30 @@ class _MotivationSourceOwner:
             experience_id = experience_id_for_event(
                 source.event_id, source.event_sequence
             )
-            record = self._experience.load_committed_current(experience_id).record
+            try:
+                record = self._experience.load_committed_current(experience_id).record
+            except ExperienceStoreError as error:
+                if stage is JournalSourceStage.RETAINED:
+                    raise
+                raise _MotivationSourceUnavailable(
+                    "archived source unproven",
+                    reason=JournalSourceReason.SOURCE_MISSING,
+                ) from error
+            if stage is JournalSourceStage.ARCHIVED and (
+                record.source_event_id != source.event_id
+                or record.source_event_sequence != source.event_sequence
+            ):
+                raise _MotivationSourceUnavailable(
+                    "archived source unproven",
+                    reason=JournalSourceReason.SOURCE_MISSING,
+                )
+            if stage is JournalSourceStage.ARCHIVED and not continuation:
+                # A new source must be retained: past the window it cannot
+                # become the origin of interest or a Goal (#381 §4).
+                raise _MotivationSourceUnavailable(
+                    "R07 source past retention",
+                    reason=JournalSourceReason.SOURCE_PAST_RETENTION,
+                )
             if (
                 record.lifecycle is not ExperienceLifecycle.ACTIVE
                 or record.experience_id != experience_id
@@ -342,6 +393,48 @@ class _MotivationSourceOwner:
             raise _MotivationSourceUnavailable(
                 "source owner read unavailable"
             ) from error
+
+    def _archived_source_sequence(
+        self, event_id: str, after: int, before: int
+    ) -> int:
+        """Recover an archived CHAT's sequence from the committed Experience.
+
+        Continuation only (IP-4c). Owners keep the request event's id but not
+        its sequence; once the event is archived, the sequence is found by
+        probing ``experience_id_for_event(event_id, s)`` for ``after < s <
+        before``, bounds taken from committed owner state. The Experience it
+        finds names the event and sequence itself, and event ids are unique
+        in the Journal, so a probe can only succeed for the real source.
+
+        The probe runs downward from ``before``: the request is the turn that
+        prompted the owner event, so it normally sits just below it. It is
+        bounded; past the bound the source is treated as missing (fail
+        closed).
+        """
+        if type(after) is not int or type(before) is not int or after < 0:
+            raise _MotivationSourceUnavailable(
+                "archived source sequence unbounded",
+                reason=JournalSourceReason.SOURCE_MISSING,
+            )
+        lowest = max(after + 1, before - _ARCHIVED_SEQUENCE_PROBE_LIMIT)
+        for candidate in range(before - 1, lowest - 1, -1):
+            experience_id = experience_id_for_event(event_id, candidate)
+            try:
+                if self._experience.load_current(experience_id) is None:
+                    continue
+                record = self._experience.load_committed_current(experience_id).record
+            except ExperienceStoreError:
+                # Damaged candidates are skipped; the real source, if
+                # damaged, is then missing (fail closed).
+                continue
+            if (
+                record.source_event_id == event_id
+                and record.source_event_sequence == candidate
+            ):
+                return candidate
+        raise _MotivationSourceUnavailable(
+            "archived source unproven", reason=JournalSourceReason.SOURCE_MISSING
+        )
 
     def _validate_commit(self, event: AgentEvent) -> None:
         # current_event() intentionally ends with the handler. Here the app's

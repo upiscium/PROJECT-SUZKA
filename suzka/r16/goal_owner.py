@@ -43,12 +43,20 @@ from suzka.runtime.agent_runtime import (
     AgentRuntime,
 )
 from suzka.runtime.event_journal import EventJournal, EventJournalError, EventLifecycle
+from suzka.runtime.journal_source import (
+    JournalSourceReason,
+    JournalSourceStage,
+    SourceUnavailable,
+    archived_high_water,
+    reason_of as _reason_of,
+    locate_journal_source,
+)
 
 if TYPE_CHECKING:
     from suzka.runtime.main_loop import SuzkaMainLoop
 
 
-class _GoalSourceUnavailable(ValueError):
+class _GoalSourceUnavailable(SourceUnavailable):
     """Bounded private HOLD cause, never source text."""
 
 
@@ -225,16 +233,29 @@ class _GoalSourceOwner:
         return event
 
     def _qualify(
-        self, selection: _GoalSourceSelection, event: AgentEvent
+        self,
+        selection: _GoalSourceSelection,
+        event: AgentEvent,
+        *,
+        continuation: bool = False,
     ) -> _QualifiedGoal:
-        """Re-read retained real R07/R12/DB1 sources; no caller proof is ingested."""
+        """Re-read real R07/R12/DB1 sources; no caller proof is ingested.
+
+        A proposal admits new sources, so they must be retained. Adoption and
+        Plan continue an admitted Goal: archived sources are accepted on the
+        committed Experience and R13 receipts (IP-4c, #381 D2 P1-3).
+        """
         self._check_binding()
         p, x = selection.proposal, selection.target
         if p.event_id == x.event_id or p.event_sequence <= x.event_sequence:
             raise _GoalSourceUnavailable("Goal source chronology invalid")
         try:
-            x_record, x_source = self._source._read(x, event)
-            p_record, p_source = self._source._read(p, event)
+            x_record, x_source = self._source._read(
+                x, event, continuation=continuation
+            )
+            p_record, p_source = self._source._read(
+                p, event, continuation=continuation
+            )
             db1_p = self._source._memory.get_committed_episodic(p.episode_id)
             if (
                 db1_p is None
@@ -320,15 +341,26 @@ class _GoalSourceOwner:
                 or inspected.reconciliation_required_transactions
             ):
                 raise _GoalSourceUnavailable("Journal recovery underway")
-            provenance = tuple(
-                row for row in inspected.records if row.event_id == entry.event_id
+            stage, provenance = locate_journal_source(
+                inspected, entry.event_id, entry.event_sequence
             )
+            if stage is JournalSourceStage.MISSING or (
+                stage is JournalSourceStage.ARCHIVED and not continuation
+            ):
+                raise _GoalSourceUnavailable(
+                    "Motivation owner event not retained",
+                    reason=JournalSourceReason.SOURCE_MISSING
+                    if stage is JournalSourceStage.MISSING
+                    else JournalSourceReason.SOURCE_PAST_RETENTION,
+                )
             # U2a is an internal R13-only mutation, not a coordinated DB1
             # transaction: require its accepted/terminal event and R13 receipt,
-            # not a fabricated external TRANSACTION_COMPLETED lifecycle.
+            # not a fabricated external TRANSACTION_COMPLETED lifecycle. An
+            # archived U2a event is backed by the R13 receipt checked above.
             for lifecycle in (
-                EventLifecycle.ACCEPTED,
-                EventLifecycle.COMPLETED,
+                ()
+                if stage is JournalSourceStage.ARCHIVED
+                else (EventLifecycle.ACCEPTED, EventLifecycle.COMPLETED)
             ):
                 matches_lifecycle = tuple(
                     row for row in provenance if row.lifecycle is lifecycle
@@ -364,7 +396,9 @@ class _GoalSourceOwner:
         except _GoalSourceUnavailable:
             raise
         except (ValueError, OSError, RuntimeError) as exc:
-            raise _GoalSourceUnavailable("Goal source read unavailable") from exc
+            raise _GoalSourceUnavailable(
+                "Goal source read unavailable", reason=_reason_of(exc)
+            ) from exc
 
     def _selection_from_goal(self, goal: GoalRecord) -> _GoalSourceSelection:
         """Derive identifiers solely from immutable R13 proposal and R07/R12."""
@@ -382,18 +416,36 @@ class _GoalSourceOwner:
         x_id = goal.target.reference
         try:
             inspection = self._journal.inspect()
-            completed = tuple(
-                row
-                for row in inspection.records
-                if row.event_id == p_id and row.lifecycle is EventLifecycle.COMPLETED
-            )
-            if len(completed) != 1 or completed[0].processing_sequence is None:
-                raise _GoalSourceUnavailable("request event not retained")
-            p_seq = completed[0].processing_sequence
+            x_entry = self._source._experience.load_committed_current(x_id).record
+            relevant = tuple(row for row in inspection.records if row.event_id == p_id)
+            if relevant:
+                completed = tuple(
+                    row
+                    for row in relevant
+                    if row.lifecycle is EventLifecycle.COMPLETED
+                )
+                if len(completed) != 1 or completed[0].processing_sequence is None:
+                    raise _GoalSourceUnavailable("request event not retained")
+                p_seq = completed[0].processing_sequence
+            else:
+                # IP-4c continuation: the request CHAT was archived. Its
+                # sequence lies after the target's and inside the archived
+                # range, before the Goal genesis.
+                genesis = goal.revision_history[0]
+                high_water = archived_high_water(inspection)
+                if genesis.event_sequence is None or high_water < 1:
+                    raise _GoalSourceUnavailable(
+                        "request event missing",
+                        reason=JournalSourceReason.SOURCE_MISSING,
+                    )
+                p_seq = self._source._archived_source_sequence(
+                    p_id,
+                    x_entry.source_event_sequence,
+                    min(genesis.event_sequence, high_water + 1),
+                )
             p_entry = self._source._experience.load_committed_current(
                 experience_id_for_event(p_id, p_seq)
             ).record
-            x_entry = self._source._experience.load_committed_current(x_id).record
             return _GoalSourceSelection(
                 _MotivationSourceRef(p_id, p_seq, p_entry.source_episode_id),
                 _MotivationSourceRef(
@@ -411,7 +463,9 @@ class _GoalSourceOwner:
             ExperienceStoreError,
             EventJournalError,
         ) as exc:
-            raise _GoalSourceUnavailable("Goal proposal sources unavailable") from exc
+            raise _GoalSourceUnavailable(
+                "Goal proposal sources unavailable", reason=_reason_of(exc)
+            ) from exc
 
     @staticmethod
     def _expect_goal_contract(goal: GoalRecord, q: _QualifiedGoal) -> None:
@@ -453,12 +507,20 @@ class _GoalSourceOwner:
             or receipt.proposal_genesis != genesis
         ):
             raise _GoalSourceUnavailable("Goal proposal receipt not bound")
-        records = tuple(
-            row
-            for row in self._journal.inspect().records
-            if row.event_id == genesis.event_id
+        stage, records = locate_journal_source(
+            self._journal.inspect(), genesis.event_id, genesis.event_sequence
         )
-        for lifecycle in (EventLifecycle.ACCEPTED, EventLifecycle.COMPLETED):
+        if stage is JournalSourceStage.MISSING:
+            raise _GoalSourceUnavailable(
+                "Goal proposal event missing",
+                reason=JournalSourceReason.SOURCE_MISSING,
+            )
+        # An archived proposal event is backed by the bound receipt above.
+        for lifecycle in (
+            ()
+            if stage is JournalSourceStage.ARCHIVED
+            else (EventLifecycle.ACCEPTED, EventLifecycle.COMPLETED)
+        ):
             events = tuple(row for row in records if row.lifecycle is lifecycle)
             if (
                 len(events) != 1
@@ -540,7 +602,7 @@ class _GoalSourceOwner:
             return "hold"
         try:
             selection = self._selection_from_goal(goal)
-            q = self._qualify(selection, event)
+            q = self._qualify(selection, event, continuation=True)
             self._expect_goal_contract(goal, q)
             self._require_real_proposal_review(goal)
             # Only an explicit conflict linked to this Goal/Motivation may
@@ -597,7 +659,11 @@ class _GoalSourceOwner:
             return
         if pending.selection is None or pending.qualification is None:
             raise _GoalSourceUnavailable("Goal qualification missing")
-        fresh = self._qualify(pending.selection, event)
+        fresh = (
+            self._qualify(pending.selection, event, continuation=True)
+            if pending.action == "adopt"
+            else self._qualify(pending.selection, event)
+        )
         if fresh != pending.qualification:
             raise _GoalSourceUnavailable("Goal source changed before WAL")
         goal = self._loop._goal_system.get(pending.goal_id or "")
