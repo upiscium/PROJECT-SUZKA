@@ -6,11 +6,19 @@ export type ModelInfo = { model_id: string; adapter_id: string | null };
 export type Attachment = { type: string; url?: string; name?: string; content_type?: string };
 
 export type ChatRequest = { message: string; attachments?: Attachment[]; debug?: boolean };
+export type CommandKind = "REVIEW_EXPERIENCE" | "COMMIT_REVIEW_EXPERIENCE";
+export type CommandTicket = { ticket_id: string; kind: CommandKind; status: string };
+export type CommandStatus = { status: string; reason: string | null };
+
 export type ChatResponse = {
   episode_id: string;
   response: string;
   emotion: Emotion;
   model: ModelInfo;
+  // IP-6b/IP-7 (#370 DRV-3, D1 2-1): present when the R16 driver is active.
+  experience_id?: string | null;
+  command_ticket?: CommandTicket | null;
+  incarnation?: string | null;
 };
 
 export type RetrievedMemory = {
@@ -95,6 +103,7 @@ async function requestUrl<T>(url: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   chat: (body: ChatRequest) => request<ChatResponse>("/api/chat", { method: "POST", body: JSON.stringify(body) }),
+  commandStatus: (ticketId: string) => request<CommandStatus>(`/api/chat/commands/${encodeURIComponent(ticketId)}`),
   debugChat: (body: ChatRequest) => adminRequest<DebugChatResponse>("/chat/debug", { method: "POST", body: JSON.stringify(body) }),
   emotion: () => adminRequest<Emotion>("/state/emotion"),
   memorySearch: (query: string) => adminRequest<MemorySearchResponse>(`/memory/search?query=${encodeURIComponent(query)}`),
