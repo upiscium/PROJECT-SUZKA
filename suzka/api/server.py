@@ -815,17 +815,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ):
             try:
                 assert recovery is not None
+                # Startup rescan input, read before the runtime starts so no
+                # event can interleave (#370 D0 §5; IP-6b review P2-6).
+                r16_rescan = (
+                    None
+                    if app.state.r16_driver is None
+                    else rescan_from(
+                        app.state.main_loop.export_goal_state(),
+                        app.state.main_loop.export_commitment_state(),
+                    )
+                )
                 app.state.agent_runtime.start()
                 app.state.state_recovery.publish_boot_anchor(recovery)
                 if app_settings.emotion.timer_enabled:
                     app.state.emotion_timer.start()
                 if app.state.r16_driver is not None:
-                    app.state.r16_driver.start(
-                        rescan_from(
-                            app.state.main_loop.export_goal_state(),
-                            app.state.main_loop.export_commitment_state(),
-                        )
-                    )
+                    app.state.r16_driver.start(r16_rescan)
             except BaseException:
                 if getattr(app.state, "r16_driver", None) is not None:
                     app.state.r16_driver.stop()

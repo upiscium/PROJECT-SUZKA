@@ -9,8 +9,9 @@ Shape (#370 D0 §0):
 - one dedicated thread ``r16-driver`` and a bounded FIFO (64 items);
 - inputs are CHAT terminals from the chat route (``notify_chat_terminal``)
   and the done-callbacks of futures the driver itself submitted;
-- callbacks only ``put_nowait`` (and count a drop on ``queue.Full``); all
-  waiting, retries and submits happen on the driver thread.
+- callbacks only append to a lock-protected done list (never dropped: one
+  entry per event the driver itself submitted) and do no I/O; all waiting,
+  retries, logging and submits happen on the driver thread.
 
 Stages (#370 D0 §2, D1, D2):
 - an ordinary CHAT turn whose committed appraisal is not neutral (the bit
@@ -258,6 +259,10 @@ class R16Driver:
         self._previewed: set[tuple[str, str]] = set()
         self._reviewed: set[str] = set()
         self._u2a_hooks: list[Callable[[_MotivationSourceRef, object], None]] = []
+        # Results of the driver's own submissions (IP-6b review P1-1): never
+        # dropped, so a stage can never be left without its result.
+        self._done: list[_Done] = []
+        self._halted = False
         self.counters: dict[str, int] = {
             "dropped": 0,
             "skipped_neutral": 0,
@@ -268,7 +273,8 @@ class R16Driver:
 
     @property
     def active(self) -> bool:
-        return self._active
+        with self._tickets_lock:
+            return self._active and not self._halted
 
     def activate(self) -> None:
         """Called after the unique activation event has completed."""
@@ -296,7 +302,7 @@ class R16Driver:
         except queue.Full:
             pass
         if thread is not None and thread is not current_thread():
-            thread.join()
+            thread.join(timeout=30)
         with self._lifecycle:
             if self._thread is thread:
                 self._thread = None
@@ -319,7 +325,7 @@ class R16Driver:
         Inactive drivers, debug chat and turns without an event are no-ops.
         """
 
-        if not self._active or self._stop.is_set():
+        if not self.active or self._stop.is_set():
             return None
         event = outcome.event
         result = outcome.value
@@ -332,6 +338,8 @@ class R16Driver:
         ticket: R16CommandTicket | None = None
         if command is not None:
             ticket = self._new_ticket(command[0])
+            if ticket is None:
+                return None
         item = _ChatTerminal(
             _MotivationSourceRef(
                 event.event_id, event.processing_sequence, result.episode_id
@@ -365,9 +373,12 @@ class R16Driver:
 
     # -- tickets -----------------------------------------------------------------
 
-    def _new_ticket(self, kind: R16CommandKind) -> R16CommandTicket:
+    def _new_ticket(self, kind: R16CommandKind) -> R16CommandTicket | None:
         ticket_id = f"{self.incarnation}.{secrets.token_urlsafe(16)}"
         with self._tickets_lock:
+            if self._halted:
+                # The driver stopped (review P2-3): no ticket can stay pending.
+                return None
             self._tickets[ticket_id] = _Ticket(kind)
             while len(self._tickets) > TICKET_CAPACITY:
                 self._tickets.popitem(last=False)
@@ -390,6 +401,7 @@ class R16Driver:
     # -- queue -------------------------------------------------------------------
 
     def _post(self, item: object) -> bool:
+        """Enqueue a CHAT terminal or rescan from a request/lifespan thread."""
         try:
             self._queue.put_nowait(item)
         except queue.Full:
@@ -404,11 +416,9 @@ class R16Driver:
     ) -> Callable[[Future[AgentEventOutcome[object]]], None]:
         def done(future: Future[AgentEventOutcome[object]]) -> None:
             # Runs on the runtime worker (possibly under its lock) or inline:
-            # enqueue only, never sleep, submit or do I/O here.
-            if not self._post(_Done(stage, future, context)):
-                command = context if isinstance(context, _Command) else None
-                if command is not None:
-                    self._finish(command.ticket_id, R16TicketStatus.DROPPED)
+            # one append under a short lock; no sleep, submit or I/O here.
+            with self._tickets_lock:
+                self._done.append(_Done(stage, future, context))
 
         return done
 
@@ -425,10 +435,12 @@ class R16Driver:
             try:
                 if isinstance(item, _ChatTerminal):
                     self._on_chat(item)
-                elif isinstance(item, _Done):
-                    self._on_done(item)
                 elif isinstance(item, _Rescan):
                     self._on_rescan(item)
+                with self._tickets_lock:
+                    finished, self._done = self._done, []
+                for result in finished:
+                    self._on_done(result)
                 self._service_waiting()
             except _DriverStopped:
                 break
@@ -439,6 +451,7 @@ class R16Driver:
 
     def _abandon_pending(self) -> None:
         with self._tickets_lock:
+            self._halted = True
             for ticket in self._tickets.values():
                 if ticket.status is R16TicketStatus.PENDING:
                     ticket.status = R16TicketStatus.UNAVAILABLE
@@ -595,10 +608,12 @@ class R16Driver:
     def _on_done(self, item: _Done) -> None:
         try:
             outcome = item.future.result()
-        except AgentRuntimeDurabilityError:
+        except (AgentRuntimeDurabilityError, AgentRuntimeStopped):
+            # The runtime is gone or fail-stopped (review P2-2): stop too.
             self._fail(item.stage, item.context, R16DriverReason.RUNTIME_UNAVAILABLE)
             raise _DriverStopped from None
         except Exception as error:
+            LOGGER.info("R16 driver stage=%s result=error", item.stage.value)
             sequence = _failed_sequence(error)
             if item.stage is _Stage.U2A and isinstance(item.context, _U2a):
                 self._u2a_terminal(item.context, sequence, None)
@@ -606,6 +621,12 @@ class R16Driver:
             self._fail(item.stage, item.context, R16OwnerReason.SOURCE_UNAVAILABLE)
             return
         sequence = outcome.event.processing_sequence
+        LOGGER.info(
+            "R16 driver stage=%s ref=%s result=%s",
+            item.stage.value,
+            _digest(outcome.event.event_id),
+            _result_code(outcome.value),
+        )
         if item.stage is _Stage.U2A:
             assert isinstance(item.context, _U2a)
             self._u2a_terminal(item.context, sequence, outcome.value)
@@ -632,12 +653,15 @@ class R16Driver:
             )
             if item.stage is _Stage.GOAL_PROPOSAL:
                 self._reviewed.add(value.subject_id)
+                _bound(self._reviewed)
             self._submit(stage, (command, value.subject_id))
             return
         if value.status is R16OwnerStatus.ADOPTED:
             self._finish(ticket_id, R16TicketStatus.ADOPTED)
             if command is not None:
                 self._adopted_goal[command.target_experience_id] = value.subject_id
+                while len(self._adopted_goal) > OBSERVED_CAPACITY:
+                    self._adopted_goal.pop(next(iter(self._adopted_goal)))
             self._maybe_preview(value.subject_id, "adopted")
             return
         if value.status is R16OwnerStatus.ACCEPTED:
@@ -674,6 +698,7 @@ class R16Driver:
         if key in self._previewed:
             return
         self._previewed.add(key)
+        _bound(self._previewed)
         self._submit(_Stage.PLAN_PREVIEW, goal_id)
 
     def _on_rescan(self, item: _Rescan) -> None:
@@ -685,6 +710,23 @@ class R16Driver:
                 self._submit(_Stage.GOAL_REVIEW, (None, goal_id))
         for commitment_id in item.commitment_ids:
             self._submit(_Stage.COMMITMENT_REVIEW, (None, commitment_id))
+
+
+def _bound(values: set[object] | set[str] | set[tuple[str, str]]) -> None:
+    """Keep incarnation-scoped sets bounded (review P2-9)."""
+    while len(values) > OBSERVED_CAPACITY:
+        values.pop()
+
+
+def _result_code(value: object) -> str:
+    if isinstance(value, R16OwnerOutcome):
+        return value.status.value if value.reason is None else value.reason.value
+    if isinstance(value, str) and value in {
+        "motivation_evidence_applied",
+        "neutral_no_eligible_appraisal",
+    }:
+        return value
+    return "other"
 
 
 class _DriverStopped(Exception):

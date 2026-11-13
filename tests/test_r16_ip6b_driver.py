@@ -435,38 +435,85 @@ def test_queue_full_submissions_are_retried_then_give_up(fakes) -> None:  # type
         _turn(6, "experience-00000000-0000-4000-8000-0000000000a4"),
         f"REVIEW_EXPERIENCE:{X1}",
     )
-    for _ in range(4):
-        time.sleep(0.3)
-        clock.now += 5
-    view = _until(
-        lambda: (v := driver.ticket(ticket.ticket_id)).status is not R16TicketStatus.PENDING
-        and v
-    )
+
+    def settled():  # type: ignore[no-untyped-def]
+        clock.now += 5  # every pending retry becomes due at the next poll
+        view = driver.ticket(ticket.ticket_id)
+        return view if view.status is not R16TicketStatus.PENDING else None
+
+    view = _until(settled)
     assert (view.status, view.reason) == (
         R16TicketStatus.UNAVAILABLE,
         R16DriverReason.RUNTIME_UNAVAILABLE,
     )
     assert goal.calls == []
+    assert goal.raise_next == []  # first try and three retries
 
 
-def test_callbacks_only_enqueue_and_a_full_queue_drops(fakes, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_results_are_never_dropped_even_when_inputs_are_full(fakes, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Review P1-1: a full input queue cannot lose a submitted stage's result,
+    so a held command never wedges."""
     import queue as queue_module
 
-    driver, *_rest = fakes
-    callback = driver._callback(
-        __import__("suzka.r16.driver", fromlist=["_Stage"])._Stage.PLAN_PREVIEW,
-        "goal-1",
+    driver, runtime, source, goal, *_rest = fakes
+    driver.notify_chat_terminal(_turn(5, X1), "hello")
+    _until(lambda: len(source.calls) == 1)
+    ticket = driver.notify_chat_terminal(
+        _turn(8, "experience-00000000-0000-4000-8000-0000000000a6"),
+        f"REVIEW_EXPERIENCE:{X1}",
     )
+    time.sleep(0.3)
 
     def full(_item: object) -> None:
         raise queue_module.Full
 
     monkeypatch.setattr(driver._queue, "put_nowait", full)
+    _resolve(source.futures[0], 6, "motivation_evidence_applied")
+    _until(lambda: len(goal.calls) == 1)
+    _resolve(goal.futures[0], 9, R16OwnerOutcome.hold(R16OwnerReason.GOAL_ALREADY_EXISTS))
+    view = _until(
+        lambda: (v := driver.ticket(ticket.ticket_id)).status is not R16TicketStatus.PENDING
+        and v
+    )
+    assert view.reason is R16OwnerReason.GOAL_ALREADY_EXISTS
+
+
+def test_a_stopped_runtime_stops_the_driver(fakes) -> None:  # type: ignore[no-untyped-def]
+    from suzka.runtime.agent_runtime import AgentRuntimeStopped
+
+    driver, runtime, source, goal, *_rest = fakes
+    driver.notify_chat_terminal(_turn(5, X1), "hello")
+    _until(lambda: len(source.calls) == 1)
+    ticket = driver.notify_chat_terminal(
+        _turn(8, "experience-00000000-0000-4000-8000-0000000000a7"),
+        f"REVIEW_EXPERIENCE:{X1}",
+    )
+    time.sleep(0.3)
+    source.futures[0].set_exception(AgentRuntimeStopped(_event(6)))
+    _until(lambda: not driver.active)
+    view = driver.ticket(ticket.ticket_id)
+    assert (view.status, view.reason) == (
+        R16TicketStatus.UNAVAILABLE,
+        R16DriverReason.RUNTIME_UNAVAILABLE,
+    )
+    # After a stop, no new ticket can be issued and left pending.
+    assert driver.notify_chat_terminal(_turn(9, X1), f"REVIEW_EXPERIENCE:{X1}") is None
+
+
+def test_callbacks_only_append_without_io(fakes, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import suzka.r16.driver as driver_module
+
+    driver, *_rest = fakes
+    callback = driver._callback(driver_module._Stage.PLAN_PREVIEW, "goal-1")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        driver_module.LOGGER, "warning", lambda *a, **k: calls.append("log")
+    )
+    monkeypatch.setattr(driver, "_post", lambda *_a: calls.append("post"))
     future: Future[Any] = Future()
     future.set_result(AgentEventOutcome(_event(3), None))
-    before = driver.counters["dropped"]
-    callback(future)  # must not block, submit or raise
-    assert driver.counters["dropped"] == before + 1
+    callback(future)  # inline, as for an already finished future
+    assert calls == []
 
 
 def test_debug_chat_and_inactive_drivers_get_no_ticket(fakes) -> None:  # type: ignore[no-untyped-def]
