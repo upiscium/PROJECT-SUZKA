@@ -22,6 +22,7 @@ from enum import Enum
 from hashlib import sha256
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 import sys
@@ -490,13 +491,10 @@ def _finish_interrupted_create(path: Path) -> None:
         return
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 2:
         return
-    prefix = f".{path.name}."
+    # Exactly the staging names create() writes: ".<name>.<uuid4 hex>.creating".
+    pattern = re.compile(rf"\.{re.escape(path.name)}\.[0-9a-f]{{32}}\.creating")
     try:
-        names = [
-            name
-            for name in os.listdir(path.parent)
-            if name.startswith(prefix) and name.endswith(".creating")
-        ]
+        names = [name for name in os.listdir(path.parent) if pattern.fullmatch(name)]
     except OSError:
         return
     matches = []
@@ -509,6 +507,8 @@ def _finish_interrupted_create(path: Path) -> None:
             matches.append(name)
     if len(matches) != 1:
         return
+    # Assumes the private (owner-only, checked) directory: no other uid can
+    # rename a file into the matched name between lstat and unlink.
     try:
         os.unlink(path.parent / matches[0])
         _fsync_directory(path.parent)

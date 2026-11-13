@@ -19,6 +19,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 
 from suzka.r16.history_participant import SubjectHistoryParticipant  # noqa: E402
+from suzka.runtime.transaction_coordinator import ParticipantDivergedError  # noqa: E402
 from suzka.r16.history_reader import HeadBlockReason, HeadStatus  # noqa: E402
 from suzka.r16.history_store import (  # noqa: E402
     HistoryPhase,
@@ -82,7 +83,7 @@ def test_crash_after_r07_prepared_before_sqlite_prepare(tmp_path: Path) -> None:
     )
     assert world.reader().head(SCOPE).status is HeadStatus.EMPTY
     # The same transaction can never be prepared later.
-    with pytest.raises(Exception):
+    with pytest.raises(ParticipantDivergedError):
         world.participant(decision).prepare(_binding(event, decision))
 
 
@@ -107,8 +108,10 @@ def test_crash_inside_the_sqlite_finalize_rolls_back_then_rolls_forward(
     )
     world.store._connection = raw
     try:
-        with pytest.raises(Exception):
+        with pytest.raises(ParticipantDivergedError) as raised:
             participant.finalize(binding)
+        cause = raised.value.__cause__
+        assert isinstance(cause, HistoryStoreConflict) or "refused" in str(raised.value)
     finally:
         world.store._connection = original
         raw.close()
@@ -170,55 +173,59 @@ def test_crash_after_ambiguous_state_stays_blocked(tmp_path: Path) -> None:
 
 
 def test_tombstone_and_prepare_race_has_one_winner(tmp_path: Path) -> None:
-    """Review P2-7: a tombstone and a PREPARE for one transaction exclude each other."""
+    """Review P2-7: both read "no row", then race; exactly one write wins."""
+
+    import suzka.r16.history_participant as participant_module
 
     world = _World(tmp_path)
     event, decision = world.decision("race", intent="a" * 64)
     binding = _binding(event, decision)
-    second = SubjectHistoryStore.open(world.store.path, max_page_count=world.store._max_page_count)
-    outcomes: list[str] = []
+    second = SubjectHistoryStore.open(
+        world.store.path, max_page_count=world.store._max_page_count
+    )
     barrier = threading.Barrier(2)
+    real_load = participant_module._load
+
+    def load_then_wait(store, incarnation, transaction_id):
+        row = real_load(store, incarnation, transaction_id)
+        barrier.wait(timeout=10)  # both threads have seen "no row"
+        return row
+
+    outcomes: list[object] = []
 
     def prepare() -> None:
-        barrier.wait()
         try:
             world.participant(decision).prepare(binding)
             outcomes.append("prepared")
-        except Exception as error:  # noqa: BLE001 - recorded for the assertion
-            outcomes.append(type(error).__name__)
+        except ParticipantDivergedError as error:
+            outcomes.append(error)
 
     def tombstone() -> None:
-        barrier.wait()
         try:
-            SubjectHistoryParticipant.abort_pending(second, world.incarnation, binding)
-            outcomes.append("aborted")
-        except Exception as error:  # noqa: BLE001
-            outcomes.append(type(error).__name__)
+            outcomes.append(
+                SubjectHistoryParticipant.abort_pending(second, world.incarnation, binding)
+            )
+        except ParticipantDivergedError as error:
+            outcomes.append(error)
 
-    threads = [threading.Thread(target=prepare), threading.Thread(target=tombstone)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(participant_module, "_load", load_then_wait)
+        threads = [threading.Thread(target=prepare), threading.Thread(target=tombstone)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
     second.close()
+    winners = [item for item in outcomes if not isinstance(item, Exception)]
+    losers = [item for item in outcomes if isinstance(item, ParticipantDivergedError)]
+    assert len(winners) == 1 and len(losers) == 1
     row = _row(world, binding.transaction_id)
-    assert row is not None
-    if row.phase is HistoryPhase.PREPARED:
-        # PREPARE won; the abort then legitimately aborted it or lost the race.
-        assert "prepared" in outcomes
+    assert row is not None and len(world.store.operations(world.incarnation)) == 1
+    if winners == ["prepared"]:
+        assert row.phase is HistoryPhase.PREPARED
     else:
-        assert row.phase is HistoryPhase.ABORTED
-    # Never two rows, never a prepared row that a tombstone also claims.
-    assert len(world.store.operations(world.incarnation)) == 1
-    with pytest.raises(HistoryStoreConflict):
-        world.store.insert_abort_tombstone(
-            incarnation_id=world.incarnation,
-            transaction_id=binding.transaction_id,
-            event_id=binding.event_id,
-            processing_sequence=binding.processing_sequence,
-            transaction_kind=binding.transaction_kind.value,
-            operation_digest=binding.operation_digest,
-        )
+        assert winners == [AbortOutcome.ALREADY_ABSENT]
+        assert row.phase is HistoryPhase.ABORTED and row.pending_bytes is None
 
 
 def test_interrupted_create_is_completed_on_open(tmp_path: Path) -> None:
