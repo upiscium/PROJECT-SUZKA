@@ -60,6 +60,10 @@ from suzka.runtime.agent_state import (
     _domain_value_system,
 )
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
+from suzka.runtime.wal_rollover import (
+    StateWALRolloverCoordinator,
+    StateWALRolloverPolicy,
+)
 from suzka.runtime.semantic_receipt_retention import (
     SemanticReceiptRetentionCoordinator,
 )
@@ -119,11 +123,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.event_journal,
                 app.state.state_wal,
             )
+            rollover_policy = getattr(app.state, "state_wal_rollover_policy", None)
+            if rollover_policy is not None and not isinstance(
+                rollover_policy, StateWALRolloverPolicy
+            ):
+                raise RuntimeError("Injected StateWAL rollover policy is invalid")
+            app.state.state_wal_rollover = StateWALRolloverCoordinator(
+                app.state.event_journal,
+                app.state.state_wal,
+                rollover_policy,
+            )
+            # Resolve an interrupted StateWAL rollover before any other startup
+            # step may append to the Journal (#382 D1 P1-2): roll forward if the
+            # manifest was published, otherwise quarantine and abort.
+            app.state.state_recovery.resolve_open_wal_rollover()
             startup_journal = app.state.event_journal.inspect()
             journal_schema = startup_journal.schema_version
             if startup_journal.open_wal_rollover is not None:
-                # No startup step may append while a StateWAL rollover is
-                # prepared but unresolved (#382 D1 P1-2).
                 raise StateRecoveryError("StateWAL rollover is unresolved")
             app.state.memory_system = getattr(
                 app.state, "memory_system", None
@@ -550,6 +566,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     candidate=candidate,
                 )
                 committed_context_view = candidate
+                # Ordinary StateWAL rollover at the clean boundary right after
+                # terminal completion, in the serial runtime worker (#382 D1
+                # P1-4). It never changes state; it only fails closed if a
+                # prepared rollover could not be resolved.
+                app.state.state_wal_rollover.maybe_rollover()
             except BaseException:
                 app.state.context_committed_reads.degrade()
                 raise

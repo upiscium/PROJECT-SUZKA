@@ -61,6 +61,9 @@ class RecoveryReason(str, Enum):
     EXACT_CURRENT_REPAIR = "exact_current_repair"
     TRUE_ROLLBACK = "true_rollback"
     UNCOMMITTED_TAIL = "uncommitted_tail"
+    # Ordinary generation switch at a clean boundary (#382 A): the baseline is
+    # the latest committed snapshot, the state is unchanged.
+    ROLLOVER = "rollover"
 
 
 class _StrictModel(BaseModel):
@@ -645,6 +648,16 @@ class StateWAL:
             record_hash="0" * 64,
         )
         raw, baseline_hash = _record_json(baseline, "suzka.state-wal.baseline")
+        self._write_new_generation(path, raw)
+        if invalid_current_detected:
+            assert prepared_recovery_id is not None
+            self._preserve_invalid_manifest(prepared_recovery_id)
+        return self._publish_manifest(
+            baseline, baseline_hash, external_reconciliation_required
+        )
+
+    def _write_new_generation(self, path: Path, raw: dict[str, Any]) -> None:
+        """Create a generation file holding exactly one baseline, durably."""
         parent_descriptor = -1
         descriptor = -1
         try:
@@ -671,12 +684,212 @@ class StateWAL:
                 os.close(descriptor)
             if parent_descriptor >= 0:
                 os.close(parent_descriptor)
-        if invalid_current_detected:
-            assert prepared_recovery_id is not None
-            self._preserve_invalid_manifest(prepared_recovery_id)
-        return self._publish_manifest(
-            baseline, baseline_hash, external_reconciliation_required
+
+    # --- ordinary generation rollover (#382 A, IP-3b) --------------------------
+
+    def prepare_rollover_generation(
+        self,
+        *,
+        generation_id: UUID,
+        journal_processing_high_water: int,
+    ) -> tuple[BaselineRecord, str]:
+        """Write, but do not publish, a new generation for the same state.
+
+        The baseline is the latest verified snapshot of the active generation
+        and is chained to that generation's last record hash. The manifest is
+        unchanged until ``publish_rollover_generation``.
+        """
+        _validate_sequence(
+            journal_processing_high_water, "journal processing high-water"
         )
+        with self._lock:
+            self._prepare_for_write()
+            # The cached inspection is sufficient: every line of the active
+            # generation passed the same verification when it was appended,
+            # and in-place tampering of verified bytes is outside the
+            # single-cooperative-writer threat model (IP-1, #384); it is caught
+            # by the full verification at process start. A full re-verification
+            # here measured ~0.37 s per record (~12 s per 32-transition
+            # rollover) on the rollover turn, for no gain inside that model.
+            current = self.inspect()
+            manifest = current.active_manifest
+            if manifest is None or not current.records:
+                raise StateWALIntegrityError("rollover requires an active generation")
+            if manifest.external_reconciliation_required:
+                raise StateWALConflictError("rollover is forbidden while gated")
+            if generation_id == manifest.active_generation_id:
+                raise StateWALConflictError("rollover must change generation")
+            latest = current.records[-1]
+            snapshot = (
+                latest.baseline_snapshot
+                if isinstance(latest, BaselineRecord)
+                else latest.candidate_snapshot
+            )
+            assert current.latest_snapshot_hash is not None
+            baseline = BaselineRecord(
+                record_type="baseline",
+                schema_version=1,
+                command_version=1,
+                record_id=uuid4(),
+                generation_id=generation_id,
+                created_at=_now(),
+                baseline_snapshot_sequence=snapshot.last_processed_event_sequence,
+                baseline_snapshot_hash=current.latest_snapshot_hash,
+                baseline_snapshot=snapshot,
+                journal_processing_high_water=journal_processing_high_water,
+                predecessor_generation_id=manifest.active_generation_id,
+                predecessor_generation_hash=current.record_hashes[-1],
+                reason=RecoveryReason.ROLLOVER,
+                previous_record_hash=None,
+                record_hash="0" * 64,
+            )
+            raw, baseline_hash = _record_json(baseline, "suzka.state-wal.baseline")
+            self._write_new_generation(self._generation_path(generation_id), raw)
+            return BaselineRecord.model_validate_json(_canonical(raw)), baseline_hash
+
+    def publish_rollover_generation(
+        self,
+        *,
+        generation_id: UUID,
+        baseline_record_hash: str,
+        journal_processing_high_water: int,
+    ) -> Manifest:
+        """Atomically make a prepared rollover generation active."""
+        with self._lock:
+            self._prepare_for_write()
+            current = self.inspect()
+            manifest = current.active_manifest
+            if manifest is None or not current.records:
+                raise StateWALIntegrityError("rollover requires an active generation")
+            if manifest.external_reconciliation_required:
+                raise StateWALConflictError("rollover is forbidden while gated")
+            baseline, baseline_hash = self._inspect_orphan_baseline(generation_id)
+            if (
+                baseline_hash != baseline_record_hash
+                or baseline.reason is not RecoveryReason.ROLLOVER
+                or baseline.predecessor_generation_id != manifest.active_generation_id
+                or baseline.predecessor_generation_hash != current.record_hashes[-1]
+                or baseline.baseline_snapshot_sequence
+                != current.latest_snapshot_sequence
+                or baseline.baseline_snapshot_hash != current.latest_snapshot_hash
+                or baseline.journal_processing_high_water
+                != journal_processing_high_water
+            ):
+                raise StateWALConflictError("rollover generation does not chain")
+            self._stage("rollover_publish")
+            return self._publish_manifest(baseline, baseline_hash, False)
+
+    def inspect_rollover_generation(
+        self, generation_id: UUID
+    ) -> tuple[BaselineRecord, str] | None:
+        """The unpublished-or-published single baseline of a generation, if valid."""
+        with self._lock:
+            try:
+                return self._inspect_orphan_baseline(generation_id)
+            except StateWALConflictError:
+                return None
+
+    def read_manifest_optional(self) -> Manifest | None:
+        """The hash-verified manifest alone, without reading any generation.
+
+        ``None`` when there is no WAL or no manifest. Used where a decision
+        depends only on which generation is published, even if that
+        generation itself is unreadable.
+        """
+        with self._lock:
+            if not self._prepare_for_read():
+                return None
+            try:
+                manifest_raw = json.loads(
+                    self._read_regular(self.root / "manifest.json")
+                )
+            except StateWALMissing:
+                return None
+            except StateWALError:
+                raise
+            except Exception:
+                raise StateWALIntegrityError("WAL manifest is invalid") from None
+            try:
+                manifest = Manifest.model_validate_json(_canonical(manifest_raw))
+                expected = _domain_hash(
+                    "suzka.state-wal.manifest",
+                    {
+                        key: value
+                        for key, value in manifest_raw.items()
+                        if key != "manifest_hash"
+                    },
+                )
+                if manifest.manifest_hash != expected:
+                    raise ValueError
+            except Exception:
+                raise StateWALIntegrityError("WAL manifest is invalid") from None
+            return manifest
+
+    def quarantine_generation(self, generation_id: UUID, reason_id: UUID) -> bool:
+        """Move a never-published generation file aside (#382 D1 P2-4)."""
+        with self._lock:
+            path = self._generation_path(generation_id)
+            if not path.exists():
+                return False
+            manifest = self.read_manifest_optional()
+            if manifest is not None and manifest.active_generation_id == generation_id:
+                raise StateWALConflictError("active generation cannot be quarantined")
+            self._preserve_partial_generation(path, reason_id)
+            return True
+
+    def prune_generations(self) -> tuple[UUID, ...]:
+        """Delete generations other than active, its predecessor and boot anchor.
+
+        Retains at most three generations (#382 D1 P0, Human decision). The
+        boot anchor is re-read under the lock immediately before unlinking.
+        Unparseable names and preserved ``.invalid`` files are left alone.
+        """
+        with self._lock:
+            self._prepare_for_write()
+            manifest = self.inspect().active_manifest
+            if manifest is None:
+                raise StateWALIntegrityError("pruning requires an active generation")
+            keep = {manifest.active_generation_id}
+            if manifest.predecessor_generation_id is not None:
+                keep.add(manifest.predecessor_generation_id)
+            anchor = self.inspect_boot_anchor_optional()
+            if anchor is not None:
+                keep.add(anchor.generation_id)
+            removed: list[UUID] = []
+            directory = self.root / "generations"
+            parent_descriptor = -1
+            try:
+                parent_descriptor = self._open_private_dir(directory)
+                for name in sorted(os.listdir(parent_descriptor)):
+                    if not name.endswith(".jsonl"):
+                        continue
+                    try:
+                        generation = UUID(name[: -len(".jsonl")])
+                    except ValueError:
+                        continue
+                    if str(generation) != name[: -len(".jsonl")] or generation in keep:
+                        continue
+                    self._stage("generation_prune")
+                    os.unlink(name, dir_fd=parent_descriptor)
+                    removed.append(generation)
+                if removed:
+                    os.fsync(parent_descriptor)
+            except StateWALError:
+                raise
+            except Exception:
+                raise StateWALError("WAL generation pruning failed") from None
+            finally:
+                if parent_descriptor >= 0:
+                    os.close(parent_descriptor)
+            return tuple(removed)
+
+    def generation_size(self) -> int:
+        """Bytes of the active generation file."""
+        with self._lock:
+            manifest = self.inspect().active_manifest
+            if manifest is None:
+                raise StateWALIntegrityError("no active generation")
+            return self._generation_path(manifest.active_generation_id).stat().st_size
 
     def _preserve_partial_generation(self, path: Path, recovery_id: UUID) -> None:
         preserved = path.with_name(f".{path.name}.{recovery_id}.{uuid4()}.invalid")
@@ -1388,6 +1601,34 @@ class StateWAL:
         journal_processing_high_water: int,
         journal_tail_record_id: UUID | None = None,
         journal_tail_record_hash: str | None = None,
+        journal_lineage_id: UUID,
+    ) -> BootAnchor:
+        # Under the WAL lock so that pruning's re-read of the boot anchor is
+        # serialised against its publication (IP-3b review P2-5).
+        with self._lock:
+            return self._publish_boot_anchor_locked(
+                snapshot_sequence=snapshot_sequence,
+                snapshot_hash=snapshot_hash,
+                generation_id=generation_id,
+                anchored_record_id=anchored_record_id,
+                anchored_record_hash=anchored_record_hash,
+                journal_processing_high_water=journal_processing_high_water,
+                journal_tail_record_id=journal_tail_record_id,
+                journal_tail_record_hash=journal_tail_record_hash,
+                journal_lineage_id=journal_lineage_id,
+            )
+
+    def _publish_boot_anchor_locked(
+        self,
+        *,
+        snapshot_sequence: int,
+        snapshot_hash: str,
+        generation_id: UUID,
+        anchored_record_id: UUID,
+        anchored_record_hash: str,
+        journal_processing_high_water: int,
+        journal_tail_record_id: UUID | None,
+        journal_tail_record_hash: str | None,
         journal_lineage_id: UUID,
     ) -> BootAnchor:
         _validate_sequence(snapshot_sequence, "snapshot sequence")

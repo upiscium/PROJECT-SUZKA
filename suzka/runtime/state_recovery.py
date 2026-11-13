@@ -41,6 +41,7 @@ from suzka.runtime.state_wal import (
     StateWAL,
     StateWALError,
     StateWALInspection,
+    StateWALIntegrityError,
     TransitionRecord,
 )
 
@@ -111,6 +112,16 @@ class DegradedStartupInspection:
     manifest: Manifest
 
 
+# Journal records that bind the current StateWAL anchor (kept in step with the
+# Journal verifier: a completed rollover moves the anchor to the new baseline).
+_WAL_ANCHOR_LIFECYCLES = frozenset(
+    {
+        EventLifecycle.CHECKPOINT,
+        EventLifecycle.COMPLETED,
+        EventLifecycle.RECOVERY_COMPLETED,
+        EventLifecycle.WAL_GENERATION_ROLLED_COMPLETED,
+    }
+)
 _PARTICIPANT_BASELINE_NAMESPACE = UUID(
     "f0ee9f9a-c256-5ec8-8f02-c245f9e8db04"
 )
@@ -629,6 +640,9 @@ class StateRecoveryCoordinator:
 
     def _prepare_startup(self) -> StateRecoveryResult:
 
+        # A prepared, unresolved StateWAL rollover is resolved before any other
+        # classification (#382 D1 P1-2), so recovery never sees it open.
+        self._resolve_open_wal_rollover()
         journal_inspection = self.journal.inspect()
         snapshot, snapshot_error = self._inspect_snapshot()
         try:
@@ -637,6 +651,14 @@ class StateRecoveryCoordinator:
         except StateWALError as error:
             wal_inspection = None
             wal_error = error
+        if wal_inspection is not None and self._active_generation_was_aborted(
+            wal_inspection
+        ):
+            # A published rollover generation whose rollover was aborted is
+            # not authoritative: classify it exactly like an invalid current
+            # WAL, so R06 repairs it from Journal-confirmed state.
+            wal_inspection = None
+            wal_error = StateWALIntegrityError("aborted rollover generation is active")
         try:
             anchor = self.wal.inspect_boot_anchor_optional()
         except StateWALError:
@@ -867,6 +889,79 @@ class StateRecoveryCoordinator:
             external=journal_inspection.external_reconciliation_required,
         )
         return self._finish_event_reconciliation(result)
+
+    def resolve_open_wal_rollover(self) -> None:
+        """Resolve a prepared, unresolved StateWAL rollover (startup only)."""
+
+        with self._lock:
+            self._resolve_open_wal_rollover()
+
+    def _resolve_open_wal_rollover(self) -> None:
+        """Roll forward a published rollover, otherwise abort it.
+
+        Decision table (#382 D1 P1-2/P1-c, IP-3b review P1-1):
+
+        - manifest unreadable: raise. Recording an abort is final, so it is
+          never decided from a read that might be transient; startup fails
+          and can be retried.
+        - manifest names another generation (the predecessor): never
+          published. Quarantine the prepared file and abort.
+        - manifest names the prepared generation and its single baseline is
+          exactly the prepared one: roll forward (COMPLETED).
+        - manifest names the prepared generation but it does not verify:
+          abort. A rollover never changes state; startup classification then
+          treats the active generation as invalid-current and repairs it from
+          Journal-confirmed state, with the predecessor retained.
+        """
+        journal = self.journal.inspect()
+        pending = journal.open_wal_rollover
+        if pending is None:
+            return
+        generation_id = UUID(pending.wal_generation_id)
+        try:
+            manifest = self.wal.read_manifest_optional()
+        except StateWALError:
+            raise StateRecoveryError(
+                "StateWAL manifest is unreadable during rollover resolution"
+            ) from None
+        if manifest is None or manifest.active_generation_id != generation_id:
+            if manifest is not None and str(manifest.active_generation_id) != (
+                pending.wal_predecessor_generation_id
+            ):
+                raise StateRecoveryError("StateWAL rollover predecessor is ambiguous")
+            self.wal.quarantine_generation(generation_id, UUID(pending.rollover_id))
+            self.journal.append_wal_rollover_aborted(pending.rollover_id)
+            return
+        published = self.wal.inspect_rollover_generation(generation_id)
+        if (
+            published is not None
+            and str(manifest.active_baseline_record_id) == pending.wal_record_id
+            and manifest.active_baseline_record_hash == pending.wal_record_hash
+            and published[1] == pending.wal_record_hash
+            and published[0].baseline_snapshot_sequence == pending.snapshot_sequence
+            and published[0].baseline_snapshot_hash == pending.snapshot_hash
+            and published[0].journal_processing_high_water
+            == journal.processing_high_water
+            and str(published[0].predecessor_generation_id)
+            == pending.wal_predecessor_generation_id
+            and published[0].predecessor_generation_hash
+            == pending.wal_predecessor_record_hash
+        ):
+            self.journal.append_wal_rollover_completed(pending.rollover_id)
+            return
+        self.journal.append_wal_rollover_aborted(pending.rollover_id)
+
+    def _active_generation_was_aborted(self, wal: StateWALInspection) -> bool:
+        """The active manifest names a generation whose rollover was aborted."""
+        manifest = wal.active_manifest
+        if manifest is None:
+            return False
+        active = str(manifest.active_generation_id)
+        return any(
+            record.lifecycle is EventLifecycle.WAL_GENERATION_ROLLED_ABORTED
+            and record.wal_generation_id == active
+            for record in self.journal.records
+        )
 
     def _recover_journal_bound_current(
         self,
@@ -1789,12 +1884,7 @@ class StateRecoveryCoordinator:
         for journal_index, evidence in enumerate(journal.records):
             if (
                 evidence.schema_version < 2
-                or evidence.lifecycle
-                not in {
-                    EventLifecycle.CHECKPOINT,
-                    EventLifecycle.COMPLETED,
-                    EventLifecycle.RECOVERY_COMPLETED,
-                }
+                or evidence.lifecycle not in _WAL_ANCHOR_LIFECYCLES
                 or evidence.wal_generation_id != str(manifest.active_generation_id)
                 or evidence.wal_record_id is None
                 or evidence.wal_record_hash is None
@@ -1839,11 +1929,19 @@ class StateRecoveryCoordinator:
             )
         }
         anchor_evidence = journal.records[journal_index]
-        prior_processing = (
-            anchor_evidence.recovery_processing_high_water
-            if anchor_evidence.lifecycle is EventLifecycle.RECOVERY_COMPLETED
-            else anchor_evidence.processing_sequence
-        )
+        if anchor_evidence.lifecycle is EventLifecycle.WAL_GENERATION_ROLLED_COMPLETED:
+            # A rollover anchors the new generation's baseline; its processing
+            # high-water is the one recorded in that baseline.
+            rolled_baseline = wal.records[wal_index]
+            if not isinstance(rolled_baseline, BaselineRecord):
+                raise StateRecoveryError("Rolled WAL anchor is not a baseline")
+            prior_processing: int | None = rolled_baseline.journal_processing_high_water
+        else:
+            prior_processing = (
+                anchor_evidence.recovery_processing_high_water
+                if anchor_evidence.lifecycle is EventLifecycle.RECOVERY_COMPLETED
+                else anchor_evidence.processing_sequence
+            )
         if prior_processing is None:
             raise StateRecoveryError("Retained Journal WAL anchor is incomplete")
         for index, record in enumerate(
@@ -1906,12 +2004,7 @@ class StateRecoveryCoordinator:
             if (
                 record.schema_version >= 2
                 and record.wal_generation_id is not None
-                and record.lifecycle
-                in {
-                    EventLifecycle.CHECKPOINT,
-                    EventLifecycle.COMPLETED,
-                    EventLifecycle.RECOVERY_COMPLETED,
-                }
+                and record.lifecycle in _WAL_ANCHOR_LIFECYCLES
             ):
                 return record.wal_generation_id
         return None
