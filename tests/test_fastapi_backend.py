@@ -382,8 +382,9 @@ def test_journal_hard_limit_refuses_new_events_across_restart(
         )
         assert response.status_code == 503
         assert journal.records == before_records
-        assert client.get("/health").json()["reason"] == (
-            "event_journal_retention_exhausted"
+        assert client.get("/health").json()["reason"] == "journal_hard_limit"
+        assert client.app.state.sleep_cycle_manager._learning_gate() == (
+            "journal_hard_limit"
         )
 
     constrained = settings.model_copy(
@@ -395,13 +396,52 @@ def test_journal_hard_limit_refuses_new_events_across_restart(
     )
     with _client(tmp_path, settings=constrained) as restarted:
         assert restarted.app.state.agent_runtime.status is AgentRuntimeStatus.CREATED
-        assert restarted.app.state.journal_compaction.last_outcome is not None
-        assert restarted.get("/health").json()["reason"] == (
-            "event_journal_retention_exhausted"
-        )
+        outcome = restarted.app.state.journal_compaction.last_outcome
+        assert outcome is not None and outcome.reason == "nothing_due"
+        assert restarted.get("/health").json()["reason"] == "journal_hard_limit"
         assert restarted.post(
             "/api/chat", json={"message": "blocked", "attachments": []}
         ).status_code == 503
+
+
+def _journal_settings(settings: Settings, **update: object) -> Settings:
+    return settings.model_copy(
+        update={"event_journal": settings.event_journal.model_copy(update=update)}
+    )
+
+
+@pytest.mark.parametrize("band", ["hard", "soft"])
+def test_start_outside_the_normal_band_compacts_and_resumes(
+    tmp_path: Path, band: str
+) -> None:
+    """IP-4b: a start in the soft or hard band attempts one compaction at the
+    clean boundary before admission is decided, and resumes when it frees
+    enough live bytes."""
+    base = _journal_settings(_settings(tmp_path), max_bytes=64 * 1024)
+    with _client(tmp_path, settings=base) as client:
+        for number in range(30):
+            assert client.post(
+                "/api/chat", json={"message": f"t{number}", "attachments": []}
+            ).status_code == 200
+        journal: EventJournal = client.app.state.event_journal
+        live = _journal_live_bytes(journal)
+        assert len(list(journal.path.parent.glob(f"{journal.path.name}.[0-9]*")))
+    limits = (
+        {"max_total_bytes": live - 1, "soft_band_bytes": 0}
+        if band == "hard"
+        else {"max_total_bytes": live + 10, "soft_band_bytes": 100}
+    )
+    limited = _journal_settings(base, retention_days=0, **limits)
+    with _client(tmp_path, settings=limited) as restarted:
+        outcome = restarted.app.state.journal_compaction.last_outcome
+        assert outcome is not None and outcome.performed, outcome
+        status = restarted.app.state.event_journal.admission_status()
+        assert status.band is EventJournalAdmissionBand.NORMAL
+        assert restarted.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
+        assert restarted.get("/health").json()["status"] == "ok"
+        assert restarted.post(
+            "/api/chat", json={"message": "after", "attachments": []}
+        ).status_code == 200
 
 
 def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -> None:
