@@ -219,3 +219,33 @@ def test_unknown_journal_reason_falls_back_to_unavailable() -> None:
     assert owner_reason(_GoalSourceUnavailable("x", reason=_Other.NEW)) is (
         R16OwnerReason.SOURCE_UNAVAILABLE
     )
+
+
+def test_a_forged_request_reason_never_depends_on_the_target(app) -> None:  # noqa: F811
+    """IP-5 review P2-a: P is read before X, so a fabricated P holds the
+    same reason whatever X is."""
+    with TestClient(app) as client:
+        state = client.app.state
+        archived = _chat_in(state, "other context, old", _OTHER)
+        _archive(state, archived)
+        state.journal_compaction.policy = JournalCompactionPolicy(30)
+        retained = _chat_in(state, "other context, recent", _OTHER)
+        fabricated_x = _MotivationSourceRef(str(uuid4()), 3, retained.episode_id)
+        _chat_in(state, "a later turn, so every target precedes the request")
+        reasons = {}
+        for name, x in (
+            ("archived", archived),
+            ("retained", retained),
+            ("fabricated", fabricated_x),
+        ):
+            # A fabricated request: an unknown id at the latest sequence.
+            high = state.event_journal.inspect().processing_high_water
+            forged_p = _MotivationSourceRef(str(uuid4()), high, retained.episode_id)
+            reasons[name] = (
+                state._goal_source_owner._submit_proposal(
+                    _GoalSourceSelection(forged_p, x)
+                )
+                .result(timeout=30)
+                .value.reason
+            )
+        assert len(set(reasons.values())) == 1, reasons

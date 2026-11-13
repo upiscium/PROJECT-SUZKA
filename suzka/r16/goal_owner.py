@@ -260,6 +260,11 @@ class _GoalSourceOwner:
         if p.event_id == x.event_id or p.event_sequence <= x.event_sequence:
             raise _GoalSourceUnavailable("Goal source chronology invalid")
         try:
+            # The request P is read first, so its outcome never depends on
+            # the requester-named target X (IP-5 review P2-a).
+            p_record, p_source = self._source._read(
+                p, event, continuation=continuation
+            )
             try:
                 x_record, x_source = self._source._read(
                     x, event, continuation=continuation
@@ -272,9 +277,6 @@ class _GoalSourceOwner:
                         error, x, p, event, continuation=continuation
                     ),
                 ) from error
-            p_record, p_source = self._source._read(
-                p, event, continuation=continuation
-            )
             db1_p = self._source._memory.get_committed_episodic(p.episode_id)
             if (
                 db1_p is None
