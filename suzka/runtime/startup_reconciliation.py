@@ -33,6 +33,14 @@ from suzka.memory.semantic_participant import (
     MemorySemanticParticipant,
 )
 from suzka.memory.semantic_store import SemanticStore, SemanticStoreError
+from suzka.r16.history_adoption import (
+    HistoryAdoptionError,
+    activate_adopted_store,
+    adopted_history_baseline,
+    current_incarnation,
+    history_registry,
+    require_adoptable,
+)
 from suzka.r16.history_codec import SUBJECT_HISTORY_PARTICIPANT_ID
 from suzka.r16.history_participant import (
     JournalCommitProofSource,
@@ -105,7 +113,7 @@ def _require_sequence(value: object, field: str, *, positive: bool = False) -> i
 class StartupReconciliationCoordinator:
     """Resolve open transactions and a true-rollback external recovery gate."""
 
-    participant_registry = (
+    participant_registry: tuple[ParticipantBaseline, ...] = (
         ParticipantBaseline(
             participant_id=MEMORY_EPISODIC_PARTICIPANT_ID,
             domain=ParticipantDomain.DURABLE_DOMAIN,
@@ -146,10 +154,18 @@ class StartupReconciliationCoordinator:
             memory.settings.memory.persist_directory
         )
         self.semantic_checkpoint_covers = semantic_checkpoint_covers
-        # #376 U4-2: the fifth resolver.  Absent until the U4-3 baseline
-        # registers ``subject.history``; a transaction naming it then fails
-        # closed as an unregistered participant.
+        # #376 U4-2/U4-3: the fifth resolver.  Without a store the registry
+        # stays the original four and a transaction naming ``subject.history``
+        # fails closed as an unregistered participant.
         self.history_store = history_store
+        if history_store is not None:
+            self.participant_registry = history_registry(type(self).participant_registry)
+            if history_incarnation is None:
+                store = history_store
+
+                def history_incarnation() -> str:
+                    return current_incarnation(journal, store)
+
         self.history_incarnation = history_incarnation
 
     def reconcile_open_transactions(self) -> tuple[bool, str | None]:
@@ -247,9 +263,25 @@ class StartupReconciliationCoordinator:
     ) -> EventJournalParticipantBaseline:
         """Establish the fixed participant epoch before normal admission."""
 
-        return self.state_recovery.establish_participant_baseline(
+        if self.history_store is not None:
+            inspection = self.journal.inspect()
+            if adopted_history_baseline(inspection) is None:
+                # Prove the store adoptable before the irreversible R07 step.
+                try:
+                    require_adoptable(self.history_store, inspection)
+                except HistoryAdoptionError as error:
+                    raise StartupReconciliationError(str(error)) from error
+        baseline = self.state_recovery.establish_participant_baseline(
             recovery, self.participant_registry
         )
+        if self.history_store is not None:
+            # #376 U4-3: PROVISIONAL -> ACTIVE only after the five-participant
+            # baseline is published; an ACTIVE store must match it exactly.
+            try:
+                activate_adopted_store(self.history_store, self.journal.inspect())
+            except HistoryAdoptionError as error:
+                raise StartupReconciliationError(str(error)) from error
+        return baseline
 
     def resume_prepared_gate_clear(self) -> bool:
         """Finish a crash window after CLEAR_PREPARED, including a prior WAL CAS."""

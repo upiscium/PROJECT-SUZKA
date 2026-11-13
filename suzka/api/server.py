@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import cast
 
 import uvicorn
@@ -69,6 +70,12 @@ from suzka.runtime.agent_state import (
     _domain_value_system,
 )
 from suzka.r16.activation import driver_activation
+from suzka.r16.history_adoption import (
+    HistoryAdoptionError,
+    adopted_history_baseline,
+    open_or_create_store,
+)
+from suzka.r16.history_store import SubjectHistoryStore
 from suzka.r16.driver import R16Driver, rescan_from
 from suzka.runtime.event_journal import EventJournalAdmissionBand
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
@@ -214,6 +221,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             elif not isinstance(injected_experience_store, ExperienceStore):
                 raise RuntimeError("Injected Experience store has an invalid type")
             app.state.experience_store = injected_experience_store
+            app.state.subject_history_store = _open_subject_history(
+                app_settings, app.state.event_journal
+            )
             app.state.startup_reconciliation = StartupReconciliationCoordinator(
                 app.state.event_journal,
                 app.state.state_recovery,
@@ -223,6 +233,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 semantic_checkpoint_covers=(
                     app.state.semantic_receipt_retention.checkpoint_covers
                 ),
+                history_store=app.state.subject_history_store,
             )
             app.state.startup_reconciliation.resume_prepared_gate_clear()
             participants_consistent = True
@@ -847,6 +858,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.emotion_timer.stop()
             app.state.agent_runtime.shutdown()
             app.state.event_journal.close()
+            if getattr(app.state, "subject_history_store", None) is not None:
+                app.state.subject_history_store.close()
 
     app = FastAPI(title=app_settings.project.name, lifespan=lifespan)
     app.state.settings = app_settings
@@ -967,3 +980,31 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def _open_subject_history(
+    app_settings: Settings, journal: EventJournal
+) -> SubjectHistoryStore | None:
+    """IP-9 U4-3: open (or, before adoption, create) the SubjectHistoryDB."""
+
+    settings = app_settings.subject_history
+    if not settings.enabled:
+        if adopted_history_baseline(journal.inspect()) is not None:
+            raise StateRecoveryError(
+                "subject.history is adopted; SubjectHistory cannot be disabled"
+            )
+        return None
+    path = settings.path.expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # No realpath: the store refuses a symlinked parent itself (P2-2).
+        return open_or_create_store(
+            journal,
+            path.parent.absolute() / path.name,
+            subject_id=app_settings.project.name,
+            max_page_count=settings.max_page_count,
+        )
+    except (HistoryAdoptionError, OSError) as error:
+        raise StateRecoveryError(f"SubjectHistory is unavailable: {error}") from error
