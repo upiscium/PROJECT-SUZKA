@@ -74,6 +74,13 @@ from suzka.runtime.agent_runtime import (
 )
 from suzka.runtime.context import ContextStatus
 from suzka.runtime.event_journal import EventJournal, EventLifecycle
+from suzka.runtime.journal_source import (
+    JournalSourceReason,
+    JournalSourceStage,
+    SourceUnavailable,
+    reason_of as _reason_of,
+    locate_journal_source,
+)
 
 if TYPE_CHECKING:
     from suzka.runtime.main_loop import SuzkaMainLoop
@@ -89,7 +96,7 @@ _ASSESS: Final = "assess_review_readiness"
 _UNKNOWN_OUTCOME_UNCERTAINTY: Final = UNCERTAINTY_SCALE
 
 
-class _PlanSourceUnavailable(ValueError):
+class _PlanSourceUnavailable(SourceUnavailable):
     """No qualified preview; never use source text in errors."""
 
 
@@ -284,6 +291,11 @@ class _PlanPreviewOwner:
         event_type: AgentEventType,
         event_source: AgentEventSource,
     ) -> None:
+        """Require an earlier owner event to be terminal (IP-4c: three-stage).
+
+        Callers check the owner's committed receipt for the event first, so
+        an archived event is accepted on that receipt; a missing one is not.
+        """
         inspection = self._journal.inspect()
         if (
             inspection.external_reconciliation_required
@@ -291,8 +303,17 @@ class _PlanPreviewOwner:
             or inspection.reconciliation_required_transactions
         ):
             raise _PlanSourceUnavailable("Journal not reconciled")
-        rows = tuple(row for row in inspection.records if row.event_id == event_id)
-        for lifecycle in (EventLifecycle.ACCEPTED, EventLifecycle.COMPLETED):
+        stage, rows = locate_journal_source(inspection, event_id, event_sequence)
+        if stage is JournalSourceStage.MISSING:
+            raise _PlanSourceUnavailable(
+                "owner event provenance missing",
+                reason=JournalSourceReason.SOURCE_MISSING,
+            )
+        for lifecycle in (
+            ()
+            if stage is JournalSourceStage.ARCHIVED
+            else (EventLifecycle.ACCEPTED, EventLifecycle.COMPLETED)
+        ):
             matches = tuple(row for row in rows if row.lifecycle is lifecycle)
             if (
                 len(matches) != 1
@@ -321,7 +342,7 @@ class _PlanPreviewOwner:
             raise _PlanSourceUnavailable("Goal is not first-review adopted")
         self._goal._require_real_proposal_review(goal)
         selection = self._goal._selection_from_goal(goal)
-        qualified = self._goal._qualify(selection, event)
+        qualified = self._goal._qualify(selection, event, continuation=True)
         self._goal._expect_goal_contract(goal, qualified)
 
         admission = goal.subject_admission
@@ -419,7 +440,7 @@ class _PlanPreviewOwner:
         ):
             raise _PlanSourceUnavailable("responsibility unaccepted or unavailable")
         selection = self._commitment._selection_from_record(record)
-        q = self._commitment._qualify(selection, event)
+        q = self._commitment._qualify(selection, event, continuation=True)
         self._commitment._assert_contract(record, q)
         self._commitment._assert_original_proposal(record)
         if (
@@ -519,9 +540,13 @@ class _PlanPreviewOwner:
         except _PlanSourceUnavailable:
             raise
         except (_GoalSourceUnavailable, _CommitmentSourceUnavailable) as exc:
-            raise _PlanSourceUnavailable("earlier source owner unqualified") from exc
+            raise _PlanSourceUnavailable(
+                "earlier source owner unqualified", reason=exc.reason
+            ) from exc
         except (ValueError, TypeError, RuntimeError, OSError) as exc:
-            raise _PlanSourceUnavailable("Plan evidence unavailable") from exc
+            raise _PlanSourceUnavailable(
+                "Plan evidence unavailable", reason=_reason_of(exc)
+            ) from exc
 
     @staticmethod
     def _plan(

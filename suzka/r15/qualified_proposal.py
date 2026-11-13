@@ -50,6 +50,12 @@ from suzka.runtime.event_journal import (
     EventJournalError,
     EventLifecycle,
 )
+from suzka.runtime.journal_source import (
+    JournalSourceReason,
+    JournalSourceStage,
+    SourceUnavailable,
+    locate_journal_source,
+)
 
 _MAX_MESSAGE_BYTES = 4096
 _OPTION_DOMAIN = b"SUZKA:R15:P1BA:SOURCE-REFERENT:V1\x00"
@@ -69,7 +75,7 @@ _LATER = re.compile(
 )
 
 
-class QualifiedProposalUnavailable(ValueError):
+class QualifiedProposalUnavailable(SourceUnavailable):
     """A coarse refusal, without raw source/model/private text."""
 
 
@@ -251,9 +257,32 @@ class QualifiedNarrativeSourceGate:
                 or inspected.reconciliation_required_transactions
             ):
                 raise QualifiedProposalUnavailable("Journal source is in recovery")
-            relevant = tuple(
-                r for r in inspected.records if r.event_id == source.event_id
+            stage, relevant = locate_journal_source(
+                inspected, source.event_id, source.event_sequence
             )
+            if stage is not JournalSourceStage.RETAINED:
+                # Admission only: a narrative source must be retained. Past
+                # the window it is PAST_RETENTION when the committed
+                # Experience proves it existed, MISSING otherwise (IP-4c).
+                reason = JournalSourceReason.SOURCE_MISSING
+                if stage is JournalSourceStage.ARCHIVED:
+                    try:
+                        archived = self._experience.load_committed_current(
+                            experience_id_for_event(
+                                source.event_id, source.event_sequence
+                            )
+                        ).record
+                    except ExperienceStoreError:
+                        archived = None
+                    if (
+                        archived is not None
+                        and archived.source_event_id == source.event_id
+                        and archived.source_event_sequence == source.event_sequence
+                    ):
+                        reason = JournalSourceReason.SOURCE_PAST_RETENTION
+                raise QualifiedProposalUnavailable(
+                    "R07 event not retained", reason=reason
+                )
             accepted = tuple(
                 r for r in relevant if r.lifecycle is EventLifecycle.ACCEPTED
             )
