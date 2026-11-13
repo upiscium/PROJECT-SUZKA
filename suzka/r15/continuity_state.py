@@ -11,7 +11,12 @@ from dataclasses import dataclass
 
 from suzka.identifiers import MAX_IDENTIFIER_CODEPOINTS, validate_identifier
 from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE
-from suzka.r15.common import canonical_json
+from suzka.r15.common import (
+    Interpretation,
+    InterpretationStatus,
+    SourceWitness,
+    canonical_json,
+)
 from suzka.r15.contracts import NarrativeLinkKind, NarrativeSelfState
 from suzka.r15.qualified_proposal import (
     QualifiedProposalUnavailable,
@@ -90,21 +95,22 @@ def _ref_value(item: QualifiedTurnRef) -> dict[str, str | int]:
 
 
 def _meaning_bound(root: NarrativeSelfState, scope: str) -> None:
+    """Topology and option set only (IP-8a, #374 D4 §1 / D5 §1).
+
+    S1 keeps A/B; a revised episode may hold A/B or UNKNOWN.  Whether the
+    revised option relates to the original as KEEPS/ADOPTS/UNKNOWN is
+    checked with its witnesses in ``_validate_retained_source_witnesses``.
+    """
     if root.revision not in (1, 2) or len(root.episodes) != root.revision:
         raise ContinuityInvalid("unsupported MVI R15 revision topology")
-    choices = []
     for episode in root.episodes:
         try:
-            choices.append(
-                restore_scoped_option(scope, episode.interpretation.statement_id)
-            )
+            choice = restore_scoped_option(scope, episode.interpretation.statement_id)
         except QualifiedProposalUnavailable as exc:
             raise ContinuityInvalid("source-bound meaning cannot be decoded") from exc
-    if any(item not in ("A", "B") for item in choices):
-        raise ContinuityInvalid("source-bound meaning remains UNKNOWN")
+        if not episode.links and choice not in ("A", "B"):
+            raise ContinuityInvalid("original meaning remains UNKNOWN")
     if root.revision == 2:
-        if set(choices) != {"A", "B"}:
-            raise ContinuityInvalid("reinterpretation did not change referent")
         ids = {ep.episode_id for ep in root.episodes}
         if not any(
             any(
@@ -115,6 +121,42 @@ def _meaning_bound(root: NarrativeSelfState, scope: str) -> None:
             for episode in root.episodes
         ):
             raise ContinuityInvalid("old interpretation is not linked")
+
+
+def _same_event(witness: SourceWitness, ref: QualifiedTurnRef) -> bool:
+    return (
+        witness.event is not None
+        and witness.event.event_id == ref.event_id
+        and witness.event.event_sequence == ref.event_sequence
+    )
+
+
+def _shape(
+    interpretation: Interpretation,
+    status: frozenset[InterpretationStatus],
+    experience: SourceWitness,
+    counter_ref: QualifiedTurnRef | None,
+) -> None:
+    """Shape only: status set, support == (experience,), counter witness event.
+
+    Confidence/estimate *values* are deliberately not checked here (D5 §1): a
+    v1-table root must still restore; values are enforced only by the private
+    re-validation's whole-episode digest.
+    """
+    if interpretation.status not in status:
+        raise ContinuityInvalid("interpretation status does not fit its relation")
+    if interpretation.status is InterpretationStatus.UNKNOWN:
+        return  # Interpretation itself enforces empty support/counter/values.
+    if interpretation.support != (experience,):
+        raise ContinuityInvalid("interpretation support is not its experience")
+    if counter_ref is None:
+        if interpretation.counter:
+            raise ContinuityInvalid("interpretation has an unexpected counter")
+    elif interpretation.status is not InterpretationStatus.PRESENT and (
+        len(interpretation.counter) != 1
+        or not _same_event(interpretation.counter[0], counter_ref)
+    ):
+        raise ContinuityInvalid("interpretation counter lost its witness")
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,47 +193,74 @@ class NarrativeContinuation:
         )
 
     def _validate_retained_source_witnesses(self, root: NarrativeSelfState) -> None:
-        """Bind the actual persisted E/E2 witness events to replay refs.
+        """Bind the persisted E/E2 witness events to replay refs by relation.
 
-        U1 currently retains these witnessed events; setup/S1/S2 episode
-        references beyond those witnesses remain technical replay hints and
-        MUST be requalified against the live source owners before use.
+        Structural only (IP-8a, #374 D5 §1): the relation is derived from the
+        root alone, total over KEEPS / UNKNOWN / ADOPTS, else refused.  The
+        setup/S1/S2 references remain technical replay hints that MUST be
+        requalified against the live source owners before use.
         """
         first = tuple(ep for ep in root.episodes if not ep.links)
         if len(first) != 1:
             raise ContinuityInvalid("original interpretation source is ambiguous")
         original = first[0]
         initial_ref = self.first_sources[1]
-        original_event = original.experience.event
-        if original_event is None:
-            raise ContinuityInvalid("original Experience event is absent")
-        if (
-            initial_ref.event_id != original_event.event_id
-            or initial_ref.event_sequence != original_event.event_sequence
-        ):
+        if not _same_event(original.experience, initial_ref):
             raise ContinuityInvalid("original E reference differs from U3 witness")
-
-        if self.revision == 2:
-            revised = tuple(ep for ep in root.episodes if ep.links)
-            if len(revised) != 1:
-                raise ContinuityInvalid("revised interpretation source is ambiguous")
-            later = revised[0]
-            subsequent_ref = self.revised_sources[3]
-            subsequent_event = later.experience.event
-            if subsequent_event is None:
-                raise ContinuityInvalid("revised Experience event is absent")
-            if (
-                subsequent_ref.event_id != subsequent_event.event_id
-                or subsequent_ref.event_sequence != subsequent_event.event_sequence
-            ):
+        _shape(
+            original.interpretation,
+            frozenset({InterpretationStatus.PRESENT, InterpretationStatus.UNKNOWN}),
+            original.experience,
+            None,
+        )
+        if self.revision != 2:
+            return
+        revised = tuple(ep for ep in root.episodes if ep.links)
+        if len(revised) != 1:
+            raise ContinuityInvalid("revised interpretation source is ambiguous")
+        later = revised[0]
+        scope = self.source_scope
+        if scope is None:
+            raise ContinuityInvalid("revised interpretation has no source scope")
+        try:
+            original_choice = restore_scoped_option(
+                scope, original.interpretation.statement_id
+            )
+            revised_choice = restore_scoped_option(
+                scope, later.interpretation.statement_id
+            )
+        except QualifiedProposalUnavailable as exc:
+            raise ContinuityInvalid("source-bound meaning cannot be decoded") from exc
+        report_ref = self.revised_sources[3]
+        status = later.interpretation.status
+        if (
+            _same_event(later.experience, initial_ref)
+            and revised_choice == original_choice
+        ):
+            # KEEPS_ORIGINAL: supported by E, opposed by the reported E2.
+            _shape(
+                later.interpretation,
+                frozenset(
+                    {InterpretationStatus.CONTRADICTORY, InterpretationStatus.CONTESTED}
+                ),
+                later.experience,
+                report_ref,
+            )
+        elif revised_choice == "UNKNOWN" and status is InterpretationStatus.UNKNOWN:
+            if not _same_event(later.experience, report_ref):
                 raise ContinuityInvalid("reported E2 differs from U3 witness")
-            if not any(
-                item.event is not None
-                and item.event.event_id == original_event.event_id
-                and item.event.event_sequence == original_event.event_sequence
-                for item in later.interpretation.counter
-            ):
-                raise ContinuityInvalid("revised counterevidence lost original E")
+        elif revised_choice not in (original_choice, "UNKNOWN"):
+            # ADOPTS_REPORT: supported by E2; CONTESTED keeps E as counter.
+            if not _same_event(later.experience, report_ref):
+                raise ContinuityInvalid("reported E2 differs from U3 witness")
+            _shape(
+                later.interpretation,
+                frozenset({InterpretationStatus.PRESENT, InterpretationStatus.CONTESTED}),
+                later.experience,
+                initial_ref,
+            )
+        else:
+            raise ContinuityInvalid("revised interpretation relation is unsupported")
 
     def canonical_value(self, root: NarrativeSelfState) -> dict[str, object]:
         if type(root) is not NarrativeSelfState or root.revision != self.revision:

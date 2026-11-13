@@ -21,7 +21,12 @@ S1=A / S2=B. Before the model sees any projection, the private reader checks:
   second WAL/owner snapshot equals the first one.
 
 The private value includes status (QUALIFIED/HOLD), revision, earlier A/B,
-current A/B and whether a later user report exists. It has no user/model
+current A/B/UNKNOWN, whether a later user report exists and, since IP-8a, a
+closed status class (PRESENT/CONTESTED/CONTRADICTORY/UNKNOWN). An UNKNOWN class
+hides both options and shows only "Current interpretation: undetermined.";
+CONTESTED/CONTRADICTORY add one fixed English disagreement line. The read
+re-derives both S1 and S2 episodes with the v2 table and compares them whole,
+so a root admitted under the earlier table is HOLD. It has no user/model
 quotes, source identifiers, personal identity, raw history, skill score,
 hidden thought or Goal/Tool authorization.
 
@@ -32,7 +37,7 @@ bounded referent-resolution exercise (such as 暫定解釈 / 比較実験) in th
 user's current request allow the qualifying read to condition Chat. A generic
 "前の案" about an unrelated plan is insufficient. This lexical gate is intentionally
 conservative, not a general proof of user-topic intent. The projection
-prefix contains only fixed strings + finite A/B, and labels all interpretations
+prefix contains only fixed strings + finite A/B (or "undetermined"), and labels all interpretations
 **provisional**. It explicitly forbids a verified-intent/success/skill/trust
 claim. New participant or changed Context forces HOLD. Otherwise the existing
 prompt/generator is unchanged. Debug Chat is never given this private prefix.
@@ -82,3 +87,22 @@ review and **separate Human Merge permission** are required. R15 U2/U4
 positive updates and final U7 remain subsequent independently scoped work.
 Full 128 MiB AgentState cap and untouched 16 MiB reserve stay binding;
 this change adds no persisted field.
+
+## R15 -> R16 interpretation read (IP-8a)
+
+`R15StatePort.read_interpretation` (adapter:
+`suzka/runtime/r15_interpretation_reader.py`) returns only closed values:
+`EPISODE(stage, status class)`, `NOT_ELIGIBLE` or `UNAVAILABLE`. It runs only
+inside the R16 plan-preview review event (`PLAN_PREVIEW_REVIEW` /
+`RUNTIME_PLAN_PREVIEW_REVIEW`) and must be called before that event opens its
+R07 transaction: the source read refuses while any transaction is open.
+
+Order: an admitted episode for X is re-validated exactly like the private
+read; otherwise X's own answer must match the prior-choice pattern exactly once
+(else `NOT_ELIGIBLE` without reading anything else); then the nearest earlier
+qualified CHAT turn of the same Context, found by a descending scan of the
+retained Journal, decides `UNAVAILABLE` (setup-shaped) or `NOT_ELIGIBLE`.
+Known fail-closed effects: no predecessor in the retained window (including a
+Context's first turn, whose start sequence is not recorded) is `UNAVAILABLE`,
+and so is any earlier turn of another Context whose Experience cannot be read
+during the scan. Both only affect X whose own answer is R15-shaped.

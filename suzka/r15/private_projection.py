@@ -12,15 +12,13 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from suzka.r15.continuity_state import ContinuityInvalid, NarrativeContinuation
-from suzka.r15.contracts import NarrativeSelfState
+from suzka.r15.common import InterpretationStatus
+from suzka.r15.contracts import NarrativeEpisode, NarrativeSelfState
+from suzka.r15.narrative_self_system import _source_episode_digest, derive_episode
 from suzka.r15.qualified_proposal import (
     QualifiedNarrativeSourceGate,
     QualifiedProposalUnavailable,
-    _LATER,
-    _PRIOR,
-    _SETUP,
-    _parse_candidate,
-    restore_scoped_option,
+    proposal_from_observed,
 )
 from suzka.runtime.agent_state import (
     AgentStateLoadError,
@@ -37,22 +35,42 @@ class PrivateReadStatus(str, Enum):
     HOLD = "hold_or_source_unavailable"
 
 
+STATUS_CLASSES = {
+    InterpretationStatus.PRESENT: "PRESENT",
+    InterpretationStatus.CONTESTED: "CONTESTED",
+    InterpretationStatus.CONTRADICTORY: "CONTRADICTORY",
+    InterpretationStatus.UNKNOWN: "UNKNOWN",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class QualifiedMeaning:
+    original: str
+    current: str
+    status_class: str
+
+
 @dataclass(frozen=True, slots=True)
 class PrivateNarrativeProjection:
-    """Only finite A/B and revision semantics; no raw source/identity/text."""
+    """Only finite A/B/UNKNOWN, revision and status-class semantics.
+
+    No raw source, identity, rationale or text.  ``status_class`` is one of
+    PRESENT / CONTESTED / CONTRADICTORY / UNKNOWN (IP-8a, #374 D3 §2).
+    """
 
     status: PrivateReadStatus
     revision: int | None
     original_referent: str | None
     current_referent: str | None
     later_user_reported: bool
+    status_class: str | None = None
 
     @property
     def qualified(self) -> bool:
         return self.status is PrivateReadStatus.QUALIFIED
 
 
-HOLD = PrivateNarrativeProjection(PrivateReadStatus.HOLD, None, None, None, False)
+HOLD = PrivateNarrativeProjection(PrivateReadStatus.HOLD, None, None, None, False, None)
 
 
 def _committed_root(
@@ -76,7 +94,7 @@ def _qualify_source_meaning(
     *,
     context_id: str,
     event_sequence: int,
-) -> tuple[str, str]:
+) -> QualifiedMeaning:
     if (
         root.revision not in (1, 2)
         or continuation.revision != root.revision
@@ -103,47 +121,37 @@ def _qualify_source_meaning(
         raise ContinuityInvalid("future, reordered, or cross-context sources")
 
     original_scope = continuation.source_scope
-    if observed[0].episode_id != original_scope or not _SETUP.fullmatch(
-        observed[0].request
-    ):
+    if observed[0].episode_id != original_scope:
         raise ContinuityInvalid("original option universe unavailable")
-    choices = {
-        name
-        for pattern in _PRIOR
-        for name in pattern.findall(observed[1].response.replace("*", ""))
-    }
-    if len(choices) != 1:
-        raise ContinuityInvalid("original first-person answer ambiguous")
-    original = next(iter(choices))
-    if _parse_candidate(observed[2].response, "S1") != original:
-        raise ContinuityInvalid("S1 no longer matches original answer")
-
+    # Same pure derivation, template gate and v2 table as admission.  D5 §2:
+    # S1 *and* S2 episodes are re-derived and compared whole (digest), so a
+    # root admitted under the v1 table is HOLD, never a stale inference.
+    stage = "S2" if root.revision == 2 else "S1"
+    proposal = proposal_from_observed(observed, stage)
     first = tuple(episode for episode in root.episodes if not episode.links)
     later = tuple(episode for episode in root.episodes if episode.links)
-    if (
-        len(first) != 1
-        or len(later) != root.revision - 1
-        or first[0].experience != observed[1].witness
-        or restore_scoped_option(original_scope, first[0].interpretation.statement_id)
-        != original
-    ):
-        raise ContinuityInvalid("U3 original meaning/witness unavailable")
-
+    if len(first) != 1 or len(later) != root.revision - 1:
+        raise ContinuityInvalid("U3 interpretation topology unavailable")
+    expected_first, _row = derive_episode(proposal, "S1")
+    if _source_episode_digest(first[0]) != _source_episode_digest(expected_first):
+        raise ContinuityInvalid("U3 original interpretation differs from re-derivation")
     if root.revision == 1:
-        return original, original
+        return QualifiedMeaning(
+            proposal.original_choice,
+            proposal.original_choice,
+            _status_class(first[0]),
+        )
+    expected_later, _row = derive_episode(proposal, "S2")
+    if _source_episode_digest(later[0]) != _source_episode_digest(expected_later):
+        raise ContinuityInvalid("U3 revised interpretation differs from re-derivation")
+    return QualifiedMeaning(
+        proposal.original_choice, proposal.selected, _status_class(later[0])
+    )
 
-    report = _LATER.fullmatch(observed[3].request)
-    selected = _parse_candidate(observed[4].response, "S2")
-    if (
-        report is None
-        or report.group(1) != selected
-        or selected == original
-        or later[0].experience != observed[3].witness
-        or restore_scoped_option(original_scope, later[0].interpretation.statement_id)
-        != selected
-    ):
-        raise ContinuityInvalid("U3 revised meaning lacks current evidence")
-    return original, selected
+
+def _status_class(episode: NarrativeEpisode) -> str:
+    # A closed string, so main_loop needs no suzka.r15 enum import (D4 §6).
+    return STATUS_CLASSES[episode.interpretation.status]
 
 
 def read_private_committed_narrative(
@@ -177,7 +185,7 @@ def read_private_committed_narrative(
         if not isinstance(before, AgentStateSnapshotV10):
             return HOLD
         root, continuation = _committed_root(before, port)
-        original, current = _qualify_source_meaning(
+        meaning = _qualify_source_meaning(
             root,
             continuation,
             gate,
@@ -191,9 +199,10 @@ def read_private_committed_narrative(
         return PrivateNarrativeProjection(
             PrivateReadStatus.QUALIFIED,
             root.revision,
-            original,
-            current,
+            meaning.original,
+            meaning.current,
             root.revision == 2,
+            meaning.status_class,
         )
     except (
         AgentStateLoadError,

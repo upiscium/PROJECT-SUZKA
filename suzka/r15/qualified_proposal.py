@@ -25,6 +25,16 @@ from suzka.memory.dual_memory_system import (
 from suzka.memory.experience_participant import experience_id_for_event
 from suzka.memory.experience_store import ExperienceStoreError
 from suzka.memory.memory_schema import MemoryRecordType
+from suzka.r15.interpretation_status import (
+    Assessment,
+    ReferentRelation,
+    Uncertainty,
+)
+from suzka.r15.request_templates import (
+    TemplateRefused,
+    match_s1_template,
+    match_s2_template,
+)
 from suzka.r15.common import (
     ClaimedOrigin,
     EventRef,
@@ -99,8 +109,23 @@ class _ObservedTurn:
 
 
 @dataclass(frozen=True, slots=True)
+class TypedCandidate:
+    """The subject's typed self-assessment, retained (#374 D2 §2)."""
+
+    referent: str
+    assessment: Assessment
+    uncertainty: Uncertainty
+
+
+@dataclass(frozen=True, slots=True)
 class QualifiedReferentProposal:
-    """Derived inside the source gate from already committed owned records."""
+    """Derived inside the source gate from already committed owned records.
+
+    ``first`` is the original first-person answer E; ``later`` the reported
+    correction E2 (S2 only).  ``source``/``contrary`` keep their v1 meaning
+    (S1: E; S2: E2 and E) for existing readers.  ``relation`` and the typed
+    S1/S2 assessments feed ``interpretation_status_v2``.
+    """
 
     stage: str
     source_scope: str
@@ -111,6 +136,11 @@ class QualifiedReferentProposal:
     original_event: EventRef
     last_observed_event: EventRef
     context_id: str
+    first: SourceWitness
+    later: SourceWitness | None
+    relation: ReferentRelation
+    s1: TypedCandidate
+    s2: TypedCandidate | None
 
 
 def scoped_option_key(setup_episode_id: str, option: str) -> str:
@@ -137,7 +167,7 @@ def restore_scoped_option(setup_episode_id: str, statement_id: str) -> str:
     return found[0]
 
 
-def _parse_candidate(value: str, phase: str) -> str:
+def _parse_candidate(value: str, phase: str) -> TypedCandidate:
     if type(value) is not str or len(value.encode("utf-8")) > _MAX_MESSAGE_BYTES:
         raise QualifiedProposalUnavailable("candidate unavailable")
 
@@ -185,7 +215,54 @@ def _parse_candidate(value: str, phase: str) -> str:
         or not 0 < len(data["rationale"].encode("utf-8")) <= 700
     ):
         raise QualifiedProposalUnavailable("candidate source or phase invalid")
-    return data["assumed_referent"]
+    return TypedCandidate(
+        data["assumed_referent"],
+        Assessment(data["assessment"]),
+        Uncertainty(data["uncertainty"]),
+    )
+
+
+def prior_referents(response: str) -> set[str]:
+    """Distinct prior-choice referents named by a first-person answer."""
+
+    text = response.replace("*", "")
+    return {selected for pattern in _PRIOR for selected in pattern.findall(text)}
+
+
+def check_registered_requests(observed: tuple[_ObservedTurn, ...]) -> None:
+    """Regenerate-and-compare: S1/S2 requests must be registered templates.
+
+    Without this, a framing could tell the model which label to answer and
+    so manufacture a status (#374 D2 §4, D3 §4).  ``observed`` is the
+    qualified (setup, E, S1[, E2, S2]) window.
+    """
+
+    try:
+        first, s1 = observed[1], observed[2]
+        match_s1_template(s1.request, first.request, first.response)
+        if len(observed) == 5:
+            later, s2 = observed[3], observed[4]
+            match_s2_template(
+                s2.request, s1.response, first.request, first.response, later.request
+            )
+    except TemplateRefused as error:
+        raise QualifiedProposalUnavailable(
+            "request is not a registered template"
+        ) from error
+
+
+def s2_relation(original: str, target: str, referent: str) -> ReferentRelation:
+    """Total over A/B/UNKNOWN once the report differs from the original."""
+
+    if original not in ("A", "B") or target not in ("A", "B") or target == original:
+        raise QualifiedProposalUnavailable("report does not differ from the original")
+    if referent == target:
+        return ReferentRelation.ADOPTS_REPORT
+    if referent == original:
+        return ReferentRelation.KEEPS_ORIGINAL
+    if referent == "UNKNOWN":
+        return ReferentRelation.UNKNOWN
+    raise QualifiedProposalUnavailable("S2 referent outside the closed set")
 
 
 class QualifiedNarrativeSourceGate:
@@ -414,54 +491,71 @@ class QualifiedNarrativeSourceGate:
             or len({item.context_id for item in observed}) != 1
         ):
             raise QualifiedProposalUnavailable("event order/context inconsistent")
-        setup, first, s1 = observed[:3]
-        if not _SETUP.fullmatch(setup.request):
-            raise QualifiedProposalUnavailable(
-                "original bounded option set unavailable"
-            )
-        # The initial response must demonstrably refer to one chosen option.
-        original_matches = {
-            selected
-            for pattern in _PRIOR
-            for selected in pattern.findall(first.response.replace("*", ""))
-        }
-        if len(original_matches) != 1:
-            raise QualifiedProposalUnavailable("original answer has no single referent")
-        original = original_matches.pop()
-        pre_candidate = _parse_candidate(s1.response, "S1")
-        if pre_candidate != original:
-            raise QualifiedProposalUnavailable(
-                "provisional S1 contradicts observed self-answer"
-            )
-        if stage == "S1":
-            return QualifiedReferentProposal(
-                "S1",
-                setup.episode_id,
-                original,
-                original,
-                first.witness,
-                None,
-                first.event,
-                s1.event,
-                first.context_id,
-            )
-        later, s2 = observed[3:]
-        target = _LATER.fullmatch(later.request)
-        next_candidate = _parse_candidate(s2.response, "S2")
-        if (
-            target is None
-            or next_candidate != target.group(1)
-            or next_candidate == original
-        ):
-            raise QualifiedProposalUnavailable("no supported new reinterpretation")
-        return QualifiedReferentProposal(
-            "S2",
-            setup.episode_id,
-            next_candidate,
-            original,
-            later.witness,
-            first.witness,
-            first.event,
-            s2.event,
-            first.context_id,
+        return proposal_from_observed(observed, stage)
+
+
+def proposal_from_observed(
+    observed: tuple[_ObservedTurn, ...], stage: str
+) -> QualifiedReferentProposal:
+    """Pure derivation shared by admission and private re-validation."""
+
+    if stage not in ("S1", "S2") or len(observed) != (3 if stage == "S1" else 5):
+        raise QualifiedProposalUnavailable("unexpected source stage")
+    setup, first, s1 = observed[:3]
+    if not _SETUP.fullmatch(setup.request):
+        raise QualifiedProposalUnavailable(
+            "original bounded option set unavailable"
         )
+    # The initial response must demonstrably refer to one chosen option.
+    original_matches = prior_referents(first.response)
+    if len(original_matches) != 1:
+        raise QualifiedProposalUnavailable("original answer has no single referent")
+    original = original_matches.pop()
+    check_registered_requests(observed)
+    pre_candidate = _parse_candidate(s1.response, "S1")
+    # D2 §1: S1 has no contrary witness; an UNKNOWN or different S1
+    # referent is refused as before (no S1 episode, D4 §7 P2-4).
+    if pre_candidate.referent != original:
+        raise QualifiedProposalUnavailable(
+            "provisional S1 contradicts observed self-answer"
+        )
+    if stage == "S1":
+        return QualifiedReferentProposal(
+            "S1",
+            setup.episode_id,
+            original,
+            original,
+            first.witness,
+            None,
+            first.event,
+            s1.event,
+            first.context_id,
+            first.witness,
+            None,
+            ReferentRelation.KEEPS_ORIGINAL,
+            pre_candidate,
+            None,
+        )
+    later, s2 = observed[3:]
+    target = _LATER.fullmatch(later.request)
+    if target is None:
+        raise QualifiedProposalUnavailable("no later user-reported referent")
+    next_candidate = _parse_candidate(s2.response, "S2")
+    # D4 §7 P2-5: the report must differ from the original explicitly.
+    relation = s2_relation(original, target.group(1), next_candidate.referent)
+    return QualifiedReferentProposal(
+        "S2",
+        setup.episode_id,
+        next_candidate.referent,
+        original,
+        later.witness,
+        first.witness,
+        first.event,
+        s2.event,
+        first.context_id,
+        first.witness,
+        later.witness,
+        relation,
+        pre_candidate,
+        next_candidate,
+    )
