@@ -328,6 +328,11 @@ class EventJournalCompaction(_JournalModel):
             self.driver_activation_record.lifecycle is not EventLifecycle.COMPLETED
             or self.driver_activation_record.event_type
             is not AgentEventType.R16_DRIVER_ACTIVATION
+            or self.driver_activation_record.source
+            is not AgentEventSource.API_R16_DRIVER_ACTIVATE
+            or self.driver_activation_record.processing_sequence is None
+            or self.driver_activation_record.processing_sequence
+            > self.archived_processing_high_water
         ):
             raise ValueError("compaction carried activation is invalid")
         for carried in self.carried_records:
@@ -1136,7 +1141,8 @@ class EventJournalAdmissionBand(str, Enum):
     HARD = "hard"
 
 
-# #381 D2 P1-4: the soft band is an allow-list over all 16 AgentEventTypes.
+# #381 D2 P1-4: the soft band is an allow-list over the AgentEventTypes (16 at
+# the time of the table; IP-6 added R16_DRIVER_ACTIVATION, refused here).
 # Cognition continues; DEBUG_CHAT, ADAPTER_EVALUATE and ADAPTER_UPDATE (Human
 # decision 2026-11-10) are refused, and so is every type not listed here,
 # including any type added later (R18/R19 external effects).
@@ -5764,6 +5770,7 @@ class EventJournal:
                 for record in (*reversed(records[:boundary]), *prior)
                 if record.lifecycle is EventLifecycle.COMPLETED
                 and record.event_type is AgentEventType.R16_DRIVER_ACTIVATION
+                and record.source is AgentEventSource.API_R16_DRIVER_ACTIVATE
             ),
             None,
         )

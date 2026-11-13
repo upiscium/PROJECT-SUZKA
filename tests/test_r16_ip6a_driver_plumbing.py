@@ -8,6 +8,7 @@ once it is archived (C9, Human decision 2026-11-13).
 
 from __future__ import annotations
 
+import dataclasses
 from threading import Event
 
 from fastapi.testclient import TestClient
@@ -17,7 +18,13 @@ from suzka.api.runtime_execution import execute_with_event
 from suzka.memory.experience_participant import experience_id_for_event
 from suzka.r16.activation import driver_activation
 from suzka.runtime.agent_runtime import AgentEventSource, AgentEventType
-from suzka.runtime.event_journal import EventLifecycle
+from suzka.runtime.event_journal import (
+    EventJournal,
+    EventJournalCompaction,
+    EventJournalIntegrityError,
+    EventLifecycle,
+)
+from suzka.runtime.journal_compaction import JournalCompactionPolicy
 
 from test_r16_ip4c_past_retention import _archive, app  # noqa: F401
 from test_r16_u2a_source_owner import _app
@@ -189,3 +196,79 @@ def test_a_compaction_without_activation_keeps_its_bytes(app) -> None:  # noqa: 
         assert compaction.driver_activation_record is None
         assert "driver_activation_record" not in compaction.model_dump(mode="json")
 
+
+
+def test_a_neutral_turn_is_not_eligible_for_u2a(app, monkeypatch) -> None:  # noqa: F811
+    """The False branch: a neutral appraisal (no valid novelty, no goal
+    progress, no threat) is not eligible, exactly as U2a would decide."""
+    from suzka.experience.records import ExperienceAppraisalEvidence
+
+    original = ExperienceAppraisalEvidence.from_result.__func__  # type: ignore[attr-defined]
+
+    def neutral(cls, result):  # type: ignore[no-untyped-def]
+        evidence = original(cls, result)
+        return dataclasses.replace(
+            evidence, novelty=None, novelty_valid=False, goal_progress=None, threat=None
+        )
+
+    monkeypatch.setattr(
+        ExperienceAppraisalEvidence, "from_result", classmethod(neutral)
+    )
+    with TestClient(app) as client:
+        state = client.app.state
+        outcome = execute_with_event(
+            state.agent_runtime,
+            AgentEventType.CHAT,
+            AgentEventSource.API_CHAT,
+            lambda: state.main_loop.chat("a plain line"),
+        )
+        assert outcome.value.experience_id is not None
+        assert outcome.value.eligible_for_u2a is False
+
+
+def _activation_records(app):  # type: ignore[no-untyped-def]  # noqa: F811
+    """Records before compaction, the boundary index, and the declaration."""
+    with TestClient(app) as client:
+        state = client.app.state
+        assert client.post("/api/r16/driver/activate", headers=ADMIN).status_code == 200
+        for number in range(8):
+            _chat(client, f"fill {number}")
+        journal = state.event_journal
+        records = journal.records
+        state.journal_compaction.policy = JournalCompactionPolicy(0)
+        _chat(client, "trigger compaction")
+        inspection = journal.inspect()
+        compaction = inspection.latest_compaction
+        assert compaction is not None
+        full = (*records, *(r for r in journal.records if r not in records))
+        boundary = next(
+            index
+            for index, record in enumerate(full)
+            if record.record_hash == compaction.boundary_checkpoint_hash
+        )
+        return full, boundary, compaction
+
+
+def test_c9_declared_activation_is_verified(app) -> None:  # noqa: F811
+    records, boundary, compaction = _activation_records(app)
+    assert compaction.driver_activation_record is not None
+    EventJournal._verify_declared_compaction(records, boundary, compaction, None)
+    missing = compaction.model_copy(update={"driver_activation_record": None})
+    with pytest.raises(EventJournalIntegrityError):
+        EventJournal._verify_declared_compaction(records, boundary, missing, None)
+
+
+def test_c9_carried_activation_kind_is_validated(app) -> None:  # noqa: F811
+    _records, _boundary, compaction = _activation_records(app)
+    record = compaction.driver_activation_record
+    assert record is not None
+    data = compaction.model_dump(mode="python")
+    for bad in (
+        record.model_copy(update={"lifecycle": EventLifecycle.ACCEPTED}),
+        record.model_copy(update={"event_type": AgentEventType.CHAT}),
+        record.model_copy(update={"source": AgentEventSource.API_CHAT}),
+    ):
+        with pytest.raises(ValueError):
+            EventJournalCompaction.model_validate(
+                {**data, "driver_activation_record": bad.model_dump(mode="python")}
+            )

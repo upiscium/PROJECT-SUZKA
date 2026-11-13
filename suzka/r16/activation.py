@@ -12,7 +12,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from suzka.runtime.agent_runtime import AgentEventType, AgentRuntime
+from suzka.runtime.agent_runtime import (
+    AgentEventSource,
+    AgentEventType,
+    AgentRuntime,
+)
 from suzka.runtime.event_journal import (
     EventJournal,
     EventJournalInspection,
@@ -32,6 +36,7 @@ def driver_activation(inspection: EventJournalInspection) -> EventJournalRecord 
         if (
             record.lifecycle is EventLifecycle.COMPLETED
             and record.event_type is AgentEventType.R16_DRIVER_ACTIVATION
+            and record.source is AgentEventSource.API_R16_DRIVER_ACTIVATE
         ):
             return record
     return None
@@ -54,6 +59,7 @@ def activation_handler(
         if (
             event is None
             or event.event_type is not AgentEventType.R16_DRIVER_ACTIVATION
+            or event.source is not AgentEventSource.API_R16_DRIVER_ACTIVATE
             or event.processing_sequence is None
         ):
             raise RuntimeError("activation runs only as its own event")

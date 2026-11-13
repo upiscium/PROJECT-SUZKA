@@ -1005,8 +1005,10 @@ def test_chat_session_selector_reuses_one_durable_context_without_response_metad
         )
 
         assert first.status_code == second.status_code == 200
-        assert set(first.json()) == {"episode_id", "response", "emotion", "model"}
-        assert set(second.json()) == {"episode_id", "response", "emotion", "model"}
+        # experience_id is approved (DRV-3); no Context metadata is returned.
+        keys = {"episode_id", "response", "emotion", "model", "experience_id"}
+        assert set(first.json()) == keys
+        assert set(second.json()) == keys
         frames = client.app.state.main_loop.context_registry.state.frames
         assert len(frames) == 1
         assert frames[0].source_session_id == "client-session"
@@ -3686,7 +3688,13 @@ def test_chat_commits_post_chat_working_memory_in_agent_state_v9(
         )
 
         assert response.status_code == 200
-        assert set(response.json()) == {"episode_id", "response", "emotion", "model"}
+        assert set(response.json()) == {
+            "episode_id",
+            "response",
+            "emotion",
+            "model",
+            "experience_id",
+        }
         snapshot = client.app.state.agent_state_store.load()
         authoritative_items = client.app.state.main_loop.working_memory.items
         assert snapshot.schema_version == 10

@@ -155,7 +155,7 @@ class ChatResult:
     # driver never has to read a store. ``experience_id`` is None when no
     # Experience was created; ``eligible_for_u2a`` is False for a neutral
     # appraisal (the same condition U2a re-checks); ``context_id`` is the
-    # turn's Context. None of these is authority.
+    # Context of that Experience (None without one). None is authority.
     experience_id: str | None = None
     eligible_for_u2a: bool = False
     context_id: str | None = None
