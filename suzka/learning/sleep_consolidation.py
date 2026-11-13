@@ -1,5 +1,6 @@
 """Sleep-time consolidation and learning cycle."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from threading import RLock
 
@@ -48,6 +49,8 @@ class SleepCycleResult:
     dream_dataset_path: str | None
     training_result: QloraTrainingResult | None
     adapter_entry: AdapterEntry | None
+    # Set when post-commit learning was not run (IP-4b: Journal soft band).
+    learning_skipped_reason: str | None = None
 
 
 class SleepCycleManager:
@@ -76,12 +79,23 @@ class SleepCycleManager:
             memory_system.settings.memory.persist_directory
         )
         self._runtime: AgentRuntime | None = None
+        self._learning_gate: Callable[[], str | None] | None = None
         self._learning_lock = RLock()
 
     def bind_runtime(self, runtime: AgentRuntime) -> None:
         if self._runtime is not None and self._runtime is not runtime:
             raise RuntimeError("SleepCycleManager is already bound to another runtime")
         self._runtime = runtime
+
+    def bind_learning_gate(self, gate: Callable[[], str | None]) -> None:
+        """Bind the check that may veto post-commit learning.
+
+        The gate returns a reason to skip training and candidate
+        registration, or None to allow them (#381 D2 P2 SLEEP: in the
+        Journal soft band, consolidation continues but weights do not).
+        """
+
+        self._learning_gate = gate
 
     def run(self) -> SleepCycleResult | CoordinatedResult[SleepCycleResult]:
         if not self.settings.sleep.enabled:
@@ -123,6 +137,14 @@ class SleepCycleManager:
             return result
         if result.training_result is not None or result.adapter_entry is not None:
             return result
+        gate = self._learning_gate
+        if gate is not None:
+            try:
+                skipped = gate()
+            except Exception:
+                skipped = "learning_gate_unavailable"
+            if skipped is not None:
+                return replace(result, learning_skipped_reason=skipped)
         with self._learning_lock:
             episodes: list[EpisodicMemoryRecord] = []
             for episode_id in result.selected_episode_ids:

@@ -89,7 +89,11 @@ agent_state:
 event_journal:
   path: .suzka/event_journal.jsonl
   max_bytes: 1048576
-  retained_files: 4
+  retained_files: 4  # deprecated: no longer deletes segments (IP-4a)
+  retention_days: 30
+  # Limits over live bytes (active + rotated; archives not counted, IP-4b).
+  max_total_bytes: 75497472  # 72 MiB: hard limit, no new events above it
+  soft_band_bytes: 16777216  # 16 MiB: above max - band, cognition only
 
 state_wal:
   directory: .suzka/private/state_wal

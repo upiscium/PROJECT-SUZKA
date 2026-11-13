@@ -10,3 +10,4 @@ class SleepRunResponse(BaseModel):
     adapter_id: str | None
     adapter_status: str | None
     dry_run: bool | None
+    learning_skipped_reason: str | None = None

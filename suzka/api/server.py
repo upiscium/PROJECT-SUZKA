@@ -59,6 +59,7 @@ from suzka.runtime.agent_state import (
     _domain_belief_system,
     _domain_value_system,
 )
+from suzka.runtime.event_journal import EventJournalAdmissionBand
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
 from suzka.runtime.journal_compaction import (
     JournalCompactionCoordinator,
@@ -71,6 +72,20 @@ from suzka.runtime.wal_rollover import (
 from suzka.runtime.semantic_receipt_retention import (
     SemanticReceiptRetentionCoordinator,
 )
+
+
+def _sleep_learning_gate(journal: EventJournal) -> Callable[[], str | None]:
+    """Veto Sleep training outside the normal Journal band (IP-4b)."""
+
+    def gate() -> str | None:
+        status = journal.admission_status()
+        if not status.available:
+            return status.reason or "event_journal_admission_unavailable"
+        if status.band is EventJournalAdmissionBand.NORMAL:
+            return None
+        return status.reason or "journal_soft_limit"
+
+    return gate
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -93,6 +108,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app_settings.event_journal.retained_files,
                     lease=journal_lease,
                     archive_dir=app_settings.event_journal.archive_dir,
+                    max_total_bytes=app_settings.event_journal.max_total_bytes,
+                    soft_band_bytes=app_settings.event_journal.soft_band_bytes,
                 )
             else:
                 if not existing_journal.has_exclusive_authority:
@@ -247,6 +264,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 recovery.external_reconciliation_required if recovery else False
             ) or not participants_consistent
             app.state.reconciliation_degraded_reason = degraded_reason
+            if participants_consistent and recovery is not None:
+                # IP-4b: a Journal restarted in the soft or hard band gets one
+                # compaction attempt at this clean boundary, before admission
+                # is decided; otherwise a hard stop could never compact.
+                try:
+                    band = app.state.event_journal.admission_status().band
+                except EventJournalError:
+                    band = None
+                if band is not None and band is not EventJournalAdmissionBand.NORMAL:
+                    app.state.journal_compaction.maybe_compact()
             retention_status = app.state.event_journal.admission_status()
             app.state.startup_retention_admission_available = retention_status.available
             app.state.startup_retention_reason = retention_status.reason
@@ -657,6 +684,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             app.state.main_loop.bind_runtime(app.state.agent_runtime)
             app.state.sleep_cycle_manager.bind_runtime(app.state.agent_runtime)
+            app.state.sleep_cycle_manager.bind_learning_gate(
+                _sleep_learning_gate(app.state.event_journal)
+            )
             # Internal selection only; no endpoint, CHAT auto-submit or timer.
             # Preserve legacy injected-runtime startup without admitting U2a
             # from an unqualified Journal/Store/Context owner combination.
@@ -827,24 +857,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "reason": app.state.reconciliation_degraded_reason
                 or "external_reconciliation_required",
             }
+        retention_band: EventJournalAdmissionBand | None
         try:
-            retention_available = app.state.event_journal.admission_status().available
+            retention_status = app.state.event_journal.admission_status()
+            retention_available = retention_status.available
+            retention_band = retention_status.band
         except EventJournalError:
             retention_available = False
+            retention_band = None
         if (
             not retention_available
             or not app.state.startup_retention_admission_available
         ):
+            hard = retention_band is EventJournalAdmissionBand.HARD or (
+                app.state.startup_retention_reason == "journal_hard_limit"
+            )
             return {
                 "status": "degraded",
                 "project": app_settings.project.name,
-                "reason": "event_journal_retention_exhausted",
+                "reason": "journal_hard_limit"
+                if hard
+                else "event_journal_retention_exhausted",
             }
         if app.state.agent_runtime.status is not AgentRuntimeStatus.ACCEPTING:
             return {
                 "status": "degraded",
                 "project": app_settings.project.name,
                 "reason": "agent_runtime_unavailable",
+            }
+        if retention_band is EventJournalAdmissionBand.SOFT:
+            # Cognition continues; DEBUG_CHAT and adapter work are refused,
+            # and Sleep skips training (#381 D2 P1-4).
+            return {
+                "status": "degraded",
+                "project": app_settings.project.name,
+                "reason": "journal_soft_limit",
             }
         return {"status": "ok", "project": app_settings.project.name}
 
