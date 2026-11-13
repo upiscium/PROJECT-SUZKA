@@ -81,6 +81,16 @@ export type SleepRunResponse = {
   dry_run: boolean | null;
 };
 
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return requestUrl<T>(`${API_BASE_URL}${path}`, init);
 }
@@ -96,7 +106,7 @@ async function requestUrl<T>(url: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) {
     const detail = await response.text();
-    throw new Error(`${response.status} ${response.statusText}: ${detail}`);
+    throw new ApiError(response.status, `${response.status} ${response.statusText}: ${detail}`);
   }
   return response.json() as Promise<T>;
 }

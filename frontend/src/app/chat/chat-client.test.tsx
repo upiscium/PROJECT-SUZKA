@@ -159,3 +159,76 @@ describe("ChatClient", () => {
     expect(screen.getByText("Unavailable after a server restart.")).toBeInTheDocument();
   });
 });
+
+describe("ChatClient ticket edge cases", () => {
+  it("treats a 404 ticket as final instead of polling for 60 seconds", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    fetchMock.mockImplementation(async (url: string) =>
+      String(url).endsWith("/api/chat")
+        ? chatResponse({
+            incarnation: "inc-1",
+            command_ticket: { ticket_id: "inc-1.gone", kind: "REVIEW_EXPERIENCE", status: "pending" },
+          })
+        : { ok: false, status: 404, statusText: "Not Found", text: async () => "" },
+    );
+    renderWithQuery();
+    await send(`REVIEW_EXPERIENCE:${EXPERIENCE}`);
+    const notice = await screen.findByRole("status", { name: "System notice" });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(POLL_LIMIT_MS);
+    });
+    await waitFor(() => expect(notice).toHaveTextContent("not found"));
+    expect(fetchMock.mock.calls.filter(([u]) => String(u).includes("/commands/")).length).toBe(1);
+  });
+
+  it("does not poll a ticket that is already settled", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    fetchMock.mockImplementation(async () =>
+      chatResponse({
+        incarnation: "inc-1",
+        command_ticket: { ticket_id: "inc-1.drop", kind: "REVIEW_EXPERIENCE", status: "dropped" },
+      }),
+    );
+    renderWithQuery();
+    await send(`REVIEW_EXPERIENCE:${EXPERIENCE}`);
+    const notice = await screen.findByRole("status", { name: "System notice" });
+    expect(notice).toHaveTextContent("Review request: dropped");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(POLL_LIMIT_MS);
+    });
+    expect(fetchMock.mock.calls.filter(([u]) => String(u).includes("/commands/")).length).toBe(0);
+  });
+
+  it("explains disabled actions when the driver becomes inactive", async () => {
+    let incarnation: string | null = "inc-1";
+    fetchMock.mockImplementation(async () => chatResponse({ experience_id: EXPERIENCE, incarnation }));
+    renderWithQuery();
+    await send("while active");
+    expect(await screen.findByRole("button", { name: "Review this" })).toBeEnabled();
+    incarnation = null;
+    await send("after deactivation");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Review this" })).toBeDisabled());
+    expect(screen.getByText("Review is unavailable right now.")).toBeInTheDocument();
+    expect(screen.queryByText("Unavailable after a server restart.")).not.toBeInTheDocument();
+  });
+
+  it("stops polling when the notice unmounts", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    fetchMock.mockImplementation(async (url: string) =>
+      String(url).endsWith("/api/chat")
+        ? chatResponse({
+            incarnation: "inc-1",
+            command_ticket: { ticket_id: "inc-1.unmount", kind: "REVIEW_EXPERIENCE", status: "pending" },
+          })
+        : statusResponse("pending"),
+    );
+    const view = renderWithQuery();
+    await send(`REVIEW_EXPERIENCE:${EXPERIENCE}`);
+    await screen.findByRole("status", { name: "System notice" });
+    view.unmount();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(POLL_LIMIT_MS);
+    });
+    expect(fetchMock.mock.calls.filter(([u]) => String(u).includes("/commands/")).length).toBe(0);
+  });
+});
