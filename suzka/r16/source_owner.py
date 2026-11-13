@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import TYPE_CHECKING
 
 from suzka.experience import (
@@ -435,6 +436,44 @@ class _MotivationSourceOwner:
         raise _MotivationSourceUnavailable(
             "archived source unproven", reason=JournalSourceReason.SOURCE_MISSING
         )
+
+    def _scoped_target_reason(
+        self,
+        error: _MotivationSourceUnavailable,
+        target: _MotivationSourceRef,
+        request: _MotivationSourceRef,
+        event: AgentEvent,
+        *,
+        continuation: bool,
+    ) -> Enum | None:
+        """Release a target's retention reason only inside the request's Context.
+
+        IP-5 review P1 (#370 D2 P2-2): a requester names the target X, so a
+        reason derived from X alone (missing, past retention) would reveal
+        whether X exists in another Context. It is kept only when the request
+        P reads successfully and X's committed Experience exists in P's
+        Context; otherwise the refusal is the uniform SOURCE_UNAVAILABLE
+        (``None``). A nonexistent X is therefore indistinguishable from an X
+        in another Context.
+        """
+        if error.reason is None:
+            return None
+        try:
+            _request_record, request_source = self._read(
+                request, event, continuation=continuation
+            )
+            target_record = self._experience.load_committed_current(
+                experience_id_for_event(target.event_id, target.event_sequence)
+            ).record
+        except (_MotivationSourceUnavailable, ExperienceStoreError, ValueError, OSError):
+            return None
+        if (
+            target_record.source_event_id != target.event_id
+            or target_record.source_event_sequence != target.event_sequence
+            or target_record.context_id != request_source.context_id
+        ):
+            return None
+        return error.reason
 
     def _validate_commit(self, event: AgentEvent) -> None:
         # current_event() intentionally ends with the handler. Here the app's

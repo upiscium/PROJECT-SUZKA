@@ -177,6 +177,8 @@ class _PlanPreviewResult:
             raise ValueError("a preview must be either a decision value or HOLD")
         if (self.hold is None) != (self.owner_reason is None):
             raise ValueError("exactly a HOLD preview carries an owner reason")
+        if self.owner_reason is not None and type(self.owner_reason) is not R16OwnerReason:
+            raise TypeError("preview owner reason must be an exact R16OwnerReason")
         if (self.decision is None) != (self.witness is None):
             raise ValueError("only qualified positive preview may have policy witness")
 

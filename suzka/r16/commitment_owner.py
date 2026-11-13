@@ -37,7 +37,11 @@ from suzka.motivation.commitment_system import (
 from suzka.motivation.common import Deadline, R13Reference, R13ReferenceKind
 from suzka.motivation.motivation import MotivationKind, MotivationLifecycle
 from suzka.motivation.system import MotivationEventOperation
-from suzka.r16.source_owner import _MotivationSourceOwner, _MotivationSourceRef
+from suzka.r16.source_owner import (
+    _MotivationSourceOwner,
+    _MotivationSourceRef,
+    _MotivationSourceUnavailable,
+)
 from suzka.runtime.agent_runtime import (
     AgentEvent,
     AgentEventOutcome,
@@ -270,9 +274,18 @@ class _CommitmentSourceOwner:
         if p.event_id == x.event_id or p.event_sequence <= x.event_sequence:
             raise _CommitmentSourceUnavailable("invalid source chronology")
         try:
-            x_record, x_source = self._source._read(
-                x, event, continuation=continuation
-            )
+            try:
+                x_record, x_source = self._source._read(
+                    x, event, continuation=continuation
+                )
+            except _MotivationSourceUnavailable as error:
+                # A target-only reason is released only within P's Context.
+                raise _CommitmentSourceUnavailable(
+                    "target source unavailable",
+                    reason=self._source._scoped_target_reason(
+                        error, x, p, event, continuation=continuation
+                    ),
+                ) from error
             p_record, p_source = self._source._read(
                 p, event, continuation=continuation
             )

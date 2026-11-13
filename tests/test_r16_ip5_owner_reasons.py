@@ -7,10 +7,14 @@ FAILED event.
 
 from __future__ import annotations
 
+from enum import Enum
+from uuid import uuid4
+
 from fastapi.testclient import TestClient
 import pytest
 
 from suzka.motivation.common import R13Reference, R13ReferenceKind
+from suzka.r16.commitment_owner import _CommitmentSourceSelection
 from suzka.r16.goal_owner import _GoalSourceSelection, _GoalSourceUnavailable
 from suzka.r16.outcomes import (
     R16OwnerOutcome,
@@ -18,7 +22,11 @@ from suzka.r16.outcomes import (
     R16OwnerStatus,
     owner_reason,
 )
+from suzka.r16.source_owner import _MotivationSourceRef
+from suzka.runtime.agent_runtime import AgentEventSource, AgentEventType
+from suzka.runtime.chat_context import ChatContextSelectors
 from suzka.runtime.event_journal import EventLifecycle
+from suzka.runtime.journal_compaction import JournalCompactionPolicy
 from suzka.runtime.journal_source import JournalSourceReason
 
 from test_r16_ip4c_past_retention import _archive, app  # noqa: F401
@@ -145,3 +153,69 @@ def test_proposal_over_an_archived_target_holds_past_retention(app) -> None:  # 
         assert held.value == R16OwnerOutcome.hold(
             R16OwnerReason.SOURCE_PAST_RETENTION
         )
+
+
+_OTHER = ChatContextSelectors(client_session_id="other-session")
+
+
+def _chat_in(state, text, selectors=None):  # type: ignore[no-untyped-def]
+    result = state.agent_runtime.submit(
+        AgentEventType.CHAT,
+        AgentEventSource.API_CHAT,
+        lambda: state.main_loop.chat(text, selectors),
+    ).result(timeout=30)
+    return _MotivationSourceRef(
+        result.event.event_id, result.event.processing_sequence, result.value.episode_id
+    )
+
+
+@pytest.mark.parametrize("owner", ["goal", "commitment"])
+def test_target_reasons_never_reveal_another_context(app, owner: str) -> None:  # noqa: F811
+    """#370 D2 P2-2 (IP-5 review P1): a target in another Context, archived or
+    retained, and a nonexistent target all hold SOURCE_UNAVAILABLE."""
+    with TestClient(app) as client:
+        state = client.app.state
+        archived = _chat_in(state, "other context, old", _OTHER)
+        _archive(state, archived)
+        state.journal_compaction.policy = JournalCompactionPolicy(30)
+        retained = _chat_in(state, "other context, recent", _OTHER)
+        fabricated = _MotivationSourceRef(str(uuid4()), 3, retained.episode_id)
+        reasons = {}
+        for name, x in (
+            ("archived", archived),
+            ("retained", retained),
+            ("fabricated", fabricated),
+        ):
+            if owner == "goal":
+                p = _chat_in(state, f"REVIEW_EXPERIENCE:{x_id(x)}")
+                held = state._goal_source_owner._submit_proposal(
+                    _GoalSourceSelection(p, x)
+                ).result(timeout=30)
+            else:
+                p = _chat_in(state, f"COMMIT_REVIEW_EXPERIENCE:1:{x_id(x)}")
+                held = state._commitment_source_owner._submit_proposal(
+                    _CommitmentSourceSelection(p, x)
+                ).result(timeout=30)
+            assert held.value.status is R16OwnerStatus.HOLD
+            reasons[name] = held.value.reason
+            rows = [
+                row.lifecycle
+                for row in state.event_journal.records
+                if row.event_id == held.event.event_id
+            ]
+            assert EventLifecycle.COMPLETED in rows
+            assert EventLifecycle.FAILED not in rows
+        assert reasons == {
+            "archived": R16OwnerReason.SOURCE_UNAVAILABLE,
+            "retained": R16OwnerReason.SOURCE_UNAVAILABLE,
+            "fabricated": R16OwnerReason.SOURCE_UNAVAILABLE,
+        }
+
+
+def test_unknown_journal_reason_falls_back_to_unavailable() -> None:
+    class _Other(str, Enum):
+        NEW = "new"
+
+    assert owner_reason(_GoalSourceUnavailable("x", reason=_Other.NEW)) is (
+        R16OwnerReason.SOURCE_UNAVAILABLE
+    )

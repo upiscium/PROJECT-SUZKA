@@ -62,7 +62,7 @@ def owner_reason(error: BaseException) -> R16OwnerReason:
     if isinstance(reason, R16OwnerReason):
         return reason
     if isinstance(reason, JournalSourceReason):
-        return _JOURNAL_REASONS[reason]
+        return _JOURNAL_REASONS.get(reason, R16OwnerReason.SOURCE_UNAVAILABLE)
     return R16OwnerReason.SOURCE_UNAVAILABLE
 
 
