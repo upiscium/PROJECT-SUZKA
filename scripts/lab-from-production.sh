@@ -2,9 +2,10 @@
 # Run an experiment against a throwaway copy of the production state (#383).
 #
 # Production is never touched: the copy lives under SUZKA_LAB_BASE, the lab
-# API listens on its own loopback port, and the copy is deleted afterwards.
-# The lab runs the deployed code and model, so it needs the same GPU memory
-# again (about 7.7 GB for gemma-4-12B-it in 4 bit); keep experiments short.
+# API runs as its own transient systemd unit on its own loopback port, and
+# both are removed afterwards. The lab runs the deployed code and model, so it
+# needs the same GPU memory again (about 7.7 GB for gemma-4-12B-it in 4 bit);
+# keep experiments short.
 #
 # Usage (on the deploy host, as a user with sudo):
 #   scripts/lab-from-production.sh [--port N] [--timeout SECONDS] [--keep] -- CMD...
@@ -12,7 +13,8 @@
 # CMD runs as the invoking user with SUZKA_LAB_URL (the lab API base URL) and
 # SUZKA_LAB_DIR set. It is killed after --timeout seconds (default 3600).
 # The copy is taken while production runs; if it caught a write midway, the
-# lab may refuse to start, which never affects production.
+# lab may refuse to start, which never affects production. If this script is
+# killed with SIGKILL, stop the lab with `systemctl stop 'suzka-lab-*'`.
 set -euo pipefail
 
 PROD_ROOT="${SUZKA_PROD_ROOT:-/opt/project-suzka}"
@@ -38,31 +40,30 @@ if [[ $# -eq 0 ]]; then
   printf 'usage: %s [--port N] [--timeout S] [--keep] -- CMD...\n' "$0" >&2
   exit 2
 fi
-PROD_PORT="$(sudo sed -n 's/^  port: *\([0-9]*\).*/\1/p' "${PROD_CONFIG}" | head -1)"
-if [[ "${PORT}" == "${PROD_PORT}" ]]; then
-  printf 'lab port %s is the production port\n' "${PORT}" >&2
+if ! [[ "${PORT}" =~ ^[1-9][0-9]{0,4}$ ]] || (( PORT > 65535 )); then
+  printf 'invalid port: %s\n' "${PORT}" >&2
   exit 2
 fi
-if curl -s -o /dev/null "http://127.0.0.1:${PORT}/health"; then
+if ! [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'invalid timeout: %s\n' "${TIMEOUT}" >&2
+  exit 2
+fi
+if [[ -n "$(ss -ltnH "sport = :${PORT}")" ]]; then
   printf 'port %s is already in use\n' "${PORT}" >&2
-  exit 2
-fi
-# Every state path must be relative, so it resolves inside the lab copy.
-if sudo grep -nE "${PROD_ROOT}|: +/" "${PROD_CONFIG}"; then
-  printf 'config has absolute paths; the lab could write production state\n' >&2
   exit 2
 fi
 
 sudo install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 700 "${LAB_BASE}"
 LAB="$(sudo -u "${SERVICE_USER}" mktemp -d "${LAB_BASE}/lab-$(date +%Y%m%d-%H%M%S)-XXXX")"
-SERVER_PID=""
+UNIT="suzka-lab-$(basename "${LAB}")"
+STARTED=0
 
 # shellcheck disable=SC2329  # invoked by the EXIT trap
 cleanup() {
-  if [[ -n "${SERVER_PID}" ]]; then
-    sudo kill "${SERVER_PID}" 2>/dev/null || true
-    for _ in $(seq 1 30); do sudo kill -0 "${SERVER_PID}" 2>/dev/null || break; sleep 1; done
-    sudo kill -9 "${SERVER_PID}" 2>/dev/null || true
+  if [[ "${STARTED}" == 1 ]]; then
+    # Stops the whole cgroup: the server and anything it started.
+    sudo systemctl stop "${UNIT}" 2>/dev/null || true
+    sudo systemctl reset-failed "${UNIT}" 2>/dev/null || true
   fi
   if [[ "${KEEP}" == 1 ]]; then
     printf 'lab kept at %s\n' "${LAB}" >&2
@@ -74,33 +75,63 @@ trap cleanup EXIT
 
 sudo cp -a "${PROD_ROOT}/.suzka" "${LAB}/.suzka"
 sudo rm -f "${LAB}/.suzka/.event_journal.jsonl.lock"
-sudo sed -E "s/^(  port:) *[0-9]+/\1 ${PORT}/" "${PROD_CONFIG}" | sudo tee "${LAB}/config.yaml" >/dev/null
-sudo install -m 600 "${PROD_ENV}" "${LAB}/backend.env"
+sudo cp "${PROD_CONFIG}" "${LAB}/prod-config.yaml"
+# systemd's EnvironmentFile= overrides Environment=, so the production config
+# path must not reach the lab through it.
+sudo grep -v '^[[:space:]]*SUZKA_CONFIG_PATH=' "${PROD_ENV}" | sudo tee "${LAB}/backend.env" >/dev/null
+SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
+sudo cp "${SCRIPTS}/lab_prepare.py" "${LAB}/lab_prepare.py"
 sudo chown -R "${SERVICE_USER}:${SERVICE_USER}" "${LAB}"
+sudo chmod 600 "${LAB}/backend.env" "${LAB}/prod-config.yaml" "${LAB}/lab_prepare.py"
 
 # The service's own environment (library path, uv/python, HOME for the model cache).
-mapfile -t SERVICE_ENV < <(systemctl show "${SERVICE}" -p Environment --value | tr ' ' '\n' | grep -v '^$')
+SERVICE_ENV=()
+while IFS= read -r assignment; do
+  [[ -n "${assignment}" ]] && SERVICE_ENV+=("${assignment}")
+done < <(systemctl show "${SERVICE}" -p Environment --value | tr ' ' '\n')
+PYTHON="${PROD_ROOT}/.venv/bin/python"
+
+# Writes LAB/config.yaml and checks the parsed settings: every Path stays in
+# LAB, and the lab port is not the production port.
+sudo -u "${SERVICE_USER}" env -i "${SERVICE_ENV[@]}" PYTHONPATH="${PROD_ROOT}" \
+  "${PYTHON}" "${LAB}/lab_prepare.py" "${LAB}/prod-config.yaml" "${LAB}" "${PORT}" >/dev/null
+
 nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader 2>/dev/null \
   | sed 's/^/GPU before lab: /' >&2 || true
 
-# SERVER_PID is sudo's; sudo relays the cleanup's SIGTERM to the server.
-sudo -u "${SERVICE_USER}" env -i "${SERVICE_ENV[@]}" \
-  "$(command -v bash)" -c 'set -a; source "$1/backend.env"; set +a; cd "$1" && exec env SUZKA_CONFIG_PATH="$1/config.yaml" PYTHONPATH="$2" "$2/.venv/bin/python" -m suzka.api.server >"$1/server.log" 2>&1' \
-  _ "${LAB}" "${PROD_ROOT}" &
-SERVER_PID=$!
+SETENV=()
+for assignment in "${SERVICE_ENV[@]}"; do
+  SETENV+=("--setenv=${assignment}")
+done
+STARTED=1
+sudo systemd-run --quiet --unit="${UNIT}" --collect \
+  -p User="${SERVICE_USER}" -p Group="${SERVICE_USER}" \
+  -p WorkingDirectory="${LAB}" \
+  -p EnvironmentFile="${LAB}/backend.env" \
+  -p StandardOutput="file:${LAB}/server.log" -p StandardError="file:${LAB}/server.log" \
+  "${SETENV[@]}" \
+  --setenv=SUZKA_CONFIG_PATH="${LAB}/config.yaml" \
+  --setenv=PYTHONPATH="${PROD_ROOT}" \
+  --setenv=HF_HUB_OFFLINE=1 --setenv=TRANSFORMERS_OFFLINE=1 \
+  "${PYTHON}" -m suzka.api.server
 
+ready=0
 for _ in $(seq 1 120); do
-  if curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/health" | grep -q 200; then
+  if [[ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/health")" == 200 ]]; then
+    ready=1
     break
   fi
-  if ! sudo kill -0 "${SERVER_PID}" 2>/dev/null; then
-    printf 'lab server exited during startup\n' >&2
-    sudo tail -20 "${LAB}/server.log" >&2 || true
-    exit 1
+  if ! systemctl is-active --quiet "${UNIT}"; then
+    break
   fi
   sleep 5
 done
-printf 'lab API at http://127.0.0.1:%s (state %s)\n' "${PORT}" "${LAB}" >&2
+if [[ "${ready}" != 1 ]]; then
+  printf 'lab did not become healthy\n' >&2
+  sudo tail -20 "${LAB}/server.log" >&2 || true
+  exit 1
+fi
+printf 'lab API at http://127.0.0.1:%s (unit %s, state %s)\n' "${PORT}" "${UNIT}" "${LAB}" >&2
 
 status=0
 SUZKA_LAB_URL="http://127.0.0.1:${PORT}" SUZKA_LAB_DIR="${LAB}" \
