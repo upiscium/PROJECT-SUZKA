@@ -47,6 +47,13 @@ class R16OwnerReason(str, Enum):
     SOURCE_PAST_RETENTION = "source_past_retention"
     SOURCE_MISSING = "source_missing"
     SOURCE_UNAVAILABLE = "source_unavailable"
+    # IP-10 (#371 D2): the CommittedDecision issuer's pre-policy refusals.
+    # Sources moved with no new policy witness (#376 §C).
+    DECISION_SOURCE_DRIFT = "decision_source_drift"
+    # SubjectHistory cannot hold another Decision (checked before PREPARE).
+    HISTORY_CAPACITY = "history_capacity"
+    # The review intent or the lineage slot is already taken.
+    DECISION_SLOT_OCCUPIED = "decision_slot_occupied"
 
 
 _JOURNAL_REASONS = {

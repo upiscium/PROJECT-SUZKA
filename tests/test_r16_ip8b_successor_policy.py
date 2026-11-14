@@ -87,6 +87,7 @@ def _input(**changes: object) -> SuccessorPolicyInputV2:
         interpretation=Interpretation.NOT_REVIEWED,
         interpretation_stage=InterpretationStage.NONE,
         as_of_r07_sequence=9,
+        as_of_snapshot_hash="c" * 64,
         event_id="event-10",
         event_sequence=10,
         now_utc=NOW,

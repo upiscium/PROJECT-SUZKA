@@ -99,6 +99,11 @@ class _QualifiedGoal:
     proposal_record_digest: str
     target_record_digest: str
     context_id: str
+    # IP-10 (#371 D2 P2-3): X's own event and revision, from this qualified
+    # record (the issuer's R15 read and Experience ref use them).
+    target_event_id: str
+    target_event_sequence: int
+    target_revision: int
 
     @property
     def target(self) -> R13Reference:
@@ -420,6 +425,9 @@ class _GoalSourceOwner:
                 proposal_record_digest=experience_record_digest(p_record),
                 target_record_digest=experience_record_digest(x_record),
                 context_id=x_record.context_id,
+                target_event_id=x_record.source_event_id,
+                target_event_sequence=x_record.source_event_sequence,
+                target_revision=x_record.revision,
             )
             _ = result.evidence  # enforce cross-kind ID uniqueness before any write
             return result
