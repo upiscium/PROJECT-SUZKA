@@ -400,6 +400,8 @@ class SuccessorPolicyInputV2:
     interpretation: Interpretation
     interpretation_stage: InterpretationStage
     as_of_r07_sequence: int
+    # IP-10 D2 P2-1 (D6-A1): hash of the committed R06 snapshot_before.
+    as_of_snapshot_hash: str
     event_id: str
     event_sequence: int
     now_utc: str
@@ -439,6 +441,7 @@ class SuccessorPolicyInputV2:
             "as_of_r07_sequence",
             maximum=MAX_PERSISTED_EVENT_SEQUENCE,
         )
+        digest(self.as_of_snapshot_hash, "as_of snapshot hash")
         identifier(self.event_id, "event id")
         integer(
             self.event_sequence,
@@ -457,6 +460,7 @@ class SuccessorPolicyInputV2:
                 "event_sequence": self.event_sequence,
                 "now_utc": self.now_utc,
                 "r07_sequence": self.as_of_r07_sequence,
+                "snapshot_hash": self.as_of_snapshot_hash,
             },
             "commitment": {
                 "deadline_utc": self.commitment_deadline_utc,
@@ -533,7 +537,11 @@ class SuccessorPolicyInputV2:
         )
         if row["schema"] != INPUT_SCHEMA:
             raise ValueError("policy input schema is not V2")
-        as_of = closed(row["as_of"], ("event_id", "event_sequence", "now_utc", "r07_sequence"), "as_of")
+        as_of = closed(
+            row["as_of"],
+            ("event_id", "event_sequence", "now_utc", "r07_sequence", "snapshot_hash"),
+            "as_of",
+        )
         commitment = closed(row["commitment"], ("deadline_utc", "ref", "state"), "commitment")
         feedback = closed(row["feedback"], ("ref", "state"), "feedback")
         interpretation = closed(row["interpretation"], ("stage", "state"), "interpretation")
@@ -574,6 +582,7 @@ class SuccessorPolicyInputV2:
                 interpretation["stage"], InterpretationStage, "interpretation stage"
             ),
             as_of_r07_sequence=_int(as_of["r07_sequence"]),
+            as_of_snapshot_hash=_str(as_of["snapshot_hash"]),
             event_id=_str(as_of["event_id"]),
             event_sequence=_int(as_of["event_sequence"]),
             now_utc=_str(as_of["now_utc"]),
@@ -933,6 +942,7 @@ def worst_case_input() -> SuccessorPolicyInputV2:
         interpretation=interpretation,
         interpretation_stage=stage,
         as_of_r07_sequence=MAX_PERSISTED_EVENT_SEQUENCE,
+        as_of_snapshot_hash="f" * 64,
         event_id=ident("event"),
         event_sequence=MAX_PERSISTED_EVENT_SEQUENCE,
         now_utc=deadline,

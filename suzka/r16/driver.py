@@ -55,6 +55,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from suzka.r16.commitment_owner import _CommitmentSourceSelection
+from suzka.r16.decision_issuer import _DecisionIssueResult
 from suzka.r16.goal_owner import _GoalSourceSelection
 from suzka.r16.outcomes import R16OwnerOutcome, R16OwnerReason, R16OwnerStatus
 from suzka.r16.source_owner import _MotivationSourceRef
@@ -729,6 +730,13 @@ def _bound(values: dict[Any, None]) -> None:
 def _result_code(value: object) -> str:
     if isinstance(value, R16OwnerOutcome):
         return value.status.value if value.reason is None else value.reason.value
+    if isinstance(value, _DecisionIssueResult):
+        # IP-10: a closed status and row ID only, never Decision contents.
+        if value.row is not None:
+            return f"{value.status.value}:{value.row.value}"
+        if value.owner_reason is not None:
+            return f"{value.status.value}:{value.owner_reason.value}"
+        return value.status.value
     if isinstance(value, str) and value in {
         "motivation_evidence_applied",
         "neutral_no_eligible_appraisal",

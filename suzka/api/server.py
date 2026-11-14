@@ -79,7 +79,9 @@ from suzka.r16.history_store import SubjectHistoryStore
 from suzka.r16.driver import R16Driver, rescan_from
 from suzka.runtime.event_journal import EventJournalAdmissionBand
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
+from suzka.r16.decision_issuer import _DecisionIssuer
 from suzka.r16.history_attestation import SubjectHistoryAttestationProvider
+from suzka.runtime.r15_interpretation_reader import R15InterpretationReader
 from suzka.runtime.journal_compaction import (
     JournalCompactionCoordinator,
     JournalCompactionPolicy,
@@ -217,8 +219,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             elif not isinstance(injected_experience_store, ExperienceStore):
                 raise RuntimeError("Injected Experience store has an invalid type")
             app.state.experience_store = injected_experience_store
-            app.state.subject_history_store = _open_subject_history(
-                app_settings, app.state.event_journal
+            # IP-10: a brand-new Journal has no lineage until its first
+            # migration checkpoint; the store is then opened after migration.
+            history_deferred = (
+                app_settings.subject_history.enabled
+                and app.state.event_journal.inspect().journal_lineage_id is None
+            )
+            app.state.subject_history_store = (
+                None
+                if history_deferred
+                else _open_subject_history(app_settings, app.state.event_journal)
             )
             app.state.journal_compaction = JournalCompactionCoordinator(
                 app.state.event_journal,
@@ -264,6 +274,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     journal_schema = app.state.event_journal.inspect().schema_version
                 if journal_schema != 4:
                     raise StateRecoveryError("Runtime requires EventJournal schema 4")
+                if history_deferred:
+                    store = _open_subject_history(app_settings, app.state.event_journal)
+                    app.state.subject_history_store = store
+                    if store is not None:
+                        app.state.startup_reconciliation.attach_history_store(store)
+                        app.state.journal_compaction.history_attestation = (
+                            SubjectHistoryAttestationProvider(
+                                app.state.event_journal, store
+                            )
+                        )
                 if recovery.external_reconciliation_required:
                     reconciliation = (
                         app.state.startup_reconciliation.reconcile_recovery_gate(
@@ -813,6 +833,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.r15_state_port._bind_private_read_sources(
                     app.state.agent_state_store, app.state.agent_runtime
                 )
+            # IP-10: the CommittedDecision issuer exists only with an adopted
+            # SubjectHistory store and a bound Plan preview owner; otherwise
+            # PLAN_PREVIEW_REVIEW stays the unchanged U3-A preview.
+            app.state.decision_issuer = None
+            history_store = getattr(app.state, "subject_history_store", None)
+            if history_store is not None and preview_owner is not None:
+                interpretation_reader = R15InterpretationReader(
+                    app.state.r15_state_port
+                )
+                app.state.decision_issuer = _DecisionIssuer(
+                    preview_owner,
+                    history_store,
+                    app.state.event_journal,
+                    app.state.state_recovery,
+                    app.state.agent_state_store,
+                    interpretation_reader.read,
+                )
+                preview_owner._bind_issuer(app.state.decision_issuer)
         except BaseException:
             app.state.event_journal.close()
             raise

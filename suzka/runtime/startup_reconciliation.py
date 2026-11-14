@@ -168,6 +168,26 @@ class StartupReconciliationCoordinator:
 
         self.history_incarnation = history_incarnation
 
+    def attach_history_store(self, store: SubjectHistoryStore) -> None:
+        """IP-10: attach a store opened after a fresh Journal's migration.
+
+        Only before ``subject.history`` is adopted and before any store was
+        attached; adoption itself still happens in ``ensure_adoption_baseline``.
+        """
+
+        if self.history_store is not None:
+            raise StartupReconciliationError("SubjectHistory store already attached")
+        if adopted_history_baseline(self.journal.inspect()) is not None:
+            raise StartupReconciliationError("SubjectHistory is already adopted")
+        journal = self.journal
+        self.history_store = store
+        self.participant_registry = history_registry(type(self).participant_registry)
+
+        def history_incarnation() -> str:
+            return current_incarnation(journal, store)
+
+        self.history_incarnation = history_incarnation
+
     def reconcile_open_transactions(self) -> tuple[bool, str | None]:
         """Resolve Path A without replaying an event handler or model call."""
 

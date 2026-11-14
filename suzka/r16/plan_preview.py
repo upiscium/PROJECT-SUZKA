@@ -84,6 +84,7 @@ from suzka.runtime.journal_source import (
 )
 
 if TYPE_CHECKING:
+    from suzka.r16.decision_issuer import _DecisionIssuer
     from suzka.runtime.main_loop import SuzkaMainLoop
 
 _POLICY_VERSION: Final = 1
@@ -143,6 +144,12 @@ class _QualifiedPreview:
     commitment_revision: int | None
     commitment_digest: str | None
     commitment_admission_event_id: str | None
+    # IP-10 (#371 D2 P2-3): X's event and revision from the qualified Goal
+    # source, and the Motivation revision (an issuer source ref).
+    experience_event_id: str
+    experience_event_sequence: int
+    experience_revision: int
+    motivation_id: str
 
     @property
     def qualified_commitment(self) -> bool:
@@ -237,7 +244,18 @@ class _PlanPreviewOwner:
         self._commitment = commitment_owner
         self._inflight: tuple[object, str] | None = None
         self._pending: _PendingPreview | None = None
+        # IP-10: installed only with SubjectHistory; otherwise unchanged U3-A.
+        self._issuer: _DecisionIssuer | None = None
         loop._bind_plan_preview_owner(self)
+
+    def _bind_issuer(self, issuer: _DecisionIssuer) -> None:
+        from suzka.r16.decision_issuer import _DecisionIssuer
+
+        if type(issuer) is not _DecisionIssuer or issuer._preview is not self:
+            raise _PlanSourceUnavailable("unqualified Decision issuer")
+        if self._issuer is not None:
+            raise _PlanSourceUnavailable("Decision issuer already bound")
+        self._issuer = issuer
 
     def _check_binding(self) -> None:
         if (
@@ -253,12 +271,12 @@ class _PlanPreviewOwner:
 
     def _submit_preview(
         self, goal_id: str
-    ) -> Future[AgentEventOutcome[_PlanPreviewResult]]:
+    ) -> Future[AgentEventOutcome[object]]:
         self._check_binding()
         validate_identifier(goal_id)
         nonce = object()
 
-        def handle() -> _PlanPreviewResult:
+        def handle() -> object:
             if self._inflight is not None or self._pending is not None:
                 raise _PlanSourceUnavailable("Plan preview already pending")
             self._inflight = (nonce, goal_id)
@@ -549,6 +567,10 @@ class _PlanPreviewOwner:
                 commitment_admission_event_id=(
                     None if obligation is None else obligation[3]
                 ),
+                experience_event_id=q_goal.target_event_id,
+                experience_event_sequence=q_goal.target_event_sequence,
+                experience_revision=q_goal.target_revision,
+                motivation_id=q_goal.motivation_id,
             )
         except _PlanSourceUnavailable:
             raise
@@ -723,10 +745,13 @@ class _PlanPreviewOwner:
             self._loop.context_registry.state,
         )
 
-    def _preview(self, loop: SuzkaMainLoop, nonce: object) -> _PlanPreviewResult:
+    def _preview(self, loop: SuzkaMainLoop, nonce: object) -> object:
         event = self._current_event(loop, nonce)
         assert self._inflight is not None
         goal_id = self._inflight[1]
+        if self._issuer is not None:
+            self._pending = None
+            return self._issuer._issue(event, goal_id)
         initial = self._state_snapshot()
         try:
             before = self._qualify(goal_id, event)
@@ -747,9 +772,15 @@ class _PlanPreviewOwner:
 
     def _validate_commit(self, event: AgentEvent) -> None:
         pending = self._pending
+        issuer = self._issuer
         if event.event_type is not AgentEventType.PLAN_PREVIEW_REVIEW:
-            if pending is not None:
+            if pending is not None or (
+                issuer is not None and issuer._pending is not None
+            ):
                 raise _PlanSourceUnavailable("stale preview pending")
+            return
+        if issuer is not None:
+            issuer._validate_commit(event)
             return
         if pending is None or pending.event != event:
             raise _PlanSourceUnavailable("unbound preview pending")
@@ -776,3 +807,5 @@ class _PlanPreviewOwner:
         del event
         self._inflight = None
         self._pending = None
+        if self._issuer is not None:
+            self._issuer._clear()
