@@ -60,12 +60,20 @@ def test_example_preserves_base_settings_and_uses_ten_absolute_paths() -> None:
         paths = raw if isinstance(raw, list) else [raw]
         assert paths and all(Path(item).is_absolute() for item in paths)
 
+    # IP-10b: the one intentional non-path difference is the production
+    # adoption of SubjectHistory (#376 H2); the base profile keeps it off.
+    assert original["subject_history"]["enabled"] is False
+    assert changed["subject_history"]["enabled"] is True
+    changed["subject_history"]["enabled"] = False
     # I0 alters only source-location examples, not live model or privacy rules.
     assert changed == original
     typed = Settings.model_validate(example)
     assert typed.memory.persist_directory == STATE_ROOT / "chroma"
     assert typed.event_journal.path == STATE_ROOT / "journal/event_journal.jsonl"
     assert typed.state_wal.directory == STATE_ROOT / "state_wal"
+    # IP-10b: the production profile adopts SubjectHistory (#376 H2).
+    assert typed.subject_history.enabled is True
+    assert typed.subject_history.max_page_count == 65_536
     assert typed.subject_history.path == (
         STATE_ROOT / "subject_history/subject_history.sqlite3"
     )
