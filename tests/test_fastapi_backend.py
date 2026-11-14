@@ -2505,10 +2505,23 @@ def test_successful_chat_is_reconstructable_without_private_payloads(
     assert "Visible API answer" not in settings.agent_state.path.read_text()
 
 
+@pytest.mark.parametrize("history", (False, True), ids=("4-participant", "5-participant"))
 def test_true_rollback_reconciles_external_state_before_runtime_acceptance(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, history: bool
 ) -> None:
     settings = _settings(tmp_path)
+    if history:
+        # IP-10b review P2-2: the production five-participant configuration.
+        settings = settings.model_copy(
+            update={
+                "subject_history": settings.subject_history.model_copy(
+                    update={
+                        "enabled": True,
+                        "path": tmp_path / "history" / "subject_history.sqlite3",
+                    }
+                )
+            }
+        )
     with _client(tmp_path, settings=settings) as client:
         client.app.state.memory_system.save_legacy_semantic("rollback WM seed")
         assert (
@@ -2578,6 +2591,14 @@ def test_true_rollback_reconciles_external_state_before_runtime_acceptance(
         manifest = restarted.app.state.state_wal.inspect().active_manifest
         assert manifest is not None
         assert not manifest.external_reconciliation_required
+        if history:
+            from suzka.r16.history_adoption import adopted_history_baseline
+            from suzka.r16.history_store import HistoryMetaPhase
+
+            inspection = restarted.app.state.event_journal.inspect()
+            assert adopted_history_baseline(inspection) is not None
+            store = restarted.app.state.subject_history_store
+            assert store is not None and store.meta().phase is HistoryMetaPhase.ACTIVE
 
 
 def test_actual_unresolved_path_a_starts_degraded_without_r06_mutation(

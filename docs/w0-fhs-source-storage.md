@@ -15,7 +15,9 @@ registration and pre-service validation are **not** implemented. Migration
 and activation each require further Human approval.
 The active `deploy/systemd/suzka-api.service`, existing
 `deploy/env/backend.env.example`, repository `config.yaml`, and runtime
-configuration loader remain unchanged.
+configuration loader remain unchanged. (Later change: IP-10b enables
+`subject_history` in the repository `config.yaml`; see the README's
+SubjectHistory section.)
 
 ## Intended paths for a Linux service
 

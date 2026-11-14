@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import pytest
 
 from suzka.config import load_settings
 
@@ -20,11 +21,17 @@ def test_repository_profile_enables_subject_history_with_the_approved_cap() -> N
     assert not settings.subject_history.path.is_absolute()
 
 
-def test_tests_never_touch_the_checkout_store(tmp_path) -> None:
-    """tests/conftest.py: a relative store path is never opened in tests."""
+def test_tests_never_touch_the_checkout_store(tmp_path, monkeypatch) -> None:
+    """tests/conftest.py: a relative store path is never opened in tests,
+    even after the test's own ``monkeypatch.undo()`` (review P1)."""
 
-    checkout_store = Path.cwd() / load_settings(ROOT / "config.yaml").subject_history.path
-    existed = checkout_store.exists()
+    from conftest import CHECKOUT_HISTORY
+
+    store_file = CHECKOUT_HISTORY / "subject_history.sqlite3"
+    monkeypatch.setenv("SUZKA_IP10B_PROBE", "1")
+    monkeypatch.undo()
+    if CHECKOUT_HISTORY.exists():
+        pytest.skip("a checkout store pre-exists outside this test session")
     with TestClient(_app(settings_in(tmp_path / "isolated"))) as client:
         assert client.app.state.subject_history_store is None
-    assert checkout_store.exists() is existed
+    assert not store_file.exists() and not CHECKOUT_HISTORY.exists()
