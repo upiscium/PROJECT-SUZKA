@@ -32,7 +32,11 @@ Commitment).  ``inverse_authorization`` is required exactly for REVERTED.
 
 Known limit: R17/R18 do not exist yet, so ledger/Feedback/Outcome references
 are generic digest-bound refs and D6-2's mandatory-reference rules are
-checked by presence only.  Kind-exact predicates belong to R17/R18.
+checked by presence only.  Kind-exact predicates belong to R17/R18.  In
+particular an inverse started after UNAUTHORIZED_EFFECT (#371 A2-1) is not
+distinguishable from one after an authorized forward effect here, so a
+MATCH_SELF under INVERSE_*/REVERTED is row 2 (HOLD) rather than row 0; R18
+must check that the original forward effect was authorized.
 
 R16 must not import ``suzka.r15``: the R15 read arrives as the closed strings
 of ``suzka.runtime.r15_interpretation_reader`` and is mapped here.
