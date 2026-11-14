@@ -643,6 +643,14 @@ class SuzkaMainLoop:
             raise RuntimeError("unbound Goal proposal owner")
         return owner._propose(self, nonce)
 
+    def _propose_self_goal_source(
+        self, owner: _GoalSourceOwner, nonce: object
+    ) -> R16OwnerOutcome:
+        """IP-11 (#379): the subject's own Goal proposal event."""
+        if owner is not self._goal_source_owner or owner is None:
+            raise RuntimeError("unbound self-Goal proposal owner")
+        return owner._propose_self(self, nonce)
+
     def _review_goal_source(
         self, owner: _GoalSourceOwner, nonce: object
     ) -> R16OwnerOutcome:

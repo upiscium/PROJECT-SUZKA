@@ -185,6 +185,20 @@ class EventJournalSettings(StrictBaseModel):
         return self
 
 
+class SelfGoalSettings(StrictBaseModel):
+    """IP-11 (#379 D1 P0-1, D2 P0 / P2-3): the subject's own Goal proposal.
+
+    Inert until the unique operator activation marker exists.  The values
+    are the #379 proposals; ``min_strength`` 0.15 is salience >= 0.5 for an
+    INTEREST (strength = 0.30 x salience x confidence, confidence 1.0).
+    """
+
+    min_strength: StrictFloat = Field(default=0.15, gt=0.0, le=1.0)
+    per_incarnation: StrictInt = Field(default=3, ge=1, le=100)
+    per_day: StrictInt = Field(default=3, ge=1, le=100)
+    stale_after_hours: StrictInt = Field(default=24, ge=1, le=24 * 30)
+
+
 class SubjectHistorySettings(StrictBaseModel):
     """IP-9 U4-3 (#376 §A): the ``subject.history`` R07 participant.
 
@@ -379,4 +393,5 @@ class Settings(StrictBaseModel):
     subject_history: SubjectHistorySettings = Field(
         default_factory=SubjectHistorySettings
     )
+    self_goal: SelfGoalSettings = Field(default_factory=SelfGoalSettings)
     values: ValueSystemSettings = Field(default_factory=ValueSystemSettings)

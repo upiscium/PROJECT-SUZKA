@@ -317,6 +317,9 @@ class EventJournalCompaction(_JournalModel):
     # Omitted from serialization when absent, so COMPACTION records written
     # before C9 keep their exact bytes and hashes.
     driver_activation_record: EventJournalRecord | None = None
+    # C11 (IP-11, #379 D2 P2-2): the unique self-Goal activation marker,
+    # carried the same way; omitted when absent (older bytes unchanged).
+    self_goal_activation_record: EventJournalRecord | None = None
     # C10 (#376 SubjectHistory compaction attestation, Human decision
     # 2026-11-14).  ``carry_version`` is always written by a C10 compaction
     # and gates every C10 recomputation; all C10 fields are omitted when
@@ -339,6 +342,7 @@ class EventJournalCompaction(_JournalModel):
         data = cast(dict[str, object], handler(self))
         for name in (
             "driver_activation_record",
+            "self_goal_activation_record",
             "carry_version",
             "history_r07_digest",
             "history_r07_count",
@@ -417,6 +421,17 @@ class EventJournalCompaction(_JournalModel):
             > self.archived_processing_high_water
         ):
             raise ValueError("compaction carried activation is invalid")
+        if self.self_goal_activation_record is not None and (
+            self.self_goal_activation_record.lifecycle is not EventLifecycle.COMPLETED
+            or self.self_goal_activation_record.event_type
+            is not AgentEventType.R16_SELF_GOAL_ACTIVATION
+            or self.self_goal_activation_record.source
+            is not AgentEventSource.API_R16_SELF_GOAL_ACTIVATE
+            or self.self_goal_activation_record.processing_sequence is None
+            or self.self_goal_activation_record.processing_sequence
+            > self.archived_processing_high_water
+        ):
+            raise ValueError("compaction carried self-Goal activation is invalid")
         self._validate_c10()
         for carried in self.carried_records:
             if carried.lifecycle is EventLifecycle.COMPACTION:
@@ -472,6 +487,7 @@ class EventJournalCompaction(_JournalModel):
                 self.true_rollback_cleared_record,
                 self.carried_tail_record,
                 self.driver_activation_record,
+                self.self_goal_activation_record,
             )
             if record is not None
         )
@@ -1264,7 +1280,9 @@ class EventJournalAdmissionBand(str, Enum):
 
 
 # #381 D2 P1-4: the soft band is an allow-list over the AgentEventTypes (16 at
-# the time of the table; IP-6 added R16_DRIVER_ACTIVATION, refused here).
+# the time of the table; IP-6 added R16_DRIVER_ACTIVATION, refused here; IP-11
+# added GOAL_SELF_PROPOSAL_REVIEW, admitted as cognition by Human decision
+# 2026-11-14, and R16_SELF_GOAL_ACTIVATION, refused like the driver's).
 # Cognition continues; DEBUG_CHAT, ADAPTER_EVALUATE and ADAPTER_UPDATE (Human
 # decision 2026-11-10) are refused, and so is every type not listed here,
 # including any type added later (R18/R19 external effects).
@@ -1279,6 +1297,7 @@ SOFT_BAND_ADMITTED_EVENT_TYPES: frozenset[AgentEventType] = frozenset(
         AgentEventType.SELF_ATTEMPT_REVIEW,
         AgentEventType.MOTIVATION_SOURCE_REVIEW,
         AgentEventType.GOAL_PROPOSAL_REVIEW,
+        AgentEventType.GOAL_SELF_PROPOSAL_REVIEW,
         AgentEventType.GOAL_ADOPTION_REVIEW,
         AgentEventType.COMMITMENT_PROPOSAL_REVIEW,
         AgentEventType.COMMITMENT_ACCEPTANCE_REVIEW,
@@ -2526,6 +2545,13 @@ class EventJournal:
                     carried_tail_record=tail_record,
                     driver_activation_record=self._declared_activation_at(
                         records, archived_count, injected
+                    ),
+                    self_goal_activation_record=self._declared_activation_at(
+                        records,
+                        archived_count,
+                        injected,
+                        AgentEventType.R16_SELF_GOAL_ACTIVATION,
+                        AgentEventSource.API_R16_SELF_GOAL_ACTIVATE,
                     ),
                     carry_version=COMPACTION_CARRY_VERSION,
                     baseline_history_records=baseline_history,
@@ -5984,6 +6010,8 @@ class EventJournal:
         records: tuple[EventJournalRecord, ...],
         boundary: int,
         injected: EventJournalRecord | None,
+        event_type: AgentEventType = AgentEventType.R16_DRIVER_ACTIVATION,
+        source: AgentEventSource = AgentEventSource.API_R16_DRIVER_ACTIVATE,
     ) -> EventJournalRecord | None:
         """The R16 driver activation to carry at ``records[boundary]`` (C9).
 
@@ -6000,8 +6028,8 @@ class EventJournal:
                 record
                 for record in (*reversed(records[:boundary]), *prior)
                 if record.lifecycle is EventLifecycle.COMPLETED
-                and record.event_type is AgentEventType.R16_DRIVER_ACTIVATION
-                and record.source is AgentEventSource.API_R16_DRIVER_ACTIVATE
+                and record.event_type is event_type
+                and record.source is source
             ),
             None,
         )
@@ -6202,6 +6230,16 @@ class EventJournal:
             records, boundary, injected
         ):
             raise EventJournalIntegrityError("compaction carried activation is invalid")
+        if declared.self_goal_activation_record != EventJournal._declared_activation_at(
+            records,
+            boundary,
+            injected,
+            AgentEventType.R16_SELF_GOAL_ACTIVATION,
+            AgentEventSource.API_R16_SELF_GOAL_ACTIVATE,
+        ):
+            raise EventJournalIntegrityError(
+                "compaction carried self-Goal activation is invalid"
+            )
         tail = declared.carried_tail_record
         prior = (
             ()

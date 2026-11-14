@@ -31,6 +31,7 @@ from suzka.memory.experience_participant import experience_id_for_event
 from suzka.memory.experience_store import ExperienceStoreError
 from suzka.memory.memory_schema import MemoryRecordType
 from suzka.motivation.common import R13Reference, R13ReferenceKind
+from suzka.motivation.motivation import MotivationKind
 from suzka.motivation.system import (
     MotivationEvidence,
     MotivationExperienceEvidence,
@@ -63,6 +64,10 @@ if TYPE_CHECKING:
 
 # Bound on probing committed Experience ids for an archived request (IP-4c).
 _ARCHIVED_SEQUENCE_PROBE_LIMIT = 65_536
+
+
+INTEREST_APPLIED = "interest_applied"
+OTHER_MOTIVATION_APPLIED = "other_motivation_applied"
 
 
 class _MotivationSourceUnavailable(SourceUnavailable):
@@ -258,7 +263,11 @@ class _MotivationSourceOwner:
                 (evidence.source_ref,),
             ),
         )
-        return "motivation_evidence_applied"
+        # IP-11 (#379 D5 P2-2): the closed result says which kind was applied,
+        # so the driver can follow an INTEREST without reading any store.
+        if evidence.kind is MotivationKind.INTEREST:
+            return INTEREST_APPLIED
+        return OTHER_MOTIVATION_APPLIED
 
     def _read(
         self,

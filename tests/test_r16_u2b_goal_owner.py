@@ -57,7 +57,7 @@ def x_id(source):
 def preexisting_interest(state, source):
     before = state.main_loop.export_goal_state()
     result = state._motivation_source_owner._submit(source).result(timeout=30)
-    assert result.value == "motivation_evidence_applied"
+    assert result.value == "interest_applied"
     assert len(state.main_loop.export_motivation_state().records) == 1
     assert state.main_loop.export_goal_state() == before
     return result

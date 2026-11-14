@@ -44,6 +44,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from enum import Enum
 import hashlib
 import logging
@@ -56,9 +57,9 @@ from typing import TYPE_CHECKING, Any
 
 from suzka.r16.commitment_owner import _CommitmentSourceSelection
 from suzka.r16.decision_issuer import _DecisionIssueResult
-from suzka.r16.goal_owner import _GoalSourceSelection
+from suzka.r16.goal_owner import _GoalSourceSelection, _SelfGoalSelection
 from suzka.r16.outcomes import R16OwnerOutcome, R16OwnerReason, R16OwnerStatus
-from suzka.r16.source_owner import _MotivationSourceRef
+from suzka.r16.source_owner import INTEREST_APPLIED, _MotivationSourceRef
 from suzka.runtime.agent_runtime import (
     AgentEventOutcome,
     AgentEventSource,
@@ -170,6 +171,8 @@ class _Stage(str, Enum):
     COMMITMENT_PROPOSAL = "commitment_proposal"
     COMMITMENT_REVIEW = "commitment_review"
     PLAN_PREVIEW = "plan_preview"
+    # IP-11 (#379): the subject's own Goal proposal after an INTEREST U2a.
+    GOAL_SELF_PROPOSAL = "goal_self_proposal"
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,9 +201,20 @@ class _Retry:
 
 
 @dataclass(frozen=True, slots=True)
+class _SelfTarget:
+    """IP-11: the committed CHAT X an INTEREST was applied to (no store read)."""
+
+    experience_id: str
+    ref: _MotivationSourceRef
+
+
+@dataclass(frozen=True, slots=True)
 class _Rescan:
     goal_ids: tuple[str, ...]
     commitment_ids: tuple[str, ...]
+    # IP-11 (#379 D1 P1-5 / D5 P3-2): eligible INTERESTs without a Goal,
+    # selected by the server before the runtime starts.
+    self_targets: tuple[_SelfTarget, ...] = ()
 
 
 _STOP = object()
@@ -236,6 +250,8 @@ class R16Driver:
         preview_owner: _PlanPreviewOwner,
         *,
         active: bool = False,
+        self_goal_active: bool = False,
+        self_goal_per_incarnation: int = 3,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._runtime = runtime
@@ -246,6 +262,15 @@ class R16Driver:
         self._clock = clock
         self.incarnation = secrets.token_hex(8)
         self._active = active
+        # IP-11: the self path also needs its own unique activation marker.
+        self._self_goal_active = self_goal_active
+        self._self_goal_limit = self_goal_per_incarnation
+        self._self_targets: dict[str, None] = {}
+        # Admitted plus waiting-for-retry self proposals (review P2-1).
+        self._self_reserved = 0
+        # X a user named in a command this incarnation: the user comes first,
+        # even when that command is told to resend (review P1-1).
+        self._user_targets: dict[str, None] = {}
         self._queue: queue.Queue[object] = queue.Queue(maxsize=QUEUE_CAPACITY)
         self._stop = Event()
         self._thread: Thread | None = None
@@ -269,6 +294,7 @@ class R16Driver:
             "dropped": 0,
             "skipped_neutral": 0,
             "submitted": 0,
+            "self_proposal_dropped": 0,
         }
 
     # -- lifecycle -----------------------------------------------------------
@@ -282,6 +308,11 @@ class R16Driver:
         """Called after the unique activation event has completed."""
 
         self._active = True
+
+    def activate_self_goal(self) -> None:
+        """IP-11: called after the unique self-Goal activation has completed."""
+
+        self._self_goal_active = True
 
     def start(self, rescan: _Rescan | None = None) -> None:
         with self._lifecycle:
@@ -486,6 +517,8 @@ class R16Driver:
     def _on_command(self, item: _ChatTerminal) -> None:
         assert item.command is not None
         kind, target_id = item.command
+        self._user_targets[target_id] = None
+        _bound(self._user_targets)
         observed = self._observed.get(target_id)
         if (
             observed is None
@@ -546,17 +579,26 @@ class R16Driver:
                     )
                 )
             else:
+                self._release_unadmitted(stage)
                 self._fail(stage, context, R16DriverReason.RUNTIME_UNAVAILABLE)
             return
         except (AgentRuntimeStopped, AgentRuntimeDurabilityError):
             self._fail(stage, context, R16DriverReason.RUNTIME_UNAVAILABLE)
             raise _DriverStopped from None
         except Exception:
+            self._release_unadmitted(stage)
             self._fail(stage, context, R16OwnerReason.SOURCE_UNAVAILABLE)
             return
         self.counters["submitted"] += 1
         LOGGER.info("R16 driver submitted stage=%s", stage.value)
         future.add_done_callback(self._callback(stage, context))
+
+    def _release_unadmitted(self, stage: _Stage) -> None:
+        """A self proposal that was never admitted frees its reservation;
+        an admitted one keeps counting even if its event fails (D3 P2-1)."""
+
+        if stage is _Stage.GOAL_SELF_PROPOSAL:
+            self._self_reserved = max(0, self._self_reserved - 1)
 
     def _resubmit(self, retry: _Retry) -> None:
         self._submit(retry.stage, retry.context, retry.attempt)
@@ -581,6 +623,11 @@ class R16Driver:
                     _CommitmentSourceSelection(context.request, context.target)
                 )
             )
+        if stage is _Stage.GOAL_SELF_PROPOSAL:
+            assert isinstance(context, _SelfTarget)
+            return _untyped(
+                self._goal._submit_self_proposal(_SelfGoalSelection(context.ref))
+            )
         if stage is _Stage.GOAL_REVIEW:
             command, subject = _review_context(context)
             return _untyped(self._goal._submit_review(subject))
@@ -591,6 +638,9 @@ class R16Driver:
         return _untyped(self._preview._submit_preview(context))
 
     def _fail(self, stage: _Stage, context: object, reason: TicketReason) -> None:
+        if stage is _Stage.GOAL_SELF_PROPOSAL:
+            self.counters["self_proposal_dropped"] += 1
+            LOGGER.warning("R16 driver self proposal dropped")
         command = _command_of(context)
         if command is not None:
             self._finish(command.ticket_id, R16TicketStatus.UNAVAILABLE, reason)
@@ -654,12 +704,9 @@ class R16Driver:
             return
         assert value.subject_id is not None
         if value.status is R16OwnerStatus.PROPOSED:
-            stage = (
-                _Stage.GOAL_REVIEW
-                if item.stage is _Stage.GOAL_PROPOSAL
-                else _Stage.COMMITMENT_REVIEW
-            )
-            if item.stage is _Stage.GOAL_PROPOSAL:
+            goal_stage = item.stage in (_Stage.GOAL_PROPOSAL, _Stage.GOAL_SELF_PROPOSAL)
+            stage = _Stage.GOAL_REVIEW if goal_stage else _Stage.COMMITMENT_REVIEW
+            if goal_stage:
                 self._reviewed[value.subject_id] = None
                 _bound(self._reviewed)
             self._submit(stage, (command, value.subject_id))
@@ -695,11 +742,32 @@ class R16Driver:
                     R16TicketStatus.HOLD,
                     R16DriverReason.SOURCE_NOT_YET_EVALUATED,
                 )
+        # IP-11: user commands on X were submitted first (above); a user who
+        # named X this incarnation (even one told to resend) keeps X.
+        if value == INTEREST_APPLIED and not waiting.held:
+            self._maybe_self_propose(_SelfTarget(waiting.experience_id, waiting.ref))
         for hook in self._u2a_hooks:
             try:
                 hook(waiting.ref, value)
             except Exception:  # pragma: no cover - defensive
                 LOGGER.exception("R16 driver U2a hook failed")
+
+    def _maybe_self_propose(self, target: _SelfTarget) -> None:
+        """#379 D2 P0: once per X and ``per_incarnation`` in total."""
+
+        if (
+            not self._self_goal_active
+            or target.experience_id in self._self_targets
+            or target.experience_id in self._user_targets
+            or self._self_reserved >= self._self_goal_limit
+        ):
+            return
+        self._self_targets[target.experience_id] = None
+        _bound(self._self_targets)
+        # Reserved before submission, so retries can never exceed the cap
+        # (#379 D2 P0 / D3 P2-1); a final drop releases it in ``_fail``.
+        self._self_reserved += 1
+        self._submit(_Stage.GOAL_SELF_PROPOSAL, target)
 
     def _maybe_preview(self, goal_id: str, trigger: str) -> None:
         key = (goal_id, trigger)
@@ -719,6 +787,8 @@ class R16Driver:
                 self._submit(_Stage.GOAL_REVIEW, (None, goal_id))
         for commitment_id in item.commitment_ids:
             self._submit(_Stage.COMMITMENT_REVIEW, (None, commitment_id))
+        for target in item.self_targets:
+            self._maybe_self_propose(target)
 
 
 def _bound(values: dict[Any, None]) -> None:
@@ -738,7 +808,8 @@ def _result_code(value: object) -> str:
             return f"{value.status.value}:{value.owner_reason.value}"
         return value.status.value
     if isinstance(value, str) and value in {
-        "motivation_evidence_applied",
+        "interest_applied",
+        "other_motivation_applied",
         "neutral_no_eligible_appraisal",
     }:
         return value
@@ -776,25 +847,88 @@ def _failed_sequence(error: BaseException) -> int | None:
     return sequence if type(sequence) is int else None
 
 
-def rescan_from(goal_state: object, commitment_state: object) -> _Rescan:
+def self_goal_targets(
+    motivation_state: object,
+    goal_state: object,
+    commitment_state: object,
+    experience_ref: Callable[[str], _MotivationSourceRef | None],
+    *,
+    marker_sequence: int,
+    min_strength: float,
+    stale_after_hours: int,
+    now: datetime,
+) -> tuple[_SelfTarget, ...]:
+    """IP-11 rescan (a): INTERESTs that may still ground a self Goal.
+
+    Selection only, read by the server before the runtime starts; the goal
+    owner re-checks every condition inside its own event.
+    """
+
+    from suzka.motivation.common import R13Reference, R13ReferenceKind
+    from suzka.motivation.goal import goal_id_for_target
+    from suzka.motivation.motivation import MotivationKind, MotivationLifecycle
+
+    goals = {record.goal_id for record in getattr(goal_state, "records", ())}
+    committed = {
+        ref
+        for record in getattr(commitment_state, "records", ())
+        for ref in record.evidence_refs
+    }
+    ledger = {
+        entry.motivation_id: entry.event_sequence
+        for entry in getattr(motivation_state, "evidence_ledger", ())
+    }
+    found: list[_SelfTarget] = []
+    for record in getattr(motivation_state, "records", ()):
+        target = record.target
+        if (
+            record.kind is not MotivationKind.INTEREST
+            or record.lifecycle is not MotivationLifecycle.ACTIVE
+            or record.revision != 0
+            or record.conflict_refs
+            or record.strength < min_strength
+            or not isinstance(target, R13Reference)
+            or target.kind is not R13ReferenceKind.EXPERIENCE
+            or ledger.get(record.motivation_id, 0) <= marker_sequence
+            or goal_id_for_target(target) in goals
+            or target in committed
+            or now - record.revision_history[0].created_at
+            > timedelta(hours=stale_after_hours)
+        ):
+            continue
+        ref = experience_ref(target.reference)
+        if ref is not None:
+            found.append(_SelfTarget(target.reference, ref))
+    return tuple(found)
+
+
+def rescan_from(
+    goal_state: object,
+    commitment_state: object,
+    self_targets: tuple[_SelfTarget, ...] = (),
+) -> _Rescan:
     """PROPOSED user-request Goals and PROPOSED Commitments at startup."""
 
     from suzka.motivation.commitment import CommitmentLifecycle
     from suzka.motivation.common import R13ReferenceKind
     from suzka.motivation.goal import GoalLifecycle
 
+    # IP-11: PROPOSED self-origin Goals are re-reviewed too (#379 D1 P1-5 b).
     goal_ids = tuple(
         record.goal_id
         for record in getattr(goal_state, "records", ())
         if record.lifecycle is GoalLifecycle.PROPOSED
-        and any(ref.kind is R13ReferenceKind.USER_REQUEST for ref in record.origin_refs)
+        and any(
+            ref.kind in (R13ReferenceKind.USER_REQUEST, R13ReferenceKind.MOTIVATION)
+            for ref in record.origin_refs
+        )
     )
     commitment_ids = tuple(
         record.commitment_id
         for record in getattr(commitment_state, "records", ())
         if record.lifecycle is CommitmentLifecycle.PROPOSED
     )
-    return _Rescan(goal_ids, commitment_ids)
+    return _Rescan(goal_ids, commitment_ids, self_targets)
 
 
 __all__ = [
@@ -806,4 +940,5 @@ __all__ = [
     "R16TicketView",
     "parse_command",
     "rescan_from",
+    "self_goal_targets",
 ]

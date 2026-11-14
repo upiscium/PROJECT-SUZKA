@@ -13,18 +13,15 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import TYPE_CHECKING, Final
 
-from suzka.identity.origin import (
-    OriginActor,
-    OriginInputKind,
-    ValueAdmissionStatus,
-    validate_origin_id,
-)
 from suzka.identity.value_system import (
     ValueSystemSnapshot,
-    recompute_seed_contract_digest,
-    value_state_digest,
 )
 from suzka.identifiers import validate_identifier
+from suzka.r16.review_value import (
+    REVIEW_VALUE_ID,
+    ReviewValueUnavailable,
+    qualify_review_value,
+)
 from suzka.motivation.commitment import (
     CommitmentAdmissionReason,
     CommitmentLifecycle,
@@ -60,6 +57,7 @@ from suzka.r16.contracts import (
     ValueEvidenceRef,
 )
 from suzka.r16.goal_owner import (
+    GoalOrigin,
     _GoalSourceOwner,
     _GoalSourceUnavailable,
     _QualifiedGoal,
@@ -88,7 +86,7 @@ if TYPE_CHECKING:
     from suzka.runtime.main_loop import SuzkaMainLoop
 
 _POLICY_VERSION: Final = 1
-_VALUE_ID: Final = "honesty"
+_VALUE_ID: Final = REVIEW_VALUE_ID
 _NORMATIVE_POLICY: Final = "human-approved-source-review-honesty/v1"
 _PLAN_A: Final = "source_first"
 _PLAN_B: Final = "responsibility_review"
@@ -150,10 +148,18 @@ class _QualifiedPreview:
     experience_event_sequence: int
     experience_revision: int
     motivation_id: str
+    # IP-11 (#379): who originated the Goal.  A self-origin Goal can never
+    # select Plan B (Human decision 2026-11-14: B stays a candidate, but is
+    # unselectable).
+    goal_origin: GoalOrigin = GoalOrigin.USER_REQUEST
 
     @property
     def qualified_commitment(self) -> bool:
         return self.commitment_id is not None
+
+    @property
+    def self_origin(self) -> bool:
+        return self.goal_origin is GoalOrigin.SUBJECT_MOTIVATION
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,7 +377,7 @@ class _PlanPreviewOwner:
             )
         self._goal._require_real_proposal_review(goal)
         selection = self._goal._selection_from_goal(goal)
-        qualified = self._goal._qualify(selection, event, continuation=True)
+        qualified = self._goal._qualify_selection(selection, event, continuation=True)
         self._goal._expect_goal_contract(goal, qualified)
 
         admission = goal.subject_admission
@@ -407,37 +413,10 @@ class _PlanPreviewOwner:
         return qualified
 
     def _qualify_value(self, context_id: str) -> tuple[int, str, str]:
-        values = self._loop._value_system.snapshot()
-        matches = tuple(value for value in values.values if value.value_id == _VALUE_ID)
-        if len(matches) != 1:
-            raise _PlanSourceUnavailable("review integrity Value missing")
-        value = matches[0]
-        if (
-            not value.is_active()
-            or not value.applies_to(context_id)
-            or value.origin.actor is not OriginActor.SYSTEM
-            or value.origin.input_kind is not OriginInputKind.CONFIG_SEED
-            or value.origin.admission is not ValueAdmissionStatus.SYSTEM_AUTHORIZED
-            or value.origin.source_ref != f"config-seed:{_VALUE_ID}"
-            or value.polarity != 1
-            or value.seed_contract_digest is None
-        ):
-            raise _PlanSourceUnavailable("review integrity Value not qualified")
-        seed = tuple(
-            item.to_declaration()
-            for item in self._loop.settings.values.seeds
-            if item.value_id == _VALUE_ID
-        )
-        if (
-            len(seed) != 1
-            or recompute_seed_contract_digest(seed[0]) != value.seed_contract_digest
-        ):
-            raise _PlanSourceUnavailable("review Value has unqualified seed origin")
-        return (
-            value.revision,
-            value_state_digest(value),
-            validate_origin_id(value.origin),
-        )
+        try:
+            return qualify_review_value(self._loop, context_id)
+        except ReviewValueUnavailable as error:
+            raise _PlanSourceUnavailable(str(error)) from error
 
     def _qualify_commitment(
         self,
@@ -571,6 +550,7 @@ class _PlanPreviewOwner:
                 experience_event_sequence=q_goal.target_event_sequence,
                 experience_revision=q_goal.target_revision,
                 motivation_id=q_goal.motivation_id,
+                goal_origin=q_goal.origin,
             )
         except _PlanSourceUnavailable:
             raise
@@ -685,6 +665,13 @@ class _PlanPreviewOwner:
             None,
         )
         candidates = (a, b, noop)
+        if q.self_origin and q.qualified_commitment:
+            # Defensive (#379 D5 P2-5): U2c is HOLD on a self-occupied X, so a
+            # self Goal never meets a Commitment; Plan B is never selectable.
+            raise _PlanSourceUnavailable(
+                "self-origin Goal cannot take a responsibility Plan",
+                reason=R16OwnerReason.SELF_GOAL_OCCUPIES_TARGET,
+            )
         obs = self._observations(q)
         if not all(item.satisfied for item in obs):
             raise _PlanSourceUnavailable("Plan ontology predicate failed")

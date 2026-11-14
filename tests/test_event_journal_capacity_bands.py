@@ -104,8 +104,12 @@ def test_soft_band_allow_list_matches_the_design_table() -> None:
         AgentEventType.ADAPTER_EVALUATE,
         AgentEventType.ADAPTER_UPDATE,
         AgentEventType.R16_DRIVER_ACTIVATION,
+        # IP-11: the self-Goal activation is refused like the driver's;
+        # GOAL_SELF_PROPOSAL_REVIEW is admitted (Human decision 2026-11-14).
+        AgentEventType.R16_SELF_GOAL_ACTIVATION,
     }
-    assert len(AgentEventType) == 17
+    assert AgentEventType.GOAL_SELF_PROPOSAL_REVIEW in SOFT_BAND_ADMITTED_EVENT_TYPES
+    assert len(AgentEventType) == 19
     assert SOFT_BAND_ADMITTED_EVENT_TYPES <= set(AgentEventType)
 
 

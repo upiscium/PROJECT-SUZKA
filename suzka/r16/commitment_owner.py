@@ -35,6 +35,8 @@ from suzka.motivation.commitment_system import (
     CommitmentSystemSnapshot,
 )
 from suzka.motivation.common import Deadline, R13Reference, R13ReferenceKind
+from suzka.motivation.goal import goal_id_for_target
+from suzka.r16.goal_owner import GoalOrigin, _GoalSourceOwner
 from suzka.motivation.motivation import MotivationKind, MotivationLifecycle
 from suzka.motivation.system import MotivationEventOperation
 from suzka.r16.source_owner import (
@@ -605,6 +607,25 @@ class _CommitmentSourceOwner:
             for record in self._loop._commitment_system.records
         )
 
+    @staticmethod
+    def _require_no_self_goal(loop: SuzkaMainLoop, q: _QualifiedCommitment) -> None:
+        """IP-11 (#379 D2 P1-3, D3 addendum): a self Goal occupies X.
+
+        Applied at both proposal and admission, so no Commitment record on X
+        is ever created while the subject's own Goal exists (no mutual
+        deadlock).  Releasing the occupation is designed after R20.
+        """
+        target = R13Reference(R13ReferenceKind.EXPERIENCE, q.target_experience_id)
+        goal = loop._goal_system.get(goal_id_for_target(target))
+        if (
+            goal is not None
+            and _GoalSourceOwner._goal_origin(goal) is GoalOrigin.SUBJECT_MOTIVATION
+        ):
+            raise _CommitmentSourceUnavailable(
+                "a self-origin Goal occupies the target",
+                reason=R16OwnerReason.SELF_GOAL_OCCUPIES_TARGET,
+            )
+
     def _propose(self, loop: SuzkaMainLoop, nonce: object) -> R16OwnerOutcome:
         event = self._event(loop, nonce, "proposal")
         assert self._inflight is not None
@@ -614,6 +635,7 @@ class _CommitmentSourceOwner:
         before = loop._commitment_system.snapshot()
         try:
             q = self._qualify(selection, event)
+            self._require_no_self_goal(loop, q)
             if self._other_responsibility_exists(q):
                 raise _CommitmentSourceUnavailable(
                     "duplicate responsibility",
@@ -689,6 +711,7 @@ class _CommitmentSourceOwner:
             q = self._qualify(selection, event, continuation=True)
             self._assert_contract(commitment, q)
             self._assert_original_proposal(commitment)
+            self._require_no_self_goal(loop, q)
             if self._other_responsibility_exists(q, excluding=commitment.commitment_id):
                 raise _CommitmentSourceUnavailable(
                     "responsibility already exists",
