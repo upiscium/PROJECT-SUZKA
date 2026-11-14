@@ -857,10 +857,14 @@ class _GoalSourceOwner:
         if existing is not None:
             raise _GoalSourceUnavailable(
                 "Goal already proposed for target",
-                reason=R16OwnerReason.SELF_GOAL_OCCUPIES_TARGET
-                if _GoalSourceOwner._goal_origin(existing)
-                is GoalOrigin.SUBJECT_MOTIVATION
-                else R16OwnerReason.GOAL_ALREADY_EXISTS,
+                # IP-5 semantics kept: only a Goal a user asked for is
+                # GOAL_ALREADY_EXISTS; any other Goal is the subject's own.
+                reason=R16OwnerReason.GOAL_ALREADY_EXISTS
+                if any(
+                    ref.kind is R13ReferenceKind.USER_REQUEST
+                    for ref in existing.origin_refs
+                )
+                else R16OwnerReason.SELF_GOAL_OCCUPIES_TARGET,
             )
 
     def _require_daily_budget(self, loop: SuzkaMainLoop, event: AgentEvent) -> None:
