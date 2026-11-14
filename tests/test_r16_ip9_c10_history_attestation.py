@@ -12,6 +12,7 @@ from dataclasses import replace
 from datetime import timedelta
 from hashlib import sha256
 from pathlib import Path
+from uuid import uuid4
 import shutil
 import sys
 
@@ -442,3 +443,39 @@ def test_compaction_after_a_recent_true_rollback(tmp_path: Path) -> None:
     _event_, root = world.commit("after-rollback", intent="9" * 64)
     head = world.reader().head(SCOPE)
     assert (head.status, head.decision, head.depth) == (HeadStatus.ADOPTED, root, 1)
+
+
+def test_attestation_of_another_store_diverges(tmp_path: Path) -> None:
+    """Review P2-5: store_id/subject_id are part of what is attested."""
+
+    world = _World(tmp_path)
+    _small(world)
+    _chain(world, 6)
+    assert _compact(world, _provider(world)).performed
+    real = world.store.meta()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            world.store, "meta", lambda: replace(real, store_id=str(uuid4()))
+        )
+        head = world.reader().head(SCOPE)
+    assert (head.status, head.reason) == (HeadStatus.BLOCKED, HeadBlockReason.DIVERGED)
+
+
+def test_non_contiguous_prefix_poisons_the_whole_incarnation(tmp_path: Path) -> None:
+    """Review P3-6: a prefix failure in the provider is not a crash."""
+
+    from suzka.r16 import history_attestation as module
+
+    world = _World(tmp_path)
+    _small(world)
+    _chain(world, 6)
+
+    def broken(_chains, _high_water):  # type: ignore[no-untyped-def]
+        raise ValueError("attested chain prefix is not contiguous")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(module, "prefix_tips", broken)
+        outcome = _compact(world, _provider(world))
+    assert outcome.performed, outcome.reason
+    attestation = world.journal.inspect().latest_compaction.history_attestation
+    assert attestation is not None and attestation.poisoned_all
