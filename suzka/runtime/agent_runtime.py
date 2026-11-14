@@ -33,6 +33,10 @@ class AgentEventType(str, Enum):
     PLAN_PREVIEW_REVIEW = "plan_preview_review"
     # #370 D0 §6 / IP-6: the operator's one-time, unique R16 driver activation.
     R16_DRIVER_ACTIVATION = "r16_driver_activation"
+    # IP-11 (#379 U2b-S): the subject's own Goal proposal from an INTEREST,
+    # and the operator's one-time, unique self-Goal activation marker.
+    GOAL_SELF_PROPOSAL_REVIEW = "goal_self_proposal_review"
+    R16_SELF_GOAL_ACTIVATION = "r16_self_goal_activation"
 
 
 class AgentEventSource(str, Enum):
@@ -65,6 +69,8 @@ class AgentEventSource(str, Enum):
     RUNTIME_COMMITMENT_ACCEPTANCE_REVIEW = "runtime.commitment_acceptance_review"
     RUNTIME_PLAN_PREVIEW_REVIEW = "runtime.plan_preview_review"
     API_R16_DRIVER_ACTIVATE = "api.r16.driver.activate"
+    RUNTIME_GOAL_SELF_PROPOSAL_REVIEW = "runtime.goal_self_proposal_review"
+    API_R16_SELF_GOAL_ACTIVATE = "api.r16.self_goal.activate"
 
 
 class AgentRuntimeStatus(str, Enum):

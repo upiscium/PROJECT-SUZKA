@@ -5,7 +5,12 @@ from pydantic import BaseModel
 
 from suzka.api.dependencies import get_agent_runtime, require_admin
 from suzka.api.runtime_execution import execute
-from suzka.r16.activation import R16DriverAlreadyActive, activation_handler
+from suzka.r16.activation import (
+    R16DriverAlreadyActive,
+    R16SelfGoalAlreadyActive,
+    activation_handler,
+    self_goal_activation_handler,
+)
 from suzka.runtime import AgentEventSource, AgentEventType, AgentRuntime
 
 
@@ -42,3 +47,33 @@ def activate_driver(
     if driver is not None:
         driver.activate()
     return R16DriverActivationResponse(active=True, activation_sequence=sequence)
+
+
+class R16SelfGoalActivationResponse(BaseModel):
+    active: bool
+    activation_sequence: int
+
+
+@router.post("/self-goal/activate", response_model=R16SelfGoalActivationResponse)
+def activate_self_goal(
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+) -> R16SelfGoalActivationResponse:
+    """IP-11: record the unique self-Goal activation; a second call is 409."""
+
+    try:
+        sequence = execute(
+            runtime,
+            AgentEventType.R16_SELF_GOAL_ACTIVATION,
+            AgentEventSource.API_R16_SELF_GOAL_ACTIVATE,
+            self_goal_activation_handler(request.app.state.event_journal, runtime),
+        )
+    except R16SelfGoalAlreadyActive as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="self-Goal path is already activated",
+        ) from exc
+    driver = getattr(request.app.state, "r16_driver", None)
+    if driver is not None:
+        driver.activate_self_goal()
+    return R16SelfGoalActivationResponse(active=True, activation_sequence=sequence)

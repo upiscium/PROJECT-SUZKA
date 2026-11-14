@@ -65,7 +65,7 @@ def _sources(state, *, motive=True, text=None, selectors=None):
     x = _chat(state, "source committed experience: synthetic")
     if motive:
         m = state._motivation_source_owner._submit(x).result(timeout=30)
-        assert m.value == "motivation_evidence_applied"
+        assert m.value == "interest_applied"
     else:
         m = None
     p = _chat(

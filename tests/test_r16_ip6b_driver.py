@@ -298,6 +298,9 @@ class _FakeOwner:
     def _submit_proposal(self, selection: object) -> Future[Any]:
         return self._record("proposal", selection)
 
+    def _submit_self_proposal(self, selection: object) -> Future[Any]:
+        return self._record("self_proposal", selection)
+
     def _submit_review(self, subject: str) -> Future[Any]:
         return self._record("review", subject)
 
@@ -393,7 +396,7 @@ def test_command_waits_for_u2a_and_is_released_by_sequence(fakes) -> None:  # ty
     _until(lambda: len(source.calls) == 1)
     assert goal.calls == []
     # U2a admitted after P: the command cannot qualify, so the user resends.
-    _resolve(source.futures[0], 7, "motivation_evidence_applied")
+    _resolve(source.futures[0], 7, "interest_applied")
     view = _until(
         lambda: (v := driver.ticket(ticket.ticket_id)).status is not R16TicketStatus.PENDING
         and v
@@ -410,7 +413,7 @@ def test_command_after_u2a_with_earlier_sequence_is_submitted(fakes) -> None:  #
         _turn(8, "experience-00000000-0000-4000-8000-0000000000a3"),
         f"REVIEW_EXPERIENCE:{X1}",
     )
-    _resolve(source.futures[0], 6, "motivation_evidence_applied")
+    _resolve(source.futures[0], 6, "interest_applied")
     _until(lambda: len(goal.calls) == 1)
     _resolve(goal.futures[0], 9, R16OwnerOutcome(R16OwnerStatus.PROPOSED, "goal-1"))
     _until(lambda: len(goal.calls) == 2)
@@ -468,7 +471,7 @@ def test_results_are_never_dropped_even_when_inputs_are_full(fakes, monkeypatch)
         raise queue_module.Full
 
     monkeypatch.setattr(driver._queue, "put_nowait", full)
-    _resolve(source.futures[0], 6, "motivation_evidence_applied")
+    _resolve(source.futures[0], 6, "interest_applied")
     _until(lambda: len(goal.calls) == 1)
     _resolve(goal.futures[0], 9, R16OwnerOutcome.hold(R16OwnerReason.GOAL_ALREADY_EXISTS))
     view = _until(

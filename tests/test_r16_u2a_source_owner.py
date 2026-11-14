@@ -139,7 +139,7 @@ def test_prior_committed_source_exact_ledger_v10_and_restart(isolated_app):
         calls = state.model_provider.calls
         owner = state._motivation_source_owner
         outcome = owner._submit(source).result(timeout=30)
-        assert outcome.value == "motivation_evidence_applied"
+        assert outcome.value == "interest_applied"
         assert outcome.event.processing_sequence > source.event_sequence
         assert state.model_provider.calls == calls
         exact = state.main_loop.export_motivation_state()

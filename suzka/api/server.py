@@ -3,7 +3,8 @@
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import cast
+from datetime import datetime, timezone
+from typing import Any, cast
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -69,14 +70,15 @@ from suzka.runtime.agent_state import (
     _domain_belief_system,
     _domain_value_system,
 )
-from suzka.r16.activation import driver_activation
+from suzka.r16.activation import driver_activation, self_goal_activation
 from suzka.r16.history_adoption import (
     HistoryAdoptionError,
     adopted_history_baseline,
     open_or_create_store,
 )
 from suzka.r16.history_store import SubjectHistoryStore
-from suzka.r16.driver import R16Driver, rescan_from
+from suzka.r16.driver import R16Driver, rescan_from, self_goal_targets
+from suzka.r16.source_owner import _MotivationSourceRef
 from suzka.runtime.event_journal import EventJournalAdmissionBand
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
 from suzka.r16.decision_issuer import _DecisionIssuer
@@ -481,6 +483,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             owner = getattr(app.state, "_goal_source_owner", None)
             if owner is None and event.event_type in {
                 AgentEventType.GOAL_PROPOSAL_REVIEW,
+                AgentEventType.GOAL_SELF_PROPOSAL_REVIEW,
                 AgentEventType.GOAL_ADOPTION_REVIEW,
             }:
                 raise StateRecoveryError("R16 Goal Source owner unavailable")
@@ -805,6 +808,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     preview_owner,
                     active=driver_activation(app.state.event_journal.inspect())
                     is not None,
+                    self_goal_active=self_goal_activation(
+                        app.state.event_journal.inspect()
+                    )
+                    is not None,
+                    self_goal_per_incarnation=app_settings.self_goal.per_incarnation,
                 )
             try:
                 narrative_reader = QualifiedNarrativeSourceGate(
@@ -880,6 +888,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     else rescan_from(
                         app.state.main_loop.export_goal_state(),
                         app.state.main_loop.export_commitment_state(),
+                        _self_goal_rescan(app, app_settings),
                     )
                 )
                 app.state.agent_runtime.start()
@@ -1026,6 +1035,35 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def _self_goal_rescan(app: FastAPI, app_settings: Settings) -> tuple[Any, ...]:
+    """IP-11 rescan (a): read before the runtime starts (#370 D2 P0-1)."""
+
+    marker = self_goal_activation(app.state.event_journal.inspect())
+    if marker is None or marker.processing_sequence is None:
+        return ()
+    store = app.state.experience_store
+
+    def experience_ref(experience_id: str) -> _MotivationSourceRef | None:
+        try:
+            record = store.load_committed_current(experience_id).record
+        except Exception:
+            return None
+        return _MotivationSourceRef(
+            record.source_event_id, record.source_event_sequence, record.source_episode_id
+        )
+
+    return self_goal_targets(
+        app.state.main_loop.export_motivation_state(),
+        app.state.main_loop.export_goal_state(),
+        app.state.main_loop.export_commitment_state(),
+        experience_ref,
+        marker_sequence=marker.processing_sequence,
+        min_strength=app_settings.self_goal.min_strength,
+        stale_after_hours=app_settings.self_goal.stale_after_hours,
+        now=datetime.now(timezone.utc),
+    )
 
 
 def _open_subject_history(

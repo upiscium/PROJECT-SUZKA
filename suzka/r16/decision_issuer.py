@@ -378,7 +378,7 @@ class _DecisionIssuer:
         commitment, commitment_ref, deadline = self._commitment(q)
         interpretation, stage = self._read_interpretation(event, q)
         predecessor, predecessor_ref = self._predecessor(
-            head, incarnation, scope, as_of, snapshot_hash, attested
+            head, incarnation, scope, as_of, snapshot_hash, attested, q.self_origin
         )
         value = SuccessorPolicyInputV2(
             required_source=RequiredSourceState.QUALIFIED,
@@ -516,7 +516,9 @@ class _DecisionIssuer:
         at = record.deadline.at
         deadline = NO_DEADLINE_UTC if at is None else _ceil_utc(at)
         return (
-            CommitmentState.ACTIVE,
+            # IP-11 (#379 D2 P1-4): a self-origin Goal never takes on a user's
+            # responsibility: with a Commitment it is INELIGIBLE (row 1).
+            CommitmentState.INELIGIBLE if q.self_origin else CommitmentState.ACTIVE,
             PolicyRef("commitment", q.commitment_id, q.commitment_revision, q.commitment_digest),
             deadline,
         )
@@ -544,6 +546,7 @@ class _DecisionIssuer:
         as_of: int,
         snapshot_hash: str,
         attested: int,
+        self_origin: bool = False,
     ) -> tuple[PredecessorState, PolicyRef | None]:
         if head is None or incarnation is None:
             return PredecessorState.UNAVAILABLE, None
@@ -561,7 +564,9 @@ class _DecisionIssuer:
             return PredecessorState.UNAVAILABLE, None
         decision = head.decision
         assert decision is not None and head.transaction_id is not None
-        if not self._head_verified(decision, incarnation, head.transaction_id):
+        if not self._head_verified(
+            decision, incarnation, head.transaction_id, self_origin
+        ):
             return PredecessorState.CONFLICT, None
         return PredecessorState.QUALIFIED, PolicyRef(
             PREDECESSOR_DECISION_KIND,
@@ -571,7 +576,11 @@ class _DecisionIssuer:
         )
 
     def _head_verified(
-        self, decision: CommittedDecisionV1, incarnation: str, transaction_id: str
+        self,
+        decision: CommittedDecisionV1,
+        incarnation: str,
+        transaction_id: str,
+        self_origin: bool = False,
     ) -> bool:
         """D2 P2-5: sealed replay, row/selection and as_of before use."""
 
@@ -591,6 +600,9 @@ class _DecisionIssuer:
             PolicyOutputKind.PLAN_B: (CandidateKind.PLAN, "candidate-b"),
             PolicyOutputKind.NO_OP: (CandidateKind.NO_OP, "candidate-noop"),
         }[replay.output]
+        if self_origin and selected is not None and selected.candidate_id == "candidate-b":
+            # IP-11: Plan B is never a self-origin Goal's head.
+            return False
         return (
             decision.policy_kind is POLICY_KIND
             and replay.history_row is decision.policy_row
@@ -661,6 +673,10 @@ class _DecisionIssuer:
             policy_input_digest(policy_bytes),
         )
         record = _decision_record(identity, q, result)
+        if q.self_origin and record.selected.candidate_id == "candidate-b":
+            # Explicit, not ``assert`` (D5 review P3-3): never issue Plan B
+            # for a self-origin Goal.
+            raise _IssuerHold(R16OwnerReason.SELF_GOAL_OCCUPIES_TARGET)
         return CommittedDecisionV1(
             incarnation_id=incarnation,
             decision_id=identity,

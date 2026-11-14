@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 from dataclasses import dataclass
+from datetime import timedelta, timezone
+from enum import Enum
 from typing import TYPE_CHECKING
 
-from suzka.experience import experience_record_digest
+from suzka.experience import ExperienceRecord, experience_record_digest
 from suzka.identifiers import validate_identifier
 from suzka.memory.experience_participant import experience_id_for_event
 from suzka.memory.experience_store import ExperienceStoreError
@@ -32,8 +34,18 @@ from suzka.motivation.goal_system import (
     GoalSystemEventOperation,
     GoalSystemSnapshot,
 )
-from suzka.motivation.motivation import MotivationKind, MotivationLifecycle
-from suzka.motivation.system import MotivationEventOperation
+from suzka.motivation.motivation import (
+    MotivationKind,
+    MotivationLifecycle,
+    MotivationRecord,
+    MotivationRevisionRecord,
+)
+from suzka.motivation.system import (
+    MotivationEventOperation,
+    MotivationEvidenceLedgerEntry,
+)
+from suzka.r16.activation import self_goal_activation
+from suzka.r16.review_value import ReviewValueUnavailable, qualify_review_value
 from suzka.r16.source_owner import (
     _MotivationSourceOwner,
     _MotivationSourceRef,
@@ -89,14 +101,36 @@ class _GoalSourceSelection:
 
 
 @dataclass(frozen=True, slots=True)
+class _SelfGoalSelection:
+    """IP-11: only the committed CHAT X whose INTEREST may ground a self Goal."""
+
+    target: _MotivationSourceRef
+
+    def __post_init__(self) -> None:
+        if type(self.target) is not _MotivationSourceRef:
+            raise _GoalSourceUnavailable("invalid self-Goal source selector")
+
+
+class GoalOrigin(str, Enum):
+    """#379: who originated the Goal (the Explanation/projection value)."""
+
+    USER_REQUEST = "user_request"
+    SUBJECT_MOTIVATION = "subject_motivation"
+
+
+AnyGoalSelection = _GoalSourceSelection | _SelfGoalSelection
+
+
+@dataclass(frozen=True, slots=True)
 class _QualifiedGoal:
-    proposal_event_id: str
+    # None for a self-origin Goal: no user request P exists (IP-11).
+    proposal_event_id: str | None
     target_experience_id: str
     motivation_id: str
     motivation_event_id: str
     motivation_revision_digest: str
     motivation_record_digest: str
-    proposal_record_digest: str
+    proposal_record_digest: str | None
     target_record_digest: str
     context_id: str
     # IP-10 (#371 D2 P2-3): X's own event and revision, from this qualified
@@ -104,15 +138,33 @@ class _QualifiedGoal:
     target_event_id: str
     target_event_sequence: int
     target_revision: int
+    origin: GoalOrigin = GoalOrigin.USER_REQUEST
+
+    def __post_init__(self) -> None:
+        if (self.origin is GoalOrigin.USER_REQUEST) != (
+            self.proposal_event_id is not None
+        ):
+            raise _GoalSourceUnavailable("Goal origin and request disagree")
 
     @property
     def target(self) -> R13Reference:
         return R13Reference(R13ReferenceKind.EXPERIENCE, self.target_experience_id)
 
     @property
+    def origin_refs(self) -> tuple[R13Reference, ...]:
+        if self.proposal_event_id is None:
+            # #379 D1 P0-2: a self Goal originates in its own Motivation.
+            return (R13Reference(R13ReferenceKind.MOTIVATION, self.motivation_id),)
+        return (R13Reference(R13ReferenceKind.USER_REQUEST, self.proposal_event_id),)
+
+    @property
     def evidence(self) -> tuple[R13Reference, ...]:
         values = (
-            R13Reference(R13ReferenceKind.USER_REQUEST, self.proposal_event_id),
+            *(
+                ()
+                if self.proposal_event_id is None
+                else (R13Reference(R13ReferenceKind.USER_REQUEST, self.proposal_event_id),)
+            ),
             self.target,
             R13Reference(R13ReferenceKind.MOTIVATION, self.motivation_id),
             R13Reference(R13ReferenceKind.EVENT, self.motivation_event_id),
@@ -126,7 +178,7 @@ class _QualifiedGoal:
 class _PendingGoal:
     event: AgentEvent
     action: str
-    selection: _GoalSourceSelection | None
+    selection: AnyGoalSelection | None
     qualification: _QualifiedGoal | None
     goal_id: str | None
     goal_snapshot: GoalSystemSnapshot
@@ -186,20 +238,37 @@ class _GoalSourceOwner:
         validate_identifier(goal_id)
         return self._submit("review", goal_id)
 
-    def _submit(self, action: str, selection: object) -> Future[AgentEventOutcome[R16OwnerOutcome]]:
-        self._check_binding()
-        nonce = object()
-        event_type, event_source = (
-            (
+    def _submit_self_proposal(
+        self, selection: _SelfGoalSelection
+    ) -> Future[AgentEventOutcome[R16OwnerOutcome]]:
+        """IP-11 (#379 D1 P1-4): a separate, later event after U2a."""
+
+        if type(selection) is not _SelfGoalSelection:
+            raise _GoalSourceUnavailable("self-Goal selector must be exact")
+        selection.__post_init__()
+        return self._submit("self_proposal", selection)
+
+    @staticmethod
+    def _event_kind(action: str) -> tuple[AgentEventType, AgentEventSource]:
+        if action == "proposal":
+            return (
                 AgentEventType.GOAL_PROPOSAL_REVIEW,
                 AgentEventSource.RUNTIME_GOAL_PROPOSAL_REVIEW,
             )
-            if action == "proposal"
-            else (
-                AgentEventType.GOAL_ADOPTION_REVIEW,
-                AgentEventSource.RUNTIME_GOAL_ADOPTION_REVIEW,
+        if action == "self_proposal":
+            return (
+                AgentEventType.GOAL_SELF_PROPOSAL_REVIEW,
+                AgentEventSource.RUNTIME_GOAL_SELF_PROPOSAL_REVIEW,
             )
+        return (
+            AgentEventType.GOAL_ADOPTION_REVIEW,
+            AgentEventSource.RUNTIME_GOAL_ADOPTION_REVIEW,
         )
+
+    def _submit(self, action: str, selection: object) -> Future[AgentEventOutcome[R16OwnerOutcome]]:
+        self._check_binding()
+        nonce = object()
+        event_type, event_source = self._event_kind(action)
 
         def handle() -> R16OwnerOutcome:
             if self._inflight is not None or self._pending is not None:
@@ -208,6 +277,8 @@ class _GoalSourceOwner:
             try:
                 if action == "proposal":
                     return self._loop._propose_goal_source(self, nonce)
+                if action == "self_proposal":
+                    return self._loop._propose_self_goal_source(self, nonce)
                 return self._loop._review_goal_source(self, nonce)
             except BaseException:
                 self._pending = None
@@ -222,17 +293,7 @@ class _GoalSourceOwner:
     ) -> AgentEvent:
         self._check_binding()
         event = self._runtime.current_event()
-        expected_type, expected_source = (
-            (
-                AgentEventType.GOAL_PROPOSAL_REVIEW,
-                AgentEventSource.RUNTIME_GOAL_PROPOSAL_REVIEW,
-            )
-            if action == "proposal"
-            else (
-                AgentEventType.GOAL_ADOPTION_REVIEW,
-                AgentEventSource.RUNTIME_GOAL_ADOPTION_REVIEW,
-            )
-        )
+        expected_type, expected_source = self._event_kind(action)
         if (
             loop is not self._loop
             or self._inflight is None
@@ -293,128 +354,9 @@ class _GoalSourceOwner:
                 or p_record.context_id != x_record.context_id
             ):
                 raise _GoalSourceUnavailable("Goal proposal is not source-qualified")
-            motivation = self._loop._motivation_system.snapshot()
-            target = R13Reference(R13ReferenceKind.EXPERIENCE, x_record.experience_id)
-            matches = tuple(
-                m
-                for m in motivation.records
-                if m.kind is MotivationKind.INTEREST and m.target == target
+            m, entry, revision = self._qualify_motivation(
+                x, x_record, upper=p.event_sequence, continuation=continuation
             )
-            if len(matches) != 1:
-                raise _GoalSourceUnavailable(
-                    "independent Motivation absent",
-                    reason=R16OwnerReason.MOTIVATION_UNAVAILABLE,
-                )
-            m = matches[0]
-            if (
-                m.lifecycle is not MotivationLifecycle.ACTIVE
-                or m.source_evidence != target
-                or m.conflict_refs
-                or len(m.revision_history) != 1
-                or m.revision != 0
-                or m.revision_history[-1].event_id is None
-            ):
-                raise _GoalSourceUnavailable(
-                    "Motivation unqualified or changed",
-                    reason=R16OwnerReason.MOTIVATION_UNAVAILABLE,
-                )
-            if any(
-                other.kind is MotivationKind.AVERSION
-                and other.target == target
-                and other.lifecycle is MotivationLifecycle.ACTIVE
-                for other in motivation.records
-            ):
-                raise _GoalSourceUnavailable(
-                    "explicit counter-Motivation",
-                    reason=R16OwnerReason.COUNTER_MOTIVATION,
-                )
-            revision = m.revision_history[-1]
-            rows = tuple(
-                entry
-                for entry in motivation.evidence_ledger
-                if entry.motivation_id == m.motivation_id
-                and entry.evidence.source_ref == target
-            )
-            if len(rows) != 1:
-                raise _GoalSourceUnavailable("Motivation source ledger ambiguous")
-            entry = rows[0]
-            receipts = tuple(
-                receipt
-                for receipt in motivation.event_receipts
-                if receipt.event_id == entry.event_id
-                and receipt.event_sequence == entry.event_sequence
-            )
-            if len(receipts) != 1:
-                raise _GoalSourceUnavailable("Motivation receipt missing")
-            receipt = receipts[0]
-            if (
-                receipt.operation is not MotivationEventOperation.EVIDENCE
-                or receipt.evidence_digest != entry.evidence.evidence_digest
-                or receipt.motivation_ids != (m.motivation_id,)
-                or receipt.evidence_refs != (target,)
-                or entry.evidence.kind is not MotivationKind.INTEREST
-                or entry.evidence.target != target
-                or entry.evidence.source_event_id != x.event_id
-                or entry.evidence.source_event_sequence != x.event_sequence
-                or entry.evidence.observed_at != x_record.created_at
-                or entry.evidence.origin_refs
-                != (R13Reference(R13ReferenceKind.EVENT, x.event_id),)
-                or entry.evidence.authority_witness_digest
-                != experience_record_digest(x_record)
-                or entry.evidence.source_ref != target
-                or revision.event_id != entry.event_id
-                or revision.event_sequence != entry.event_sequence
-                or not (x.event_sequence < entry.event_sequence < p.event_sequence)
-            ):
-                raise _GoalSourceUnavailable(
-                    "Motivation historical revision unqualified"
-                )
-            inspected = self._journal.inspect()
-            if (
-                inspected.external_reconciliation_required
-                or inspected.open_transactions
-                or inspected.reconciliation_required_transactions
-            ):
-                raise _GoalSourceUnavailable("Journal recovery underway")
-            stage, provenance = locate_journal_source(
-                inspected, entry.event_id, entry.event_sequence
-            )
-            if stage is JournalSourceStage.MISSING or (
-                stage is JournalSourceStage.ARCHIVED and not continuation
-            ):
-                raise _GoalSourceUnavailable(
-                    "Motivation owner event not retained",
-                    reason=JournalSourceReason.SOURCE_MISSING
-                    if stage is JournalSourceStage.MISSING
-                    else JournalSourceReason.SOURCE_PAST_RETENTION,
-                )
-            # U2a is an internal R13-only mutation, not a coordinated DB1
-            # transaction: require its accepted/terminal event and R13 receipt,
-            # not a fabricated external TRANSACTION_COMPLETED lifecycle. An
-            # archived U2a event is backed by the R13 receipt checked above.
-            for lifecycle in (
-                ()
-                if stage is JournalSourceStage.ARCHIVED
-                else (EventLifecycle.ACCEPTED, EventLifecycle.COMPLETED)
-            ):
-                matches_lifecycle = tuple(
-                    row for row in provenance if row.lifecycle is lifecycle
-                )
-                if (
-                    len(matches_lifecycle) != 1
-                    or matches_lifecycle[0].event_type
-                    is not AgentEventType.MOTIVATION_SOURCE_REVIEW
-                    or matches_lifecycle[0].source
-                    is not AgentEventSource.RUNTIME_MOTIVATION_SOURCE_REVIEW
-                    or (
-                        lifecycle is not EventLifecycle.ACCEPTED
-                        and matches_lifecycle[0].processing_sequence
-                        != entry.event_sequence
-                    )
-                ):
-                    raise _GoalSourceUnavailable("Motivation owner event not terminal")
-            if any(row.lifecycle is EventLifecycle.FAILED for row in provenance):
-                raise _GoalSourceUnavailable("Motivation event failed")
             result = _QualifiedGoal(
                 proposal_event_id=p.event_id,
                 target_experience_id=x_record.experience_id,
@@ -438,8 +380,304 @@ class _GoalSourceOwner:
                 "Goal source read unavailable", reason=_reason_of(exc)
             ) from exc
 
-    def _selection_from_goal(self, goal: GoalRecord) -> _GoalSourceSelection:
+    def _qualify_self(
+        self,
+        selection: _SelfGoalSelection,
+        event: AgentEvent,
+        *,
+        continuation: bool = False,
+        proposal: bool = False,
+    ) -> _QualifiedGoal:
+        """IP-11 (#379 D1-D3, D5): an INTEREST on X may ground a self Goal.
+
+        Source qualification only.  The budget and "X has no Goal" are
+        checked once in ``_propose_self`` (D5 P2-1), never here, so the
+        WAL-before re-qualification cannot count its own proposal.
+        """
+        self._check_binding()
+        x = selection.target
+        settings = self._loop.settings.self_goal
+        if event.processing_sequence is None:
+            raise _GoalSourceUnavailable("self-Goal event not sequenced")
+        try:
+            inspected = self._journal.inspect()
+            marker = self_goal_activation(inspected)
+            if marker is None or marker.processing_sequence is None:
+                raise _GoalSourceUnavailable(
+                    "self-Goal path not activated",
+                    reason=R16OwnerReason.SELF_GOAL_NOT_ACTIVATED,
+                )
+            if (
+                inspected.external_reconciliation_required
+                or inspected.open_transactions
+                or inspected.reconciliation_required_transactions
+            ):
+                raise _GoalSourceUnavailable("Journal recovery underway")
+            # X is a committed CHAT Experience only (#379 D1 P2): U2a never
+            # reads anything else, so no self Goal can ground another.
+            x_record, _x_source = self._source._read(
+                x, event, continuation=continuation
+            )
+            m, entry, revision = self._qualify_motivation(
+                x, x_record, upper=event.processing_sequence, continuation=continuation
+            )
+            # Only Motivations from U2a events after the marker (D2 P2-2).
+            if entry.event_sequence <= marker.processing_sequence:
+                raise _GoalSourceUnavailable(
+                    "Motivation precedes self-Goal activation",
+                    reason=R16OwnerReason.SELF_GOAL_NOT_ACTIVATED,
+                )
+            if m.strength < settings.min_strength:
+                raise _GoalSourceUnavailable(
+                    "INTEREST below self-Goal threshold",
+                    reason=R16OwnerReason.MOTIVATION_BELOW_THRESHOLD,
+                )
+            if proposal:
+                created = m.revision_history[0].created_at
+                if event.requested_at.astimezone(timezone.utc) - created.astimezone(
+                    timezone.utc
+                ) > timedelta(hours=settings.stale_after_hours):
+                    raise _GoalSourceUnavailable(
+                        "INTEREST too old for a self Goal",
+                        reason=R16OwnerReason.MOTIVATION_STALE,
+                    )
+            # A user's responsibility on X comes first (#379 D3 P1-1).
+            target = R13Reference(R13ReferenceKind.EXPERIENCE, x_record.experience_id)
+            if any(
+                target in record.evidence_refs
+                for record in self._loop._commitment_system.snapshot().records
+            ):
+                raise _GoalSourceUnavailable(
+                    "a Commitment already names the target",
+                    reason=R16OwnerReason.TARGET_HAS_COMMITMENT,
+                )
+            # The Plan's Value must be qualified now (D5 P2-3).
+            qualify_review_value(self._loop, x_record.context_id)
+            result = _QualifiedGoal(
+                proposal_event_id=None,
+                target_experience_id=x_record.experience_id,
+                motivation_id=m.motivation_id,
+                motivation_event_id=entry.event_id,
+                motivation_revision_digest=revision.record_digest,
+                motivation_record_digest=m.record_digest,
+                proposal_record_digest=None,
+                target_record_digest=experience_record_digest(x_record),
+                context_id=x_record.context_id,
+                target_event_id=x_record.source_event_id,
+                target_event_sequence=x_record.source_event_sequence,
+                target_revision=x_record.revision,
+                origin=GoalOrigin.SUBJECT_MOTIVATION,
+            )
+            _ = result.evidence
+            return result
+        except _GoalSourceUnavailable:
+            raise
+        except _MotivationSourceUnavailable as error:
+            raise _GoalSourceUnavailable(
+                "self-Goal target unavailable", reason=owner_reason(error)
+            ) from error
+        except ReviewValueUnavailable as error:
+            raise _GoalSourceUnavailable(
+                "review Value not qualified", reason=R16OwnerReason.SOURCE_UNAVAILABLE
+            ) from error
+        except (ValueError, OSError, RuntimeError) as exc:
+            raise _GoalSourceUnavailable(
+                "self-Goal source read unavailable", reason=_reason_of(exc)
+            ) from exc
+
+    def _qualify_selection(
+        self,
+        selection: AnyGoalSelection,
+        event: AgentEvent,
+        *,
+        continuation: bool = False,
+    ) -> _QualifiedGoal:
+        """Dispatch by origin (#379 D1 P1-1); Plan preview uses this too."""
+
+        if type(selection) is _SelfGoalSelection:
+            return self._qualify_self(selection, event, continuation=continuation)
+        if type(selection) is _GoalSourceSelection:
+            return self._qualify(selection, event, continuation=continuation)
+        raise _GoalSourceUnavailable("unknown Goal source selector")
+
+    def _qualify_motivation(
+        self,
+        x: _MotivationSourceRef,
+        x_record: ExperienceRecord,
+        *,
+        upper: int,
+        continuation: bool,
+    ) -> tuple[MotivationRecord, MotivationEvidenceLedgerEntry, MotivationRevisionRecord]:
+        """The one INTEREST on X and its U2a provenance (shared by U2b/U2b-S).
+
+        ``upper`` bounds the U2a event: before the request P (user path) or
+        before the current event (self path, never the same event).
+        """
+        motivation = self._loop._motivation_system.snapshot()
+        target = R13Reference(R13ReferenceKind.EXPERIENCE, x_record.experience_id)
+        matches = tuple(
+            m
+            for m in motivation.records
+            if m.kind is MotivationKind.INTEREST and m.target == target
+        )
+        if len(matches) != 1:
+            raise _GoalSourceUnavailable(
+                "independent Motivation absent",
+                reason=R16OwnerReason.MOTIVATION_UNAVAILABLE,
+            )
+        m = matches[0]
+        if (
+            m.lifecycle is not MotivationLifecycle.ACTIVE
+            or m.source_evidence != target
+            or m.conflict_refs
+            or len(m.revision_history) != 1
+            or m.revision != 0
+            or m.revision_history[-1].event_id is None
+        ):
+            raise _GoalSourceUnavailable(
+                "Motivation unqualified or changed",
+                reason=R16OwnerReason.MOTIVATION_UNAVAILABLE,
+            )
+        if any(
+            other.kind is MotivationKind.AVERSION
+            and other.target == target
+            and other.lifecycle is MotivationLifecycle.ACTIVE
+            for other in motivation.records
+        ):
+            raise _GoalSourceUnavailable(
+                "explicit counter-Motivation",
+                reason=R16OwnerReason.COUNTER_MOTIVATION,
+            )
+        revision = m.revision_history[-1]
+        rows = tuple(
+            entry
+            for entry in motivation.evidence_ledger
+            if entry.motivation_id == m.motivation_id
+            and entry.evidence.source_ref == target
+        )
+        if len(rows) != 1:
+            raise _GoalSourceUnavailable("Motivation source ledger ambiguous")
+        entry = rows[0]
+        receipts = tuple(
+            receipt
+            for receipt in motivation.event_receipts
+            if receipt.event_id == entry.event_id
+            and receipt.event_sequence == entry.event_sequence
+        )
+        if len(receipts) != 1:
+            raise _GoalSourceUnavailable("Motivation receipt missing")
+        receipt = receipts[0]
+        if (
+            receipt.operation is not MotivationEventOperation.EVIDENCE
+            or receipt.evidence_digest != entry.evidence.evidence_digest
+            or receipt.motivation_ids != (m.motivation_id,)
+            or receipt.evidence_refs != (target,)
+            or entry.evidence.kind is not MotivationKind.INTEREST
+            or entry.evidence.target != target
+            or entry.evidence.source_event_id != x.event_id
+            or entry.evidence.source_event_sequence != x.event_sequence
+            or entry.evidence.observed_at != x_record.created_at
+            or entry.evidence.origin_refs
+            != (R13Reference(R13ReferenceKind.EVENT, x.event_id),)
+            or entry.evidence.authority_witness_digest
+            != experience_record_digest(x_record)
+            or entry.evidence.source_ref != target
+            or revision.event_id != entry.event_id
+            or revision.event_sequence != entry.event_sequence
+            or not (x.event_sequence < entry.event_sequence < upper)
+        ):
+            raise _GoalSourceUnavailable(
+                "Motivation historical revision unqualified"
+            )
+        inspected = self._journal.inspect()
+        if (
+            inspected.external_reconciliation_required
+            or inspected.open_transactions
+            or inspected.reconciliation_required_transactions
+        ):
+            raise _GoalSourceUnavailable("Journal recovery underway")
+        stage, provenance = locate_journal_source(
+            inspected, entry.event_id, entry.event_sequence
+        )
+        if stage is JournalSourceStage.MISSING or (
+            stage is JournalSourceStage.ARCHIVED and not continuation
+        ):
+            raise _GoalSourceUnavailable(
+                "Motivation owner event not retained",
+                reason=JournalSourceReason.SOURCE_MISSING
+                if stage is JournalSourceStage.MISSING
+                else JournalSourceReason.SOURCE_PAST_RETENTION,
+            )
+        # U2a is an internal R13-only mutation, not a coordinated DB1
+        # transaction: require its accepted/terminal event and R13 receipt,
+        # not a fabricated external TRANSACTION_COMPLETED lifecycle. An
+        # archived U2a event is backed by the R13 receipt checked above.
+        for lifecycle in (
+            ()
+            if stage is JournalSourceStage.ARCHIVED
+            else (EventLifecycle.ACCEPTED, EventLifecycle.COMPLETED)
+        ):
+            matches_lifecycle = tuple(
+                row for row in provenance if row.lifecycle is lifecycle
+            )
+            if (
+                len(matches_lifecycle) != 1
+                or matches_lifecycle[0].event_type
+                is not AgentEventType.MOTIVATION_SOURCE_REVIEW
+                or matches_lifecycle[0].source
+                is not AgentEventSource.RUNTIME_MOTIVATION_SOURCE_REVIEW
+                or (
+                    lifecycle is not EventLifecycle.ACCEPTED
+                    and matches_lifecycle[0].processing_sequence
+                    != entry.event_sequence
+                )
+            ):
+                raise _GoalSourceUnavailable("Motivation owner event not terminal")
+        if any(row.lifecycle is EventLifecycle.FAILED for row in provenance):
+            raise _GoalSourceUnavailable("Motivation event failed")
+        return m, entry, revision
+
+    @staticmethod
+    def _goal_origin(goal: GoalRecord) -> GoalOrigin:
+        if (
+            len(goal.origin_refs) == 1
+            and goal.origin_refs[0].kind is R13ReferenceKind.MOTIVATION
+        ):
+            return GoalOrigin.SUBJECT_MOTIVATION
+        return GoalOrigin.USER_REQUEST
+
+    def _selection_from_goal(self, goal: GoalRecord) -> AnyGoalSelection:
         """Derive identifiers solely from immutable R13 proposal and R07/R12."""
+        if self._goal_origin(goal) is GoalOrigin.SUBJECT_MOTIVATION:
+            return self._self_selection_from_goal(goal)
+        return self._user_selection_from_goal(goal)
+
+    def _self_selection_from_goal(self, goal: GoalRecord) -> _SelfGoalSelection:
+        if (
+            goal.description != _DESCRIPTION
+            or goal.target.kind is not R13ReferenceKind.EXPERIENCE
+            or goal.deadline.is_set
+            or goal.dependencies
+            or goal.conflicts
+        ):
+            raise _GoalSourceUnavailable("unrecognized self-Goal contract")
+        try:
+            x_entry = self._source._experience.load_committed_current(
+                goal.target.reference
+            ).record
+        except (ValueError, OSError, RuntimeError, ExperienceStoreError) as exc:
+            raise _GoalSourceUnavailable(
+                "self-Goal target unavailable", reason=_reason_of(exc)
+            ) from exc
+        return _SelfGoalSelection(
+            _MotivationSourceRef(
+                x_entry.source_event_id,
+                x_entry.source_event_sequence,
+                x_entry.source_episode_id,
+            )
+        )
+
+    def _user_selection_from_goal(self, goal: GoalRecord) -> _GoalSourceSelection:
         if (
             goal.description != _DESCRIPTION
             or goal.target.kind is not R13ReferenceKind.EXPERIENCE
@@ -510,8 +748,7 @@ class _GoalSourceOwner:
         if (
             goal.description != _DESCRIPTION
             or goal.target != q.target
-            or goal.origin_refs
-            != (R13Reference(R13ReferenceKind.USER_REQUEST, q.proposal_event_id),)
+            or goal.origin_refs != q.origin_refs
             or goal.evidence_refs != q.evidence
             or goal.deadline.is_set
             or goal.dependencies
@@ -554,6 +791,11 @@ class _GoalSourceOwner:
                 reason=JournalSourceReason.SOURCE_MISSING,
             )
         # An archived proposal event is backed by the bound receipt above.
+        expected_type, expected_source = self._event_kind(
+            "self_proposal"
+            if self._goal_origin(goal) is GoalOrigin.SUBJECT_MOTIVATION
+            else "proposal"
+        )
         for lifecycle in (
             ()
             if stage is JournalSourceStage.ARCHIVED
@@ -562,8 +804,8 @@ class _GoalSourceOwner:
             events = tuple(row for row in records if row.lifecycle is lifecycle)
             if (
                 len(events) != 1
-                or events[0].event_type is not AgentEventType.GOAL_PROPOSAL_REVIEW
-                or events[0].source is not AgentEventSource.RUNTIME_GOAL_PROPOSAL_REVIEW
+                or events[0].event_type is not expected_type
+                or events[0].source is not expected_source
                 or (
                     lifecycle is EventLifecycle.COMPLETED
                     and events[0].processing_sequence != genesis.event_sequence
@@ -582,32 +824,81 @@ class _GoalSourceOwner:
         before = loop._goal_system.snapshot()
         try:
             q = self._qualify(selection, event)
-            target = q.target
-            goal_id = goal_id_for_target(target)
-            existing = loop._goal_system.get(goal_id)
-            if existing is not None:
-                raise _GoalSourceUnavailable(
-                    "Goal already proposed for target",
-                    reason=R16OwnerReason.GOAL_ALREADY_EXISTS
-                    if any(
-                        ref.kind is R13ReferenceKind.USER_REQUEST
-                        for ref in existing.origin_refs
-                    )
-                    else R16OwnerReason.SELF_GOAL_OCCUPIES_TARGET,
-                )
+            self._require_target_free(loop, q.target)
         except _GoalSourceUnavailable as error:
             # IP-5: an unqualified proposal is a HOLD with a closed reason,
             # not a FAILED event. Nothing was mutated.
             self._pending = _PendingGoal(event, "hold", None, None, None, before)
             return R16OwnerOutcome.hold(owner_reason(error))
+        return self._ingest(loop, event, "proposal", selection, q)
+
+    def _propose_self(self, loop: SuzkaMainLoop, nonce: object) -> R16OwnerOutcome:
+        """IP-11 (#379): a PROPOSED self-origin Goal, never its adoption."""
+
+        event = self._current_event(loop, nonce, "self_proposal")
+        assert self._inflight is not None
+        selection = self._inflight[2]
+        if type(selection) is not _SelfGoalSelection:
+            raise _GoalSourceUnavailable("invalid self-Goal source selector")
+        before = loop._goal_system.snapshot()
+        try:
+            q = self._qualify_self(selection, event, proposal=True)
+            self._require_target_free(loop, q.target)
+            # Once per proposal, outside qualification (D5 P2-1).
+            self._require_daily_budget(loop, event)
+        except _GoalSourceUnavailable as error:
+            self._pending = _PendingGoal(event, "hold", None, None, None, before)
+            return R16OwnerOutcome.hold(owner_reason(error))
+        return self._ingest(loop, event, "self_proposal", selection, q)
+
+    @staticmethod
+    def _require_target_free(loop: SuzkaMainLoop, target: R13Reference) -> None:
+        existing = loop._goal_system.get(goal_id_for_target(target))
+        if existing is not None:
+            raise _GoalSourceUnavailable(
+                "Goal already proposed for target",
+                reason=R16OwnerReason.GOAL_ALREADY_EXISTS
+                if any(
+                    ref.kind is R13ReferenceKind.USER_REQUEST
+                    for ref in existing.origin_refs
+                )
+                else R16OwnerReason.SELF_GOAL_OCCUPIES_TARGET,
+            )
+
+    def _require_daily_budget(self, loop: SuzkaMainLoop, event: AgentEvent) -> None:
+        """#379 D2 P0: self Goals per UTC day, from their genesis ``created_at``."""
+
+        day = event.requested_at.astimezone(timezone.utc).date()
+        count = sum(
+            1
+            for goal in loop._goal_system.records
+            if self._goal_origin(goal) is GoalOrigin.SUBJECT_MOTIVATION
+            and goal.revision_history[0].created_at.astimezone(timezone.utc).date()
+            == day
+        )
+        if count >= loop.settings.self_goal.per_day:
+            raise _GoalSourceUnavailable(
+                "self-Goal daily budget exhausted",
+                reason=R16OwnerReason.SELF_GOAL_BUDGET_EXHAUSTED,
+            )
+
+    def _ingest(
+        self,
+        loop: SuzkaMainLoop,
+        event: AgentEvent,
+        action: str,
+        selection: AnyGoalSelection,
+        q: _QualifiedGoal,
+    ) -> R16OwnerOutcome:
+        target = q.target
+        goal_id = goal_id_for_target(target)
         evidence = q.evidence
+        origin_refs = q.origin_refs
         assert event.processing_sequence is not None
         proposal_digest = goal_proposal_digest(
             target,
             _DESCRIPTION,
-            origin_refs=(
-                R13Reference(R13ReferenceKind.USER_REQUEST, q.proposal_event_id),
-            ),
+            origin_refs=origin_refs,
             evidence_refs=evidence,
         )
         genesis = GoalRevisionRecord(
@@ -626,9 +917,7 @@ class _GoalSourceOwner:
             goal_id=goal_id,
             target=target,
             description=_DESCRIPTION,
-            origin_refs=(
-                R13Reference(R13ReferenceKind.USER_REQUEST, q.proposal_event_id),
-            ),
+            origin_refs=origin_refs,
             evidence_refs=evidence,
             revision_history=(genesis,),
         )
@@ -639,7 +928,7 @@ class _GoalSourceOwner:
             ),
         )
         self._pending = _PendingGoal(
-            event, "proposal", selection, q, goal_id, loop._goal_system.snapshot()
+            event, action, selection, q, goal_id, loop._goal_system.snapshot()
         )
         return R16OwnerOutcome(R16OwnerStatus.PROPOSED, goal_id)
 
@@ -656,7 +945,7 @@ class _GoalSourceOwner:
             return R16OwnerOutcome.hold(R16OwnerReason.NOT_PENDING_REVIEW)
         try:
             selection = self._selection_from_goal(goal)
-            q = self._qualify(selection, event, continuation=True)
+            q = self._qualify_selection(selection, event, continuation=True)
             self._expect_goal_contract(goal, q)
             self._require_real_proposal_review(goal)
             # Only an explicit conflict linked to this Goal/Motivation may
@@ -703,6 +992,7 @@ class _GoalSourceOwner:
         pending = self._pending
         if event.event_type not in {
             AgentEventType.GOAL_PROPOSAL_REVIEW,
+            AgentEventType.GOAL_SELF_PROPOSAL_REVIEW,
             AgentEventType.GOAL_ADOPTION_REVIEW,
         }:
             if pending is not None:
@@ -716,11 +1006,18 @@ class _GoalSourceOwner:
             return
         if pending.selection is None or pending.qualification is None:
             raise _GoalSourceUnavailable("Goal qualification missing")
-        fresh = (
-            self._qualify(pending.selection, event, continuation=True)
-            if pending.action == "adopt"
-            else self._qualify(pending.selection, event)
-        )
+        if pending.action == "self_proposal":
+            if type(pending.selection) is not _SelfGoalSelection:
+                raise _GoalSourceUnavailable("self-Goal selection missing")
+            fresh = self._qualify_self(pending.selection, event, proposal=True)
+        elif pending.action == "proposal":
+            if type(pending.selection) is not _GoalSourceSelection:
+                raise _GoalSourceUnavailable("Goal selection missing")
+            fresh = self._qualify(pending.selection, event)
+        else:
+            fresh = self._qualify_selection(
+                pending.selection, event, continuation=True
+            )
         if fresh != pending.qualification:
             raise _GoalSourceUnavailable("Goal source changed before WAL")
         goal = self._loop._goal_system.get(pending.goal_id or "")
@@ -730,7 +1027,7 @@ class _GoalSourceOwner:
         if pending.action == "adopt":
             self._require_real_proposal_review(goal)
         if (
-            pending.action == "proposal"
+            pending.action in ("proposal", "self_proposal")
             and goal.lifecycle is not GoalLifecycle.PROPOSED
         ):
             raise _GoalSourceUnavailable("unexpected Goal proposal mutation")

@@ -31,6 +31,12 @@ class R16OwnerReason(str, Enum):
     # subject's own (IP-11 U2b-S) that occupies X.
     GOAL_ALREADY_EXISTS = "goal_already_exists"
     SELF_GOAL_OCCUPIES_TARGET = "self_goal_occupies_target"
+    # IP-11 (#379 D1-D3): the subject's own Goal proposal refusals.
+    SELF_GOAL_NOT_ACTIVATED = "self_goal_not_activated"
+    MOTIVATION_BELOW_THRESHOLD = "motivation_below_threshold"
+    MOTIVATION_STALE = "motivation_stale"
+    SELF_GOAL_BUDGET_EXHAUSTED = "self_goal_budget_exhausted"
+    TARGET_HAS_COMMITMENT = "target_has_commitment"
     COMMITMENT_ALREADY_EXISTS = "commitment_already_exists"
     # The reviewed record is not (or no longer) waiting for this review.
     NOT_PENDING_REVIEW = "not_pending_review"

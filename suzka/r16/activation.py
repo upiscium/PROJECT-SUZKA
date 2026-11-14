@@ -66,3 +66,47 @@ def activation_handler(
         return event.processing_sequence
 
     return handle
+
+
+class R16SelfGoalAlreadyActive(ValueError):
+    """IP-11: the unique self-Goal activation already exists."""
+
+
+def self_goal_activation(
+    inspection: EventJournalInspection,
+) -> EventJournalRecord | None:
+    """IP-11 (#379 D2 P2-2 / D3 P2-3): the completed self-Goal marker.
+
+    Retained, or carried by the compaction in effect (C11).  Only
+    Motivations from U2a events after this marker can ground a self Goal.
+    """
+
+    for record in (*reversed(inspection.records), *inspection.carried_records):
+        if (
+            record.lifecycle is EventLifecycle.COMPLETED
+            and record.event_type is AgentEventType.R16_SELF_GOAL_ACTIVATION
+            and record.source is AgentEventSource.API_R16_SELF_GOAL_ACTIVATE
+        ):
+            return record
+    return None
+
+
+def self_goal_activation_handler(
+    journal: EventJournal, runtime: AgentRuntime
+) -> Callable[[], int]:
+    """The serialized handler of the unique self-Goal activation event."""
+
+    def handle() -> int:
+        if self_goal_activation(journal.inspect()) is not None:
+            raise R16SelfGoalAlreadyActive("self-Goal path is already activated")
+        event = runtime.current_event()
+        if (
+            event is None
+            or event.event_type is not AgentEventType.R16_SELF_GOAL_ACTIVATION
+            or event.source is not AgentEventSource.API_R16_SELF_GOAL_ACTIVATE
+            or event.processing_sequence is None
+        ):
+            raise RuntimeError("activation runs only as its own event")
+        return event.processing_sequence
+
+    return handle

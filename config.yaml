@@ -112,6 +112,14 @@ subject_history:
   # 2026-11-14).
   max_page_count: 65536
 
+# IP-11 (#379): the subject's own Goal proposal from an INTEREST Motivation.
+# Inert until the one-time operator activation (POST /api/r16/self-goal/activate).
+self_goal:
+  min_strength: 0.15
+  per_incarnation: 3
+  per_day: 3
+  stale_after_hours: 24
+
 values:
   seeds:
     - value_id: care
