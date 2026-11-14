@@ -100,6 +100,7 @@ from suzka.runtime.context import (
     ContextNotFound,
     ContextRegistry,
     ContextRegistryState,
+    ContextStateInvalid,
     ContextStatus,
     ContextType,
     validate_context_registry_state,
@@ -1823,11 +1824,13 @@ class SuzkaMainLoop:
         )
 
     def _participant_scoped(self, context_id: str) -> bool:
-        """The same Context condition U2a re-checks; a missing Context counts as scoped."""
+        """The same Context condition U2a re-checks; an unreadable Context counts as scoped."""
 
         try:
             return bool(self.context_registry.get(context_id).participant_refs)
-        except ContextNotFound:
+        except (ContextNotFound, ContextStateInvalid):
+            # Unreachable for the id this turn just resolved, but never fail
+            # a CHAT over a fact that only gates U2a (review P3-1).
             return True
 
     @staticmethod

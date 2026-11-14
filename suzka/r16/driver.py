@@ -43,7 +43,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
 import hashlib
@@ -511,6 +511,8 @@ class R16Driver:
             self._observed.move_to_end(item.experience_id)
             while len(self._observed) > OBSERVED_CAPACITY:
                 self._observed.popitem(last=False)
+        if item.participant_scoped and item.context_id is not None:
+            self._scope_context(item.context_id)
         if item.command is not None:
             self._on_command(item)
             return
@@ -525,6 +527,33 @@ class R16Driver:
         self._u2a[item.experience_id] = _U2a(
             item.experience_id, item.ref, self._clock()
         )
+
+    def _scope_context(self, context_id: str) -> None:
+        """A participant is now bound to this Context (review P2-1).
+
+        Participant refs are never removed, so every earlier turn of the
+        Context is scoped from here on: a U2a still waiting there would fail
+        in the owner, so it is dropped and its held commands HOLD. A U2a
+        already submitted may still fail; that window is accepted.
+        """
+        for experience_id, observed in list(self._observed.items()):
+            if observed.context_id == context_id and not observed.participant_scoped:
+                # Same key: the LRU order is kept.
+                self._observed[experience_id] = replace(
+                    observed, participant_scoped=True
+                )
+        for experience_id, waiting in list(self._u2a.items()):
+            seen = self._observed.get(experience_id)
+            if waiting.submitted or seen is None or seen.context_id != context_id:
+                continue
+            del self._u2a[experience_id]
+            self.counters["skipped_participant_scope"] += 1
+            for command in waiting.held:
+                self._finish(
+                    command.ticket_id,
+                    R16TicketStatus.HOLD,
+                    R16DriverReason.PARTICIPANT_SCOPE_UNSUPPORTED,
+                )
 
     def _on_command(self, item: _ChatTerminal) -> None:
         assert item.command is not None
