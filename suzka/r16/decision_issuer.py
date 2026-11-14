@@ -109,14 +109,17 @@ from suzka.r16.successor_policy import (
     utc_timestamp,
 )
 from suzka.runtime.agent_runtime import AgentEvent
-from suzka.runtime.agent_state import AgentStateStore
-from suzka.runtime.event_journal import EventJournal, EventJournalInspection
+from suzka.runtime.agent_state import AgentStateLoadError, AgentStateStore
+from suzka.runtime.event_journal import (
+    EventJournal,
+    EventJournalInspection,
+    TransactionKind,
+)
 from suzka.runtime.state_recovery import StateRecoveryCoordinator
 from suzka.runtime.transaction_coordinator import (
     CoordinatedResult,
     TransactionCoordinator,
 )
-from suzka.runtime.event_journal import TransactionKind
 
 if TYPE_CHECKING:
     from suzka.r16.plan_preview import _PlanPreviewOwner, _QualifiedPreview
@@ -281,17 +284,29 @@ class _DecisionIssuer:
 
         self._pending = None
         initial = self._preview._state_snapshot()
+        state: RequiredSourceState | None
         try:
             before = self._preview._qualify(goal_id, event)
             after = self._preview._qualify(goal_id, event)
             if after != before or self._preview._state_snapshot() != initial:
                 raise _PlanSourceUnavailable("Decision source changed")
         except _PlanSourceConflict:
-            return self._unqualified(event, RequiredSourceState.CONFLICT)
+            state = RequiredSourceState.CONFLICT
         except _PlanSourceUnavailable:
-            return self._unqualified(event, RequiredSourceState.UNAVAILABLE)
+            state = RequiredSourceState.UNAVAILABLE
+        else:
+            state = None
         try:
+            if state is not None:
+                return self._unqualified(event, state)
             return self._issue_qualified(event, before, initial)
+        except (HistoryStoreError, AgentStateLoadError):
+            # Review P2-3: a temporary store/state read failure is a HOLD.
+            hold = _IssuerHold(R16OwnerReason.SOURCE_UNAVAILABLE)
+            LOGGER.info("R16 issuer result=hold reason=%s", hold.reason.value)
+            return _DecisionIssueResult(
+                DecisionIssueStatus.HOLD, None, None, None, hold.reason
+            )
         except _IssuerHold as hold:
             LOGGER.info("R16 issuer result=hold reason=%s", hold.reason.value)
             return _DecisionIssueResult(
@@ -513,13 +528,13 @@ class _DecisionIssuer:
             read = self._interpretation(
                 event, q.experience_event_id, q.experience_event_sequence
             )
+            return interpretation_from_r15(
+                getattr(read, "outcome", None),
+                getattr(read, "stage", None),
+                getattr(read, "status", None),
+            )
         except Exception:
             return Interpretation.UNAVAILABLE, InterpretationStage.NONE
-        return interpretation_from_r15(
-            getattr(read, "outcome", None),
-            getattr(read, "stage", None),
-            getattr(read, "status", None),
-        )
 
     def _predecessor(
         self,
@@ -598,6 +613,9 @@ class _DecisionIssuer:
         sealed = SuccessorPolicyInputV2.from_bytes(head.policy_input_bytes)
         if sealed.evidence_fingerprint() == value.evidence_fingerprint():
             if result.is_hold or result.history_row is not head.policy_row:
+                # Same evidence, different row: only the predecessor/as_of
+                # changed the table's answer, so the head is not reproducible
+                # and no Decision is issued (reported as source drift).
                 raise _IssuerHold(R16OwnerReason.DECISION_SOURCE_DRIFT)
             LOGGER.info("R16 issuer result=existing row=%s", result.row.value)
             return _DecisionIssueResult(
@@ -710,6 +728,8 @@ class _DecisionIssuer:
         # the R06 snapshot hash and the SubjectHistory rows below confirm.
         if current_incarnation(self._journal, self._store) != pending.incarnation:
             raise _PlanSourceUnavailable("Decision incarnation changed before WAL")
+        # Precondition check only: no R06 commit can occur between the handler
+        # and this checkpoint in the serialized runtime (review P1-2 note).
         if self._snapshot()[0] != pending.snapshot_hash:
             raise _PlanSourceUnavailable("Decision snapshot changed before WAL")
         rows = self._store.operations(pending.incarnation)
@@ -718,6 +738,9 @@ class _DecisionIssuer:
         if (
             len(own) != 1
             or own[0].phase is not HistoryPhase.PREPARED
+            or own[0].review_intent_key != pending.committed.review_intent_key
+            or own[0].lineage_scope != pending.committed.lineage_scope
+            or own[0].predecessor_key != pending.committed.predecessor_key
             or operations_digest(others) != pending.rows_digest
         ):
             raise _PlanSourceUnavailable("SubjectHistory changed before WAL")

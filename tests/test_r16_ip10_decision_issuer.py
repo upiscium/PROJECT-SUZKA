@@ -326,3 +326,186 @@ def test_hold_events_complete_without_failure(app, monkeypatch) -> None:
         _issue(state, gid)
         records = state.event_journal.inspect().records
         assert not any(record.lifecycle is EventLifecycle.FAILED for record in records)
+
+
+def _startup_wired(state) -> None:
+    """Review P2-4: the store, reconciliation and compaction agree."""
+
+    assert state.subject_history_store is not None
+    assert state.startup_reconciliation.history_store is state.subject_history_store
+    assert state.journal_compaction.history_attestation is not None
+
+
+def test_fresh_and_existing_journal_startups_are_wired(tmp_path) -> None:
+    settings = _settings(tmp_path / "wired")
+    with TestClient(_app(settings)) as client:  # brand-new Journal: deferred
+        _startup_wired(client.app.state)
+    with TestClient(_app(settings)) as client:  # existing Journal: direct
+        _startup_wired(client.app.state)
+
+
+def test_row_4b_and_existing_after_commitment(app, monkeypatch) -> None:
+    with TestClient(app) as client:
+        state = client.app.state
+        x, gid = _qualified_goal(state)
+        _qualified_commitment(state, x)
+        monkeypatch.setattr(
+            state.decision_issuer,
+            "_interpretation",
+            lambda *args: SimpleNamespace(outcome="EPISODE", stage="S2", status="CONTESTED"),
+        )
+        issued = _issue(state, gid)
+        assert (issued.status, issued.row) == (DecisionIssueStatus.ISSUED, SuccessorRow.ROW_4B)
+        assert issued.decision.decision.selected.candidate_id == "candidate-a"
+        again = _issue(state, gid)
+        assert (again.status, again.decision_id) == (
+            DecisionIssueStatus.EXISTING,
+            issued.decision_id,
+        )
+
+
+def test_occupied_lineage_slot_holds_before_prepare(app, monkeypatch) -> None:
+    with TestClient(app) as client:
+        state = client.app.state
+        x, gid = _qualified_goal(state)
+        first = _issue(state, gid)
+        issuer = state.decision_issuer
+        monkeypatch.setattr(
+            issuer,
+            "_interpretation",
+            lambda *args: SimpleNamespace(outcome="EPISODE", stage="S2", status="PRESENT"),
+        )
+        # A successor that would reuse the GENESIS slot of the first Decision.
+        monkeypatch.setattr(issuer, "_committed", lambda *args: first.decision)
+        held = _issue(state, gid)
+        assert (held.status, held.owner_reason) == (
+            DecisionIssueStatus.HOLD,
+            R16OwnerReason.DECISION_SLOT_OCCUPIED,
+        )
+        assert len(_history_transactions(state)) == 1
+
+
+def test_deadline_margin_holds_before_prepare(app, monkeypatch) -> None:
+    with TestClient(app) as client:
+        state = client.app.state
+        x, gid = _qualified_goal(state)
+        commitment_id = _qualified_commitment(state, x)
+        record = state.main_loop._commitment_system.get(commitment_id)
+        at = record.deadline.at
+        if at is None:
+            pytest.skip("fixture Commitment has no deadline")
+        issuer = state.decision_issuer
+        monkeypatch.setattr(issuer, "_clock", lambda: at - issuer_module.DEADLINE_MARGIN / 2)
+        held = _issue(state, gid)
+        assert (held.status, held.owner_reason) == (
+            DecisionIssueStatus.HOLD,
+            R16OwnerReason.DEADLINE_ELAPSED,
+        )
+        monkeypatch.setattr(issuer, "_clock", lambda: at - issuer_module.DEADLINE_MARGIN * 2)
+        assert _issue(state, gid).status is DecisionIssueStatus.ISSUED
+
+
+def test_head_without_finalized_proof_is_a_conflict(app, monkeypatch) -> None:
+    """Review P2-2: real head check, not a patched verifier."""
+
+    with TestClient(app) as client:
+        state = client.app.state
+        x, gid = _qualified_goal(state)
+        _issue(state, gid)
+        monkeypatch.setattr(
+            state.subject_history_store, "finalized_decision", lambda *args: None
+        )
+        held = _issue(state, gid)
+        assert (held.status, held.row) == (DecisionIssueStatus.HOLD, SuccessorRow.ROW_0)
+
+
+def test_store_read_failure_is_a_hold_not_a_failed_event(app, monkeypatch) -> None:
+    """Review P2-3."""
+
+    from suzka.r16.history_store import HistoryStoreUnavailable
+
+    with TestClient(app) as client:
+        state = client.app.state
+        x, gid = _qualified_goal(state)
+
+        def unavailable(*args):
+            raise HistoryStoreUnavailable("locked")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(state.subject_history_store, "operations", unavailable)
+            held = _issue(state, gid)
+        # The reader turns it into an unavailable lineage (row 1); any later
+        # read failure is an issuer HOLD.  Never a FAILED event.
+        assert held.status is DecisionIssueStatus.HOLD
+        assert held.row is SuccessorRow.ROW_1 or (
+            held.owner_reason is R16OwnerReason.SOURCE_UNAVAILABLE
+        )
+        records = state.event_journal.inspect().records
+        assert not any(record.lifecycle is EventLifecycle.FAILED for record in records)
+        assert _issue(state, gid).status is DecisionIssueStatus.ISSUED
+
+
+def test_crash_after_prepare_is_tombstoned_then_reissued(tmp_path) -> None:
+    """Review P2-1: a fail-stop at _validate_commit recovers at startup."""
+
+    from suzka.runtime.agent_runtime import AgentRuntimeDurabilityError
+
+    settings = _settings(tmp_path / "crash-prepare")
+    with TestClient(_app(settings)) as client:
+        state = client.app.state
+        x, gid = _qualified_goal(state)
+        issuer = state.decision_issuer
+
+        def crash(event):
+            raise RuntimeError("simulated pre-WAL failure")
+
+        issuer._validate_commit = crash  # type: ignore[method-assign]
+        with pytest.raises(AgentRuntimeDurabilityError):
+            _issue(state, gid)
+    with TestClient(_app(settings)) as client:
+        state = client.app.state
+        assert state.event_journal.inspect().open_transactions == ()
+        rows = state.subject_history_store.operations(
+            state.decision_issuer._pending.incarnation
+            if state.decision_issuer._pending
+            else _incarnation(state)
+        )
+        assert [row.phase for row in rows] == [HistoryPhase.ABORTED]
+        issued = _issue(state, gid)
+        assert issued.status is DecisionIssueStatus.ISSUED
+
+
+def test_crash_after_internal_commit_rolls_forward_then_existing(tmp_path) -> None:
+    """Review P2-1: a failure after R06 is finalized at startup."""
+
+    from suzka.r16.history_participant import SubjectHistoryParticipant
+    from suzka.runtime.agent_runtime import AgentRuntimeDurabilityError
+
+    settings = _settings(tmp_path / "crash-finalize")
+    with TestClient(_app(settings)) as client:
+        state = client.app.state
+        x, gid = _qualified_goal(state)
+        real = SubjectHistoryParticipant.finalize
+
+        def crash(self, binding):
+            raise RuntimeError("simulated post-R06 failure")
+
+        SubjectHistoryParticipant.finalize = crash  # type: ignore[method-assign]
+        try:
+            with pytest.raises(AgentRuntimeDurabilityError):
+                _issue(state, gid)
+        finally:
+            SubjectHistoryParticipant.finalize = real  # type: ignore[method-assign]
+    with TestClient(_app(settings)) as client:
+        state = client.app.state
+        assert state.event_journal.inspect().open_transactions == ()
+        rows = state.subject_history_store.operations(_incarnation(state))
+        assert [row.phase for row in rows] == [HistoryPhase.FINALIZED]
+        again = _issue(state, gid)
+        assert again.status is DecisionIssueStatus.EXISTING
+
+
+def _incarnation(state):
+    from suzka.r16.history_adoption import current_incarnation
+
+    return current_incarnation(state.event_journal, state.subject_history_store)
