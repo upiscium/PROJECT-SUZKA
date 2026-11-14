@@ -76,7 +76,8 @@ trap cleanup EXIT
 sudo cp -a "${PROD_ROOT}/.suzka" "${LAB}/.suzka"
 sudo rm -f "${LAB}/.suzka/.event_journal.jsonl.lock"
 # A symlink in the copy could lead lab writes back out of it.
-if [[ -n "$(sudo find "${LAB}/.suzka" -type l -print -quit)" ]]; then
+LINKS="$(sudo find "${LAB}/.suzka" -type l -print -quit)"
+if [[ -n "${LINKS}" ]]; then
   printf 'the state copy contains symlinks; refusing\n' >&2
   exit 1
 fi
@@ -137,7 +138,7 @@ if [[ "${ready}" != 1 ]]; then
   exit 1
 fi
 MAIN_PID="$(systemctl show -p MainPID --value "${UNIT}")"
-if ! sudo cat "/proc/${MAIN_PID}/environ" | tr '\0' '\n' | grep -qx "SUZKA_CONFIG_PATH=${LAB}/config.yaml"; then
+if ! sudo cat "/proc/${MAIN_PID}/environ" | tr '\0' '\n' | grep -qxF "SUZKA_CONFIG_PATH=${LAB}/config.yaml"; then
   printf 'lab server is not using the lab config; refusing\n' >&2
   exit 1
 fi
