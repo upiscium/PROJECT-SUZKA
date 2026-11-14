@@ -16,7 +16,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 
-from suzka.runtime.event_journal import EventJournal, EventJournalCompactionOutcome
+from suzka.runtime.event_journal import (
+    EventJournal,
+    EventJournalCompactionOutcome,
+    HistoryAttestationProvider,
+)
 from suzka.runtime.semantic_receipt_retention import (
     SemanticReceiptRetentionCoordinator,
 )
@@ -47,10 +51,14 @@ class JournalCompactionCoordinator:
         journal: EventJournal,
         policy: JournalCompactionPolicy | None = None,
         semantic: SemanticReceiptRetentionCoordinator | None = None,
+        history_attestation: HistoryAttestationProvider | None = None,
     ) -> None:
         self.journal = journal
         self.policy = policy or JournalCompactionPolicy()
         self.semantic = semantic
+        # C10 (#376): required by the Journal itself once subject.history is
+        # registered; without it compaction is refused, never fail-open.
+        self.history_attestation = history_attestation
         # Visible until IP-4b's health limits exist (IP-4a review P1-4): a
         # compaction that keeps failing or deferring must not be silent.
         self.last_outcome: EventJournalCompactionOutcome | None = None
@@ -84,6 +92,7 @@ class JournalCompactionCoordinator:
                 retention_days=self.policy.retention_days,
                 carried_tail=None if semantic is None else semantic.carried_tail(),
                 guard=None if semantic is None else semantic.compaction_blocked,
+                history_attestation=self.history_attestation,
             )
         except Exception as error:
             LOGGER.warning(

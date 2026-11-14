@@ -79,6 +79,7 @@ from suzka.r16.history_store import SubjectHistoryStore
 from suzka.r16.driver import R16Driver, rescan_from
 from suzka.runtime.event_journal import EventJournalAdmissionBand
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
+from suzka.r16.history_attestation import SubjectHistoryAttestationProvider
 from suzka.runtime.journal_compaction import (
     JournalCompactionCoordinator,
     JournalCompactionPolicy,
@@ -195,11 +196,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             elif not isinstance(compaction_policy, JournalCompactionPolicy):
                 raise RuntimeError("Injected Journal compaction policy is invalid")
-            app.state.journal_compaction = JournalCompactionCoordinator(
-                app.state.event_journal,
-                compaction_policy,
-                app.state.semantic_receipt_retention,
-            )
             injected_main_loop = getattr(app.state, "main_loop", None)
             if injected_main_loop is not None and not isinstance(
                 injected_main_loop, SuzkaMainLoop
@@ -223,6 +219,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.experience_store = injected_experience_store
             app.state.subject_history_store = _open_subject_history(
                 app_settings, app.state.event_journal
+            )
+            app.state.journal_compaction = JournalCompactionCoordinator(
+                app.state.event_journal,
+                compaction_policy,
+                app.state.semantic_receipt_retention,
+                history_attestation=(
+                    None
+                    if app.state.subject_history_store is None
+                    else SubjectHistoryAttestationProvider(
+                        app.state.event_journal, app.state.subject_history_store
+                    )
+                ),
             )
             app.state.startup_reconciliation = StartupReconciliationCoordinator(
                 app.state.event_journal,
