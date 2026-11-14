@@ -164,6 +164,9 @@ class _U2a:
     experience_id: str
     ref: _MotivationSourceRef
     queued_at: float
+    # The Context of X, so a later binding finds it even after X left the
+    # observed LRU (review P3-2).
+    context_id: str | None = None
     submitted: bool = False
     held: list[_Command] = field(default_factory=list)
 
@@ -525,7 +528,7 @@ class R16Driver:
             self.counters["skipped_neutral"] += 1
             return
         self._u2a[item.experience_id] = _U2a(
-            item.experience_id, item.ref, self._clock()
+            item.experience_id, item.ref, self._clock(), item.context_id
         )
 
     def _scope_context(self, context_id: str) -> None:
@@ -533,8 +536,10 @@ class R16Driver:
 
         Participant refs are never removed, so every earlier turn of the
         Context is scoped from here on: a U2a still waiting there would fail
-        in the owner, so it is dropped and its held commands HOLD. A U2a
-        already submitted may still fail; that window is accepted.
+        in the owner, so it is dropped. A U2a already submitted may still
+        fail; that window is accepted. A command on a waiting U2a submits it
+        at once (D2 P1-2), so a dropped U2a holds no commands today; the HOLD
+        loop below only guards that invariant.
         """
         for experience_id, observed in list(self._observed.items()):
             if observed.context_id == context_id and not observed.participant_scoped:
@@ -543,8 +548,7 @@ class R16Driver:
                     observed, participant_scoped=True
                 )
         for experience_id, waiting in list(self._u2a.items()):
-            seen = self._observed.get(experience_id)
-            if waiting.submitted or seen is None or seen.context_id != context_id:
+            if waiting.submitted or waiting.context_id != context_id:
                 continue
             del self._u2a[experience_id]
             self.counters["skipped_participant_scope"] += 1
