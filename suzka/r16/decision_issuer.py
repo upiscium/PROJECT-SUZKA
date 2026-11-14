@@ -676,7 +676,7 @@ class _DecisionIssuer:
         if q.self_origin and record.selected.candidate_id == "candidate-b":
             # Explicit, not ``assert`` (D5 review P3-3): never issue Plan B
             # for a self-origin Goal.
-            raise _IssuerHold(R16OwnerReason.SELF_GOAL_OCCUPIES_TARGET)
+            raise _IssuerHold(R16OwnerReason.PLAN_SOURCE_CONFLICT)
         return CommittedDecisionV1(
             incarnation_id=incarnation,
             decision_id=identity,

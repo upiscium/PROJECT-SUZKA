@@ -570,3 +570,309 @@ def test_s1_shape_end_to_end_without_any_user_request(tmp_path, monkeypatch) -> 
             )
         )
         assert state.main_loop.export_commitment_state().records == ()
+
+
+# --- review follow-ups -----------------------------------------------------------
+
+
+def test_a_waiting_user_command_keeps_x_from_the_subject() -> None:
+    """Review P1-1: told to resend, the user still keeps X (no self Goal)."""
+
+    import time
+
+    from test_r16_ip6b_driver import _resolve, _turn, _until
+
+    from suzka.r16.driver import R16DriverReason, R16TicketStatus
+
+    driver, source, goal = _self_driver()
+    try:
+        driver._runtime.pending = 1  # defer U2a until the command arrives
+        driver.notify_chat_terminal(_turn(5, _x(1)), "hello")
+        ticket = driver.notify_chat_terminal(
+            _turn(6, _x(0xA2)), f"COMMIT_REVIEW_EXPERIENCE:1:{_x(1)}"
+        )
+        assert ticket is not None
+        _until(lambda: len(source.calls) == 1)
+        _resolve(source.futures[0], 7, INTEREST_APPLIED)
+        view = _until(
+            lambda: (v := driver.ticket(ticket.ticket_id)).status
+            is not R16TicketStatus.PENDING
+            and v
+        )
+        assert view.reason is R16DriverReason.SOURCE_NOT_YET_EVALUATED
+        time.sleep(0.5)
+        assert goal.calls == []  # no self proposal on the user's X
+        # Later INTERESTs on that X (e.g. rescan) stay excluded too.
+        from suzka.r16.driver import _SelfTarget
+
+        driver._maybe_self_propose(_SelfTarget(_x(1), source.calls[0][1]))  # type: ignore[arg-type]
+        assert goal.calls == []
+    finally:
+        driver.stop()
+
+
+def test_cap_holds_while_submissions_wait_for_retry() -> None:
+    """Review P2-1: reservations, not admissions, bound the cap."""
+
+    import time
+
+    from test_r16_ip6b_driver import _resolve, _turn, _until
+
+    from suzka.runtime.agent_runtime import AgentRuntimeQueueFull
+
+    driver, source, goal = _self_driver(limit=3)
+    try:
+        goal.raise_next = [AgentRuntimeQueueFull("full")] * 4
+        for index in range(4):
+            sequence = 10 + 2 * index
+            driver.notify_chat_terminal(_turn(sequence, _x(index + 1)), "hi")
+            _until(lambda n=index + 1: len(source.calls) == n)
+            _resolve(source.futures[index], sequence + 1, INTEREST_APPLIED)
+        time.sleep(4)  # every retry has fired
+        assert len([c for c in goal.calls if c[0] == "self_proposal"]) <= 3
+    finally:
+        driver.stop()
+
+
+def test_interest_after_three_other_u2a_results_is_proposed() -> None:
+    """D5 P2-2: non-INTEREST U2a results never consume the cap."""
+
+    from test_r16_ip6b_driver import _resolve, _turn, _until
+
+    driver, source, goal = _self_driver(limit=1)
+    try:
+        for index in range(3):
+            sequence = 10 + 2 * index
+            driver.notify_chat_terminal(_turn(sequence, _x(index + 1)), "hi")
+            _until(lambda n=index + 1: len(source.calls) == n)
+            _resolve(source.futures[index], sequence + 1, "other_motivation_applied")
+        driver.notify_chat_terminal(_turn(30, _x(9)), "hi")
+        _until(lambda: len(source.calls) == 4)
+        _resolve(source.futures[3], 31, INTEREST_APPLIED)
+        _until(lambda: len(goal.calls) == 1)
+        assert goal.calls[0][0] == "self_proposal"
+    finally:
+        driver.stop()
+
+
+def _history_settings(root, **self_goal):
+    settings = _settings(root, **self_goal)
+    return settings.model_copy(
+        update={
+            "subject_history": settings.subject_history.model_copy(
+                update={"enabled": True, "path": root / "h" / "subject_history.sqlite3"}
+            )
+        }
+    )
+
+
+def test_self_head_verification_and_plan_b_refusal(tmp_path) -> None:
+    """D5 P1-1 / review P2-2: a self head verifies; a self head that selected
+    B (built past the owners) is a conflict, and so is issuing one."""
+
+    from dataclasses import replace
+
+    from suzka.r16.contracts import CandidateSelection
+    from suzka.r16.decision_issuer import DecisionIssueStatus, _IssuerHold
+    from suzka.r16.history_reader import SubjectHistoryReader
+
+    with TestClient(_app(_history_settings(tmp_path / "head"))) as client:
+        state = client.app.state
+        _activate(state)
+        x = _interest(state)
+        goal_id = _propose(state, x).subject_id
+        _review(state, goal_id)
+        issued = state._plan_preview_owner._submit_preview(goal_id).result(timeout=30).value
+        assert issued.status is DecisionIssueStatus.ISSUED
+        committed = issued.decision
+        head = SubjectHistoryReader(state.event_journal, state.subject_history_store).head(
+            committed.lineage_scope
+        )
+        issuer = state.decision_issuer
+        assert issuer._head_verified(
+            committed, committed.incarnation_id, head.transaction_id, True
+        )
+        b = {c.candidate_id: c for c in committed.decision.candidates}["candidate-b"]
+        forged = replace(
+            committed,
+            decision=replace(
+                committed.decision,
+                selected=CandidateSelection(
+                    committed.decision.selected.schema_version,
+                    b.candidate_id,
+                    b.content_digest,
+                ),
+            ),
+        )
+        assert not issuer._head_verified(
+            forged, committed.incarnation_id, head.transaction_id, True
+        )
+        # Issuing a self Plan B is refused explicitly (not an ``assert``).
+        from suzka.r16 import decision_issuer as module
+
+        real = module._decision_record
+
+        def b_record(identity, q, result):  # type: ignore[no-untyped-def]
+            record = real(identity, q, result)
+            chosen = {c.candidate_id: c for c in record.candidates}["candidate-b"]
+            return replace(
+                record,
+                selected=CandidateSelection(
+                    record.selected.schema_version, chosen.candidate_id, chosen.content_digest
+                ),
+            )
+
+        module._decision_record = b_record  # type: ignore[assignment]
+        try:
+            with pytest.raises(_IssuerHold):
+                issuer._committed(
+                    *_committed_args(state, issuer, goal_id, committed)
+                )
+        finally:
+            module._decision_record = real  # type: ignore[assignment]
+
+
+def _committed_args(state, issuer, goal_id, committed):  # type: ignore[no-untyped-def]
+    from types import SimpleNamespace
+
+    from suzka.r16.successor_policy import (
+        PolicyOutputKind,
+        SuccessorPolicyInputV2,
+        SuccessorPolicyResult,
+        SuccessorRow,
+    )
+
+    sealed = SuccessorPolicyInputV2.from_bytes(committed.policy_input_bytes)
+    q = SimpleNamespace(
+        goal_id=goal_id,
+        goal_revision=1,
+        goal_digest="a" * 64,
+        value_id="honesty",
+        value_revision=0,
+        value_digest="b" * 64,
+        self_origin=True,
+        commitment_id=None,
+        context_id="context-1",
+        context_last_modified_revision=0,
+        experience_id="experience-x",
+        experience_revision=0,
+        experience_digest="c" * 64,
+        motivation_id="motivation-1",
+        motivation_revision_digest="d" * 64,
+    )
+    event = SimpleNamespace(event_id=committed.issuer_event_id, processing_sequence=committed.issuer_sequence)
+    result = SuccessorPolicyResult(SuccessorRow.ROW_3, PolicyOutputKind.PLAN_A, None)
+    return event, q, sealed, result, committed.incarnation_id, committed.lineage_scope, None
+
+
+def test_preview_alone_holds_a_self_goal_with_a_commitment(tmp_path) -> None:
+    """D5 P2-5: without the issuer, the preview never selects B for a self Goal."""
+
+    from dataclasses import replace
+
+    from suzka.r16.plan_preview import _PlanSourceUnavailable
+
+    with TestClient(_app(_settings(tmp_path / "preview"))) as client:
+        state = client.app.state
+        _activate(state)
+        x = _interest(state)
+        goal_id = _propose(state, x).subject_id
+        _review(state, goal_id)
+        owner = state._plan_preview_owner
+        assert owner._issuer is None
+        captured = {}
+        real = owner._build_decision
+
+        def capture(q):  # type: ignore[no-untyped-def]
+            captured["q"] = q
+            return real(q)
+
+        owner._build_decision = capture  # type: ignore[method-assign]
+        try:
+            preview = owner._submit_preview(goal_id).result(timeout=30).value
+        finally:
+            owner._build_decision = real  # type: ignore[method-assign]
+        assert preview.decision is not None
+        assert preview.decision.selected.candidate_id == "candidate-a"
+        q = captured["q"]
+        assert q.self_origin
+        with pytest.raises(_PlanSourceUnavailable):
+            real(
+                replace(
+                    q,
+                    commitment_id="commitment-1",
+                    commitment_revision=1,
+                    commitment_digest="e" * 64,
+                    commitment_admission_event_id="event-1",
+                )
+            )
+
+
+def test_real_app_driver_without_the_self_marker_never_proposes(tmp_path, monkeypatch) -> None:
+    import time
+
+    from test_r16_ip6b_driver import ADMIN, TOKEN, _chat, _until
+
+    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", TOKEN)
+    with TestClient(_app(_settings(tmp_path / "nomark", min_strength=0.15))) as client:
+        state = client.app.state
+        assert client.post("/api/r16/driver/activate", headers=ADMIN).status_code == 200
+        x = _chat(client, "something worth looking into later, I think")
+        _until(
+            lambda: any(
+                m.target.reference == x["experience_id"]
+                for m in state.main_loop.export_motivation_state().records
+            )
+        )
+        time.sleep(1.0)
+        assert state.main_loop.export_goal_state().records == ()
+
+
+def test_restart_rescan_adopts_a_proposed_self_goal_once(tmp_path, monkeypatch) -> None:
+    """Rescan (b) and no double proposal after restart (review P2-2)."""
+
+    from test_r16_ip6b_driver import ADMIN, TOKEN, _until
+
+    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", TOKEN)
+    settings = _settings(tmp_path / "rescan", min_strength=0.15)
+    with TestClient(_app(settings)) as client:
+        state = client.app.state
+        assert client.post("/api/r16/self-goal/activate", headers=ADMIN).status_code == 200
+        x = _interest(state)
+        goal_id = _propose(state, x).subject_id  # crash before adoption
+    with TestClient(_app(settings)) as client:
+        state = client.app.state
+        assert client.post("/api/r16/driver/activate", headers=ADMIN).status_code == 200
+    with TestClient(_app(settings)) as client:
+        state = client.app.state
+        goal = _until(
+            lambda: (g := state.main_loop._goal_system.get(goal_id)) is not None
+            and g.lifecycle is GoalLifecycle.ADOPTED
+            and g
+        )
+        assert goal.goal_id == goal_id
+        assert len(state.main_loop.export_goal_state().records) == 1
+
+
+def test_occupied_x_is_reported_on_the_users_ticket(tmp_path, monkeypatch) -> None:
+    """D3 P1-2(c): the user sees the closed reason on the ticket."""
+
+    from test_r16_ip6b_driver import ADMIN, TOKEN, _chat, _settled, _until
+
+    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", TOKEN)
+    with TestClient(_app(_settings(tmp_path / "ticket", min_strength=0.15))) as client:
+        state = client.app.state
+        assert client.post("/api/r16/driver/activate", headers=ADMIN).status_code == 200
+        assert client.post("/api/r16/self-goal/activate", headers=ADMIN).status_code == 200
+        x = _chat(client, "something worth looking into later, I think")
+        _until(
+            lambda: any(
+                g.origin_refs[0].kind is R13ReferenceKind.MOTIVATION
+                for g in state.main_loop.export_goal_state().records
+            )
+        )
+        command = _chat(client, f"COMMIT_REVIEW_EXPERIENCE:1:{x['experience_id']}")
+        view = _settled(client, command["command_ticket"]["ticket_id"])
+        assert view["status"] == "hold"
+        assert view["reason"] == "self_goal_occupies_target"
+        assert state.main_loop.export_commitment_state().records == ()

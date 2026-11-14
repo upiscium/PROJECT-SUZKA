@@ -266,7 +266,11 @@ class R16Driver:
         self._self_goal_active = self_goal_active
         self._self_goal_limit = self_goal_per_incarnation
         self._self_targets: dict[str, None] = {}
-        self._self_admitted = 0
+        # Admitted plus waiting-for-retry self proposals (review P2-1).
+        self._self_reserved = 0
+        # X a user named in a command this incarnation: the user comes first,
+        # even when that command is told to resend (review P1-1).
+        self._user_targets: dict[str, None] = {}
         self._queue: queue.Queue[object] = queue.Queue(maxsize=QUEUE_CAPACITY)
         self._stop = Event()
         self._thread: Thread | None = None
@@ -513,6 +517,8 @@ class R16Driver:
     def _on_command(self, item: _ChatTerminal) -> None:
         assert item.command is not None
         kind, target_id = item.command
+        self._user_targets[target_id] = None
+        _bound(self._user_targets)
         observed = self._observed.get(target_id)
         if (
             observed is None
@@ -582,9 +588,6 @@ class R16Driver:
             self._fail(stage, context, R16OwnerReason.SOURCE_UNAVAILABLE)
             return
         self.counters["submitted"] += 1
-        if stage is _Stage.GOAL_SELF_PROPOSAL:
-            # The per-incarnation cap counts admitted events (#379 D3 P2-1).
-            self._self_admitted += 1
         LOGGER.info("R16 driver submitted stage=%s", stage.value)
         future.add_done_callback(self._callback(stage, context))
 
@@ -628,6 +631,8 @@ class R16Driver:
     def _fail(self, stage: _Stage, context: object, reason: TicketReason) -> None:
         if stage is _Stage.GOAL_SELF_PROPOSAL:
             self.counters["self_proposal_dropped"] += 1
+            # A dropped proposal was never admitted: release its reservation.
+            self._self_reserved = max(0, self._self_reserved - 1)
             LOGGER.warning("R16 driver self proposal dropped")
         command = _command_of(context)
         if command is not None:
@@ -730,9 +735,9 @@ class R16Driver:
                     R16TicketStatus.HOLD,
                     R16DriverReason.SOURCE_NOT_YET_EVALUATED,
                 )
-        # IP-11: user commands on X were submitted first (above); only then
-        # may the subject propose its own Goal on X.
-        if value == INTEREST_APPLIED:
+        # IP-11: user commands on X were submitted first (above); a user who
+        # named X this incarnation (even one told to resend) keeps X.
+        if value == INTEREST_APPLIED and not waiting.held:
             self._maybe_self_propose(_SelfTarget(waiting.experience_id, waiting.ref))
         for hook in self._u2a_hooks:
             try:
@@ -746,11 +751,15 @@ class R16Driver:
         if (
             not self._self_goal_active
             or target.experience_id in self._self_targets
-            or self._self_admitted >= self._self_goal_limit
+            or target.experience_id in self._user_targets
+            or self._self_reserved >= self._self_goal_limit
         ):
             return
         self._self_targets[target.experience_id] = None
         _bound(self._self_targets)
+        # Reserved before submission, so retries can never exceed the cap
+        # (#379 D2 P0 / D3 P2-1); a final drop releases it in ``_fail``.
+        self._self_reserved += 1
         self._submit(_Stage.GOAL_SELF_PROPOSAL, target)
 
     def _maybe_preview(self, goal_id: str, trigger: str) -> None:

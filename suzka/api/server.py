@@ -1033,10 +1033,6 @@ def main() -> None:
     )
 
 
-if __name__ == "__main__":
-    main()
-
-
 def _self_goal_rescan(app: FastAPI, app_settings: Settings) -> tuple[Any, ...]:
     """IP-11 rescan (a): read before the runtime starts (#370 D2 P0-1)."""
 
@@ -1092,3 +1088,7 @@ def _open_subject_history(
         )
     except (HistoryAdoptionError, OSError) as error:
         raise StateRecoveryError(f"SubjectHistory is unavailable: {error}") from error
+
+
+if __name__ == "__main__":
+    main()

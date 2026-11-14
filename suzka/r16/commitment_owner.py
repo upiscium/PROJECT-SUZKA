@@ -36,6 +36,7 @@ from suzka.motivation.commitment_system import (
 )
 from suzka.motivation.common import Deadline, R13Reference, R13ReferenceKind
 from suzka.motivation.goal import goal_id_for_target
+from suzka.r16.goal_owner import GoalOrigin, _GoalSourceOwner
 from suzka.motivation.motivation import MotivationKind, MotivationLifecycle
 from suzka.motivation.system import MotivationEventOperation
 from suzka.r16.source_owner import (
@@ -616,8 +617,9 @@ class _CommitmentSourceOwner:
         """
         target = R13Reference(R13ReferenceKind.EXPERIENCE, q.target_experience_id)
         goal = loop._goal_system.get(goal_id_for_target(target))
-        if goal is not None and any(
-            ref.kind is R13ReferenceKind.MOTIVATION for ref in goal.origin_refs
+        if (
+            goal is not None
+            and _GoalSourceOwner._goal_origin(goal) is GoalOrigin.SUBJECT_MOTIVATION
         ):
             raise _CommitmentSourceUnavailable(
                 "a self-origin Goal occupies the target",
