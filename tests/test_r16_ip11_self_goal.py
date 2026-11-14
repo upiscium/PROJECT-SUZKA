@@ -622,14 +622,23 @@ def test_cap_holds_while_submissions_wait_for_retry() -> None:
 
     driver, source, goal = _self_driver(limit=3)
     try:
-        goal.raise_next = [AgentRuntimeQueueFull("full")] * 4
+        # Each of the first three is refused once, so all wait for a retry
+        # while the fourth INTEREST arrives.
+        goal.raise_next = [AgentRuntimeQueueFull("full")] * 3
         for index in range(4):
             sequence = 10 + 2 * index
             driver.notify_chat_terminal(_turn(sequence, _x(index + 1)), "hi")
             _until(lambda n=index + 1: len(source.calls) == n)
             _resolve(source.futures[index], sequence + 1, INTEREST_APPLIED)
-        time.sleep(4)  # every retry has fired
-        assert len([c for c in goal.calls if c[0] == "self_proposal"]) <= 3
+        time.sleep(0.5)
+        assert goal.calls == []  # nothing admitted yet; three wait for retry
+        driver._clock.now += 10  # every retry is now due
+        _until(lambda: len(goal.calls) == 3)
+        time.sleep(0.5)
+        proposed = [c[1].target for c in goal.calls if c[0] == "self_proposal"]
+        assert len(proposed) == 3
+        fourth = source.calls[3][1]
+        assert fourth not in proposed  # the fourth X was never proposed
     finally:
         driver.stop()
 

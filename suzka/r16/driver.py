@@ -579,17 +579,26 @@ class R16Driver:
                     )
                 )
             else:
+                self._release_unadmitted(stage)
                 self._fail(stage, context, R16DriverReason.RUNTIME_UNAVAILABLE)
             return
         except (AgentRuntimeStopped, AgentRuntimeDurabilityError):
             self._fail(stage, context, R16DriverReason.RUNTIME_UNAVAILABLE)
             raise _DriverStopped from None
         except Exception:
+            self._release_unadmitted(stage)
             self._fail(stage, context, R16OwnerReason.SOURCE_UNAVAILABLE)
             return
         self.counters["submitted"] += 1
         LOGGER.info("R16 driver submitted stage=%s", stage.value)
         future.add_done_callback(self._callback(stage, context))
+
+    def _release_unadmitted(self, stage: _Stage) -> None:
+        """A self proposal that was never admitted frees its reservation;
+        an admitted one keeps counting even if its event fails (D3 P2-1)."""
+
+        if stage is _Stage.GOAL_SELF_PROPOSAL:
+            self._self_reserved = max(0, self._self_reserved - 1)
 
     def _resubmit(self, retry: _Retry) -> None:
         self._submit(retry.stage, retry.context, retry.attempt)
@@ -631,8 +640,6 @@ class R16Driver:
     def _fail(self, stage: _Stage, context: object, reason: TicketReason) -> None:
         if stage is _Stage.GOAL_SELF_PROPOSAL:
             self.counters["self_proposal_dropped"] += 1
-            # A dropped proposal was never admitted: release its reservation.
-            self._self_reserved = max(0, self._self_reserved - 1)
             LOGGER.warning("R16 driver self proposal dropped")
         command = _command_of(context)
         if command is not None:
