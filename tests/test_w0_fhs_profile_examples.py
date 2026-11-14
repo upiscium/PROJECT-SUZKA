@@ -60,11 +60,8 @@ def test_example_preserves_base_settings_and_uses_ten_absolute_paths() -> None:
         paths = raw if isinstance(raw, list) else [raw]
         assert paths and all(Path(item).is_absolute() for item in paths)
 
-    # IP-10b: the one intentional non-path difference is the production
-    # adoption of SubjectHistory (#376 H2); the base profile keeps it off.
-    assert original["subject_history"]["enabled"] is False
-    assert changed["subject_history"]["enabled"] is True
-    changed["subject_history"]["enabled"] = False
+    # IP-10b: both profiles adopt SubjectHistory (#376 H2).
+    assert original["subject_history"]["enabled"] is True
     # I0 alters only source-location examples, not live model or privacy rules.
     assert changed == original
     typed = Settings.model_validate(example)
