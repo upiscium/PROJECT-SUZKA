@@ -113,6 +113,9 @@ class R16DriverReason(str, Enum):
     SOURCE_NOT_OBSERVED = "source_not_observed"
     SOURCE_NOT_YET_EVALUATED = "source_not_yet_evaluated"
     RUNTIME_UNAVAILABLE = "runtime_unavailable"
+    # The Context names a participant (interlocutor_key); U2a admits no
+    # event-time participant identity yet, so the driver never submits it.
+    PARTICIPANT_SCOPE_UNSUPPORTED = "participant_scope_unsupported"
 
 
 TicketReason = R16OwnerReason | R16DriverReason
@@ -144,6 +147,7 @@ class _Ticket:
 class _Observed:
     ref: _MotivationSourceRef
     context_id: str
+    participant_scoped: bool = False
 
 
 @dataclass(slots=True)
@@ -183,6 +187,7 @@ class _ChatTerminal:
     eligible_for_u2a: bool
     command: tuple[R16CommandKind, str] | None
     ticket_id: str | None
+    participant_scoped: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +298,7 @@ class R16Driver:
         self.counters: dict[str, int] = {
             "dropped": 0,
             "skipped_neutral": 0,
+            "skipped_participant_scope": 0,
             "submitted": 0,
             "self_proposal_dropped": 0,
         }
@@ -382,6 +388,7 @@ class R16Driver:
             result.eligible_for_u2a,
             command,
             None if ticket is None else ticket.ticket_id,
+            result.participant_scoped,
         )
         if not self._post(item) and ticket is not None:
             self._finish(ticket.ticket_id, R16TicketStatus.DROPPED)
@@ -498,7 +505,9 @@ class R16Driver:
 
     def _on_chat(self, item: _ChatTerminal) -> None:
         if item.experience_id is not None and item.context_id is not None:
-            self._observed[item.experience_id] = _Observed(item.ref, item.context_id)
+            self._observed[item.experience_id] = _Observed(
+                item.ref, item.context_id, item.participant_scoped
+            )
             self._observed.move_to_end(item.experience_id)
             while len(self._observed) > OBSERVED_CAPACITY:
                 self._observed.popitem(last=False)
@@ -506,6 +515,9 @@ class R16Driver:
             self._on_command(item)
             return
         if item.experience_id is None:
+            return
+        if item.participant_scoped:
+            self.counters["skipped_participant_scope"] += 1
             return
         if not item.eligible_for_u2a:
             self.counters["skipped_neutral"] += 1
@@ -531,6 +543,14 @@ class R16Driver:
                 item.ticket_id,
                 R16TicketStatus.UNAVAILABLE,
                 R16DriverReason.SOURCE_NOT_OBSERVED,
+            )
+            return
+        if observed.participant_scoped or item.participant_scoped:
+            # Same Context as the requester (checked above): no oracle.
+            self._finish(
+                item.ticket_id,
+                R16TicketStatus.HOLD,
+                R16DriverReason.PARTICIPANT_SCOPE_UNSUPPORTED,
             )
             return
         assert item.ticket_id is not None
