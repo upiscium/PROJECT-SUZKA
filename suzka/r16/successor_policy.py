@@ -26,6 +26,10 @@ No row grants WRITE: the R18 ActionIntent issuer separately admits only row
 revisions, digests and event links, never raw text.  The state enums must
 come from their Domain Owner adapters; this module cannot tell (D6-1).
 
+Commitment states other than ABSENT/CONFLICT require the Commitment ref and
+deadline (a self-origin Goal's INELIGIBLE, #379 D2, is about an existing
+Commitment).  ``inverse_authorization`` is required exactly for REVERTED.
+
 Known limit: R17/R18 do not exist yet, so ledger/Feedback/Outcome references
 are generic digest-bound refs and D6-2's mandatory-reference rules are
 checked by presence only.  Kind-exact predicates belong to R17/R18.
@@ -111,8 +115,19 @@ class LedgerState(str, Enum):
     INVERSE_INTENT_ISSUED = "INVERSE_INTENT_ISSUED"
     INVERSE_CLAIMED = "INVERSE_CLAIMED"
     INVERSE_IN_DOUBT = "INVERSE_IN_DOUBT"
+    # #371 D6-A2 A2-2: terminal inverse refusal / absence.
+    INVERSE_POLICY_DENIED = "INVERSE_POLICY_DENIED"
+    INVERSE_APPROVAL_EXPIRED_UNCLAIMED = "INVERSE_APPROVAL_EXPIRED_UNCLAIMED"
+    INVERSE_VERIFIED_ABSENT = "INVERSE_VERIFIED_ABSENT"
     REVERTED = "REVERTED"
     CORRUPT = "CORRUPT"
+
+
+class InverseAuthorization(str, Enum):
+    """A2-2: separate immutable authorization of a REVERTED inverse."""
+
+    AUTHORIZED = "AUTHORIZED"
+    UNPROVEN = "UNPROVEN"
 
 
 class FeedbackState(str, Enum):
@@ -175,6 +190,9 @@ _PENDING_LEDGER: Final = frozenset(
         LedgerState.INVERSE_INTENT_ISSUED,
         LedgerState.INVERSE_CLAIMED,
         LedgerState.INVERSE_IN_DOUBT,
+        LedgerState.INVERSE_POLICY_DENIED,
+        LedgerState.INVERSE_APPROVAL_EXPIRED_UNCLAIMED,
+        LedgerState.INVERSE_VERIFIED_ABSENT,
         LedgerState.REVERTED,
     }
 )
@@ -187,17 +205,31 @@ _OUTCOME_FORBIDDEN: Final = frozenset(
         LedgerState.APPROVAL_EXPIRED_UNCLAIMED,
     }
 )
-# D6-2: Feedback needs a verified (or proven, then inverted) forward effect.
-_FEEDBACK_ALLOWED_LEDGER: Final = frozenset(
+# Forward effect proven, then an inverse attempted or applied (A2-2/A2-3).
+_INVERSE_LEDGER: Final = frozenset(
     {
-        LedgerState.ACTIVE_VERIFIED_AUTHORIZED,
-        LedgerState.UNAUTHORIZED_EFFECT,
         LedgerState.INVERSE_INTENT_ISSUED,
         LedgerState.INVERSE_CLAIMED,
         LedgerState.INVERSE_IN_DOUBT,
+        LedgerState.INVERSE_POLICY_DENIED,
+        LedgerState.INVERSE_APPROVAL_EXPIRED_UNCLAIMED,
+        LedgerState.INVERSE_VERIFIED_ABSENT,
         LedgerState.REVERTED,
     }
 )
+# D6-2: Feedback needs a verified (or proven, then inverted) forward effect.
+_FEEDBACK_ALLOWED_LEDGER: Final = frozenset(
+    {LedgerState.ACTIVE_VERIFIED_AUTHORIZED, LedgerState.UNAUTHORIZED_EFFECT}
+    | _INVERSE_LEDGER
+)
+# A2-3: a MATCH_SELF admitted at T survives a later inverse/REVERTED (it is
+# then held by row 2); it can never accompany an unauthorized effect.
+_MATCH_SELF_LEDGER: Final = frozenset(
+    {LedgerState.ACTIVE_VERIFIED_AUTHORIZED} | _INVERSE_LEDGER
+)
+PREDECESSOR_DECISION_KIND: Final = "decision"
+# D6-1: ABSENT_INITIAL stores the verified no-predecessor query horizon.
+NO_PREDECESSOR_HORIZON_KIND: Final = "history-horizon"
 _SETTLED_OR_NOT_REVIEWED: Final = frozenset(
     {Interpretation.SETTLED, Interpretation.NOT_REVIEWED}
 )
@@ -357,6 +389,7 @@ class SuccessorPolicyInputV2:
     commitment_deadline_utc: str | None
     ledger: LedgerState
     ledger_refs: tuple[PolicyRef, ...]
+    inverse_authorization: InverseAuthorization | None
     feedback: FeedbackState
     feedback_ref: PolicyRef | None
     verified_outcome_ref: PolicyRef | None
@@ -386,6 +419,11 @@ class SuccessorPolicyInputV2:
             value = getattr(self, name)
             if value is not None and type(value) is not PolicyRef:
                 raise TypeError(f"{name} must be an exact PolicyRef")
+        if (
+            self.inverse_authorization is not None
+            and type(self.inverse_authorization) is not InverseAuthorization
+        ):
+            raise TypeError("inverse_authorization must be an exact InverseAuthorization")
         if self.lineage_ref is not None and type(self.lineage_ref) is not LineageRef:
             raise TypeError("lineage_ref must be an exact LineageRef")
         if self.commitment_deadline_utc is not None:
@@ -430,6 +468,9 @@ class SuccessorPolicyInputV2:
                 "state": self.interpretation.value,
             },
             "ledger": {
+                "inverse_authorization": None
+                if self.inverse_authorization is None
+                else self.inverse_authorization.value,
                 "refs": [item.canonical_value() for item in self.ledger_refs],
                 "state": self.ledger.value,
             },
@@ -456,8 +497,20 @@ class SuccessorPolicyInputV2:
 
     @classmethod
     def from_bytes(cls, payload: bytes) -> Self:
-        """Strict inverse of ``canonical_bytes`` (sealed replay, D6-3)."""
+        """Strict inverse of ``canonical_bytes`` (sealed replay, D6-3).
 
+        Every failure is a ``ValueError`` so callers fail closed on one type.
+        """
+
+        try:
+            return cls._from_bytes(payload)
+        except ValueError:
+            raise
+        except (TypeError, UnicodeDecodeError, RecursionError) as error:
+            raise ValueError("policy input bytes are invalid") from error
+
+    @classmethod
+    def _from_bytes(cls, payload: bytes) -> Self:
         row = closed(
             parse_json(payload, MAX_POLICY_INPUT_BYTES),
             (
@@ -480,7 +533,8 @@ class SuccessorPolicyInputV2:
         commitment = closed(row["commitment"], ("deadline_utc", "ref", "state"), "commitment")
         feedback = closed(row["feedback"], ("ref", "state"), "feedback")
         interpretation = closed(row["interpretation"], ("stage", "state"), "interpretation")
-        ledger = closed(row["ledger"], ("refs", "state"), "ledger")
+        ledger = closed(row["ledger"], ("inverse_authorization", "refs", "state"), "ledger")
+        inverse = ledger["inverse_authorization"]
         lineage = closed(row["lineage"], ("ref", "state"), "lineage")
         predecessor = closed(row["predecessor"], ("ref", "state"), "predecessor")
         required = closed(row["required_source"], ("refs", "state"), "required_source")
@@ -505,6 +559,9 @@ class SuccessorPolicyInputV2:
                 PolicyRef.from_value(item)
                 for item in sequence(ledger["refs"], "ledger_refs", MAX_LEDGER_REFS, json_input=True)
             ),
+            inverse_authorization=None
+            if inverse is None
+            else parse_enum(inverse, InverseAuthorization, "inverse_authorization"),
             feedback=parse_enum(feedback["state"], FeedbackState, "feedback"),
             feedback_ref=_optional_ref(feedback["ref"]),
             verified_outcome_ref=_optional_ref(row["verified_outcome"]),
@@ -561,6 +618,13 @@ class SuccessorPolicyResult:
     write_eligible: bool = False
 
     def __post_init__(self) -> None:
+        if (
+            type(self.row) is not SuccessorRow
+            or type(self.output) is not PolicyOutputKind
+            or (self.hold_reason is not None and type(self.hold_reason) is not ReasonCode)
+            or type(self.write_eligible) is not bool
+        ):
+            raise TypeError("policy result fields must be exact enum values")
         if (self.output is PolicyOutputKind.HOLD) != (self.hold_reason is not None):
             raise ValueError("exactly a HOLD carries a reason")
         if self.write_eligible:
@@ -615,7 +679,14 @@ def cross_reference_conflicts(value: SuccessorPolicyInputV2) -> tuple[str, ...]:
     kinds = tuple(item.kind for item in value.source_refs)
     if value.required_source is RequiredSourceState.QUALIFIED and kinds != _REQUIRED_KINDS:
         hits.append("required_source_refs")
-    if (value.predecessor is PredecessorState.QUALIFIED) != (value.predecessor_ref is not None):
+    predecessor_kind = None if value.predecessor_ref is None else value.predecessor_ref.kind
+    if value.predecessor is PredecessorState.QUALIFIED:
+        if predecessor_kind != PREDECESSOR_DECISION_KIND:
+            hits.append("predecessor_ref")
+    elif value.predecessor is PredecessorState.ABSENT_INITIAL:
+        if predecessor_kind != NO_PREDECESSOR_HORIZON_KIND:
+            hits.append("predecessor_ref")
+    elif predecessor_kind not in (None, PREDECESSOR_DECISION_KIND, NO_PREDECESSOR_HORIZON_KIND):
         hits.append("predecessor_ref")
     if value.lineage is LineageState.CONSISTENT and value.lineage_ref is None:
         hits.append("lineage_ref")
@@ -626,11 +697,20 @@ def cross_reference_conflicts(value: SuccessorPolicyInputV2) -> tuple[str, ...]:
         value.commitment_ref is None or value.commitment_deadline_utc is None
     ):
         hits.append("commitment_ref")
+    if (
+        value.commitment is CommitmentState.ACTIVE
+        and value.commitment_deadline_utc is not None
+        and value.commitment_deadline_utc <= value.now_utc
+    ):
+        # Expiry is the adapter's (D6-4), but the same sealed clock must agree.
+        hits.append("active_commitment_past_deadline")
     if value.ledger is LedgerState.NONE:
         if value.ledger_refs:
             hits.append("ledger_none_has_refs")
     elif value.ledger is not LedgerState.CORRUPT and not value.ledger_refs:
         hits.append("ledger_refs")
+    if (value.ledger is LedgerState.REVERTED) != (value.inverse_authorization is not None):
+        hits.append("inverse_authorization")
     if value.verified_outcome_ref is not None and value.ledger in _OUTCOME_FORBIDDEN:
         hits.append("outcome_without_effect")
     if (
@@ -648,15 +728,29 @@ def cross_reference_conflicts(value: SuccessorPolicyInputV2) -> tuple[str, ...]:
             hits.append("feedback_without_verified_effect")
         if (
             value.feedback is FeedbackState.MATCH_SELF
-            and value.ledger is not LedgerState.ACTIVE_VERIFIED_AUTHORIZED
+            and value.ledger not in _MATCH_SELF_LEDGER
         ):
             hits.append("positive_feedback_without_authorized_effect")
-    if value.as_of_r07_sequence > value.event_sequence:
-        hits.append("as_of_after_event")
-    if value.verified_outcome_ref is not None and any(
-        item.sort_key == value.verified_outcome_ref.sort_key for item in value.source_refs
-    ):
-        hits.append("outcome_reuses_source_identity")
+    # D6-A1: as_of is committed state before the newly assigned event.
+    if value.as_of_r07_sequence >= value.event_sequence:
+        hits.append("as_of_not_before_event")
+    every = [
+        *value.source_refs,
+        *value.ledger_refs,
+        *(
+            item
+            for item in (
+                value.predecessor_ref,
+                value.commitment_ref,
+                value.feedback_ref,
+                value.verified_outcome_ref,
+            )
+            if item is not None
+        ),
+    ]
+    keys = [item.sort_key for item in every]
+    if len(keys) != len(set(keys)):
+        hits.append("reference_identity_reused")
     return tuple(hits)
 
 
@@ -784,46 +878,56 @@ def worst_case_input() -> SuccessorPolicyInputV2:
     """The largest encodable input: every bounded field at its maximum.
 
     Identifiers are ASCII (no JSON escaping), so maximal lengths and maximal
-    integers give the maximal canonical length; enums take their longest
-    member.  ``test_r16_ip8b`` asserts this fits ``MAX_POLICY_INPUT_BYTES``
-    (D6-3 / D3 P2-4 legal-bound proof).
+    integers give the maximal canonical length.  Every ref uses a maximal
+    kind and ID; every enum takes its longest member, and the
+    (stage, interpretation) pair is the longest closed pair.  The test
+    asserts this fits ``MAX_POLICY_INPUT_BYTES`` and that no single-field
+    change makes it longer (D6-3 / D3 P2-4 legal-bound proof).
     """
 
     from suzka.identifiers import MAX_IDENTIFIER_CODEPOINTS
 
     def ident(prefix: str) -> str:
-        return (prefix + "x" * MAX_IDENTIFIER_CODEPOINTS)[:MAX_IDENTIFIER_CODEPOINTS]
+        return (prefix + "-" + "x" * MAX_IDENTIFIER_CODEPOINTS)[:MAX_IDENTIFIER_CODEPOINTS]
 
-    def ref(kind: str) -> PolicyRef:
-        return PolicyRef(ident(kind), ident(kind + "-id"), MAX_PERSISTED_REVISION, "f" * 64)
+    def ref(name: str) -> PolicyRef:
+        return PolicyRef(ident(name + "k"), ident(name), MAX_PERSISTED_REVISION, "f" * 64)
 
     def longest(kind: type[Enum]) -> Enum:
         return max(kind, key=lambda member: len(str(member.value)))
 
+    def refs(prefix: str, count: int) -> tuple[PolicyRef, ...]:
+        return tuple(
+            sorted((ref(f"{prefix}{index}") for index in range(count)), key=lambda r: r.sort_key)
+        )
+
+    stage, interpretation = max(
+        (
+            (stage, item)
+            for stage, allowed in _STAGE_INTERPRETATIONS.items()
+            for item in allowed
+        ),
+        key=lambda pair: len(pair[0].value) + len(pair[1].value),
+    )
     deadline = "9999-12-31T23:59:59Z"
     return SuccessorPolicyInputV2(
         required_source=longest(RequiredSourceState),  # type: ignore[arg-type]
-        source_refs=tuple(
-            PolicyRef(kind, ident(kind), MAX_PERSISTED_REVISION, "f" * 64)
-            for kind in _REQUIRED_KINDS
-        ),
+        source_refs=refs("source", len(_REQUIRED_KINDS)),
         predecessor=longest(PredecessorState),  # type: ignore[arg-type]
-        predecessor_ref=ref("decision"),
+        predecessor_ref=ref("predecessor"),
         lineage=longest(LineageState),  # type: ignore[arg-type]
         lineage_ref=LineageRef(ident("lineage"), ident("baseline"), "f" * 64, "f" * 64, "f" * 64),
         commitment=longest(CommitmentState),  # type: ignore[arg-type]
         commitment_ref=ref("commitment"),
         commitment_deadline_utc=deadline,
         ledger=longest(LedgerState),  # type: ignore[arg-type]
-        ledger_refs=tuple(
-            sorted((ref(f"ledger{i}") for i in range(MAX_LEDGER_REFS)), key=lambda r: r.sort_key)
-        ),
+        ledger_refs=refs("ledger", MAX_LEDGER_REFS),
+        inverse_authorization=longest(InverseAuthorization),  # type: ignore[arg-type]
         feedback=longest(FeedbackState),  # type: ignore[arg-type]
         feedback_ref=ref("feedback"),
         verified_outcome_ref=ref("outcome"),
-        # The longest pair allowed with a stage.
-        interpretation=Interpretation.CONTRADICTORY,
-        interpretation_stage=InterpretationStage.S2,
+        interpretation=interpretation,
+        interpretation_stage=stage,
         as_of_r07_sequence=MAX_PERSISTED_EVENT_SEQUENCE,
         event_id=ident("event"),
         event_sequence=MAX_PERSISTED_EVENT_SEQUENCE,
@@ -839,6 +943,9 @@ __all__ = [
     "FeedbackState",
     "Interpretation",
     "InterpretationStage",
+    "InverseAuthorization",
+    "NO_PREDECESSOR_HORIZON_KIND",
+    "PREDECESSOR_DECISION_KIND",
     "LedgerState",
     "LineageRef",
     "LineageState",

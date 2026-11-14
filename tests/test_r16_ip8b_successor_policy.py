@@ -20,11 +20,13 @@ from suzka.r16.history_codec import (  # noqa: E402
 )
 from suzka.r16.successor_policy import (  # noqa: E402
     MAX_LEDGER_REFS,
+    NO_PREDECESSOR_HORIZON_KIND,
     POLICY_KIND,
     CommitmentState,
     FeedbackState,
     Interpretation,
     InterpretationStage,
+    InverseAuthorization,
     LedgerState,
     LineageRef,
     LineageState,
@@ -50,6 +52,7 @@ SOURCES = tuple(PolicyRef(kind, f"{kind}-1", 1, D) for kind in ("context", "expe
 LINEAGE = LineageRef("lineage-1", "baseline-1", D, None, "b" * 64)
 COMMITMENT = PolicyRef("commitment", "commitment-1", 1, D)
 PREDECESSOR = PolicyRef("decision", "decision-1", 1, D)
+HORIZON = PolicyRef(NO_PREDECESSOR_HORIZON_KIND, "horizon-9", 9, D)
 LEDGER = (PolicyRef("ledger", "ledger-1", 1, D),)
 OUTCOME = PolicyRef("outcome", "outcome-1", 1, D)
 FEEDBACK = PolicyRef("feedback", "feedback-1", 1, D)
@@ -69,7 +72,7 @@ def _input(**changes: object) -> SuccessorPolicyInputV2:
         required_source=RequiredSourceState.QUALIFIED,
         source_refs=SOURCES,
         predecessor=PredecessorState.ABSENT_INITIAL,
-        predecessor_ref=None,
+        predecessor_ref=HORIZON,
         lineage=LineageState.CONSISTENT,
         lineage_ref=LINEAGE,
         commitment=CommitmentState.ABSENT,
@@ -77,6 +80,7 @@ def _input(**changes: object) -> SuccessorPolicyInputV2:
         commitment_deadline_utc=None,
         ledger=LedgerState.NONE,
         ledger_refs=(),
+        inverse_authorization=None,
         feedback=FeedbackState.ABSENT,
         feedback_ref=None,
         verified_outcome_ref=None,
@@ -197,13 +201,19 @@ def _consistent(
     return _input(
         required_source=required,
         predecessor=predecessor,
-        predecessor_ref=PREDECESSOR if predecessor is PredecessorState.QUALIFIED else None,
+        predecessor_ref={
+            PredecessorState.QUALIFIED: PREDECESSOR,
+            PredecessorState.ABSENT_INITIAL: HORIZON,
+        }.get(predecessor),
         lineage=lineage,
         commitment=commitment,
         commitment_ref=None if commitment is CommitmentState.ABSENT else COMMITMENT,
         commitment_deadline_utc=None if commitment is CommitmentState.ABSENT else DEADLINE,
         ledger=ledger,
         ledger_refs=() if ledger is LedgerState.NONE else LEDGER,
+        inverse_authorization=InverseAuthorization.UNPROVEN
+        if ledger is LedgerState.REVERTED
+        else None,
         verified_outcome_ref=None if ledger in (
             LedgerState.NONE,
             LedgerState.INTENT_ISSUED,
@@ -217,7 +227,7 @@ def _consistent(
 
 
 def test_policy_is_total_and_never_writes_over_every_state_tuple() -> None:
-    """All 3*4*3*5*14*6*5 state tuples: total, closed, no WRITE path."""
+    """All 3*4*3*5*17*6*5 state tuples: total, closed, no WRITE path."""
 
     seen: set[SuccessorRow] = set()
     for states in product(
@@ -270,6 +280,7 @@ def test_uncertain_only_downgrades_rows_4_and_5_to_plan_a() -> None:
     [
         (_input(source_refs=SOURCES[:3]), "required_source_refs"),
         (_input(predecessor_ref=PREDECESSOR), "predecessor_ref"),
+        (_input(predecessor_ref=None), "predecessor_ref"),
         (_input(predecessor=PredecessorState.QUALIFIED), "predecessor_ref"),
         (_input(lineage_ref=None), "lineage_ref"),
         (_input(commitment_ref=COMMITMENT), "absent_commitment_has_refs"),
@@ -282,8 +293,13 @@ def test_uncertain_only_downgrades_rows_4_and_5_to_plan_a() -> None:
         (_verified(feedback_ref=None), "feedback_ref"),
         (_verified(ledger=LedgerState.CLAIMED, verified_outcome_ref=None), "feedback_without_verified_effect"),
         (_verified(ledger=LedgerState.UNAUTHORIZED_EFFECT), "positive_feedback_without_authorized_effect"),
-        (_input(as_of_r07_sequence=11), "as_of_after_event"),
-        (_verified(verified_outcome_ref=PolicyRef("goal", "goal-1", 1, D)), "outcome_reuses_source_identity"),
+        (_input(as_of_r07_sequence=11), "as_of_not_before_event"),
+        (_input(as_of_r07_sequence=10), "as_of_not_before_event"),
+        (_verified(verified_outcome_ref=PolicyRef("goal", "goal-1", 1, D)), "reference_identity_reused"),
+        (_verified(feedback_ref=COMMITMENT), "reference_identity_reused"),
+        (_verified(ledger=LedgerState.REVERTED), "inverse_authorization"),
+        (_verified(inverse_authorization=InverseAuthorization.AUTHORIZED), "inverse_authorization"),
+        (_active(now_utc=DEADLINE), "active_commitment_past_deadline"),
     ],
 )
 def test_cross_reference_inconsistency_is_row_0(value, hit) -> None:  # type: ignore[no-untyped-def]
@@ -350,6 +366,96 @@ def test_worst_case_input_fits_the_8_kib_bound() -> None:
     # Every bounded collection is at its maximum.
     assert len(worst.source_refs) == 4 and len(worst.ledger_refs) == MAX_LEDGER_REFS
     assert SuccessorPolicyInputV2.from_bytes(worst.canonical_bytes()) == worst
+
+
+def test_no_single_field_change_makes_the_worst_case_longer() -> None:
+    """P2-1: every enum member, every allowed pair and None are no longer."""
+
+    from enum import Enum
+
+    worst = worst_case_input()
+    size = len(worst.canonical_bytes())
+    for field, kind in (
+        ("required_source", RequiredSourceState),
+        ("predecessor", PredecessorState),
+        ("lineage", LineageState),
+        ("commitment", CommitmentState),
+        ("ledger", LedgerState),
+        ("feedback", FeedbackState),
+        ("inverse_authorization", InverseAuthorization),
+    ):
+        member: Enum
+        for member in kind:
+            assert len(replace(worst, **{field: member}).canonical_bytes()) <= size
+    for interpretation, stage in STAGE_PAIRS:
+        changed = replace(worst, interpretation=interpretation, interpretation_stage=stage)
+        assert len(changed.canonical_bytes()) <= size
+    for field in (
+        "predecessor_ref",
+        "lineage_ref",
+        "commitment_ref",
+        "commitment_deadline_utc",
+        "inverse_authorization",
+        "feedback_ref",
+        "verified_outcome_ref",
+    ):
+        assert len(replace(worst, **{field: None}).canonical_bytes()) <= size
+    # Refs already use maximal kind, ID, revision and digest.
+    for item in (*worst.source_refs, *worst.ledger_refs):
+        assert (len(item.kind), len(item.ref_id)) == (128, 128)
+
+
+STAGE_PAIRS = (
+    (Interpretation.NOT_REVIEWED, InterpretationStage.NONE),
+    (Interpretation.UNAVAILABLE, InterpretationStage.NONE),
+    (Interpretation.SETTLED, InterpretationStage.S1),
+    (Interpretation.UNCERTAIN, InterpretationStage.S1),
+    (Interpretation.SETTLED, InterpretationStage.S2),
+    (Interpretation.UNCERTAIN, InterpretationStage.S2),
+    (Interpretation.CONTRADICTORY, InterpretationStage.S2),
+)
+
+
+def test_inverse_and_reverted_states_hold_on_row_2() -> None:
+    """P1-1 / P2-2: A2-2 inverse states are row 2, and a MATCH_SELF admitted
+    before the inverse (A2-3) is retained and held, not a conflict."""
+
+    for ledger in (
+        LedgerState.INVERSE_INTENT_ISSUED,
+        LedgerState.INVERSE_CLAIMED,
+        LedgerState.INVERSE_IN_DOUBT,
+        LedgerState.INVERSE_POLICY_DENIED,
+        LedgerState.INVERSE_APPROVAL_EXPIRED_UNCLAIMED,
+        LedgerState.INVERSE_VERIFIED_ABSENT,
+        LedgerState.REVERTED,
+    ):
+        extra = (
+            {"inverse_authorization": InverseAuthorization.AUTHORIZED}
+            if ledger is LedgerState.REVERTED
+            else {}
+        )
+        for feedback, ref in (
+            (FeedbackState.MATCH_SELF, FEEDBACK),
+            (FeedbackState.ABSENT, None),
+            (FeedbackState.UNKNOWN, FEEDBACK),
+        ):
+            value = _verified(ledger=ledger, feedback=feedback, feedback_ref=ref, **extra)
+            result = evaluate(value)
+            assert (result.row, result.hold_reason) == (
+                SuccessorRow.ROW_2,
+                ReasonCode.INSUFFICIENT_EVIDENCE,
+            ), (ledger, feedback, cross_reference_conflicts(value))
+
+
+def test_policy_result_requires_exact_enums() -> None:
+    with pytest.raises(TypeError):
+        SuccessorPolicyResult("3", "PLAN_A", None)  # type: ignore[arg-type]
+
+
+def test_from_bytes_fails_with_one_error_type() -> None:
+    for payload in (b"\xff", b"[]", b"{}", b'{"a":'):
+        with pytest.raises(ValueError):
+            SuccessorPolicyInputV2.from_bytes(payload)
 
 
 def test_sealed_bytes_round_trip_and_replay() -> None:
