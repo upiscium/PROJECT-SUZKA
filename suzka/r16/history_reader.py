@@ -28,11 +28,17 @@ Goal/Value/Context before any new action.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 from suzka.r16.contracts import CandidateKind
 from suzka.r16.history_adoption import resolve_incarnation
+from suzka.r16.history_attestation_digest import (
+    ChainNode,
+    operations_digest,
+    prefix_tips,
+    scopes_digest,
+)
 from suzka.r16.history_codec import (
     GENESIS,
     SUBJECT_HISTORY_PARTICIPANT_ID,
@@ -52,6 +58,7 @@ from suzka.r16.history_store import (
 from suzka.runtime.event_journal import (
     EventFailureCategory,
     EventJournal,
+    EventJournalHistoryAttestation,
     EventJournalInspection,
     EventJournalRecord,
     EventJournalTransaction,
@@ -75,6 +82,8 @@ class HeadBlockReason(str, Enum):
     DIVERGED = "DIVERGED"
     LINEAGE_GAP = "LINEAGE_GAP"
     DUPLICATE_CHILD = "DUPLICATE_CHILD"
+    # C10: permanently blocked at compaction time and attested as such.
+    POISONED = "POISONED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +188,36 @@ class _JournalView:
         return transaction
 
 
+class ReaderTransient(Exception):
+    """A temporary inability to read (store/Journal/incarnation unavailable).
+
+    Distinct from a BLOCKED classification so the C10 provider defers
+    instead of poisoning (#376 C10 D3 P2-3).
+    """
+
+    def __init__(self, reason: HeadBlockReason) -> None:
+        super().__init__(reason.value)
+        self.reason = reason
+
+
+@dataclass(frozen=True, slots=True)
+class ReaderClassification:
+    """Whole-incarnation result (#376 C10 D3 §2).
+
+    ``global_block`` comes from whole-incarnation reconciliation (no row for
+    a transaction, phase mismatch, unproven tombstone, attestation mismatch,
+    poisoned incarnation); ``heads`` holds every scope's own result.
+    """
+
+    incarnation: str
+    horizon: int
+    attested_high_water: int
+    global_block: HeadBlockReason | None
+    heads: dict[str, HistoryHead]
+    chains: dict[str, tuple[ChainNode, ...]]
+    rows: tuple[HistoryOperationRow, ...]
+
+
 class SubjectHistoryReader:
     """Read-only lineage head resolution for the current incarnation."""
 
@@ -196,49 +235,164 @@ class SubjectHistoryReader:
 
     def head(self, lineage_scope: str) -> HistoryHead:
         try:
-            return self._head(lineage_scope)
-        except _Blocked as blocked:
-            return HistoryHead(lineage_scope, HeadStatus.BLOCKED, blocked.reason)
-        except HistoryStoreError:
-            return HistoryHead(
-                lineage_scope, HeadStatus.BLOCKED, HeadBlockReason.STORE_UNAVAILABLE
-            )
-        except (TypeError, ValueError):
-            return HistoryHead(lineage_scope, HeadStatus.BLOCKED, HeadBlockReason.DIVERGED)
+            result = self.classify((lineage_scope,))
+        except ReaderTransient as transient:
+            return HistoryHead(lineage_scope, HeadStatus.BLOCKED, transient.reason)
+        if result.global_block is not None:
+            return HistoryHead(lineage_scope, HeadStatus.BLOCKED, result.global_block)
+        return result.heads[lineage_scope]
 
-    def _head(self, lineage_scope: str) -> HistoryHead:
-        try:
-            inspection = self.journal.inspect()
-        except Exception:
-            raise _Blocked(HeadBlockReason.JOURNAL_UNAVAILABLE) from None
+    def classify(
+        self,
+        scopes: tuple[str, ...] = (),
+        *,
+        inspection: EventJournalInspection | None = None,
+    ) -> ReaderClassification:
+        """Classify the whole current incarnation and the given scopes.
+
+        Raises ``ReaderTransient`` only for temporary unavailability.
+        """
+
+        if inspection is None:
+            try:
+                inspection = self.journal.inspect()
+            except Exception:
+                raise ReaderTransient(HeadBlockReason.JOURNAL_UNAVAILABLE) from None
         # One inspection for both the incarnation and the evidence (no TOCTOU).
         try:
             incarnation, horizon = self.incarnation(inspection)
         except HistoryStoreError:
-            raise
+            raise ReaderTransient(HeadBlockReason.STORE_UNAVAILABLE) from None
         except Exception:
-            raise _Blocked(HeadBlockReason.INCARNATION_UNAVAILABLE) from None
+            raise ReaderTransient(HeadBlockReason.INCARNATION_UNAVAILABLE) from None
+        try:
+            rows = self.store.operations(incarnation)
+        except HistoryStoreError:
+            raise ReaderTransient(HeadBlockReason.STORE_UNAVAILABLE) from None
+        result = ReaderClassification(incarnation, horizon, 0, None, {}, {}, rows)
+        try:
+            # Inside the try (review P2-2): a mismatch is a block, not a leak.
+            attestation, high_water = _current_attestation(
+                inspection, incarnation, horizon
+            )
+            result = replace(result, attested_high_water=high_water)
+            if attestation is not None:
+                meta = self.store.meta()
+                if (
+                    attestation.store_id != meta.store_id
+                    or attestation.subject_id != meta.subject_id
+                ):
+                    # Review P2-5: another store cannot satisfy the attestation.
+                    raise _Blocked(HeadBlockReason.DIVERGED)
+            return self._classify(
+                inspection, incarnation, horizon, attestation, high_water, rows, scopes
+            )
+        except _Blocked as blocked:
+            return replace(result, global_block=blocked.reason)
+        except HistoryStoreError:
+            raise ReaderTransient(HeadBlockReason.STORE_UNAVAILABLE) from None
+        except (TypeError, ValueError):
+            return replace(result, global_block=HeadBlockReason.DIVERGED)
+
+    def _classify(
+        self,
+        inspection: EventJournalInspection,
+        incarnation: str,
+        horizon: int,
+        attestation: EventJournalHistoryAttestation | None,
+        high_water: int,
+        rows: tuple[HistoryOperationRow, ...],
+        requested: tuple[str, ...],
+    ) -> ReaderClassification:
         if inspection.open_gate_clear is not None or inspection.open_recoveries:
             raise _Blocked(HeadBlockReason.UNRESOLVED_OPERATION)
-        view = _JournalView.of(inspection, horizon)
-        rows = self.store.operations(incarnation)
-        self._reconcile_all(rows, view)
-        nodes: list[tuple[CommittedDecisionV1, str]] = []
-        for row in rows:
-            if (
-                row.operation_kind is HistoryOperationKind.R16_DECISION_ISSUE
-                and row.lineage_scope == lineage_scope
+        attested = tuple(row for row in rows if row.processing_sequence <= high_water)
+        live = tuple(row for row in rows if row.processing_sequence > high_water)
+        if attestation is not None:
+            # C10: <= H is checked against the creation-time attestation; the
+            # R07 facts it replaced were matched one to one when it was made.
+            if operations_digest(attested) != (
+                attestation.operations_count,
+                attestation.operations_digest,
             ):
-                node = self._node(incarnation, row, view)
-                if node is not None:
-                    nodes.append(node)
-        return self._chain(lineage_scope, nodes)
+                raise _Blocked(HeadBlockReason.DIVERGED)
+            if attestation.poisoned_all:
+                raise _Blocked(HeadBlockReason.POISONED)
+        view = _JournalView.of(inspection, max(horizon, high_water))
+        self._reconcile_all(live, view)
+        poisoned = frozenset(() if attestation is None else attestation.poisoned_scopes)
+        scopes = sorted(
+            {
+                row.lineage_scope
+                for row in rows
+                if row.operation_kind is HistoryOperationKind.R16_DECISION_ISSUE
+                and row.lineage_scope is not None
+            }
+            | set(requested)
+        )
+        heads: dict[str, HistoryHead] = {}
+        chains: dict[str, tuple[ChainNode, ...]] = {}
+        prefixes: dict[str, tuple[ChainNode, ...]] = {}
+        for scope in scopes:
+            scoped = tuple(
+                row
+                for row in rows
+                if row.operation_kind is HistoryOperationKind.R16_DECISION_ISSUE
+                and row.lineage_scope == scope
+            )
+            if scope in poisoned:
+                heads[scope] = HistoryHead(scope, HeadStatus.BLOCKED, HeadBlockReason.POISONED)
+                continue
+            # The attested prefix must itself be a valid chain (global check).
+            attested_nodes = [
+                node
+                for row in scoped
+                if row.processing_sequence <= high_water
+                for node in (self._internal_node(incarnation, row),)
+                if node is not None
+            ]
+            if attested_nodes:
+                prefixes[scope] = self._chain_nodes(attested_nodes)
+            try:
+                nodes = [
+                    *attested_nodes,
+                    *(
+                        node
+                        for row in scoped
+                        if row.processing_sequence > high_water
+                        for node in (self._node(incarnation, row, view),)
+                        if node is not None
+                    ),
+                ]
+                chain = self._chain_nodes(nodes)
+            except _Blocked as blocked:
+                heads[scope] = HistoryHead(scope, HeadStatus.BLOCKED, blocked.reason)
+                continue
+            chains[scope] = chain
+            heads[scope] = (
+                HistoryHead(
+                    scope,
+                    HeadStatus.ADOPTED,
+                    decision=chain[-1].decision,
+                    transaction_id=chain[-1].transaction_id,
+                    depth=len(chain),
+                )
+                if chain
+                else HistoryHead(scope, HeadStatus.EMPTY)
+            )
+        if attestation is not None and scopes_digest(
+            prefix_tips(prefixes, high_water)
+        ) != (attestation.scope_count, attestation.scopes_digest):
+            raise _Blocked(HeadBlockReason.DIVERGED)
+        return ReaderClassification(
+            incarnation, horizon, high_water, None, heads, chains, rows
+        )
 
     @staticmethod
     def _reconcile_all(
         rows: tuple[HistoryOperationRow, ...], view: _JournalView
     ) -> None:
-        """Both directions over the whole incarnation (review P1-2)."""
+        """Both directions over the retained part of the incarnation."""
 
         by_transaction = {row.transaction_id: row for row in rows}
         if len(by_transaction) != len(rows):
@@ -265,21 +419,21 @@ class SubjectHistoryReader:
             if row.phase is not expected:
                 raise _Blocked(HeadBlockReason.DIVERGED)
 
-    def _node(
-        self, incarnation: str, row: HistoryOperationRow, view: _JournalView
-    ) -> tuple[CommittedDecisionV1, str] | None:
-        if row.transaction_id in view.open:
-            raise _Blocked(HeadBlockReason.UNRESOLVED_OPERATION)
+    def _internal_node(
+        self, incarnation: str, row: HistoryOperationRow
+    ) -> ChainNode | None:
+        """SQLite-internal checks only (attested rows, C10 D2 §1)."""
+
         if row.phase is HistoryPhase.ABORTED:
             return None
-        transaction = view.committed[row.transaction_id]
-        outcomes = [
-            outcome
-            for participant, outcome in transaction.participant_outcomes
-            if participant == SUBJECT_HISTORY_PARTICIPANT_ID
-        ]
-        if len(outcomes) != 1 or outcomes[0] not in _ADOPTED_OUTCOMES:
+        if row.phase is not HistoryPhase.FINALIZED:
             raise _Blocked(HeadBlockReason.DIVERGED)
+        node, _receipt = self._decoded(incarnation, row)
+        return node
+
+    def _decoded(
+        self, incarnation: str, row: HistoryOperationRow
+    ) -> tuple[ChainNode, PostcommitReceiptV1]:
         finalized = self.store.finalized_decision(incarnation, row.transaction_id)
         if finalized is None or row.pending_bytes != finalized.committed_bytes:
             raise _Blocked(HeadBlockReason.DIVERGED)
@@ -300,46 +454,71 @@ class SubjectHistoryReader:
             or receipt.processing_sequence != row.processing_sequence
         ):
             raise _Blocked(HeadBlockReason.DIVERGED)
+        return ChainNode(decision, row.transaction_id, row.processing_sequence), receipt
+
+    def _node(
+        self, incarnation: str, row: HistoryOperationRow, view: _JournalView
+    ) -> ChainNode | None:
+        if row.transaction_id in view.open:
+            raise _Blocked(HeadBlockReason.UNRESOLVED_OPERATION)
+        if row.phase is HistoryPhase.ABORTED:
+            return None
+        transaction = view.committed[row.transaction_id]
+        outcomes = [
+            outcome
+            for participant, outcome in transaction.participant_outcomes
+            if participant == SUBJECT_HISTORY_PARTICIPANT_ID
+        ]
+        if len(outcomes) != 1 or outcomes[0] not in _ADOPTED_OUTCOMES:
+            raise _Blocked(HeadBlockReason.DIVERGED)
+        node, receipt = self._decoded(incarnation, row)
         terminals = view.event_terminals.get((row.event_id, row.processing_sequence), ())
         if not terminals:
             raise _Blocked(HeadBlockReason.MISSING_JOURNAL_PROOF)
         if len(terminals) != 1 or not _terminal_matches(terminals[0], receipt):
             raise _Blocked(HeadBlockReason.DIVERGED)
-        return decision, row.transaction_id
+        return node
 
     @staticmethod
-    def _chain(
-        lineage_scope: str, nodes: list[tuple[CommittedDecisionV1, str]]
-    ) -> HistoryHead:
+    def _chain_nodes(nodes: list[ChainNode]) -> tuple[ChainNode, ...]:
         if not nodes:
-            return HistoryHead(lineage_scope, HeadStatus.EMPTY)
-        children: dict[str, list[tuple[CommittedDecisionV1, str]]] = {}
+            return ()
+        children: dict[str, list[ChainNode]] = {}
         for node in nodes:
-            children.setdefault(node[0].predecessor_key, []).append(node)
+            children.setdefault(node.decision.predecessor_key, []).append(node)
         if any(len(items) > 1 for items in children.values()):
             raise _Blocked(HeadBlockReason.DUPLICATE_CHILD)
         key = GENESIS
         parent: CommittedDecisionV1 | None = None
-        tip: tuple[CommittedDecisionV1, str] | None = None
-        depth = 0
+        chain: list[ChainNode] = []
         while key in children:
             child = children[key][0]
             expected = None if parent is None else parent.content_digest
-            if child[0].predecessor_digest != expected:
+            if child.decision.predecessor_digest != expected:
                 raise _Blocked(HeadBlockReason.DIVERGED)
-            depth += 1
-            if depth > len(nodes):
+            chain.append(child)
+            if len(chain) > len(nodes):
                 raise _Blocked(HeadBlockReason.DIVERGED)
-            tip, parent, key = child, child[0], child[0].decision_id
-        if depth != len(nodes) or tip is None:
+            parent, key = child.decision, child.decision.decision_id
+        if len(chain) != len(nodes):
             raise _Blocked(HeadBlockReason.LINEAGE_GAP)
-        return HistoryHead(
-            lineage_scope,
-            HeadStatus.ADOPTED,
-            decision=tip[0],
-            transaction_id=tip[1],
-            depth=depth,
-        )
+        return tuple(chain)
+
+
+def _current_attestation(
+    inspection: EventJournalInspection, incarnation: str, horizon: int
+) -> tuple[EventJournalHistoryAttestation | None, int]:
+    """The latest COMPACTION's attestation for this incarnation (D2 P2-2)."""
+
+    compaction = inspection.latest_compaction
+    if compaction is None or compaction.history_attestation is None:
+        return None, 0
+    attestation = compaction.history_attestation
+    if attestation.incarnation_id != incarnation:
+        return None, 0
+    if attestation.horizon != horizon:
+        raise _Blocked(HeadBlockReason.DIVERGED)
+    return attestation, compaction.archived_processing_high_water
 
 
 def _terminal_matches(record: EventJournalRecord, receipt: PostcommitReceiptV1) -> bool:

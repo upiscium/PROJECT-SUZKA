@@ -44,6 +44,13 @@ _HASH_DOMAIN_V3 = b"PROJECT-SUZKA:event-journal:v3\0"
 _HASH_DOMAIN_V4 = b"PROJECT-SUZKA:event-journal:v4\0"
 _ARCHIVE_ROOT_DOMAIN = b"SUZKA:R07:JOURNAL-ARCHIVE:V1\0"
 _ARCHIVE_NAME_PATTERN = re.compile(r"(\d+)-(\d+)-([0-9a-f-]{36})\.jsonl\.gz")
+# C10 (#376 SubjectHistory compaction attestation): the Journal decides from
+# its own records whether ``subject.history`` is adopted and must be attested.
+HISTORY_PARTICIPANT_ID = "subject.history"
+COMPACTION_CARRY_VERSION = 10
+MAX_ATTESTED_POISONED_SCOPES = 1024
+_HISTORY_R07_DOMAIN = b"PROJECT-SUZKA:R07:SUBJECT-HISTORY-R07-LAYER:V1\0"
+_HISTORY_ATTESTATION_DOMAIN = b"PROJECT-SUZKA:R07:SUBJECT-HISTORY-ATTESTATION:V1\0"
 # Fields introduced by schema 4. They are absent from (and excluded when
 # hashing or serialising) every record of an older schema, so v1-v3 record
 # hashes and bytes are unchanged.
@@ -221,6 +228,58 @@ class ParticipantRequirement(_JournalModel):
         return value
 
 
+class EventJournalHistoryAttestation(_JournalModel):
+    """C10 SQLite layer declared by the ``subject.history`` provider.
+
+    Opaque to the Journal beyond its shape: the provider computed it inside
+    ``compact()`` after checking the archived R07 tuples against the
+    SubjectHistory rows one to one (#376 C10 D3 §1).  It covers every
+    current-incarnation row with processing sequence <= the COMPACTION's
+    archived high-water.  Its trust is that creation-time check (D3 §6).
+    """
+
+    incarnation_id: str
+    horizon: int = Field(ge=0, le=MAX_PERSISTED_EVENT_SEQUENCE)
+    store_id: str = Field(min_length=1, max_length=64)
+    subject_id: str = Field(min_length=1, max_length=128)
+    operations_count: int = Field(ge=0)
+    operations_digest: str
+    scope_count: int = Field(ge=0)
+    scopes_digest: str
+    poisoned_all: bool
+    poisoned_scopes: tuple[str, ...] = ()
+    previous_attestation_hash: str | None = None
+
+    @model_validator(mode="after")
+    def validate_attestation(self) -> EventJournalHistoryAttestation:
+        for value in (
+            self.incarnation_id,
+            self.operations_digest,
+            self.scopes_digest,
+            self.previous_attestation_hash,
+        ):
+            if value is not None and _HASH_PATTERN.fullmatch(value) is None:
+                raise ValueError("history attestation digest is invalid")
+        if (
+            len(self.poisoned_scopes) > MAX_ATTESTED_POISONED_SCOPES
+            or list(self.poisoned_scopes) != sorted(set(self.poisoned_scopes))
+            or any(not 1 <= len(item) <= 128 for item in self.poisoned_scopes)
+            or (self.poisoned_all and self.poisoned_scopes)
+        ):
+            raise ValueError("history attestation poisoned scopes are invalid")
+        return self
+
+    @property
+    def attestation_hash(self) -> str:
+        payload = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(_HISTORY_ATTESTATION_DOMAIN + payload).hexdigest()
+
+
 class EventJournalCompaction(_JournalModel):
     """What a COMPACTION record declares (#381 D1/D2).
 
@@ -258,14 +317,37 @@ class EventJournalCompaction(_JournalModel):
     # Omitted from serialization when absent, so COMPACTION records written
     # before C9 keep their exact bytes and hashes.
     driver_activation_record: EventJournalRecord | None = None
+    # C10 (#376 SubjectHistory compaction attestation, Human decision
+    # 2026-11-14).  ``carry_version`` is always written by a C10 compaction
+    # and gates every C10 recomputation; all C10 fields are omitted when
+    # absent so older COMPACTION records keep their exact bytes and hashes.
+    carry_version: int | None = None
+    # Every earlier participant baseline of the lineage, oldest first; the
+    # latest stays in ``baseline_record`` (finite: one per strict registry
+    # growth).
+    baseline_history_records: tuple[EventJournalRecord, ...] = ()
+    # R07 layer: cumulative digest/count of every archived transaction that
+    # requires ``subject.history`` (all incarnations), Journal-computed.
+    history_r07_digest: str | None = None
+    history_r07_count: int | None = None
+    history_attestation: EventJournalHistoryAttestation | None = None
 
     @model_serializer(mode="wrap")
     def _omit_absent_activation(
         self, handler: SerializerFunctionWrapHandler
     ) -> dict[str, object]:
         data = cast(dict[str, object], handler(self))
-        if self.driver_activation_record is None:
-            data.pop("driver_activation_record", None)
+        for name in (
+            "driver_activation_record",
+            "carry_version",
+            "history_r07_digest",
+            "history_r07_count",
+            "history_attestation",
+        ):
+            if getattr(self, name) is None:
+                data.pop(name, None)
+        if not self.baseline_history_records:
+            data.pop("baseline_history_records", None)
         return data
 
     @model_validator(mode="after")
@@ -335,16 +417,56 @@ class EventJournalCompaction(_JournalModel):
             > self.archived_processing_high_water
         ):
             raise ValueError("compaction carried activation is invalid")
+        self._validate_c10()
         for carried in self.carried_records:
             if carried.lifecycle is EventLifecycle.COMPACTION:
                 raise ValueError("compaction cannot carry a compaction")
         return self
+
+    def _validate_c10(self) -> None:
+        if self.carry_version is None:
+            if (
+                self.baseline_history_records
+                or self.history_r07_digest is not None
+                or self.history_r07_count is not None
+                or self.history_attestation is not None
+            ):
+                raise ValueError("C10 fields require the C10 carry version")
+            return
+        if (
+            self.carry_version != COMPACTION_CARRY_VERSION
+            or self.history_r07_digest is None
+            or _HASH_PATTERN.fullmatch(self.history_r07_digest) is None
+            or self.history_r07_count is None
+            or self.history_r07_count < 0
+        ):
+            raise ValueError("C10 compaction declaration is invalid")
+        history = self.baseline_history_records
+        if history and self.baseline_record is None:
+            raise ValueError("C10 baseline history needs the latest baseline")
+        chain = (*history, *(() if self.baseline_record is None else (self.baseline_record,)))
+        for earlier, later in zip(chain, chain[1:]):
+            if (
+                later.lifecycle is not EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED
+                or earlier.lifecycle
+                is not EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED
+                or earlier.record_hash == later.record_hash
+                or earlier.journal_lineage_id != later.journal_lineage_id
+                or earlier.participant_registry is None
+                or later.participant_registry is None
+                or not set(earlier.participant_registry)
+                < set(later.participant_registry)
+            ):
+                raise ValueError("C10 baseline history is not a strict chain")
+        # The horizon may exceed the archived high-water: after a recent true
+        # rollback the archived range holds no current-incarnation row at all.
 
     @property
     def carried_records(self) -> tuple[EventJournalRecord, ...]:
         return tuple(
             record
             for record in (
+                *self.baseline_history_records,
                 self.baseline_record,
                 self.true_rollback_completed_record,
                 self.true_rollback_cleared_record,
@@ -1432,6 +1554,48 @@ class EventJournalCompactionOutcome:
     archived_segments: int = 0
     archived_records: int = 0
     archive_file: str | None = None
+    # The provider's reason for a deferral or refusal (C10 review P2-3).
+    detail: str | None = None
+
+
+HistoryR07Tuple = tuple[object, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryAttestationRequest:
+    """What ``compact()`` hands the C10 provider (#376 C10 D3 §1).
+
+    ``r07_tuples`` are the archived range's ``subject.history`` transactions
+    computed by the Journal from its own records; the provider must match
+    the current incarnation's ones to SubjectHistory rows one to one.
+    """
+
+    archived_high_water: int
+    r07_tuples: tuple[HistoryR07Tuple, ...]
+    previous: EventJournalHistoryAttestation | None
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryAttestationDefer:
+    """A *temporary* reason not to compact now (store busy/unavailable)."""
+
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryAttestationRefuse:
+    """A *permanent* reason the provider cannot attest (adoption mismatch).
+
+    Never silently retried as a deferral: the outcome says ``refused``.
+    """
+
+    reason: str
+
+
+HistoryAttestationProvider = Callable[
+    [HistoryAttestationRequest],
+    "EventJournalHistoryAttestation | HistoryAttestationDefer | HistoryAttestationRefuse",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -2137,6 +2301,7 @@ class EventJournal:
         now: datetime | None = None,
         carried_tail: tuple[str, str] | None = None,
         guard: Callable[[int], bool] | None = None,
+        history_attestation: HistoryAttestationProvider | None = None,
     ) -> EventJournalCompactionOutcome:
         """Archive whole rotated segments older than the retention window.
 
@@ -2156,6 +2321,13 @@ class EventJournal:
         to be archived and returns True to defer (e.g. Semantic receipts that
         still need that evidence, #381 D1 P0-2); it runs under the Journal
         lock before anything is written.
+
+        C10 (#376): every compaction carries the full baseline history and
+        the cumulative ``subject.history`` R07 layer.  When the Journal's own
+        baselines register ``subject.history``, ``history_attestation`` must
+        attest the archived range: without it the result is
+        ``history_attestation_required`` (never a silent archive); a provider
+        ``HistoryAttestationDefer`` is ``deferred_history``.
         """
         if (
             isinstance(retention_days, bool)
@@ -2246,6 +2418,58 @@ class EventJournal:
             baseline, rollback, cleared = self._declared_state_at(
                 records, archived_count, injected
             )
+            baseline_history = self._declared_baseline_history_at(
+                records, archived_count, injected, baseline
+            )
+            r07_tuples = self._history_r07_tuples(archived)
+            r07_digest, r07_count = self._history_r07_layer(
+                *self._previous_r07(injected), r07_tuples
+            )
+            attestation: EventJournalHistoryAttestation | None = None
+            history_chain = (
+                *baseline_history,
+                *(() if baseline is None else (baseline,)),
+            )
+            # Defensive (review P3-8): archived subject.history transactions
+            # always need an attestation, whatever the baselines say.
+            if self._registers_history(history_chain) or r07_tuples:
+                # Decided from the Journal's own records, never from wiring.
+                if history_attestation is None:
+                    return EventJournalCompactionOutcome(
+                        False, "history_attestation_required"
+                    )
+                previous_attestation = (
+                    None
+                    if injected is None or injected.compaction is None
+                    else injected.compaction.history_attestation
+                )
+                attested = history_attestation(
+                    HistoryAttestationRequest(
+                        boundary_record.processing_sequence,
+                        r07_tuples,
+                        previous_attestation,
+                    )
+                )
+                if isinstance(attested, HistoryAttestationDefer):
+                    return EventJournalCompactionOutcome(
+                        False, "deferred_history", detail=attested.reason
+                    )
+                if isinstance(attested, HistoryAttestationRefuse):
+                    return EventJournalCompactionOutcome(
+                        False, "history_attestation_refused", detail=attested.reason
+                    )
+                if type(attested) is not EventJournalHistoryAttestation or (
+                    attested.previous_attestation_hash
+                    != (
+                        None
+                        if previous_attestation is None
+                        else previous_attestation.attestation_hash
+                    )
+                ):
+                    return EventJournalCompactionOutcome(
+                        False, "history_attestation_required"
+                    )
+                attestation = attested
             tail_record: EventJournalRecord | None = None
             if carried_tail is not None:
                 prior = (
@@ -2273,35 +2497,42 @@ class EventJournal:
             except Exception:
                 self._unlink_quietly(archive_path)
                 raise
-            declared = EventJournalCompaction(
-                compaction_id=compaction_id,
-                boundary_checkpoint_hash=boundary_record.record_hash,
-                archived_first_record_hash=archived[0].record_hash,
-                archived_last_record_hash=archived[-1].record_hash,
-                archived_record_count=len(archived),
-                archived_processing_floor=archived[0].processing_sequence,
-                archived_processing_high_water=boundary_record.processing_sequence,
-                archived_first_timestamp=archived[0].timestamp,
-                archived_last_timestamp=archived[-1].timestamp,
-                archived_root=self._archived_root(archived),
-                archive_file=archive_name,
-                archive_sha256=hashlib.sha256(compressed).hexdigest(),
-                archive_raw_sha256=hashlib.sha256(raw).hexdigest(),
-                archive_bytes=len(compressed),
-                retention_days=retention_days,
-                as_of=as_of,
-                previous_compaction_hash=(
-                    None if previous is None else previous.record_hash
-                ),
-                baseline_record=baseline,
-                true_rollback_completed_record=rollback,
-                true_rollback_cleared_record=cleared,
-                carried_tail_record=tail_record,
-                driver_activation_record=self._declared_activation_at(
-                    records, archived_count, injected
-                ),
-            )
             try:
+                # Inside the try: an invalid declaration must not orphan the
+                # archive just written (C10 review P1-1).
+                declared = EventJournalCompaction(
+                    compaction_id=compaction_id,
+                    boundary_checkpoint_hash=boundary_record.record_hash,
+                    archived_first_record_hash=archived[0].record_hash,
+                    archived_last_record_hash=archived[-1].record_hash,
+                    archived_record_count=len(archived),
+                    archived_processing_floor=archived[0].processing_sequence,
+                    archived_processing_high_water=boundary_record.processing_sequence,
+                    archived_first_timestamp=archived[0].timestamp,
+                    archived_last_timestamp=archived[-1].timestamp,
+                    archived_root=self._archived_root(archived),
+                    archive_file=archive_name,
+                    archive_sha256=hashlib.sha256(compressed).hexdigest(),
+                    archive_raw_sha256=hashlib.sha256(raw).hexdigest(),
+                    archive_bytes=len(compressed),
+                    retention_days=retention_days,
+                    as_of=as_of,
+                    previous_compaction_hash=(
+                        None if previous is None else previous.record_hash
+                    ),
+                    baseline_record=baseline,
+                    true_rollback_completed_record=rollback,
+                    true_rollback_cleared_record=cleared,
+                    carried_tail_record=tail_record,
+                    driver_activation_record=self._declared_activation_at(
+                        records, archived_count, injected
+                    ),
+                    carry_version=COMPACTION_CARRY_VERSION,
+                    baseline_history_records=baseline_history,
+                    history_r07_digest=r07_digest,
+                    history_r07_count=r07_count,
+                    history_attestation=attestation,
+                )
                 record = self._make_record(
                     EventLifecycle.COMPACTION,
                     previous_hash=records[-1].record_hash,
@@ -5668,6 +5899,11 @@ class EventJournal:
                     "compaction carried record is not authentic"
                 )
         state.injected_compaction = effective
+        # C10: earlier baselines first, then the latest (D3 §3 ordering), so
+        # baselines[-1] stays the latest and the first adoption is findable.
+        for carried in declared.baseline_history_records:
+            state.baseline_records_seen.append(carried)
+            state.gate_records.append(carried)
         if declared.baseline_record is not None:
             state.baseline_records_seen.append(declared.baseline_record)
             state.gate_records.append(declared.baseline_record)
@@ -5702,15 +5938,10 @@ class EventJournal:
                 if record.lifecycle
                 is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED
             ),
-            next(
-                (
-                    record
-                    for record in prior
-                    if record.lifecycle
-                    is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED
-                ),
-                None,
-            ),
+            # The declared latest baseline, never an earlier C10 history one.
+            None
+            if injected is None or injected.compaction is None
+            else injected.compaction.baseline_record,
         )
         rollback: EventJournalRecord | None = None
         cleared: EventJournalRecord | None = None
@@ -5776,6 +6007,164 @@ class EventJournal:
         )
 
     @staticmethod
+    def _declared_baseline_history_at(
+        records: tuple[EventJournalRecord, ...],
+        boundary: int,
+        injected: EventJournalRecord | None,
+        latest: EventJournalRecord | None,
+    ) -> tuple[EventJournalRecord, ...]:
+        """Every earlier baseline of the lineage, oldest first (C10, D3 §3)."""
+        prior: tuple[EventJournalRecord, ...] = ()
+        if injected is not None and injected.compaction is not None:
+            declared = injected.compaction
+            prior = (
+                *declared.baseline_history_records,
+                *(() if declared.baseline_record is None else (declared.baseline_record,)),
+            )
+        seen: set[str] = set()
+        ordered: list[EventJournalRecord] = []
+        for record in (
+            *prior,
+            *(
+                item
+                for item in records[:boundary]
+                if item.lifecycle is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED
+            ),
+        ):
+            if record.record_hash not in seen:
+                seen.add(record.record_hash)
+                ordered.append(record)
+        if latest is not None:
+            ordered = [item for item in ordered if item.record_hash != latest.record_hash]
+        return tuple(ordered)
+
+    @staticmethod
+    def _registers_history(records: tuple[EventJournalRecord, ...]) -> bool:
+        return any(
+            item.participant_id == HISTORY_PARTICIPANT_ID
+            for record in records
+            if record.lifecycle is EventLifecycle.PARTICIPANT_BASELINE_ESTABLISHED
+            for item in record.participant_registry or ()
+        )
+
+    @staticmethod
+    def _history_r07_tuples(
+        records: tuple[EventJournalRecord, ...],
+    ) -> tuple[HistoryR07Tuple, ...]:
+        """R07 facts of every ``subject.history`` transaction in ``records``.
+
+        A pure function of the records (C10 D3 §1): binding, participant
+        outcome, transaction terminal and the event's terminal(s).
+        """
+        # One pass to index (review P3-7): this runs under the Journal lock.
+        prepared: list[EventJournalRecord] = []
+        by_transaction: dict[str, list[EventJournalRecord]] = {}
+        by_event: dict[tuple[str | None, int | None], list[EventJournalRecord]] = {}
+        for record in records:
+            if record.transaction_id is not None:
+                by_transaction.setdefault(record.transaction_id, []).append(record)
+                if record.lifecycle is EventLifecycle.TRANSACTION_PREPARED and any(
+                    item.participant_id == HISTORY_PARTICIPANT_ID
+                    for item in record.required_participants or ()
+                ):
+                    prepared.append(record)
+            elif record.lifecycle in (
+                EventLifecycle.COMPLETED,
+                EventLifecycle.RECOVERY_CLASSIFIED,
+                EventLifecycle.FAILED,
+            ):
+                by_event.setdefault(
+                    (record.event_id, record.processing_sequence), []
+                ).append(record)
+        result: list[HistoryR07Tuple] = []
+        for record in prepared:
+            requirement = next(
+                item
+                for item in record.required_participants or ()
+                if item.participant_id == HISTORY_PARTICIPANT_ID
+            )
+            txid = record.transaction_id
+            assert txid is not None
+            related = by_transaction.get(txid, ())
+            outcomes = tuple(
+                (
+                    item.lifecycle.value,
+                    None
+                    if item.participant_outcome is None
+                    else item.participant_outcome.value,
+                    None if item.abort_outcome is None else item.abort_outcome.value,
+                )
+                for item in related
+                if item.participant_id == HISTORY_PARTICIPANT_ID
+                and item.lifecycle
+                in (EventLifecycle.PARTICIPANT_FINALIZED, EventLifecycle.PARTICIPANT_ABORTED)
+            )
+            terminals = tuple(
+                item.lifecycle.value
+                for item in related
+                if item.lifecycle
+                in (
+                    EventLifecycle.TRANSACTION_COMPLETED,
+                    EventLifecycle.TRANSACTION_RECONCILED,
+                    EventLifecycle.TRANSACTION_ABORTED,
+                )
+            )
+            events = tuple(
+                (
+                    item.lifecycle.value,
+                    None if item.failure_category is None else item.failure_category.value,
+                    item.snapshot_sequence,
+                    item.snapshot_hash,
+                    item.wal_record_id,
+                    item.wal_record_hash,
+                )
+                for item in by_event.get(
+                    (record.event_id, record.processing_sequence), ()
+                )
+            )
+            result.append(
+                (
+                    txid,
+                    record.event_id,
+                    record.processing_sequence,
+                    None if record.transaction_kind is None else record.transaction_kind.value,
+                    requirement.operation_digest,
+                    outcomes,
+                    terminals,
+                    events,
+                )
+            )
+        return tuple(result)
+
+    @staticmethod
+    def _history_r07_layer(
+        previous_digest: str | None,
+        previous_count: int,
+        tuples: tuple[HistoryR07Tuple, ...],
+    ) -> tuple[str, int]:
+        payload = json.dumps(
+            [previous_digest, [list(item) for item in tuples]],
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=list,
+        ).encode("utf-8")
+        return (
+            hashlib.sha256(_HISTORY_R07_DOMAIN + payload).hexdigest(),
+            previous_count + len(tuples),
+        )
+
+    @staticmethod
+    def _previous_r07(injected: EventJournalRecord | None) -> tuple[str | None, int]:
+        if (
+            injected is None
+            or injected.compaction is None
+            or injected.compaction.carry_version is None
+        ):
+            return None, 0
+        declared = injected.compaction
+        return declared.history_r07_digest, declared.history_r07_count or 0
+
+    @staticmethod
     def _verify_declared_compaction(
         records: tuple[EventJournalRecord, ...],
         boundary: int,
@@ -5821,6 +6210,54 @@ class EventJournal:
         )
         if tail is not None and tail not in archived and tail not in prior:
             raise EventJournalIntegrityError("compaction carried tail is unknown")
+        if declared.carry_version is not None:
+            # C10 only: recompute while the archived records are present
+            # (pre-C10 compactions are not reinterpreted, D3 §4).
+            history = EventJournal._declared_baseline_history_at(
+                records, boundary, injected, baseline
+            )
+            digest, count = EventJournal._history_r07_layer(
+                *EventJournal._previous_r07(injected),
+                EventJournal._history_r07_tuples(archived),
+            )
+            if (
+                declared.baseline_history_records != history
+                or declared.history_r07_digest != digest
+                or declared.history_r07_count != count
+            ):
+                raise EventJournalIntegrityError("compaction C10 declaration is invalid")
+            chain = (*history, *(() if baseline is None else (baseline,)))
+            archived_history = count != EventJournal._previous_r07(injected)[1]
+            if (
+                EventJournal._registers_history(chain) or archived_history
+            ) and declared.history_attestation is None:
+                raise EventJournalIntegrityError(
+                    "compaction lacks the required history attestation"
+                )
+            # Review P2-4: the attestation chain is re-checked on every load.
+            previous_attestation = (
+                None
+                if injected is None or injected.compaction is None
+                else injected.compaction.history_attestation
+            )
+            if declared.history_attestation is not None and (
+                declared.history_attestation.previous_attestation_hash
+                != (
+                    None
+                    if previous_attestation is None
+                    else previous_attestation.attestation_hash
+                )
+            ):
+                raise EventJournalIntegrityError(
+                    "compaction history attestation chain is broken"
+                )
+        elif (
+            injected is not None
+            and injected.compaction is not None
+            and injected.compaction.carry_version is not None
+        ):
+            # Review P2-4: no downgrade from a C10 compaction to a pre-C10 one.
+            raise EventJournalIntegrityError("compaction downgrades the C10 carry")
 
     @staticmethod
     def _rollover_view(record: EventJournalRecord) -> EventJournalWalRollover:
