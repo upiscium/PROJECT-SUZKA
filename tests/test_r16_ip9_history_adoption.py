@@ -249,8 +249,14 @@ def test_server_opens_creates_and_refuses_disabling(tmp_path: Path) -> None:
     from test_startup_reconciliation import _settings
 
     memory, _state, journal, _wal, recovery = _graph(tmp_path)
-    settings = _settings(tmp_path)
-    assert settings.subject_history.enabled is False
+    base = _settings(tmp_path)
+    # IP-10b: config.yaml now enables SubjectHistory; this test needs the
+    # explicitly disabled form.
+    settings = base.model_copy(
+        update={
+            "subject_history": base.subject_history.model_copy(update={"enabled": False})
+        }
+    )
     assert _open_subject_history(settings, journal) is None
 
     enabled = settings.model_copy(

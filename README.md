@@ -81,6 +81,24 @@ Build the frontend after the env file is configured because `NEXT_PUBLIC_API_BAS
 sudo -u suzka bash -lc 'set -a; source /etc/project-suzka/frontend.env; set +a; cd /opt/project-suzka/frontend && npm run build'
 ```
 
+### SubjectHistory (one-way adoption)
+
+`config.yaml` enables `subject_history` (IP-10b, #376 H2). The first clean
+startup after updating to it adopts the SubjectHistory store
+(`/opt/project-suzka/.suzka/private/subject_history/subject_history.sqlite3`)
+into the EventJournal **irreversibly**:
+
+- Back up the whole `/opt/project-suzka/.suzka/` directory before the first
+  startup on a version that enables it.
+- After adoption the store and the Journal are inseparable. Never delete
+  `.suzka/` (no `git clean -fdx`, no fresh re-clone in place), and never
+  restore one without the other.
+- Do not go back to a commit with `subject_history.enabled: false` after
+  adoption; startup then fails closed.
+- Do not run the test suite inside `/opt/project-suzka`.
+- Rows are never deleted; once `max_page_count` (65536 pages, 256 MiB) is
+  reached, later Decisions HOLD with `HISTORY_CAPACITY`.
+
 ### 4. Install Services
 
 ```bash

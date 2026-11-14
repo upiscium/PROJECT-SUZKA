@@ -15,7 +15,9 @@ registration and pre-service validation are **not** implemented. Migration
 and activation each require further Human approval.
 The active `deploy/systemd/suzka-api.service`, existing
 `deploy/env/backend.env.example`, repository `config.yaml`, and runtime
-configuration loader remain unchanged.
+configuration loader remain unchanged. (Later change: IP-10b enables
+`subject_history` in the repository `config.yaml`; see the README's
+SubjectHistory section.)
 
 ## Intended paths for a Linux service
 
@@ -30,6 +32,7 @@ configuration loader remain unchanged.
 | Chroma DB1/DB2 | `/var/lib/project-suzka/chroma` | Persistent memory and pending episodic staging |
 | Experience | `/var/lib/project-suzka/experience` | R12 history and derived evidence |
 | Semantic | `/var/lib/project-suzka/semantic` | Independent semantic records and receipts |
+| SubjectHistory | `/var/lib/project-suzka/subject_history/subject_history.sqlite3` | R16 committed Decisions (#376). Once adopted it is inseparable from the Journal: never delete, recreate or restore it apart from the Journal (keep its SQLite sidecar files with it). The service creates the 0700 directory; changing `project.name` after adoption fails closed |
 | Dreams | `/var/lib/project-suzka/dreams/dream_dataset.jsonl` | Private derived training data |
 | Learned adapters | `/var/lib/project-suzka/adapters` | Retained training output |
 | Adapter registry | `/var/lib/project-suzka/adapter_registry.json` | Committed registry |
@@ -39,8 +42,9 @@ configuration loader remain unchanged.
 | Replaceable cache | `/var/cache/project-suzka` | Optional; model/download cache configuration not implemented |
 | Program and virtualenv | `/opt/project-suzka/venv` | Preinstalled immutable/non-editable package, **not installed** |
 
-The nine `Path`-valued configuration fields are supplied as explicit absolute
-paths in `deploy/config/config.fhs.yaml.example`. `ExperienceStore` and
+The ten `Path`-valued configuration fields are supplied as explicit absolute
+paths in `deploy/config/config.fhs.yaml.example`; an offline migration must move
+the SubjectHistory store together with the Journal. `ExperienceStore` and
 `SemanticStore` currently derive their roots as siblings of the configured
 Chroma root, so `.../chroma` maps them to `.../experience` and
 `.../semantic`. Episodic staging remains beneath the Chroma memory root.
