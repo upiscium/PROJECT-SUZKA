@@ -458,10 +458,8 @@ class EventJournalCompaction(_JournalModel):
                 < set(later.participant_registry)
             ):
                 raise ValueError("C10 baseline history is not a strict chain")
-        if self.history_attestation is not None and (
-            self.history_attestation.horizon > self.archived_processing_high_water
-        ):
-            raise ValueError("C10 history attestation horizon is invalid")
+        # The horizon may exceed the archived high-water: after a recent true
+        # rollback the archived range holds no current-incarnation row at all.
 
     @property
     def carried_records(self) -> tuple[EventJournalRecord, ...]:
@@ -1556,6 +1554,8 @@ class EventJournalCompactionOutcome:
     archived_segments: int = 0
     archived_records: int = 0
     archive_file: str | None = None
+    # The provider's reason for a deferral or refusal (C10 review P2-3).
+    detail: str | None = None
 
 
 HistoryR07Tuple = tuple[object, ...]
@@ -1582,9 +1582,19 @@ class HistoryAttestationDefer:
     reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class HistoryAttestationRefuse:
+    """A *permanent* reason the provider cannot attest (adoption mismatch).
+
+    Never silently retried as a deferral: the outcome says ``refused``.
+    """
+
+    reason: str
+
+
 HistoryAttestationProvider = Callable[
     [HistoryAttestationRequest],
-    "EventJournalHistoryAttestation | HistoryAttestationDefer",
+    "EventJournalHistoryAttestation | HistoryAttestationDefer | HistoryAttestationRefuse",
 ]
 
 
@@ -2420,7 +2430,9 @@ class EventJournal:
                 *baseline_history,
                 *(() if baseline is None else (baseline,)),
             )
-            if self._registers_history(history_chain):
+            # Defensive (review P3-8): archived subject.history transactions
+            # always need an attestation, whatever the baselines say.
+            if self._registers_history(history_chain) or r07_tuples:
                 # Decided from the Journal's own records, never from wiring.
                 if history_attestation is None:
                     return EventJournalCompactionOutcome(
@@ -2439,7 +2451,13 @@ class EventJournal:
                     )
                 )
                 if isinstance(attested, HistoryAttestationDefer):
-                    return EventJournalCompactionOutcome(False, "deferred_history")
+                    return EventJournalCompactionOutcome(
+                        False, "deferred_history", detail=attested.reason
+                    )
+                if isinstance(attested, HistoryAttestationRefuse):
+                    return EventJournalCompactionOutcome(
+                        False, "history_attestation_refused", detail=attested.reason
+                    )
                 if type(attested) is not EventJournalHistoryAttestation or (
                     attested.previous_attestation_hash
                     != (
@@ -2479,40 +2497,42 @@ class EventJournal:
             except Exception:
                 self._unlink_quietly(archive_path)
                 raise
-            declared = EventJournalCompaction(
-                compaction_id=compaction_id,
-                boundary_checkpoint_hash=boundary_record.record_hash,
-                archived_first_record_hash=archived[0].record_hash,
-                archived_last_record_hash=archived[-1].record_hash,
-                archived_record_count=len(archived),
-                archived_processing_floor=archived[0].processing_sequence,
-                archived_processing_high_water=boundary_record.processing_sequence,
-                archived_first_timestamp=archived[0].timestamp,
-                archived_last_timestamp=archived[-1].timestamp,
-                archived_root=self._archived_root(archived),
-                archive_file=archive_name,
-                archive_sha256=hashlib.sha256(compressed).hexdigest(),
-                archive_raw_sha256=hashlib.sha256(raw).hexdigest(),
-                archive_bytes=len(compressed),
-                retention_days=retention_days,
-                as_of=as_of,
-                previous_compaction_hash=(
-                    None if previous is None else previous.record_hash
-                ),
-                baseline_record=baseline,
-                true_rollback_completed_record=rollback,
-                true_rollback_cleared_record=cleared,
-                carried_tail_record=tail_record,
-                driver_activation_record=self._declared_activation_at(
-                    records, archived_count, injected
-                ),
-                carry_version=COMPACTION_CARRY_VERSION,
-                baseline_history_records=baseline_history,
-                history_r07_digest=r07_digest,
-                history_r07_count=r07_count,
-                history_attestation=attestation,
-            )
             try:
+                # Inside the try: an invalid declaration must not orphan the
+                # archive just written (C10 review P1-1).
+                declared = EventJournalCompaction(
+                    compaction_id=compaction_id,
+                    boundary_checkpoint_hash=boundary_record.record_hash,
+                    archived_first_record_hash=archived[0].record_hash,
+                    archived_last_record_hash=archived[-1].record_hash,
+                    archived_record_count=len(archived),
+                    archived_processing_floor=archived[0].processing_sequence,
+                    archived_processing_high_water=boundary_record.processing_sequence,
+                    archived_first_timestamp=archived[0].timestamp,
+                    archived_last_timestamp=archived[-1].timestamp,
+                    archived_root=self._archived_root(archived),
+                    archive_file=archive_name,
+                    archive_sha256=hashlib.sha256(compressed).hexdigest(),
+                    archive_raw_sha256=hashlib.sha256(raw).hexdigest(),
+                    archive_bytes=len(compressed),
+                    retention_days=retention_days,
+                    as_of=as_of,
+                    previous_compaction_hash=(
+                        None if previous is None else previous.record_hash
+                    ),
+                    baseline_record=baseline,
+                    true_rollback_completed_record=rollback,
+                    true_rollback_cleared_record=cleared,
+                    carried_tail_record=tail_record,
+                    driver_activation_record=self._declared_activation_at(
+                        records, archived_count, injected
+                    ),
+                    carry_version=COMPACTION_CARRY_VERSION,
+                    baseline_history_records=baseline_history,
+                    history_r07_digest=r07_digest,
+                    history_r07_count=r07_count,
+                    history_attestation=attestation,
+                )
                 record = self._make_record(
                     EventLifecycle.COMPACTION,
                     previous_hash=records[-1].record_hash,
@@ -6036,15 +6056,26 @@ class EventJournal:
         A pure function of the records (C10 D3 §1): binding, participant
         outcome, transaction terminal and the event's terminal(s).
         """
-        prepared = [
-            record
-            for record in records
-            if record.lifecycle is EventLifecycle.TRANSACTION_PREPARED
-            and any(
-                item.participant_id == HISTORY_PARTICIPANT_ID
-                for item in record.required_participants or ()
-            )
-        ]
+        # One pass to index (review P3-7): this runs under the Journal lock.
+        prepared: list[EventJournalRecord] = []
+        by_transaction: dict[str, list[EventJournalRecord]] = {}
+        by_event: dict[tuple[str | None, int | None], list[EventJournalRecord]] = {}
+        for record in records:
+            if record.transaction_id is not None:
+                by_transaction.setdefault(record.transaction_id, []).append(record)
+                if record.lifecycle is EventLifecycle.TRANSACTION_PREPARED and any(
+                    item.participant_id == HISTORY_PARTICIPANT_ID
+                    for item in record.required_participants or ()
+                ):
+                    prepared.append(record)
+            elif record.lifecycle in (
+                EventLifecycle.COMPLETED,
+                EventLifecycle.RECOVERY_CLASSIFIED,
+                EventLifecycle.FAILED,
+            ):
+                by_event.setdefault(
+                    (record.event_id, record.processing_sequence), []
+                ).append(record)
         result: list[HistoryR07Tuple] = []
         for record in prepared:
             requirement = next(
@@ -6053,6 +6084,8 @@ class EventJournal:
                 if item.participant_id == HISTORY_PARTICIPANT_ID
             )
             txid = record.transaction_id
+            assert txid is not None
+            related = by_transaction.get(txid, ())
             outcomes = tuple(
                 (
                     item.lifecycle.value,
@@ -6061,17 +6094,15 @@ class EventJournal:
                     else item.participant_outcome.value,
                     None if item.abort_outcome is None else item.abort_outcome.value,
                 )
-                for item in records
-                if item.transaction_id == txid
-                and item.participant_id == HISTORY_PARTICIPANT_ID
+                for item in related
+                if item.participant_id == HISTORY_PARTICIPANT_ID
                 and item.lifecycle
                 in (EventLifecycle.PARTICIPANT_FINALIZED, EventLifecycle.PARTICIPANT_ABORTED)
             )
             terminals = tuple(
                 item.lifecycle.value
-                for item in records
-                if item.transaction_id == txid
-                and item.lifecycle
+                for item in related
+                if item.lifecycle
                 in (
                     EventLifecycle.TRANSACTION_COMPLETED,
                     EventLifecycle.TRANSACTION_RECONCILED,
@@ -6087,15 +6118,8 @@ class EventJournal:
                     item.wal_record_id,
                     item.wal_record_hash,
                 )
-                for item in records
-                if item.event_id == record.event_id
-                and item.processing_sequence == record.processing_sequence
-                and item.transaction_id is None
-                and item.lifecycle
-                in (
-                    EventLifecycle.COMPLETED,
-                    EventLifecycle.RECOVERY_CLASSIFIED,
-                    EventLifecycle.FAILED,
+                for item in by_event.get(
+                    (record.event_id, record.processing_sequence), ()
                 )
             )
             result.append(
@@ -6203,12 +6227,37 @@ class EventJournal:
             ):
                 raise EventJournalIntegrityError("compaction C10 declaration is invalid")
             chain = (*history, *(() if baseline is None else (baseline,)))
-            if EventJournal._registers_history(chain) and (
-                declared.history_attestation is None
-            ):
+            archived_history = count != EventJournal._previous_r07(injected)[1]
+            if (
+                EventJournal._registers_history(chain) or archived_history
+            ) and declared.history_attestation is None:
                 raise EventJournalIntegrityError(
                     "compaction lacks the required history attestation"
                 )
+            # Review P2-4: the attestation chain is re-checked on every load.
+            previous_attestation = (
+                None
+                if injected is None or injected.compaction is None
+                else injected.compaction.history_attestation
+            )
+            if declared.history_attestation is not None and (
+                declared.history_attestation.previous_attestation_hash
+                != (
+                    None
+                    if previous_attestation is None
+                    else previous_attestation.attestation_hash
+                )
+            ):
+                raise EventJournalIntegrityError(
+                    "compaction history attestation chain is broken"
+                )
+        elif (
+            injected is not None
+            and injected.compaction is not None
+            and injected.compaction.carry_version is not None
+        ):
+            # Review P2-4: no downgrade from a C10 compaction to a pre-C10 one.
+            raise EventJournalIntegrityError("compaction downgrades the C10 carry")
 
     @staticmethod
     def _rollover_view(record: EventJournalRecord) -> EventJournalWalRollover:

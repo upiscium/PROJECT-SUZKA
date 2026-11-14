@@ -15,6 +15,8 @@ from pathlib import Path
 import shutil
 import sys
 
+import pytest
+
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -336,3 +338,107 @@ def test_coordinator_passes_the_provider(tmp_path: Path) -> None:
     outcome = coordinator.maybe_compact()
     assert outcome.performed, outcome.reason
     assert world.reader().head(SCOPE).decision == decisions[-1]
+
+
+def test_poisoned_scope_stays_poisoned_after_a_second_compaction(tmp_path: Path) -> None:
+    world = _World(tmp_path)
+    _small(world)
+    orphan_parent = _committed(
+        _event("never-committed", 999), incarnation=world.incarnation, intent="a" * 64
+    )
+    world.commit("orphan", intent="b" * 64, parent=orphan_parent)
+    root = _commit_scope(world, "other-root", intent="c" * 64, scope=OTHER_SCOPE)
+    assert _compact(world, _provider(world)).reason in (None, "nothing_due")
+    _chain(world, 8, prefix="filler")
+    outcome = world.journal.compact(
+        retention_days=1,
+        now=LATER + timedelta(days=3),
+        history_attestation=_provider(world),
+    )
+    assert outcome.performed, outcome.reason
+    attestation = world.journal.inspect().latest_compaction.history_attestation
+    assert attestation is not None and SCOPE in attestation.poisoned_scopes
+    assert world.reader().head(SCOPE).reason is HeadBlockReason.POISONED
+    assert world.reader().head(OTHER_SCOPE).decision == root
+
+
+def test_permanent_adoption_mismatch_is_refused_not_deferred(tmp_path: Path) -> None:
+    from suzka.r16 import history_attestation as module
+    from suzka.r16.history_adoption import HistoryAdoptionError
+
+    world = _World(tmp_path)
+    _small(world)
+    _chain(world, 6)
+
+    def mismatch(_inspection, _store):  # type: ignore[no-untyped-def]
+        raise HistoryAdoptionError("SubjectHistory adoption evidence is not exact")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(module, "resolve_incarnation", mismatch)
+        outcome = _compact(world, _provider(world))
+    assert (outcome.performed, outcome.reason, outcome.detail) == (
+        False,
+        "history_attestation_refused",
+        "history_adoption_invalid",
+    )
+
+
+def test_compaction_after_a_recent_true_rollback(tmp_path: Path) -> None:
+    """Review P1-1: a horizon above the archived high-water is valid."""
+
+    import json
+
+    from suzka.r16.history_adoption import resolve_incarnation
+    from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
+    from suzka.runtime.state_recovery import StateRecoveryCoordinator
+
+    world = _World(tmp_path)
+    world.recovery.publish_boot_anchor(world.recovery.prepare_startup())
+    _small(world)
+    decisions = _chain(world, 6)
+    old_incarnation = world.incarnation
+    # Everything from here on is recent: only the older segments are due, so
+    # the rollback horizon ends above the archived high-water.
+    world.journal._clock = lambda: NOW + timedelta(days=1)  # type: ignore[method-assign]
+    _chain(world, 2, prefix="recent", parent=decisions[-1])
+
+    wal = world.recovery.wal
+    manifest = wal.inspect().active_manifest
+    assert manifest is not None
+    generation = wal.root / "generations" / f"{manifest.active_generation_id}.jsonl"
+    lines = generation.read_bytes().splitlines(keepends=True)
+    transition = json.loads(lines[1])
+    transition["record_hash"] = "0" * 64
+    lines[1] = json.dumps(transition, separators=(",", ":")).encode() + b"\n"
+    generation.write_bytes(b"".join(lines))
+    world.state.path.unlink()
+    rolled_back = StateRecoveryCoordinator(world.state, world.journal, wal).prepare_startup()
+    assert rolled_back.true_rollback_performed
+    assert StartupReconciliationCoordinator(
+        world.journal, world.recovery, world.memory, history_store=world.store
+    ).reconcile_recovery_gate(rolled_back).participants_consistent
+    new_incarnation, horizon = resolve_incarnation(world.journal.inspect(), world.store)
+    assert new_incarnation != old_incarnation
+
+    outcome = world.journal.compact(
+        retention_days=1,
+        now=NOW + timedelta(days=1, hours=12),
+        history_attestation=_provider(world),
+    )
+    assert outcome.performed, (outcome.reason, outcome.detail)
+    compaction = world.journal.inspect().latest_compaction
+    assert compaction is not None and compaction.history_attestation is not None
+    attestation = compaction.history_attestation
+    assert attestation.incarnation_id == new_incarnation
+    assert attestation.horizon == horizon > compaction.archived_processing_high_water
+    assert attestation.operations_count == 0
+    archives = list(world.journal.archive_dir.glob("*.jsonl.gz"))
+    assert len(archives) == 1  # nothing orphaned
+
+    # The new incarnation starts empty and adopts a fresh GENESIS root.
+    world.incarnation = new_incarnation
+    world.sequence = world.journal.inspect().processing_high_water
+    assert world.reader().head(SCOPE).status is HeadStatus.EMPTY
+    _event_, root = world.commit("after-rollback", intent="9" * 64)
+    head = world.reader().head(SCOPE)
+    assert (head.status, head.decision, head.depth) == (HeadStatus.ADOPTED, root, 1)

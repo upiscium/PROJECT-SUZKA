@@ -43,10 +43,14 @@ from suzka.runtime.event_journal import (
     EventJournalHistoryAttestation,
     EventLifecycle,
     HistoryAttestationDefer,
+    HistoryAttestationRefuse,
     HistoryAttestationRequest,
 )
+from suzka.r16.history_store import HistoryMetaPhase
 
-# Resolvable by startup reconciliation: never poisoned (D3 §3).
+# Resolvable by startup reconciliation: never poisoned (D3 §3).  Compaction
+# runs only at a clean R07 boundary, so this is not expected to be reached
+# there; deferring is the safe choice if it ever is (review P3-9).
 _TRANSIENT_BLOCKS = frozenset({HeadBlockReason.UNRESOLVED_OPERATION})
 
 
@@ -59,7 +63,9 @@ class SubjectHistoryAttestationProvider:
 
     def __call__(
         self, request: HistoryAttestationRequest
-    ) -> EventJournalHistoryAttestation | HistoryAttestationDefer:
+    ) -> (
+        EventJournalHistoryAttestation | HistoryAttestationDefer | HistoryAttestationRefuse
+    ):
         try:
             inspection = self.journal.inspect()
         except Exception:
@@ -70,7 +76,15 @@ class SubjectHistoryAttestationProvider:
         except HistoryStoreError:
             return HistoryAttestationDefer("store_unavailable")
         except HistoryAdoptionError:
-            return HistoryAttestationDefer("incarnation_unavailable")
+            # Review P2-3: only a not-yet-active store or an open gate clear is
+            # temporary; any other adoption mismatch is permanent.
+            try:
+                provisional = self.store.meta().phase is HistoryMetaPhase.PROVISIONAL
+            except HistoryStoreError:
+                return HistoryAttestationDefer("store_unavailable")
+            if provisional or inspection.open_gate_clear is not None:
+                return HistoryAttestationDefer("incarnation_unavailable")
+            return HistoryAttestationRefuse("history_adoption_invalid")
         latest = inspection.latest_compaction
         if (None if latest is None else latest.history_attestation) != request.previous:
             # The request and the inspection describe different chains.
@@ -113,7 +127,11 @@ class SubjectHistoryAttestationProvider:
                 for scope, chain in result.chains.items()
                 if scope not in poisoned
             }
-            tips = prefix_tips(chains, high_water)
+            try:
+                tips = prefix_tips(chains, high_water)
+            except ValueError:
+                # Review P3-6: same treatment as the reader (a divergence).
+                poisoned_all, poisoned, tips = True, set(), {}
         scope_count, scopes = scopes_digest(tips)
         return EventJournalHistoryAttestation(
             incarnation_id=incarnation,

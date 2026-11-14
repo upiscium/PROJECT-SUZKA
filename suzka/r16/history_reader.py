@@ -269,11 +269,21 @@ class SubjectHistoryReader:
             rows = self.store.operations(incarnation)
         except HistoryStoreError:
             raise ReaderTransient(HeadBlockReason.STORE_UNAVAILABLE) from None
-        attestation, high_water = _current_attestation(inspection, incarnation, horizon)
-        result = ReaderClassification(
-            incarnation, horizon, high_water, None, {}, {}, rows
-        )
+        result = ReaderClassification(incarnation, horizon, 0, None, {}, {}, rows)
         try:
+            # Inside the try (review P2-2): a mismatch is a block, not a leak.
+            attestation, high_water = _current_attestation(
+                inspection, incarnation, horizon
+            )
+            result = replace(result, attested_high_water=high_water)
+            if attestation is not None:
+                meta = self.store.meta()
+                if (
+                    attestation.store_id != meta.store_id
+                    or attestation.subject_id != meta.subject_id
+                ):
+                    # Review P2-5: another store cannot satisfy the attestation.
+                    raise _Blocked(HeadBlockReason.DIVERGED)
             return self._classify(
                 inspection, incarnation, horizon, attestation, high_water, rows, scopes
             )
