@@ -73,6 +73,8 @@ def main(prod_config: str, lab_dir: str, port_text: str) -> int:
         for text in _strings(json.loads(registry.read_text(encoding="utf-8"))):
             if text.startswith(("/", "~")):
                 problems.append(f"adapter registry names an absolute path: {text}")
+            elif "/" in text and not (lab / text).resolve().is_relative_to(lab):
+                problems.append(f"adapter registry path leaves the lab: {text}")
     for problem in problems:
         print(f"lab_prepare: {problem}", file=sys.stderr)
     if problems:

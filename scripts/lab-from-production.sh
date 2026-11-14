@@ -75,14 +75,21 @@ trap cleanup EXIT
 
 sudo cp -a "${PROD_ROOT}/.suzka" "${LAB}/.suzka"
 sudo rm -f "${LAB}/.suzka/.event_journal.jsonl.lock"
+# A symlink in the copy could lead lab writes back out of it.
+if [[ -n "$(sudo find "${LAB}/.suzka" -type l -print -quit)" ]]; then
+  printf 'the state copy contains symlinks; refusing\n' >&2
+  exit 1
+fi
 sudo cp "${PROD_CONFIG}" "${LAB}/prod-config.yaml"
-# systemd's EnvironmentFile= overrides Environment=, so the production config
-# path must not reach the lab through it.
-sudo grep -v '^[[:space:]]*SUZKA_CONFIG_PATH=' "${PROD_ENV}" | sudo tee "${LAB}/backend.env" >/dev/null
+sudo cp "${PROD_ENV}" "${LAB}/backend.env"
+# systemd's EnvironmentFile= overrides Environment=, and a later file wins over
+# an earlier one, so these lab settings beat anything in backend.env.
+printf '%s\n' "SUZKA_CONFIG_PATH=${LAB}/config.yaml" "PYTHONPATH=${PROD_ROOT}" \
+  HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 | sudo tee "${LAB}/lab.env" >/dev/null
 SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
 sudo cp "${SCRIPTS}/lab_prepare.py" "${LAB}/lab_prepare.py"
 sudo chown -R "${SERVICE_USER}:${SERVICE_USER}" "${LAB}"
-sudo chmod 600 "${LAB}/backend.env" "${LAB}/prod-config.yaml" "${LAB}/lab_prepare.py"
+sudo chmod 600 "${LAB}/backend.env" "${LAB}/lab.env" "${LAB}/prod-config.yaml" "${LAB}/lab_prepare.py"
 
 # The service's own environment (library path, uv/python, HOME for the model cache).
 SERVICE_ENV=()
@@ -107,12 +114,10 @@ STARTED=1
 sudo systemd-run --quiet --unit="${UNIT}" --collect \
   -p User="${SERVICE_USER}" -p Group="${SERVICE_USER}" \
   -p WorkingDirectory="${LAB}" \
-  -p EnvironmentFile="${LAB}/backend.env" \
+  -p EnvironmentFile="${LAB}/backend.env" -p EnvironmentFile="${LAB}/lab.env" \
+  -p ReadOnlyPaths="${PROD_ROOT}" -p ReadOnlyPaths="$(dirname "${PROD_CONFIG}")" \
   -p StandardOutput="file:${LAB}/server.log" -p StandardError="file:${LAB}/server.log" \
   "${SETENV[@]}" \
-  --setenv=SUZKA_CONFIG_PATH="${LAB}/config.yaml" \
-  --setenv=PYTHONPATH="${PROD_ROOT}" \
-  --setenv=HF_HUB_OFFLINE=1 --setenv=TRANSFORMERS_OFFLINE=1 \
   "${PYTHON}" -m suzka.api.server
 
 ready=0
@@ -129,6 +134,11 @@ done
 if [[ "${ready}" != 1 ]]; then
   printf 'lab did not become healthy\n' >&2
   sudo tail -20 "${LAB}/server.log" >&2 || true
+  exit 1
+fi
+MAIN_PID="$(systemctl show -p MainPID --value "${UNIT}")"
+if ! sudo cat "/proc/${MAIN_PID}/environ" | tr '\0' '\n' | grep -qx "SUZKA_CONFIG_PATH=${LAB}/config.yaml"; then
+  printf 'lab server is not using the lab config; refusing\n' >&2
   exit 1
 fi
 printf 'lab API at http://127.0.0.1:%s (unit %s, state %s)\n' "${PORT}" "${UNIT}" "${LAB}" >&2
