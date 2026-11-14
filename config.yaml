@@ -103,7 +103,7 @@ state_wal:
 subject_history:
   enabled: false
   path: .suzka/private/subject_history/subject_history.sqlite3
-  # 256 MiB at 4 KiB pages (#376 D1-9, Human-approved 2026-11-14).  This
+  # 256 MiB with SQLite's usual 4096-byte pages (#376 D1-9, Human-approved 2026-11-14).  This
   # development/test profile keeps the store disabled; the production
   # (FHS) profile enables it (IP-10b).
   max_page_count: 65536

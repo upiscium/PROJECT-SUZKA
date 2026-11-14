@@ -195,9 +195,9 @@ class SubjectHistorySettings(StrictBaseModel):
 
     enabled: StrictBool = False
     path: Path = Path(".suzka/private/subject_history/subject_history.sqlite3")
-    # SQLite page cap (4 KiB pages by default: 16384 pages = 64 MiB).  The
-    # numeric bound is provisional pending the #376 D1-9 Human gate.
-    max_page_count: StrictInt = Field(default=16_384, ge=64, le=2_147_483_646)
+    # SQLite page cap.  #376 D1-9 (Human-approved 2026-11-14): 65536 pages,
+    # 256 MiB when the SQLite page size is the usual 4096 bytes.
+    max_page_count: StrictInt = Field(default=65_536, ge=64, le=2_147_483_646)
 
 
 class StateWALSettings(StrictBaseModel):

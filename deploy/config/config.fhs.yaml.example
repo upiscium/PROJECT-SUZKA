@@ -93,7 +93,7 @@ subject_history:
   # Decision HOLDs with HISTORY_CAPACITY.  Disabling afterwards fails closed.
   enabled: true
   path: /var/lib/project-suzka/subject_history/subject_history.sqlite3
-  max_page_count: 65536  # 256 MiB at 4 KiB pages (#376 D1-9, Human-approved)
+  max_page_count: 65536  # 256 MiB with SQLite's usual 4096-byte pages (#376 D1-9, Human-approved)
 values:
   seeds:
   - value_id: care
