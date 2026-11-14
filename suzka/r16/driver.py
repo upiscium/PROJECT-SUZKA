@@ -43,7 +43,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
 import hashlib
@@ -113,6 +113,9 @@ class R16DriverReason(str, Enum):
     SOURCE_NOT_OBSERVED = "source_not_observed"
     SOURCE_NOT_YET_EVALUATED = "source_not_yet_evaluated"
     RUNTIME_UNAVAILABLE = "runtime_unavailable"
+    # The Context names a participant (interlocutor_key); U2a admits no
+    # event-time participant identity yet, so the driver never submits it.
+    PARTICIPANT_SCOPE_UNSUPPORTED = "participant_scope_unsupported"
 
 
 TicketReason = R16OwnerReason | R16DriverReason
@@ -144,6 +147,7 @@ class _Ticket:
 class _Observed:
     ref: _MotivationSourceRef
     context_id: str
+    participant_scoped: bool = False
 
 
 @dataclass(slots=True)
@@ -160,6 +164,9 @@ class _U2a:
     experience_id: str
     ref: _MotivationSourceRef
     queued_at: float
+    # The Context of X, so a later binding finds it even after X left the
+    # observed LRU (review P3-2).
+    context_id: str | None = None
     submitted: bool = False
     held: list[_Command] = field(default_factory=list)
 
@@ -183,6 +190,7 @@ class _ChatTerminal:
     eligible_for_u2a: bool
     command: tuple[R16CommandKind, str] | None
     ticket_id: str | None
+    participant_scoped: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +301,7 @@ class R16Driver:
         self.counters: dict[str, int] = {
             "dropped": 0,
             "skipped_neutral": 0,
+            "skipped_participant_scope": 0,
             "submitted": 0,
             "self_proposal_dropped": 0,
         }
@@ -382,6 +391,7 @@ class R16Driver:
             result.eligible_for_u2a,
             command,
             None if ticket is None else ticket.ticket_id,
+            result.participant_scoped,
         )
         if not self._post(item) and ticket is not None:
             self._finish(ticket.ticket_id, R16TicketStatus.DROPPED)
@@ -498,21 +508,56 @@ class R16Driver:
 
     def _on_chat(self, item: _ChatTerminal) -> None:
         if item.experience_id is not None and item.context_id is not None:
-            self._observed[item.experience_id] = _Observed(item.ref, item.context_id)
+            self._observed[item.experience_id] = _Observed(
+                item.ref, item.context_id, item.participant_scoped
+            )
             self._observed.move_to_end(item.experience_id)
             while len(self._observed) > OBSERVED_CAPACITY:
                 self._observed.popitem(last=False)
+        if item.participant_scoped and item.context_id is not None:
+            self._scope_context(item.context_id)
         if item.command is not None:
             self._on_command(item)
             return
         if item.experience_id is None:
             return
+        if item.participant_scoped:
+            self.counters["skipped_participant_scope"] += 1
+            return
         if not item.eligible_for_u2a:
             self.counters["skipped_neutral"] += 1
             return
         self._u2a[item.experience_id] = _U2a(
-            item.experience_id, item.ref, self._clock()
+            item.experience_id, item.ref, self._clock(), item.context_id
         )
+
+    def _scope_context(self, context_id: str) -> None:
+        """A participant is now bound to this Context (review P2-1).
+
+        Participant refs are never removed, so every earlier turn of the
+        Context is scoped from here on: a U2a still waiting there would fail
+        in the owner, so it is dropped. A U2a already submitted may still
+        fail; that window is accepted. A command on a waiting U2a submits it
+        at once (D2 P1-2), so a dropped U2a holds no commands today; the HOLD
+        loop below only guards that invariant.
+        """
+        for experience_id, observed in list(self._observed.items()):
+            if observed.context_id == context_id and not observed.participant_scoped:
+                # Same key: the LRU order is kept.
+                self._observed[experience_id] = replace(
+                    observed, participant_scoped=True
+                )
+        for experience_id, waiting in list(self._u2a.items()):
+            if waiting.submitted or waiting.context_id != context_id:
+                continue
+            del self._u2a[experience_id]
+            self.counters["skipped_participant_scope"] += 1
+            for command in waiting.held:
+                self._finish(
+                    command.ticket_id,
+                    R16TicketStatus.HOLD,
+                    R16DriverReason.PARTICIPANT_SCOPE_UNSUPPORTED,
+                )
 
     def _on_command(self, item: _ChatTerminal) -> None:
         assert item.command is not None
@@ -531,6 +576,14 @@ class R16Driver:
                 item.ticket_id,
                 R16TicketStatus.UNAVAILABLE,
                 R16DriverReason.SOURCE_NOT_OBSERVED,
+            )
+            return
+        if observed.participant_scoped or item.participant_scoped:
+            # Same Context as the requester (checked above): no oracle.
+            self._finish(
+                item.ticket_id,
+                R16TicketStatus.HOLD,
+                R16DriverReason.PARTICIPANT_SCOPE_UNSUPPORTED,
             )
             return
         assert item.ticket_id is not None

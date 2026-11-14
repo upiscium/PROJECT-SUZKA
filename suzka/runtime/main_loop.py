@@ -97,8 +97,10 @@ from suzka.runtime.session_participant import (
 from suzka.runtime.session_state import SessionState
 from suzka.runtime.context import (
     ContextFrame,
+    ContextNotFound,
     ContextRegistry,
     ContextRegistryState,
+    ContextStateInvalid,
     ContextStatus,
     ContextType,
     validate_context_registry_state,
@@ -162,9 +164,13 @@ class ChatResult:
     # Experience was created; ``eligible_for_u2a`` is False for a neutral
     # appraisal (the same condition U2a re-checks); ``context_id`` is the
     # Context of that Experience (None without one). None is authority.
+    # ``participant_scoped`` is True when that Context names a participant
+    # (``interlocutor_key``): U2a admits no event-time participant identity
+    # yet, so such a turn is never eligible and its commands HOLD up front.
     experience_id: str | None = None
     eligible_for_u2a: bool = False
     context_id: str | None = None
+    participant_scoped: bool = False
 
 
 @dataclass(frozen=True)
@@ -1793,6 +1799,9 @@ class SuzkaMainLoop:
             else None
         )
         appraisal = None if record is None else record.appraisal
+        participant_scoped = record is not None and self._participant_scoped(
+            record.context_id
+        )
         return ChatResult(
             episode_id=computed.memory_participant.episode_id(transaction_id),
             response=computed.response,
@@ -1804,13 +1813,25 @@ class SuzkaMainLoop:
             adapter_id=self.adapter_id,
             experience_id=None if record is None else record.experience_id,
             eligible_for_u2a=appraisal is not None
+            and not participant_scoped
             and (
                 appraisal.novelty_valid
                 or appraisal.goal_progress is not None
                 or appraisal.threat is not None
             ),
             context_id=None if record is None else record.context_id,
+            participant_scoped=participant_scoped,
         )
+
+    def _participant_scoped(self, context_id: str) -> bool:
+        """The same Context condition U2a re-checks; an unreadable Context counts as scoped."""
+
+        try:
+            return bool(self.context_registry.get(context_id).participant_refs)
+        except (ContextNotFound, ContextStateInvalid):
+            # Unreachable for the id this turn just resolved, but never fail
+            # a CHAT over a fact that only gates U2a (review P3-1).
+            return True
 
     @staticmethod
     def _participants(computed: _ComputedChat) -> tuple[TransactionParticipant, ...]:
