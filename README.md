@@ -99,6 +99,28 @@ into the EventJournal **irreversibly**:
 - Rows are never deleted; once `max_page_count` (65536 pages, 256 MiB) is
   reached, later Decisions HOLD with `HISTORY_CAPACITY`.
 
+### Experiments never run against production
+
+Chat turns become the subject's permanent experience, and after SubjectHistory
+adoption they cannot be removed. Run real-model experiments on a throwaway copy
+of the production state instead:
+
+```bash
+scripts/lab-from-production.sh --timeout 3600 -- python3 my_experiment.py
+```
+
+The script copies `/opt/project-suzka/.suzka/` and `/etc/project-suzka/config.yaml`
+into `/var/lib/suzka/lab/` and starts the deployed code there as a transient
+systemd unit (`suzka-lab-*`) on `127.0.0.1:8101`. It then runs the command with
+`SUZKA_LAB_URL` set, and on exit stops the unit and deletes the copy (`--keep`
+keeps the copy). It loads the model a second time, so it needs that much free
+GPU memory (about 7.7 GB for gemma-4-12B-it).
+
+It refuses to run when the parsed settings contain any path that is absolute,
+starts with `~` or leaves the copy, when the lab port is the production port,
+and when the port is already in use. If the script itself is killed with
+SIGKILL, stop the lab with `sudo systemctl stop 'suzka-lab-*'`.
+
 ### 4. Install Services
 
 ```bash
