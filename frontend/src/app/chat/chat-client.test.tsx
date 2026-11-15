@@ -43,7 +43,7 @@ async function send(text: string) {
   const user = vi.isFakeTimers()
     ? userEvent.setup({ advanceTimers: vi.advanceTimersByTime.bind(vi) })
     : userEvent.setup();
-  await user.type(screen.getByPlaceholderText("Send a message to PROJECT-SUZKA"), text);
+  await user.type(screen.getByPlaceholderText("Send a message to PROJECT-SUZKA (Ctrl+Enter to send)"), text);
   await user.click(screen.getByRole("button", { name: "Send" }));
   return user;
 }
@@ -66,6 +66,22 @@ describe("ChatClient", () => {
     expect(screen.queryByText(/retrieved memory/i)).not.toBeInTheDocument();
     // No driver: no review actions.
     expect(screen.queryByRole("button", { name: "Review this" })).not.toBeInTheDocument();
+  });
+
+  it("shows the user's turn and a spinner while waiting, and sends with Ctrl+Enter", async () => {
+    let resolve: (value: unknown) => void = () => {};
+    fetchMock.mockReturnValue(new Promise((r) => { resolve = r; }));
+    renderWithQuery();
+    const box = screen.getByPlaceholderText("Send a message to PROJECT-SUZKA (Ctrl+Enter to send)");
+    await userEvent.type(box, "hi there{Control>}{Enter}{/Control}");
+
+    expect(await screen.findByText("hi there")).toBeInTheDocument();
+    expect(box).toHaveValue("");
+    expect(screen.getByRole("status", { name: "SUZKA is responding" })).toBeInTheDocument();
+
+    await act(async () => resolve(chatResponse({ response: "Reply" })));
+    expect(await screen.findByText("Reply")).toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "SUZKA is responding" })).not.toBeInTheDocument();
   });
 
   it("builds the exact command text from a turn's experience", async () => {

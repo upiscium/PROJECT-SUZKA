@@ -82,6 +82,9 @@ button, input, textarea { font: inherit; }
 .chat-bubble.assistant { justify-self: start; background: rgba(30, 41, 59, 0.7); }
 .chat-bubble p, .record p { white-space: pre-wrap; }
 .composer { display: grid; gap: 0.75rem; }
+.chat-bubble.pending { display: grid; gap: 0.5rem; }
+.spinner { width: 1.1rem; height: 1.1rem; border: 2px solid var(--border); border-top-color: currentColor; border-radius: 50%; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 /* IP-7: system notices are not the subject's speech (#370 D1 2-4). */
 .system-notice { justify-self: center; max-width: 90%; padding: 0.5rem 0.85rem; border: 1px dashed var(--border); border-radius: 0.5rem; color: var(--muted); font-size: 0.9rem; }
 .system-notice p { margin: 0.25rem 0 0; }

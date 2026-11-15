@@ -48,17 +48,19 @@ export function ChatClient() {
   const [history, setHistory] = useState<ChatTurn[]>([]);
   const mutation = useMutation({
     mutationFn: api.chat,
-    onSuccess: (result, variables) => {
+    // The user's turn shows as soon as it is sent; the reply follows it.
+    onMutate: (variables) => {
+      setHistory((current) => [...current, { role: "user", content: variables.message }]);
+    },
+    onSuccess: (result) => {
       const ticket = result.command_ticket;
       setHistory((current) => [
         ...current,
-        { role: "user", content: variables.message },
         { role: "assistant", content: result.response, result },
         ...(ticket
           ? [{ role: "system" as const, ticketId: ticket.ticket_id, kind: ticket.kind, status: ticket.status }]
           : []),
       ]);
-      setMessage("");
     },
   });
 
@@ -70,6 +72,11 @@ export function ChatClient() {
   const incarnation = latest?.incarnation ?? null;
 
   const send = (text: string) => mutation.mutate({ message: text, attachments: [], debug: false });
+  const submitDraft = () => {
+    if (!message.trim() || mutation.isPending) return;
+    send(message);
+    setMessage("");
+  };
 
   return (
     <div className="page">
@@ -114,16 +121,32 @@ export function ChatClient() {
             </div>
           ),
         )}
+        {mutation.isPending ? (
+          <div className="chat-bubble assistant pending" role="status" aria-label="SUZKA is responding">
+            <strong>SUZKA</strong>
+            <span className="spinner" aria-hidden="true" />
+          </div>
+        ) : null}
       </Card>
 
       <form
         className="composer"
         onSubmit={(event) => {
           event.preventDefault();
-          if (message.trim()) send(message);
+          submitDraft();
         }}
       >
-        <Textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="Send a message to PROJECT-SUZKA" />
+        <Textarea
+          value={message}
+          onChange={(event) => setMessage(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+              event.preventDefault();
+              submitDraft();
+            }
+          }}
+          placeholder="Send a message to PROJECT-SUZKA (Ctrl+Enter to send)"
+        />
         <Button disabled={mutation.isPending || !message.trim()} type="submit">{mutation.isPending ? "Sending" : "Send"}</Button>
       </form>
 
