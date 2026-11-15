@@ -312,8 +312,8 @@ def test_feedback_only_from_authorized_effect_and_never_absent_or_invalid() -> N
 
 
 def test_feedback_state_of_each_comparison() -> None:
-    # MISMATCH / UNKNOWN rows are defensive: an authorized effect always
-    # matches in V1, so these are fixture-only paths.
+    # MISMATCH / UNKNOWN come only from non-authorized assessments, which never
+    # yield Feedback; through the projection they are unreachable in V1.
     authorized = _assessment()
     assert feedback_state_of(authorized) is FeedbackState.MATCH_SELF
     environment = _assessment(_outcome(foreign_change=True))
@@ -333,66 +333,144 @@ def test_feedback_state_of_each_comparison() -> None:
 
 # -------------------------------------------------------------- projection
 
+CLAIM = 25
 
-def _chain() -> tuple[ExpectedObservationV1, OutcomeAssessmentV1, DecisionFeedbackV1]:
+
+def _chain() -> tuple[
+    ExpectedObservationV1, OutcomeAssessmentV1, DecisionFeedbackV1, VerifiedOutcomeView
+]:
     forecast = _forecast()
-    assessment = OutcomeAssessmentV1.issue(forecast, _outcome(), EVENT_A, 30)
-    return forecast, assessment, DecisionFeedbackV1.issue(assessment, EVENT_B, 31)
+    outcome = _outcome()
+    assessment = OutcomeAssessmentV1.issue(forecast, outcome, EVENT_A, 30)
+    return forecast, assessment, DecisionFeedbackV1.issue(assessment, EVENT_B, 31), outcome
+
+
+def _project(
+    ledger: LedgerState,
+    forecast: ExpectedObservationV1 | None,
+    feedback: DecisionFeedbackV1 | None,
+    assessment: OutcomeAssessmentV1 | None,
+    outcome: VerifiedOutcomeView | None,
+    *,
+    intent: str = "intent-1",
+    forward: str = FORWARD,
+    claim: int | None = CLAIM,
+) -> FeedbackState:
+    return project_feedback_state(
+        ledger,
+        forecast,
+        feedback,
+        assessment,
+        outcome,
+        action_intent_id=intent,
+        forward_key=forward,
+        claim_sequence=claim,
+    )
+
+
+AUTHORIZED = LedgerState.ACTIVE_VERIFIED_AUTHORIZED
 
 
 def test_projection_of_a_valid_chain_is_match_self() -> None:
-    forecast, assessment, feedback = _chain()
-    state = project_feedback_state(
-        LedgerState.ACTIVE_VERIFIED_AUTHORIZED, forecast, feedback, assessment
-    )
-    assert state is FeedbackState.MATCH_SELF
+    forecast, assessment, feedback, outcome = _chain()
+    assert _project(AUTHORIZED, forecast, feedback, assessment, outcome) is FeedbackState.MATCH_SELF
 
 
 def test_projection_keeps_historical_match_self_after_an_inverse() -> None:
-    forecast, assessment, feedback = _chain()
+    forecast, assessment, feedback, outcome = _chain()
     for ledger in (LedgerState.INVERSE_IN_DOUBT, LedgerState.REVERTED):
-        assert (
-            project_feedback_state(ledger, forecast, feedback, assessment)
-            is FeedbackState.MATCH_SELF
-        )
+        assert _project(ledger, forecast, feedback, assessment, outcome) is FeedbackState.MATCH_SELF
 
 
 def test_claimed_ledger_without_a_forecast_is_invalid() -> None:
     for ledger in (LedgerState.CLAIMED, LedgerState.IN_DOUBT, LedgerState.CORRUPT):
-        assert project_feedback_state(ledger, None, None, None) is FeedbackState.INVALID
+        assert _project(ledger, None, None, None, None) is FeedbackState.INVALID
     for ledger in (LedgerState.NONE, LedgerState.INTENT_ISSUED):
-        assert project_feedback_state(ledger, None, None, None) is FeedbackState.ABSENT
+        assert _project(ledger, None, None, None, None, claim=None) is FeedbackState.ABSENT
+    with pytest.raises(ValueError):
+        _project(LedgerState.CLAIMED, _forecast(), None, None, None, claim=None)
 
 
 def test_no_feedback_is_absent_even_with_an_assessment() -> None:
     forecast = _forecast()
-    absent = OutcomeAssessmentV1.issue(forecast, _outcome(OutcomeState.VERIFIED_ABSENT), EVENT_A, 30)
-    assert (
-        project_feedback_state(LedgerState.VERIFIED_ABSENT, forecast, None, absent)
-        is FeedbackState.ABSENT
+    outcome = _outcome(OutcomeState.VERIFIED_ABSENT)
+    absent = OutcomeAssessmentV1.issue(forecast, outcome, EVENT_A, 30)
+    assert _project(LedgerState.VERIFIED_ABSENT, forecast, None, absent, outcome) is (
+        FeedbackState.ABSENT
     )
 
 
-def test_feedback_without_its_assessment_or_with_wrong_bindings_is_invalid() -> None:
-    forecast, assessment, feedback = _chain()
-    ledger = LedgerState.ACTIVE_VERIFIED_AUTHORIZED
-    assert project_feedback_state(ledger, forecast, feedback, None) is FeedbackState.INVALID
-    other_forecast = _forecast(action_intent_id="intent-2")
-    assert (
-        project_feedback_state(ledger, other_forecast, feedback, assessment)
-        is FeedbackState.INVALID
+def test_forecast_for_another_intent_or_after_the_claim_is_invalid() -> None:
+    forecast, assessment, feedback, outcome = _chain()
+    # A self-consistent chain that belongs to another ActionIntent.
+    assert _project(AUTHORIZED, forecast, feedback, assessment, outcome, intent="intent-2") is (
+        FeedbackState.INVALID
     )
+    assert _project(
+        AUTHORIZED, forecast, feedback, assessment, outcome, forward="9" * 64
+    ) is FeedbackState.INVALID
+    # Forecast committed at or after the EXECUTION_CLAIM (hindsight).
+    assert _project(AUTHORIZED, forecast, feedback, assessment, outcome, claim=20) is (
+        FeedbackState.INVALID
+    )
+    assert _project(LedgerState.CLAIMED, forecast, None, None, None, claim=19) is (
+        FeedbackState.INVALID
+    )
+
+
+def test_feedback_with_wrong_bindings_is_invalid() -> None:
+    forecast, assessment, feedback, outcome = _chain()
+    assert _project(AUTHORIZED, forecast, feedback, None, outcome) is FeedbackState.INVALID
+    assert _project(AUTHORIZED, forecast, feedback, assessment, None) is FeedbackState.INVALID
     other = OutcomeAssessmentV1.issue(forecast, _outcome(outcome_digest="9" * 64), EVENT_A, 30)
-    assert project_feedback_state(ledger, forecast, feedback, other) is FeedbackState.INVALID
-
-
-def test_feedback_from_a_non_authorized_outcome_is_invalid() -> None:
-    # A forged record: Feedback bound to an UNAUTHORIZED_EFFECT assessment
-    # (e.g. an inverse after an unauthorized effect).
-    forecast = _forecast()
-    bad = OutcomeAssessmentV1.issue(
-        forecast, _outcome(OutcomeState.UNAUTHORIZED_EFFECT), EVENT_A, 30
+    assert _project(AUTHORIZED, forecast, feedback, other, outcome) is FeedbackState.INVALID
+    # The assessment's own forecast digest is tampered; the Feedback is not.
+    tampered = replace(assessment, forecast_digest="9" * 64)
+    rebound = replace(
+        feedback,
+        assessment_id=tampered.assessment_id,
+        assessment_digest=tampered.assessment_digest,
     )
+    assert _project(AUTHORIZED, forecast, rebound, tampered, outcome) is FeedbackState.INVALID
+    # The Feedback binds an older Outcome revision than the selected one.
+    newer = replace(outcome, outcome_revision=2)
+    assert _project(AUTHORIZED, forecast, feedback, assessment, newer) is FeedbackState.INVALID
+
+
+def test_feedback_with_an_incompatible_ledger_is_invalid() -> None:
+    forecast, assessment, feedback, outcome = _chain()
+    for ledger in LedgerState:
+        expected = (
+            FeedbackState.MATCH_SELF
+            if ledger is AUTHORIZED
+            or ledger.value.startswith("INVERSE_")
+            or ledger is LedgerState.REVERTED
+            else FeedbackState.INVALID
+        )
+        claim = None if ledger in (
+            LedgerState.NONE,
+            LedgerState.INTENT_ISSUED,
+            LedgerState.POLICY_DENIED,
+            LedgerState.APPROVAL_EXPIRED_UNCLAIMED,
+        ) else CLAIM
+        assert _project(ledger, forecast, feedback, assessment, outcome, claim=claim) is expected
+
+
+def test_forged_authorized_assessment_over_an_unauthorized_outcome_is_invalid() -> None:
+    # The real forward Outcome was UNAUTHORIZED_EFFECT and an inverse followed.
+    # A corrupt assessment row claims it was authorized; its Feedback is
+    # self-consistent. The real Outcome view exposes the forgery.
+    forecast, assessment, feedback, outcome = _chain()
+    real = replace(outcome, outcome_state=OutcomeState.UNAUTHORIZED_EFFECT)
+    assert _project(LedgerState.REVERTED, forecast, feedback, assessment, real) is (
+        FeedbackState.INVALID
+    )
+
+
+def test_feedback_from_a_non_authorized_assessment_is_invalid() -> None:
+    forecast = _forecast()
+    real = _outcome(OutcomeState.UNAUTHORIZED_EFFECT)
+    bad = OutcomeAssessmentV1.issue(forecast, real, EVENT_A, 30)
     forged = DecisionFeedbackV1(
         bad.assessment_id,
         bad.assessment_digest,
@@ -405,20 +483,24 @@ def test_feedback_from_a_non_authorized_outcome_is_invalid() -> None:
         EVENT_B,
         31,
     )
-    assert (
-        project_feedback_state(LedgerState.REVERTED, forecast, forged, bad)
-        is FeedbackState.INVALID
-    )
+    assert _project(LedgerState.REVERTED, forecast, forged, bad, real) is FeedbackState.INVALID
 
 
 def test_stored_state_that_differs_from_the_recomputed_one_is_invalid() -> None:
-    forecast, assessment, feedback = _chain()
+    forecast, assessment, feedback, outcome = _chain()
     tampered = replace(feedback, feedback_state=FeedbackState.MISMATCH)
-    assert (
-        project_feedback_state(
-            LedgerState.ACTIVE_VERIFIED_AUTHORIZED, forecast, tampered, assessment
-        )
-        is FeedbackState.INVALID
+    assert _project(AUTHORIZED, forecast, tampered, assessment, outcome) is FeedbackState.INVALID
+
+
+def test_projection_never_emits_mismatch_or_unknown_in_v1() -> None:
+    # Structurally unreachable: Feedback needs an authorized effect, and an
+    # authorized effect always MATCHes (assessment invariant).
+    forecast, assessment, feedback, outcome = _chain()
+    env_outcome = replace(outcome, foreign_change=True)
+    env = OutcomeAssessmentV1.issue(forecast, env_outcome, EVENT_A, 30)
+    env_feedback = DecisionFeedbackV1.issue(env, EVENT_B, 31)
+    assert _project(AUTHORIZED, forecast, env_feedback, env, env_outcome) is (
+        FeedbackState.MATCH_OTHER_OR_UNKNOWN
     )
 
 
@@ -426,7 +508,7 @@ def test_stored_state_that_differs_from_the_recomputed_one_is_invalid() -> None:
 
 
 def test_selector_takes_the_latest_terminal_outcome_revision_first() -> None:
-    _, _, feedback = _chain()
+    _, _, feedback, _ = _chain()
     revisions = [
         TerminalOutcomeRevision("outcome-1", 1, 30),
         TerminalOutcomeRevision("outcome-1", 2, 40),
@@ -438,18 +520,111 @@ def test_selector_takes_the_latest_terminal_outcome_revision_first() -> None:
 
 
 def test_selector_ignores_records_at_or_after_the_horizon() -> None:
-    _, _, feedback = _chain()
+    _, _, feedback, _ = _chain()
     revisions = [TerminalOutcomeRevision("outcome-1", 1, 30)]
     assert select_feedback(revisions, [feedback], 31) is None
     assert select_feedback(revisions, [feedback], 32) == feedback
     assert select_feedback([], [feedback], 32) is None
 
 
+def test_selector_refuses_mixed_outcomes_and_wrong_types() -> None:
+    _, _, feedback, _ = _chain()
+    mixed = [
+        TerminalOutcomeRevision("outcome-1", 1, 30),
+        TerminalOutcomeRevision("inverse-outcome-1", 2, 40),
+    ]
+    with pytest.raises(ValueError):
+        select_feedback(mixed, [feedback], 50)
+    with pytest.raises(TypeError):
+        select_feedback([("outcome-1", 1, 30)], [feedback], 50)  # type: ignore[list-item]
+    with pytest.raises(ValueError):
+        select_feedback(
+            [TerminalOutcomeRevision("outcome-1", 1, 30), TerminalOutcomeRevision("outcome-1", 1, 31)],
+            [],
+            50,
+        )
+    with pytest.raises(ValueError):
+        TerminalOutcomeRevision("outcome-1", 0, 30)
+
+
 def test_selector_refuses_duplicate_v1_records() -> None:
-    _, _, feedback = _chain()
+    _, _, feedback, _ = _chain()
     revisions = [TerminalOutcomeRevision("outcome-1", 1, 30)]
     with pytest.raises(ValueError):
         select_feedback(revisions, [feedback, replace(feedback, admitting_sequence=33)], 40)
+
+
+# ------------------------------------------------------------- binding
+
+
+def _binding(**changes: Any) -> dict[str, Any]:
+    forecast = _forecast()
+    values: dict[str, Any] = {
+        "decision_id": forecast.decision_id,
+        "decision_committed_digest": forecast.decision_committed_digest,
+        "policy_kind": forecast.policy_kind,
+        "action_intent_id": forecast.action_intent_id,
+        "action_intent_digest": forecast.action_intent_digest,
+        "forward_key": forecast.forward_key,
+        "target_instance_id": forecast.target_instance_id,
+        "target_namespace": forecast.target_namespace,
+        "target_expected_revision": forecast.target_expected_revision,
+    }
+    return {**values, **changes}
+
+
+def test_forecast_binding_to_its_decision_intent_and_target() -> None:
+    _forecast().check_binding(**_binding())
+    for changes in (
+        {"policy_kind": PolicyKind.SUCCESSOR_POLICY_V1},
+        {"decision_committed_digest": "9" * 64},
+        {"action_intent_id": "intent-2"},
+        {"forward_key": "9" * 64},
+        {"target_instance_id": "00000000-0000-4000-8000-0000000000bb"},
+        {"target_expected_revision": 1},
+    ):
+        with pytest.raises(ValueError):
+            _forecast().check_binding(**_binding(**changes))
+
+
+# ---------------------------------------------------------- parse negatives
+
+
+def _dump(row: dict[str, Any]) -> bytes:
+    return json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def test_assessment_and_feedback_parse_negatives() -> None:
+    forecast, assessment, feedback, _ = _chain()
+    arow = json.loads(assessment.canonical_bytes())
+    frow = json.loads(feedback.canonical_bytes())
+    bad_rows = [
+        (OutcomeAssessmentV1, dict(arow, assessment_digest="0" * 64)),
+        (OutcomeAssessmentV1, dict(arow, extra=1)),
+        (OutcomeAssessmentV1, dict(arow, schema_version=True)),
+        (OutcomeAssessmentV1, dict(arow, contributors=["SELF", "UNKNOWN"])),
+        (DecisionFeedbackV1, dict(frow, feedback_digest="0" * 64)),
+        (DecisionFeedbackV1, dict(frow, feedback_revision=2)),
+        (DecisionFeedbackV1, dict(frow, supersedes={"id": "x"})),
+        (DecisionFeedbackV1, dict(frow, schema_version=True)),
+    ]
+    for kind, row in bad_rows:
+        with pytest.raises((TypeError, ValueError)):
+            kind.from_json(_dump(row))
+
+
+def test_feedback_must_be_a_later_event_than_its_assessment() -> None:
+    _, assessment, _, _ = _chain()
+    with pytest.raises(ValueError):
+        DecisionFeedbackV1.issue(assessment, EVENT_B, 30)
+
+
+def test_constructor_bound_is_never_reached_by_valid_identifiers() -> None:
+    # Identifiers are at most 128 code points, so a valid record stays far
+    # below 4 KiB; the bound is a backstop for from_json input.
+    long = "x" * 128
+    forecast = _forecast(lineage_scope=long, selected_candidate_id=long, action_intent_id=long)
+    assert len(forecast.canonical_bytes()) < MAX_RECORD_BYTES
 
 
 # ------------------------------------------------------------------ purity

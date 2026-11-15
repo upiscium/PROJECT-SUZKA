@@ -106,6 +106,21 @@ class Contributor(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
+# Ledger states in which a positive Feedback can legitimately exist: the
+# authorized effect itself, or that effect followed by an inverse (D-R17 §5
+# as-of rule). Any other ledger with a Feedback is a contradiction.
+_FEEDBACK_LEDGER: Final = frozenset(
+    {
+        LedgerState.ACTIVE_VERIFIED_AUTHORIZED,
+        LedgerState.INVERSE_INTENT_ISSUED,
+        LedgerState.INVERSE_CLAIMED,
+        LedgerState.INVERSE_IN_DOUBT,
+        LedgerState.INVERSE_POLICY_DENIED,
+        LedgerState.INVERSE_APPROVAL_EXPIRED_UNCLAIMED,
+        LedgerState.INVERSE_VERIFIED_ABSENT,
+        LedgerState.REVERTED,
+    }
+)
 # Ledger states before any claim: a missing forecast is not yet a defect.
 _PRE_CLAIM_LEDGER: Final = frozenset(
     {
@@ -238,6 +253,40 @@ class ExpectedObservationV1:
         _revision(self.target_expected_revision, "target_expected_revision")
         digest(self.predicted_payload_digest, "predicted_payload_digest")
         _bounded(self.canonical_bytes(), "forecast")
+
+    def check_binding(
+        self,
+        *,
+        decision_id: str,
+        decision_committed_digest: str,
+        policy_kind: PolicyKind,
+        action_intent_id: str,
+        action_intent_digest: str,
+        forward_key: str,
+        target_instance_id: str,
+        target_namespace: str,
+        target_expected_revision: int,
+    ) -> None:
+        """D-R17 §2: refuse a forecast not bound to this Decision, I and target.
+
+        The issuer (IP-16) passes values it read from the terminal Decision and
+        ActionIntent; this check only compares them.
+        """
+
+        expected = {
+            "decision_id": decision_id,
+            "decision_committed_digest": decision_committed_digest,
+            "policy_kind": policy_kind,
+            "action_intent_id": action_intent_id,
+            "action_intent_digest": action_intent_digest,
+            "forward_key": forward_key,
+            "target_instance_id": target_instance_id,
+            "target_namespace": target_namespace,
+            "target_expected_revision": target_expected_revision,
+        }
+        for name, value in expected.items():
+            if getattr(self, name) != value:
+                raise ValueError(f"forecast {name} does not match its source")
 
     def _body(self) -> dict[str, object]:
         return {
@@ -665,8 +714,8 @@ class DecisionFeedbackV1:
             raise TypeError("assessment must be an OutcomeAssessmentV1")
         if not assessment.positive_feedback_eligible:
             raise ValueError("only an authorized verified effect yields Feedback")
-        if admitting_sequence < assessment.admitting_sequence:
-            raise ValueError("Feedback cannot precede its assessment")
+        if admitting_sequence <= assessment.admitting_sequence:
+            raise ValueError("Feedback is a later event than its assessment")
         return cls(
             assessment.assessment_id,
             assessment.assessment_digest,
@@ -783,9 +832,18 @@ def select_feedback(
     """
 
     event_sequence(before_sequence, "before_sequence")
-    terminal = [
-        item for item in outcome_revisions if item.terminal_sequence < before_sequence
-    ]
+    revisions = tuple(outcome_revisions)
+    records = tuple(feedbacks)
+    if any(type(item) is not TerminalOutcomeRevision for item in revisions):
+        raise TypeError("outcome_revisions must be TerminalOutcomeRevision values")
+    if any(type(item) is not DecisionFeedbackV1 for item in records):
+        raise TypeError("feedbacks must be DecisionFeedbackV1 values")
+    outcome_ids = {item.verified_outcome_id for item in revisions} | {
+        item.verified_outcome_id for item in records
+    }
+    if len(outcome_ids) > 1:
+        raise ValueError("pass the revisions and Feedback of one forward Outcome only")
+    terminal = [item for item in revisions if item.terminal_sequence < before_sequence]
     if not terminal:
         return None
     latest = max(terminal, key=lambda item: item.outcome_revision)
@@ -793,7 +851,7 @@ def select_feedback(
         raise ValueError("one forward Outcome revision appears twice")
     matching = [
         item
-        for item in feedbacks
+        for item in records
         if item.admitting_sequence < before_sequence
         and item.verified_outcome_id == latest.verified_outcome_id
         and item.outcome_revision == latest.outcome_revision
@@ -811,38 +869,71 @@ def project_feedback_state(
     forecast: ExpectedObservationV1 | None,
     feedback: DecisionFeedbackV1 | None,
     assessment: OutcomeAssessmentV1 | None,
+    outcome: VerifiedOutcomeView | None,
+    *,
+    action_intent_id: str,
+    forward_key: str,
+    claim_sequence: int | None,
 ) -> FeedbackState:
     """D-R17 §5: the trusted projection to SuccessorPolicy FeedbackState.
 
-    ``forecast`` is the terminal forecast for this ActionIntent / forward_key
-    as of the horizon, ``feedback`` the record ``select_feedback`` chose and
-    ``assessment`` the one that Feedback binds. Only this adapter emits
-    INVALID. A read failure is not an input here: the issuer turns it into
-    UNAVAILABLE (HOLD) and never calls this function.
+    Inputs, all as of the successor Decision's horizon and read by the issuer
+    (IP-19):
+
+    - ``ledger``: the current R18 ledger state of this forward operation;
+    - ``forecast``: the terminal forecast found for this forward_key, if any;
+    - ``feedback``: the record ``select_feedback`` chose, and ``assessment``
+      the one it binds;
+    - ``outcome``: the latest terminal forward Outcome revision, if any;
+    - ``action_intent_id`` / ``forward_key``: the ActionIntent the ledger is
+      about; ``claim_sequence``: the EXECUTION_CLAIM event, once claimed.
+
+    Only this adapter emits INVALID. A read failure is not an input here: the
+    issuer turns it into UNAVAILABLE (HOLD) and never calls this function.
+    In V1 only MATCH_SELF, MATCH_OTHER_OR_UNKNOWN, ABSENT and INVALID can
+    come out: Feedback needs an authorized effect, and an authorized effect
+    always MATCHes, so MISMATCH / UNKNOWN are structurally unreachable here.
     """
 
     if type(ledger) is not LedgerState:
         raise TypeError("ledger must be a LedgerState")
-    if forecast is None and ledger not in _PRE_CLAIM_LEDGER:
-        return FeedbackState.INVALID  # #367 D2-2: claimed without a forecast
+    claimed = ledger not in _PRE_CLAIM_LEDGER
+    if claimed and claim_sequence is None and ledger is not LedgerState.CORRUPT:
+        raise ValueError("a claimed ledger needs its claim sequence")
+    if forecast is None:
+        if claimed:
+            return FeedbackState.INVALID  # #367 D2-2: claimed without a forecast
+        return FeedbackState.ABSENT if feedback is None else FeedbackState.INVALID
+    if forecast.action_intent_id != action_intent_id or forecast.forward_key != forward_key:
+        return FeedbackState.INVALID
+    if claim_sequence is not None and forecast.admitting_sequence >= claim_sequence:
+        return FeedbackState.INVALID  # the forecast must precede the effect's claim
     if feedback is None:
         return FeedbackState.ABSENT
-    if forecast is None or assessment is None:
+    if assessment is None or outcome is None or ledger not in _FEEDBACK_LEDGER:
         return FeedbackState.INVALID
     if (
         feedback.forecast_id != forecast.forecast_id
         or feedback.forecast_digest != forecast.forecast_digest
         or assessment.forecast_id != forecast.forecast_id
+        or assessment.forecast_digest != forecast.forecast_digest
         or feedback.assessment_id != assessment.assessment_id
         or feedback.assessment_digest != assessment.assessment_digest
-        or feedback.verified_outcome_id != assessment.verified_outcome_id
-        or feedback.outcome_revision != assessment.outcome_revision
-        or feedback.outcome_digest != assessment.outcome_digest
-        or feedback.admitting_sequence < assessment.admitting_sequence
+        or feedback.admitting_sequence <= assessment.admitting_sequence
         or assessment.admitting_sequence <= forecast.admitting_sequence
     ):
         return FeedbackState.INVALID
-    if not assessment.positive_feedback_eligible:
+    for record in (feedback, assessment):
+        if (
+            record.verified_outcome_id != outcome.verified_outcome_id
+            or record.outcome_revision != outcome.outcome_revision
+            or record.outcome_digest != outcome.outcome_digest
+        ):
+            return FeedbackState.INVALID
+    if (
+        outcome.outcome_state is not OutcomeState.ACTIVE_VERIFIED_AUTHORIZED
+        or assessment.outcome_state is not outcome.outcome_state
+    ):
         # Feedback from an Outcome that was not authorized when issued,
         # including an inverse after UNAUTHORIZED_EFFECT.
         return FeedbackState.INVALID
