@@ -260,6 +260,7 @@ class ExpectedObservationV1:
         decision_id: str,
         decision_committed_digest: str,
         policy_kind: PolicyKind,
+        policy_row: PolicyRow,
         action_intent_id: str,
         action_intent_digest: str,
         forward_key: str,
@@ -273,19 +274,26 @@ class ExpectedObservationV1:
         ActionIntent; this check only compares them.
         """
 
+        if type(policy_kind) is not PolicyKind or policy_kind is not self.policy_kind:
+            raise ValueError("forecast policy_kind does not match its Decision")
+        if type(policy_row) is not PolicyRow or policy_row is not PolicyRow.ROW_4:
+            raise ValueError("only a row 4 Decision may have a forward forecast")
+        if (
+            type(target_expected_revision) is not int
+            or target_expected_revision != self.target_expected_revision
+        ):
+            raise ValueError("forecast target_expected_revision does not match its source")
         expected = {
             "decision_id": decision_id,
             "decision_committed_digest": decision_committed_digest,
-            "policy_kind": policy_kind,
             "action_intent_id": action_intent_id,
             "action_intent_digest": action_intent_digest,
             "forward_key": forward_key,
             "target_instance_id": target_instance_id,
             "target_namespace": target_namespace,
-            "target_expected_revision": target_expected_revision,
         }
         for name, value in expected.items():
-            if getattr(self, name) != value:
+            if type(value) is not str or getattr(self, name) != value:
                 raise ValueError(f"forecast {name} does not match its source")
 
     def _body(self) -> dict[str, object]:
@@ -887,6 +895,8 @@ def project_feedback_state(
     - ``outcome``: the latest terminal forward Outcome revision, if any;
     - ``action_intent_id`` / ``forward_key``: the ActionIntent the ledger is
       about; ``claim_sequence``: the EXECUTION_CLAIM event, once claimed.
+      This is a weaker bound than D-R17's "forecast before Policy and
+      approval", which the issuer (IP-16) enforces when it admits them.
 
     Only this adapter emits INVALID. A read failure is not an input here: the
     issuer turns it into UNAVAILABLE (HOLD) and never calls this function.
@@ -897,6 +907,10 @@ def project_feedback_state(
 
     if type(ledger) is not LedgerState:
         raise TypeError("ledger must be a LedgerState")
+    identifier(action_intent_id, "action_intent_id")
+    digest(forward_key, "forward_key")
+    if claim_sequence is not None:
+        event_sequence(claim_sequence, "claim_sequence")
     claimed = ledger not in _PRE_CLAIM_LEDGER
     if claimed and claim_sequence is None and ledger is not LedgerState.CORRUPT:
         raise ValueError("a claimed ledger needs its claim sequence")
@@ -936,6 +950,14 @@ def project_feedback_state(
     ):
         # Feedback from an Outcome that was not authorized when issued,
         # including an inverse after UNAUTHORIZED_EFFECT.
+        return FeedbackState.INVALID
+    try:
+        expected = assess(forecast, outcome)
+    except ValueError:
+        return FeedbackState.INVALID
+    if expected != (assessment.comparison, assessment.contributors):
+        # The stored comparison or attribution does not follow from the
+        # Outcome (e.g. SELF claimed despite a foreign change).
         return FeedbackState.INVALID
     recomputed = feedback_state_of(assessment)
     if recomputed is not feedback.feedback_state:

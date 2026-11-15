@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 import suzka.r17 as r17
-from suzka.r16.history_codec import PolicyKind
+from suzka.r16.history_codec import PolicyKind, PolicyRow
 from suzka.r16.successor_policy import FeedbackState, LedgerState
 from suzka.r17 import contracts
 from suzka.r17.contracts import (
@@ -486,6 +486,27 @@ def test_feedback_from_a_non_authorized_assessment_is_invalid() -> None:
     assert _project(LedgerState.REVERTED, forecast, forged, bad, real) is FeedbackState.INVALID
 
 
+def test_forged_attribution_that_does_not_follow_from_the_outcome_is_invalid() -> None:
+    forecast = _forecast()
+    for real in (
+        _outcome(foreign_change=True),
+        _outcome(effect_operation_key="9" * 64),
+    ):
+        honest = OutcomeAssessmentV1.issue(forecast, real, EVENT_A, 30)
+        forged = replace(honest, contributors=(Contributor.SELF,))
+        feedback = DecisionFeedbackV1.issue(forged, EVENT_B, 31)
+        assert feedback.feedback_state is FeedbackState.MATCH_SELF
+        assert _project(AUTHORIZED, forecast, feedback, forged, real) is FeedbackState.INVALID
+
+
+def test_projection_validates_its_scalar_inputs() -> None:
+    forecast, assessment, feedback, outcome = _chain()
+    with pytest.raises(ValueError):
+        _project(AUTHORIZED, forecast, feedback, assessment, outcome, claim=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        _project(AUTHORIZED, forecast, feedback, assessment, outcome, forward="x")
+
+
 def test_stored_state_that_differs_from_the_recomputed_one_is_invalid() -> None:
     forecast, assessment, feedback, outcome = _chain()
     tampered = replace(feedback, feedback_state=FeedbackState.MISMATCH)
@@ -563,6 +584,7 @@ def _binding(**changes: Any) -> dict[str, Any]:
         "decision_id": forecast.decision_id,
         "decision_committed_digest": forecast.decision_committed_digest,
         "policy_kind": forecast.policy_kind,
+        "policy_row": PolicyRow.ROW_4,
         "action_intent_id": forecast.action_intent_id,
         "action_intent_digest": forecast.action_intent_digest,
         "forward_key": forecast.forward_key,
@@ -582,6 +604,9 @@ def test_forecast_binding_to_its_decision_intent_and_target() -> None:
         {"forward_key": "9" * 64},
         {"target_instance_id": "00000000-0000-4000-8000-0000000000bb"},
         {"target_expected_revision": 1},
+        {"target_expected_revision": 0.0},
+        {"policy_kind": "SUCCESSOR_POLICY_V2"},
+        {"policy_row": PolicyRow.ROW_5},
     ):
         with pytest.raises(ValueError):
             _forecast().check_binding(**_binding(**changes))
