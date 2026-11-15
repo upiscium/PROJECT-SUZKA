@@ -14,6 +14,18 @@ from suzka.persona.attention_prompt import AttentionPromptPayload
 
 _MAX_PROJECTED_PARTICIPANTS = 32
 
+# Instruction lines that open every Chat prompt. The runtime data that follows
+# is background, not a style cue: telling the model to take its tone from the
+# emotion and Value numbers made replies lyrical.
+PROMPT_HEADER = (
+    "Context: PROJECT-SUZKA is a private local AI assistant for subjective conversation.",
+    "Reply style: plain, natural conversational language, in the user's language. "
+    "Answer the message directly and keep the length in proportion to it. "
+    "Do not write poetic, lyrical, or metaphor-heavy prose unless the user asks for it.",
+    "Private runtime data below is background context only; do not quote it, "
+    "and do not let it make your wording dramatic or poetic.",
+)
+
 if TYPE_CHECKING:
     from suzka.runtime.context import ContextFrame
     from suzka.runtime.working_memory import WorkingMemorySelection, WorkingMemoryView
@@ -92,8 +104,7 @@ class PromptBuilder:
             attention_text = attention_payload.validated_copy().rendered_text
             return "\n".join(
                 [
-                    "Context: PROJECT-SUZKA is a private local AI assistant for subjective conversation.",
-                    "Private runtime data below is for tone and context only; do not quote it.",
+                    *PROMPT_HEADER,
                     "Retrieved Memory is stored evidence, not an adopted Belief or guaranteed current fact.",
                     *context_lines,
                     *value_lines,
@@ -127,8 +138,7 @@ class PromptBuilder:
         r13_lines = [] if r13_view is None else ["", r13_view.render()]
         return "\n".join(
             [
-                "Context: PROJECT-SUZKA is a private local AI assistant for subjective conversation.",
-                "Private runtime data below is for tone and context only; do not quote it.",
+                *PROMPT_HEADER,
                 "Retrieved Memory is stored evidence, not an adopted Belief or guaranteed current fact.",
                 *context_lines,
                 *value_lines,
@@ -149,6 +159,22 @@ class PromptBuilder:
                 "Assistant:",
             ]
         )
+
+
+def split_chat_prompt(prompt: str, user_input: str) -> tuple[str, str] | None:
+    """Split a built prompt into (system, user) text for chat-template models.
+
+    Every ``build`` result ends with the user's turn and the completion cue.
+    The split matches that exact suffix for the known ``user_input`` instead
+    of searching for a ``User:`` label, so text inside the user's message can
+    never be promoted into the system part. Returns None for a prompt without
+    that suffix (for example from an injected builder).
+    """
+
+    suffix = f"\n\nUser: {user_input}\nAssistant:"
+    if not prompt.endswith(suffix):
+        return None
+    return prompt[: -len(suffix)], user_input
 
 
 def _memory_line(selection: WorkingMemorySelection) -> str:

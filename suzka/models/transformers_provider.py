@@ -38,7 +38,27 @@ class TransformersProvider:
             self.attach_adapter(adapter_path)
 
     def generate(self, prompt: str) -> str:
-        inputs = self._generation_inputs(prompt)
+        return self._generate_from(self._generation_inputs(prompt))
+
+    def generate_chat(self, system_text: str, user_text: str) -> str:
+        """Generate with instructions in the system role and the user's text alone in the user role.
+
+        Plain checkpoints have no roles, so they get the same completion
+        prompt that ``PromptBuilder`` would have produced.
+        """
+
+        if not self._uses_chat_template():
+            return self.generate(f"{system_text}\n\nUser: {user_text}{PLAIN_ASSISTANT_CUE}")
+        return self._generate_from(
+            self._chat_inputs(
+                [
+                    {"role": "system", "content": [{"type": "text", "text": system_text}]},
+                    {"role": "user", "content": [{"type": "text", "text": user_text}]},
+                ]
+            )
+        )
+
+    def _generate_from(self, inputs: dict[str, torch.Tensor]) -> str:
         inputs = self._move_inputs_to_model_device(inputs)
         generation_kwargs: dict[str, Any] = {
             "max_new_tokens": self.settings.generation.max_new_tokens,
@@ -106,7 +126,9 @@ class TransformersProvider:
         if not self._uses_chat_template():
             return self._tokenize(prompt)
         user_text = prompt.removesuffix(PLAIN_ASSISTANT_CUE).rstrip()
-        messages = [{"role": "user", "content": [{"type": "text", "text": user_text}]}]
+        return self._chat_inputs([{"role": "user", "content": [{"type": "text", "text": user_text}]}])
+
+    def _chat_inputs(self, messages: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         encoded = self.processor.apply_chat_template(
             messages,
             add_generation_prompt=True,
