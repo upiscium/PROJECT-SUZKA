@@ -127,7 +127,8 @@ class ConversationTraceSettings(StrictBaseModel):
     max_items_per_context: StrictInt = Field(
         default=20, ge=1, le=MAX_TRACE_ITEMS_PER_CONTEXT
     )
-    max_rendered_bytes: StrictInt = Field(default=4096, ge=256, le=16384)
+    # At least 1024 so a shortened CJK turn (~400 bytes) still fits (#421 review).
+    max_rendered_bytes: StrictInt = Field(default=4096, ge=1024, le=16384)
 
     @model_validator(mode="after")
     def validate_relations(self) -> "ConversationTraceSettings":
