@@ -196,10 +196,12 @@ def _consistent(
     ledger: LedgerState,
     feedback: FeedbackState,
     interpretation: Interpretation,
+    version: PolicyKind = PolicyKind.SUCCESSOR_POLICY_V2,
 ) -> SuccessorPolicyInputV2:
     """Refs filled exactly as each state requires, so only states vary."""
 
     return _input(
+        version=version,
         required_source=required,
         predecessor=predecessor,
         predecessor_ref={
@@ -220,6 +222,7 @@ def _consistent(
             LedgerState.INTENT_ISSUED,
             LedgerState.POLICY_DENIED,
             LedgerState.APPROVAL_EXPIRED_UNCLAIMED,
+            LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT,
         ) else OUTCOME,
         feedback=feedback,
         feedback_ref=None if feedback in (FeedbackState.ABSENT, FeedbackState.INVALID) else FEEDBACK,
@@ -227,8 +230,20 @@ def _consistent(
     )
 
 
-def test_policy_is_total_and_never_writes_over_every_state_tuple() -> None:
-    """All 3*4*3*5*17*6*5 state tuples: total, closed, no WRITE path."""
+def _ledger_states(version: PolicyKind) -> tuple[LedgerState, ...]:
+    """IP-13: PRIOR_INCARNATION_EFFECT_PRESENT exists only in V3."""
+
+    return tuple(
+        state
+        for state in LedgerState
+        if version is PolicyKind.SUCCESSOR_POLICY_V3
+        or state is not LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT
+    )
+
+
+@pytest.mark.parametrize("version", [PolicyKind.SUCCESSOR_POLICY_V2, PolicyKind.SUCCESSOR_POLICY_V3])
+def test_policy_is_total_and_never_writes_over_every_state_tuple(version: PolicyKind) -> None:
+    """Every state tuple of each version: total, closed, no WRITE path."""
 
     seen: set[SuccessorRow] = set()
     for states in product(
@@ -236,11 +251,11 @@ def test_policy_is_total_and_never_writes_over_every_state_tuple() -> None:
         PredecessorState,
         LineageState,
         CommitmentState,
-        LedgerState,
+        _ledger_states(version),
         FeedbackState,
         Interpretation,
     ):
-        value = _consistent(*states)
+        value = _consistent(*states, version=version)
         result = evaluate(value)
         seen.add(result.row)
         interpretation = states[-1]
@@ -369,19 +384,20 @@ def test_worst_case_input_fits_the_8_kib_bound() -> None:
     assert SuccessorPolicyInputV2.from_bytes(worst.canonical_bytes()) == worst
 
 
-def test_no_single_field_change_makes_the_worst_case_longer() -> None:
+@pytest.mark.parametrize("version", [PolicyKind.SUCCESSOR_POLICY_V2, PolicyKind.SUCCESSOR_POLICY_V3])
+def test_no_single_field_change_makes_the_worst_case_longer(version: PolicyKind) -> None:
     """P2-1: every enum member, every allowed pair and None are no longer."""
 
     from enum import Enum
 
-    worst = worst_case_input()
+    worst = worst_case_input(version)
     size = len(worst.canonical_bytes())
     for field, kind in (
         ("required_source", RequiredSourceState),
         ("predecessor", PredecessorState),
         ("lineage", LineageState),
         ("commitment", CommitmentState),
-        ("ledger", LedgerState),
+        ("ledger", _ledger_states(version)),
         ("feedback", FeedbackState),
         ("inverse_authorization", InverseAuthorization),
     ):

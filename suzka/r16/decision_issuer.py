@@ -342,6 +342,7 @@ class _DecisionIssuer:
             event_id=event.event_id,
             event_sequence=_sequence(event),
             now_utc=utc_timestamp(event.requested_at),
+            version=POLICY_KIND,
         )
         return self._hold_result(evaluate(value))
 
@@ -403,6 +404,7 @@ class _DecisionIssuer:
             event_id=event.event_id,
             event_sequence=_sequence(event),
             now_utc=now_utc,
+            version=POLICY_KIND,
         )
         result = evaluate(value)
         if (
@@ -604,7 +606,8 @@ class _DecisionIssuer:
             # IP-11: Plan B is never a self-origin Goal's head.
             return False
         return (
-            decision.policy_kind is POLICY_KIND
+            # IP-13: a head sealed in V2 stays valid after the issuer moves on.
+            decision.policy_kind is sealed.version
             and replay.history_row is decision.policy_row
             and selected is not None
             and (selected.kind, selected.candidate_id) == expected_kind
@@ -663,7 +666,7 @@ class _DecisionIssuer:
         policy_bytes = value.canonical_bytes()
         intent = checksum(
             _INTENT_DOMAIN,
-            [incarnation, predecessor_key, value.evidence_fingerprint(), POLICY_KIND.value],
+            [incarnation, predecessor_key, value.evidence_fingerprint(), value.version.value],
         )
         identity = decision_id_for(
             incarnation,
@@ -687,7 +690,8 @@ class _DecisionIssuer:
             predecessor_key=predecessor_key,
             predecessor_digest=None if predecessor is None else predecessor.content_digest,
             decision=record,
-            policy_kind=POLICY_KIND,
+            # IP-13: the label always follows the sealed bytes.
+            policy_kind=value.version,
             policy_row=result.history_row,
             policy_input_bytes=policy_bytes,
             source_refs=_history_refs(q),
