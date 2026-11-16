@@ -1087,6 +1087,7 @@ def _open_subject_history(
             path.parent.absolute() / path.name,
             subject_id=app_settings.project.name,
             max_page_count=settings.max_page_count,
+            r18_enabled=app_settings.r18.enabled,
         )
     except (HistoryAdoptionError, OSError) as error:
         raise StateRecoveryError(f"SubjectHistory is unavailable: {error}") from error
