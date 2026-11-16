@@ -526,6 +526,29 @@ def test_a_crash_before_commit_leaves_the_v2_file(tmp_path: Path, monkeypatch: p
     assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == HISTORY_SCHEMA_VERSION
 
 
+@pytest.mark.parametrize("stage", ["rebuilt:action_intents", "verified"])
+def test_a_killed_v2_migration_leaves_v2_and_a_rerun_migrates(tmp_path: Path, stage: str) -> None:
+    """As for v1: a real crash (os._exit, hot journal) leaves the v2 file."""
+
+    import subprocess
+    import sys
+
+    path, _ = _v2_store_with_decisions(tmp_path)
+    script = (
+        "import os\n"
+        "from pathlib import Path\n"
+        "from suzka.r16 import history_migration as m\n"
+        f"m._STAGE_HOOK = lambda name: os._exit(9) if name == {stage!r} else None\n"
+        f"m.migrate(Path({str(path)!r}))\n"
+    )
+    completed = subprocess.run([sys.executable, "-c", script], cwd=Path(__file__).parents[1], check=False)
+    assert completed.returncode == 9
+    with pytest.raises(HistoryStoreMigrationRequired, match="v2"):
+        SubjectHistoryStore.open(path, max_page_count=PAGES)
+    assert history_migration.main([str(path)]) == 0
+    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == HISTORY_SCHEMA_VERSION
+
+
 def test_the_migration_command_on_v2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     path, _ = _v2_store_with_decisions(tmp_path)
     assert history_migration.main(["--max-page-count", str(PAGES), str(path)]) == 0

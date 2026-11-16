@@ -68,7 +68,8 @@ _META_COLUMNS: Final = (
     "phase, adopted_baseline_id, adopted_baseline_hash, genesis_incarnation_id"
 )
 
-# v2 adds about 40 pages to an empty v1 store (66 vs 21); keep a margin.
+# v1 -> v3 adds about 40 pages to an empty v1 store (the v2 objects; 66 vs 21),
+# and v2 -> v3 only rebuilds tables that are empty; keep a margin.
 _MIGRATION_PAGES: Final = 64
 
 # Tests inject a failure at a named stage to prove crash safety.
