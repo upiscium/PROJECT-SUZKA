@@ -101,6 +101,7 @@ class PromptBuilder:
         r13_view: R13PromptView | None = None,
         *,
         attention_payload: AttentionPromptPayload | None = None,
+        conversation_trace_text: str = "",
     ) -> str:
         if attention_payload is not None:
             if type(attention_payload) is not AttentionPromptPayload:
@@ -119,6 +120,7 @@ class PromptBuilder:
                     "",
                     attention_text,
                     "",
+                    *_trace_lines(conversation_trace_text),
                     "Emotion:",
                     f"- valence: {emotion_state.valence:.6f}",
                     f"- arousal: {emotion_state.arousal:.6f}",
@@ -157,6 +159,7 @@ class PromptBuilder:
                 f"- arousal: {emotion_state.arousal:.6f}",
                 f"- optimal_loss: {emotion_state.optimal_loss:.6f}",
                 "",
+                *_trace_lines(conversation_trace_text),
                 "Stored episodic evidence:",
                 *(episodic_lines or ["- none"]),
                 "",
@@ -194,6 +197,16 @@ def split_chat_prompt(prompt: str, user_input: str) -> tuple[str, str] | None:
     system_text = body[:boundary]
     runtime_data = body[boundary + 1 :]
     return system_text, f"{runtime_data}\n\n{CURRENT_MESSAGE_HEADING}\n{user_input}"
+
+
+def _trace_lines(conversation_trace_text: str) -> list[str]:
+    """The rendered ConversationTrace block and a blank line, or nothing (#417 D1 §5)."""
+
+    if type(conversation_trace_text) is not str:
+        raise TypeError("conversation_trace_text must be a string")
+    if not conversation_trace_text:
+        return []
+    return [conversation_trace_text, ""]
 
 
 def _memory_line(selection: WorkingMemorySelection) -> str:

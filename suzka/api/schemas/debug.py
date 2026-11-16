@@ -75,6 +75,22 @@ class EmotionUpdateSchema(BaseModel):
     reasons: list[EmotionUpdateReasonCode]
 
 
+class ConversationTraceItemSchema(BaseModel):
+    episode_id: str
+    retention: float
+    stability_hours: float
+    display: str
+    double_recall: bool
+    read_status: str
+
+
+class ConversationTraceDiagnosticsSchema(BaseModel):
+    """#417 D1 §6-2: how this turn saw the ConversationTrace (admin debug only)."""
+
+    state: str
+    items: list[ConversationTraceItemSchema]
+
+
 class ChatDiagnosticsSchema(BaseModel):
     measurement: LossMeasurementSchema
     appraisal: AppraisalSchema
@@ -89,6 +105,7 @@ class DebugChatResponse(ChatResponse):
     retrieved_memory: RetrievedMemorySchema
     generation_params: GenerationParamsSchema
     diagnostics: ChatDiagnosticsSchema
+    conversation_trace: ConversationTraceDiagnosticsSchema
 
 
 class EmotionStateResponse(EmotionSchema):

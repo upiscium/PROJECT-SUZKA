@@ -6,6 +6,7 @@ import copy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import inspect
+import logging
 from typing import TYPE_CHECKING, Callable, cast
 
 from suzka.attention.adapters import (
@@ -16,6 +17,7 @@ from suzka.attention.contracts import (
     AttentionContinuity,
     AttentionEvent,
     AttentionTarget,
+    AttentionTargetKind,
 )
 from suzka.attention.system import (
     AttentionRefreshResult,
@@ -51,6 +53,7 @@ from suzka.identity import (
     ValueSystemSnapshot,
 )
 from suzka.memory import DualMemorySystem, MemoryContext, MemoryRecordType
+from suzka.memory.memory_schema import EpisodicMemoryRecord
 from suzka.experience import (
     ExperienceAppraisalEvidence,
     ExperienceEmotionContributions,
@@ -95,7 +98,16 @@ from suzka.runtime.session_participant import (
     SessionTurnParticipant,
 )
 from suzka.runtime.session_state import SessionState
-from suzka.runtime.conversation_trace import ConversationTrace, TraceParameters
+from suzka.runtime.conversation_trace import (
+    ConversationTrace,
+    RecalledTurn,
+    RenderedTrace,
+    TraceParameters,
+    TraceTurnKind,
+    render_trace,
+)
+from suzka.r16.commands import parse_command
+from suzka.working_memory_contracts import working_memory_item_id
 from suzka.runtime.context import (
     ContextFrame,
     ContextNotFound,
@@ -174,6 +186,39 @@ class ChatResult:
     participant_scoped: bool = False
 
 
+
+LOGGER = logging.getLogger(__name__)
+
+@dataclass(frozen=True)
+class ConversationTraceItemDiagnostic:
+    """One trace item as this turn saw it (#417 D1 §6-2; admin debug only)."""
+
+    episode_id: str
+    retention: float
+    stability_hours: float
+    display: str  # shown | faint | hidden_by_budget | in_working_memory | unreadable | hidden
+    double_recall: bool
+    read_status: str  # resolved | archived | missing | unavailable | malformed
+
+
+@dataclass(frozen=True)
+class ConversationTraceDiagnostics:
+    state: str  # enabled | frozen | disabled | participant_scoped | no_event
+    items: tuple[ConversationTraceItemDiagnostic, ...] = ()
+
+
+@dataclass(frozen=True)
+class _TraceTurnView:
+    now: datetime
+    context_id: str
+    rendered: RenderedTrace
+    # Only items the model saw (shown here, or shown by Working Memory) and
+    # that DB1 also retrieved this turn (D1 §3-§5, #425 review P3-1).
+    double_recall_ids: frozenset[str]
+    in_working_memory_ids: frozenset[str]
+    diagnostics: ConversationTraceDiagnostics
+
+
 @dataclass(frozen=True)
 class DebugChatTrace:
     """Request-scoped diagnostic data that must never become durable authority."""
@@ -183,6 +228,7 @@ class DebugChatTrace:
     memory_context: MemoryContext
     working_memory_view: WorkingMemoryView
     diagnostics: ChatDiagnostics
+    conversation_trace: ConversationTraceDiagnostics = ConversationTraceDiagnostics("disabled")
 
 
 @dataclass(frozen=True)
@@ -361,6 +407,7 @@ class SuzkaMainLoop:
             TraceParameters.from_settings(trace_settings),
             enabled=trace_settings.enabled,
         )
+        self._trace_defects_logged: set[str] = set()
         self.working_memory = (
             working_memory
             if working_memory is not None
@@ -1332,6 +1379,22 @@ class SuzkaMainLoop:
             if event is not None
             else None
         )
+        trace_view = self._conversation_trace_view(
+            event,
+            current_context,
+            capture_debug=capture_debug,
+            working_memory_view=working_memory_view,
+            attention_payload=attention_payload,
+            memory_context=memory_context,
+        )
+        if trace_view is not None and not self._builder_shows_trace(attention_payload):
+            # The injected builder drops the block: nothing was shown, so only
+            # double recalls of what Working Memory showed may reinforce.
+            trace_view = replace(
+                trace_view,
+                rendered=RenderedTrace("", (), ()),
+                double_recall_ids=trace_view.double_recall_ids & trace_view.in_working_memory_ids,
+            )
         prompt_context_view = context_view
         if r15_context_safe_chat:
             # The Context remains authoritative only in R09. These literal
@@ -1356,6 +1419,9 @@ class SuzkaMainLoop:
             prompt_context_view,
             value_view,
             attention_payload=attention_payload,
+            conversation_trace_text=(
+                trace_view.rendered.text if trace_view is not None else ""
+            ),
         )
         if scoped_interaction is not None:
             from suzka.r15.scoped_interaction import neutral_prompt_line
@@ -1513,6 +1579,28 @@ class SuzkaMainLoop:
                     memory_participant.operation_digest,
                 ),
             )
+            if trace_view is not None:
+                # In the handler, before commit: a failure restores the
+                # committed trace with the rest of AgentState (D1 §4).
+                self.conversation_trace.reinforce(
+                    trace_view.context_id,
+                    trace_view.now,
+                    turn_sequence=event_sequence,
+                    shown_episode_ids=trace_view.rendered.shown_episode_ids,
+                    double_recall_episode_ids=trace_view.double_recall_ids,
+                )
+                self.conversation_trace.add(
+                    trace_view.context_id,
+                    episode_id=experience_record.source_episode_id,
+                    turn_kind=(
+                        TraceTurnKind.COMMAND
+                        if parse_command(user_input) is not None
+                        else TraceTurnKind.CHAT
+                    ),
+                    requested_at=trace_view.now,
+                    event_sequence=event_sequence,
+                    surprise=appraisal.novelty if appraisal.novelty_valid else None,
+                )
         session_participant = SessionTurnParticipant(
             self.session_state,
             SessionTurnOperation(
@@ -1534,6 +1622,11 @@ class SuzkaMainLoop:
                 memory_context=memory_context,
                 working_memory_view=working_memory_view,
                 diagnostics=diagnostics,
+                conversation_trace=(
+                    trace_view.diagnostics
+                    if trace_view is not None
+                    else self._conversation_trace_state_label(event, current_context)
+                ),
             )
         return _ComputedChat(
             response=processed_response.visible_response,
@@ -1750,10 +1843,16 @@ class SuzkaMainLoop:
         value_view: ValuePromptView,
         *,
         attention_payload: AttentionPromptPayload | None = None,
+        conversation_trace_text: str = "",
     ) -> str:
         """Pass prompt projections while retaining older injected builders."""
 
         build = cast(Callable[..., str], self.prompt_builder.build)
+        trace_arguments: dict[str, object] = (
+            {"conversation_trace_text": conversation_trace_text}
+            if conversation_trace_text
+            else {}
+        )
         if attention_payload is not None:
             if type(attention_payload) is not AttentionPromptPayload:
                 raise TypeError(
@@ -1770,6 +1869,7 @@ class SuzkaMainLoop:
                 context_view=context_view,
                 value_view=value_view,
                 attention_payload=attention_payload,
+                **trace_arguments,
             )
         parameters = tuple(inspect.signature(build).parameters.values())
         keyword_names = {
@@ -1789,11 +1889,172 @@ class SuzkaMainLoop:
             keyword_arguments["value_view"] = value_view
         if accepts_kwargs or "r13_view" in keyword_names:
             keyword_arguments["r13_view"] = r13_view
+        if trace_arguments and (
+            accepts_kwargs or "conversation_trace_text" in keyword_names
+        ):
+            keyword_arguments.update(trace_arguments)
         return build(
             user_input,
             emotion_state,
             working_memory_view,
             **keyword_arguments,
+        )
+
+    def _conversation_trace_state_label(
+        self, event: AgentEvent | None, current_context: ContextFrame
+    ) -> ConversationTraceDiagnostics:
+        trace = self.conversation_trace
+        if trace.frozen:
+            return ConversationTraceDiagnostics("frozen")
+        if not trace.enabled:
+            return ConversationTraceDiagnostics("disabled")
+        if event is None:
+            return ConversationTraceDiagnostics("no_event")
+        return ConversationTraceDiagnostics("participant_scoped")
+
+    def _conversation_trace_view(
+        self,
+        event: AgentEvent | None,
+        current_context: ContextFrame,
+        *,
+        capture_debug: bool,
+        working_memory_view: WorkingMemoryView,
+        attention_payload: AttentionPromptPayload | None,
+        memory_context: MemoryContext,
+    ) -> _TraceTurnView | None:
+        """Forget, read and render this Context's trace for one Chat turn (#417 D1 §3-§5).
+
+        Returns None when the trace does nothing this turn: disabled, frozen
+        after V11 (D1-b), no runtime event, or a Context with participants
+        (D1-c). DEBUG_CHAT only reads: it never forgets, drops or reinforces.
+        """
+
+        trace = self.conversation_trace
+        if not trace.enabled or event is None or current_context.participant_refs:
+            return None
+        now = event.requested_at
+        context_id = current_context.context_id
+        if not capture_debug:
+            for removal in trace.forget(now):
+                LOGGER.info(
+                    "ConversationTrace forgot %s (%s)", removal.episode_id, removal.reason.value
+                )
+        retrieved_ids = frozenset(record.id for record in memory_context.db1_results)
+        in_working_memory = self._episodes_in_working_memory_prompt(
+            working_memory_view, attention_payload
+        )
+        recalled: list[RecalledTurn] = []
+        seen: list[tuple[str, float, float, str, str]] = []
+        for item, retention in trace.candidates(context_id, now):
+            status, record = self._read_trace_episode(item.episode_id)
+            if status == "archived":
+                if not capture_debug and trace.drop(context_id, item.episode_id):
+                    LOGGER.info("ConversationTrace forgot %s (archived)", item.episode_id)
+                seen.append((item.episode_id, retention, item.stability_hours, "hidden", status))
+                continue
+            if status != "resolved" or record is None:
+                if status in {"missing", "malformed"} and (
+                    item.episode_id not in self._trace_defects_logged
+                ):
+                    self._trace_defects_logged.add(item.episode_id)
+                    LOGGER.warning(
+                        "ConversationTrace defect: episode %s is %s", item.episode_id, status
+                    )
+                seen.append((item.episode_id, retention, item.stability_hours, "unreadable", status))
+                continue
+            if item.episode_id in in_working_memory:
+                seen.append(
+                    (item.episode_id, retention, item.stability_hours, "in_working_memory", status)
+                )
+                continue
+            recalled.append(RecalledTurn(item, retention, record.user_input, record.response))
+            seen.append((item.episode_id, retention, item.stability_hours, "", status))
+        rendered = render_trace(recalled, now, trace.parameters)
+        shown = set(rendered.shown_episode_ids)
+        faint = set(rendered.faint_episode_ids)
+        seen_ids = {episode_id for episode_id, *_rest in seen}
+        visible_in_wm = frozenset(in_working_memory & seen_ids)
+        double_recall_ids = retrieved_ids & (shown | visible_in_wm)
+        items = []
+        for episode_id, retention, stability, display, status in seen:
+            if not display:
+                display = (
+                    "hidden_by_budget"
+                    if episode_id not in shown
+                    else "faint"
+                    if episode_id in faint
+                    else "shown"
+                )
+            items.append(
+                ConversationTraceItemDiagnostic(
+                    episode_id=episode_id,
+                    retention=retention,
+                    stability_hours=stability,
+                    display=display,
+                    double_recall=episode_id in double_recall_ids,
+                    read_status=status,
+                )
+            )
+        return _TraceTurnView(
+            now=now,
+            context_id=context_id,
+            rendered=rendered,
+            double_recall_ids=frozenset(double_recall_ids),
+            in_working_memory_ids=visible_in_wm,
+            diagnostics=ConversationTraceDiagnostics("enabled", tuple(items)),
+        )
+
+    def _builder_shows_trace(self, attention_payload: AttentionPromptPayload | None) -> bool:
+        """Whether the prompt builder will render ``conversation_trace_text``."""
+
+        if attention_payload is not None:
+            return True  # the Attention path requires the exact PromptBuilder
+        parameters = inspect.signature(self.prompt_builder.build).parameters.values()
+        return any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            or parameter.name == "conversation_trace_text"
+            for parameter in parameters
+        )
+
+    def _read_trace_episode(self, episode_id: str) -> tuple[str, EpisodicMemoryRecord | None]:
+        """Read one DB1 episode, mapping each failure to a named status (D1 §4)."""
+
+        from suzka.memory import EpisodicMemoryFormatError, EpisodicMemoryReadError
+
+        try:
+            committed = self.memory_system.get_committed_episodic(episode_id)
+        except EpisodicMemoryReadError:
+            return "unavailable", None
+        except EpisodicMemoryFormatError:
+            return "malformed", None
+        if committed is None:
+            return "missing", None
+        if committed.record.archived:
+            return "archived", None
+        return "resolved", committed.record
+
+    @staticmethod
+    def _episodes_in_working_memory_prompt(
+        view: WorkingMemoryView, payload: AttentionPromptPayload | None
+    ) -> frozenset[str]:
+        """Episodes the prompt already shows through Working Memory (dedupe, D1 §5)."""
+
+        episodic = [
+            selection
+            for selection in view.selected
+            if selection.source_kind is WorkingMemorySourceKind.EPISODIC
+        ]
+        if payload is None:
+            return frozenset(selection.source_id for selection in episodic)
+        included = set(payload.included_candidate_ids)
+        return frozenset(
+            selection.source_id
+            for selection in episodic
+            if AttentionTarget(
+                AttentionTargetKind.WORKING_MEMORY,
+                working_memory_item_id(WorkingMemorySourceKind.EPISODIC, selection.source_id),
+            ).candidate_id
+            in included
         )
 
     def _chat_result(self, computed: _ComputedChat, transaction_id: str) -> ChatResult:
