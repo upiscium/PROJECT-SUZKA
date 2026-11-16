@@ -82,6 +82,12 @@ button, input, textarea { font: inherit; }
 .chat-bubble.assistant { justify-self: start; background: rgba(30, 41, 59, 0.7); }
 .chat-bubble p, .record p { white-space: pre-wrap; }
 .composer { display: grid; gap: 0.75rem; }
+.chat-sessions-header { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; }
+.chat-session-list { list-style: none; margin: 0.5rem 0 0; padding: 0; display: grid; gap: 0.25rem; max-height: 14rem; overflow-y: auto; }
+.chat-session-list li { display: flex; align-items: center; gap: 0.25rem; border-radius: 0.5rem; }
+.chat-session-list li.active { background: rgba(14, 165, 233, 0.16); }
+.chat-session-open { flex: 1; min-width: 0; text-align: left; background: none; border: 0; color: inherit; padding: 0.4rem 0.6rem; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: inherit; }
+.chat-session-delete { background: none; border: 0; color: var(--muted); padding: 0.4rem 0.6rem; cursor: pointer; font: inherit; }
 .chat-bubble.pending { display: grid; gap: 0.5rem; }
 .spinner { width: 1.1rem; height: 1.1rem; border: 2px solid var(--border); border-top-color: currentColor; border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }

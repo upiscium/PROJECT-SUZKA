@@ -1,8 +1,17 @@
 "use client";
 
-import { useMutation } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
-import { ApiError, api, type ChatResponse, type CommandKind, type CommandStatus } from "@/lib/api";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
+import {
+  ApiError,
+  api,
+  type ChatLogTurn,
+  type ChatRequest,
+  type ChatResponse,
+  type ChatSession,
+  type CommandKind,
+  type CommandStatus,
+} from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
 import { Textarea } from "@/components/ui/input";
@@ -36,6 +45,31 @@ const STATUS_LABEL: Record<string, string> = {
   unknown_after_restart: "unknown (the server restarted)",
 };
 
+// Per-viewer convenience: which session to reopen. Not authoritative state.
+export const SESSION_STORAGE_KEY = "suzka.chat.session";
+
+function storedSession(): string | null {
+  try {
+    return window.localStorage.getItem(SESSION_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function storeSession(sessionId: string | null) {
+  try {
+    if (sessionId) window.localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+    else window.localStorage.removeItem(SESSION_STORAGE_KEY);
+  } catch {
+    // Storage may be unavailable (private window); the screen still works.
+  }
+}
+
+function turnsFromLog(turns: ChatLogTurn[]): ChatTurn[] {
+  // Restored turns carry no response metadata, so they offer no review actions.
+  return turns.map((turn) => ({ role: turn.role, content: turn.content }));
+}
+
 export function reviewCommand(kind: CommandKind, experienceId: string): string {
   // The screen builds the exact command text the owners check (DRV-3).
   return kind === "REVIEW_EXPERIENCE"
@@ -46,8 +80,85 @@ export function reviewCommand(kind: CommandKind, experienceId: string): string {
 export function ChatClient() {
   const [message, setMessage] = useState("");
   const [history, setHistory] = useState<ChatTurn[]>([]);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  // The mutation reads the session through a ref so review buttons on an
+  // already-rendered turn still post to the current session.
+  const sessionRef = useRef<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const queryClient = useQueryClient();
+  const sessions = useQuery({ queryKey: ["chat-sessions"], queryFn: api.chatSessions });
+
+  const selectSession = (id: string | null) => {
+    sessionRef.current = id;
+    setSessionId(id);
+    storeSession(id);
+  };
+
+  const openSession = async (id: string) => {
+    setLoadError(null);
+    try {
+      const detail = await api.chatSession(id);
+      selectSession(id);
+      setHistory(turnsFromLog(detail.turns));
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) {
+        if (storedSession() === id) storeSession(null);
+        setLoadError("That chat no longer exists.");
+      } else {
+        setLoadError(error instanceof Error ? error.message : "Could not load the chat.");
+      }
+    }
+  };
+
+  useEffect(() => {
+    const id = storedSession();
+    if (id) void openSession(id);
+    // Only on first render: reopen the last session this viewer used.
+  }, []);
+
+  const startNewChat = () => {
+    selectSession(null);
+    setHistory([]);
+    setLoadError(null);
+  };
+
+  const deleteSession = async (session: ChatSession) => {
+    if (!window.confirm(`Delete the chat "${session.title || "Untitled"}"? Only its transcript is removed; SUZKA's memory is not.`)) return;
+    try {
+      await api.deleteChatSession(session.session_id);
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 404)) {
+        setLoadError(error instanceof Error ? error.message : "Could not delete the chat.");
+        return;
+      }
+    }
+    if (sessionRef.current === session.session_id) startNewChat();
+    void queryClient.invalidateQueries({ queryKey: ["chat-sessions"] });
+  };
+
   const mutation = useMutation({
-    mutationFn: api.chat,
+    mutationFn: async (body: ChatRequest) => {
+      let id = sessionRef.current;
+      let unsaved = false;
+      if (!id) {
+        // The first message of a new chat opens its session. The transcript
+        // is display-only, so failing to open one never blocks the turn.
+        try {
+          const created = await api.createChatSession();
+          if (typeof created?.session_id === "string") {
+            id = created.session_id;
+            selectSession(id);
+          }
+        } catch {
+          unsaved = true;
+        }
+      }
+      const result = await api.chat(id ? { ...body, chat_session_id: id } : body);
+      return unsaved ? { ...result, transcript_saved: false } : result;
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ["chat-sessions"] });
+    },
     // The user's turn shows as soon as it is sent; the reply follows it.
     onMutate: (variables) => {
       setHistory((current) => [...current, { role: "user", content: variables.message }]);
@@ -88,6 +199,38 @@ export function ChatClient() {
         {latest ? <Badge>{latest.model.model_id}</Badge> : null}
       </header>
 
+      <Card className="chat-sessions" aria-label="Chats">
+        <div className="chat-sessions-header">
+          <CardTitle>Chats</CardTitle>
+          <Button type="button" disabled={mutation.isPending} onClick={startNewChat}>New chat</Button>
+        </div>
+        <ul className="chat-session-list">
+          {(sessions.data?.sessions ?? []).map((session) => (
+            <li key={session.session_id} className={session.session_id === sessionId ? "active" : undefined}>
+              <button
+                type="button"
+                className="chat-session-open"
+                disabled={mutation.isPending}
+                aria-current={session.session_id === sessionId ? "true" : undefined}
+                onClick={() => void openSession(session.session_id)}
+              >
+                {session.title || "Untitled"}
+              </button>
+              <button
+                type="button"
+                className="chat-session-delete"
+                disabled={mutation.isPending}
+                aria-label={`Delete ${session.title || "Untitled"}`}
+                onClick={() => void deleteSession(session)}
+              >
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+        {loadError ? <p className="error">{loadError}</p> : null}
+      </Card>
+
       {latest ? (
         <Card>
           <CardTitle>Current Model</CardTitle>
@@ -110,6 +253,9 @@ export function ChatClient() {
             <div key={`${turn.role}-${index}`} className={`chat-bubble ${turn.role}`}>
               <strong>{turn.role === "user" ? "You" : "SUZKA"}</strong>
               <p>{turn.content}</p>
+              {turn.role === "assistant" && turn.result?.transcript_saved === false ? (
+                <span className="muted">This turn was not saved to the chat history.</span>
+              ) : null}
               {turn.role === "assistant" && turn.result ? (
                 <ReviewActions
                   result={turn.result}

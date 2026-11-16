@@ -19,8 +19,11 @@ class ChatRequest(BaseModel):
     context_id: StrictStr | None = None
     client_session_id: StrictStr | None = None
     interlocutor_key: StrictStr | None = None
+    # The Chat screen's transcript session (display only). Unlike
+    # client_session_id it never selects a Context.
+    chat_session_id: StrictStr | None = None
 
-    @field_validator("context_id", "client_session_id", "interlocutor_key")
+    @field_validator("context_id", "client_session_id", "interlocutor_key", "chat_session_id")
     @classmethod
     def validate_selector(cls, value: str | None) -> str | None:
         if value is None:
@@ -61,6 +64,40 @@ class ChatResponse(BaseModel):
     # restart (D2 addendum P2-3). Both None while the driver is inactive.
     command_ticket: CommandTicketSchema | None = None
     incarnation: str | None = None
+    # Whether this turn was written to the request's chat_session_id
+    # transcript; None when no session was given.
+    transcript_saved: bool | None = None
+
+
+class ChatSessionSchema(BaseModel):
+    session_id: str
+    title: str
+    created_at: str
+    updated_at: str
+
+
+class ChatSessionListResponse(BaseModel):
+    sessions: list[ChatSessionSchema]
+
+
+class ChatSessionCreateRequest(BaseModel):
+    title: StrictStr = Field(default="", max_length=200)
+
+
+class ChatSessionRenameRequest(BaseModel):
+    title: StrictStr = Field(min_length=1, max_length=200)
+
+
+class ChatLogTurnSchema(BaseModel):
+    role: str
+    content: str
+    episode_id: str | None = None
+    created_at: str
+
+
+class ChatSessionDetailResponse(BaseModel):
+    session: ChatSessionSchema
+    turns: list[ChatLogTurnSchema]
 
 
 class CommandTicketStatusResponse(BaseModel):

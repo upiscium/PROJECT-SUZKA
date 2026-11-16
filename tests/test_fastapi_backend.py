@@ -460,6 +460,7 @@ def test_api_chat_works_with_dummy_provider_without_debug_leak(tmp_path: Path) -
             "experience_id",
             "command_ticket",
             "incarnation",
+            "transcript_saved",
         }
         assert data["response"] == "Visible API answer."
         assert "hidden_thought" not in data
@@ -1016,6 +1017,7 @@ def test_chat_session_selector_reuses_one_durable_context_without_response_metad
             "experience_id",
             "command_ticket",
             "incarnation",
+            "transcript_saved",
         }
         assert set(first.json()) == keys
         assert set(second.json()) == keys
@@ -3727,6 +3729,7 @@ def test_chat_commits_post_chat_working_memory_in_agent_state_v9(
             "experience_id",
             "command_ticket",
             "incarnation",
+            "transcript_saved",
         }
         snapshot = client.app.state.agent_state_store.load()
         authoritative_items = client.app.state.main_loop.working_memory.items

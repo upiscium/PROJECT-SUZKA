@@ -214,6 +214,16 @@ class SubjectHistorySettings(StrictBaseModel):
     max_page_count: StrictInt = Field(default=65_536, ge=64, le=2_147_483_646)
 
 
+class ChatLogSettings(StrictBaseModel):
+    """Display-only Chat transcript for the Chat screen's sessions.
+
+    It is never read by the runtime, so it does not enter prompts, memory,
+    or learning. The default lets deployments without this section start.
+    """
+
+    path: Path = Path(".suzka/private/chat_log/chat_log.sqlite3")
+
+
 class StateWALSettings(StrictBaseModel):
     directory: Path = Path(".suzka/private/state_wal")
 
@@ -390,6 +400,7 @@ class Settings(StrictBaseModel):
     agent_state: AgentStateSettings = Field(default_factory=AgentStateSettings)
     event_journal: EventJournalSettings = Field(default_factory=EventJournalSettings)
     state_wal: StateWALSettings = Field(default_factory=StateWALSettings)
+    chat_log: ChatLogSettings = Field(default_factory=ChatLogSettings)
     subject_history: SubjectHistorySettings = Field(
         default_factory=SubjectHistorySettings
     )

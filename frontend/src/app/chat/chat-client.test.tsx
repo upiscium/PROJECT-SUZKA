@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ChatClient, FIRST_POLL_MS, POLL_LIMIT_MS, reviewCommand } from "./chat-client";
+import { ChatClient, FIRST_POLL_MS, POLL_LIMIT_MS, SESSION_STORAGE_KEY, reviewCommand } from "./chat-client";
 
 const fetchMock = vi.fn();
 const EXPERIENCE = "experience-00000000-0000-4000-8000-000000000001";
@@ -11,6 +11,7 @@ const EXPERIENCE = "experience-00000000-0000-4000-8000-000000000001";
 beforeEach(() => {
   fetchMock.mockReset();
   vi.stubGlobal("fetch", fetchMock);
+  window.localStorage.clear();
 });
 
 afterEach(() => {
@@ -246,5 +247,84 @@ describe("ChatClient ticket edge cases", () => {
       await vi.advanceTimersByTimeAsync(POLL_LIMIT_MS);
     });
     expect(fetchMock.mock.calls.filter(([u]) => String(u).includes("/commands/")).length).toBe(0);
+  });
+});
+
+describe("ChatClient sessions", () => {
+  const SESSION = { session_id: "s-1", title: "Earlier chat", created_at: "t0", updated_at: "t1" };
+
+  function json(body: unknown, status = 200) {
+    return { ok: status < 400, status, statusText: "", json: async () => body, text: async () => JSON.stringify(body) };
+  }
+
+  it("opens a session for the first message and sends its id with the turn", async () => {
+    const chatBodies: Array<Record<string, unknown>> = [];
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const path = String(url);
+      if (path.endsWith("/api/chat/sessions") && init?.method === "POST") return json(SESSION, 201);
+      if (path.endsWith("/api/chat/sessions")) return json({ sessions: [] });
+      if (path.endsWith("/api/chat")) {
+        chatBodies.push(JSON.parse(init?.body as string));
+        return chatResponse({ transcript_saved: true });
+      }
+      throw new Error(`unexpected ${path}`);
+    });
+    renderWithQuery();
+    await send("hello");
+
+    expect(await screen.findByText("Visible answer")).toBeInTheDocument();
+    expect(chatBodies[0].chat_session_id).toBe("s-1");
+    expect(window.localStorage.getItem(SESSION_STORAGE_KEY)).toBe("s-1");
+  });
+
+  it("reopens the stored session and shows its saved turns", async () => {
+    window.localStorage.setItem(SESSION_STORAGE_KEY, "s-1");
+    fetchMock.mockImplementation(async (url: string) => {
+      const path = String(url);
+      if (path.endsWith("/api/chat/sessions")) return json({ sessions: [SESSION] });
+      if (path.endsWith("/api/chat/sessions/s-1")) {
+        return json({
+          session: SESSION,
+          turns: [
+            { role: "user", content: "old question", episode_id: null, created_at: "t0" },
+            { role: "assistant", content: "old answer", episode_id: "ep", created_at: "t0" },
+          ],
+        });
+      }
+      throw new Error(`unexpected ${path}`);
+    });
+    renderWithQuery();
+
+    expect(await screen.findByText("old question")).toBeInTheDocument();
+    expect(screen.getByText("old answer")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Earlier chat" })).toHaveAttribute("aria-current", "true");
+  });
+
+  it("starts an empty chat with New chat and forgets a stored session that is gone", async () => {
+    window.localStorage.setItem(SESSION_STORAGE_KEY, "gone");
+    fetchMock.mockImplementation(async (url: string) => {
+      const path = String(url);
+      if (path.endsWith("/api/chat/sessions")) return json({ sessions: [] });
+      if (path.endsWith("/api/chat/sessions/gone")) return json({ detail: "Chat session not found" }, 404);
+      throw new Error(`unexpected ${path}`);
+    });
+    renderWithQuery();
+
+    expect(await screen.findByText("That chat no longer exists.")).toBeInTheDocument();
+    expect(window.localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "New chat" }));
+    expect(screen.getByText("No messages yet.")).toBeInTheDocument();
+  });
+
+  it("says when a turn was not saved to the history", async () => {
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      const path = String(url);
+      if (path.endsWith("/api/chat/sessions") && init?.method === "POST") return json(SESSION, 201);
+      if (path.endsWith("/api/chat/sessions")) return json({ sessions: [] });
+      return chatResponse({ transcript_saved: false });
+    });
+    renderWithQuery();
+    await send("hello");
+    expect(await screen.findByText("This turn was not saved to the chat history.")).toBeInTheDocument();
   });
 });

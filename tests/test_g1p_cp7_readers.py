@@ -445,4 +445,8 @@ def test_cp7_registered_http_get_routes_match_source_audited_inventory(
             # IP-6b (#370 D1 2-2, D2 P1-4): reads only the R16 driver's
             # settled in-memory ticket results; no committed or live state.
             "/api/chat/commands/{ticket_id}",
+            # Display-only Chat transcript (suzka/chat_log.py): its own store,
+            # never subject state, so no committed-read path is involved.
+            "/api/chat/sessions",
+            "/api/chat/sessions/{session_id}",
         }
