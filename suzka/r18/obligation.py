@@ -50,6 +50,8 @@ def normalize_request_text(text: str) -> str:
     """V1 normalization: Unicode NFC, whitespace runs to one space, stripped."""
     if type(text) is not str:
         raise TypeError("request text must be a string")
+    if len(text) > 4 * MAX_REQUEST_TEXT:
+        raise ValueError("request text exceeds its bound")
     normalized = " ".join(unicodedata.normalize("NFC", text).split())
     if not normalized:
         raise ValueError("request text is empty")
@@ -92,12 +94,27 @@ def check_secret_directory(directory: Path) -> None:
     The secret file itself is 0600; the directory rule keeps anyone else from
     replacing it.
     """
+    if not isinstance(directory, Path) or not directory.is_absolute():
+        raise ObligationSecretError("the target directory must be absolute")
+    if os.path.realpath(directory) != str(directory):
+        raise ObligationSecretError("the target directory must be a normal path without symlinks")
     try:
         info = os.lstat(directory)
     except OSError as error:
         raise ObligationSecretError("the target directory is unavailable") from error
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
         raise ObligationSecretError("the target directory custody is invalid")
+
+
+def _check_secret_file(info: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_mode & 0o077
+        or info.st_nlink != 1
+        or info.st_size != SECRET_BYTES
+    ):
+        raise ObligationSecretError("the obligation secret custody is invalid")
 
 
 def load_obligation_secret(directory: Path) -> bytes:
@@ -111,17 +128,19 @@ def load_obligation_secret(directory: Path) -> bytes:
         raise ObligationSecretError("the obligation secret is missing (run target_init)") from None
     except OSError as error:
         raise ObligationSecretError("the obligation secret is unavailable") from error
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.geteuid()
-        or info.st_mode & 0o077
-        or info.st_nlink != 1
-        or info.st_size != SECRET_BYTES
-    ):
-        raise ObligationSecretError("the obligation secret custody is invalid")
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    _check_secret_file(info)
     try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as error:
+        raise ObligationSecretError("the obligation secret is unavailable") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            raise ObligationSecretError("the obligation secret changed while it was opened")
+        _check_secret_file(opened)
         data = os.read(descriptor, SECRET_BYTES + 1)
+    except OSError as error:
+        raise ObligationSecretError("the obligation secret is unavailable") from error
     finally:
         os.close(descriptor)
     if len(data) != SECRET_BYTES:
@@ -139,7 +158,8 @@ def create_obligation_secret(directory: Path) -> Path:
     except FileExistsError as error:
         raise ObligationSecretError("the obligation secret already exists; it is never replaced") from error
     try:
-        os.write(descriptor, os.urandom(SECRET_BYTES))
+        if os.write(descriptor, os.urandom(SECRET_BYTES)) != SECRET_BYTES:
+            raise ObligationSecretError("the obligation secret was not fully written")
         os.fsync(descriptor)
     finally:
         os.close(descriptor)

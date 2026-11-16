@@ -158,3 +158,19 @@ def test_target_init_refuses_a_shared_directory(tmp_path: Path) -> None:
 def test_the_target_path_setting_defaults_under_private() -> None:
     assert R18Settings().target_path == Path(".suzka/private/r18/target.sqlite3")
     assert R18Settings().enabled is False
+
+
+def test_the_secret_directory_must_be_absolute_and_symlink_free(tmp_path: Path) -> None:
+    directory = _private(tmp_path)
+    create_obligation_secret(directory)
+    with pytest.raises(ObligationSecretError, match="absolute"):
+        load_obligation_secret(Path("relative/r18"))
+    alias = tmp_path / "alias"
+    os.symlink(directory, alias)
+    with pytest.raises(ObligationSecretError, match="symlinks"):
+        load_obligation_secret(alias)
+
+
+def test_oversized_raw_text_is_refused_before_normalization() -> None:
+    with pytest.raises(ValueError, match="bound"):
+        normalize_request_text(" " * (4 * 16_384 + 1))

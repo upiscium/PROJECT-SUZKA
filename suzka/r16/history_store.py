@@ -275,13 +275,16 @@ BEGIN
 END""",
     # Record inserts: only inside the FINALIZE of their exact PREPARED
     # operation kind, and only after the previous stage exists (§2b).
+    # IP-16 §9: Intents repeat across incarnations, so a forecast, verdict or
+    # challenge belongs to its Intent's incarnation, and an assessment only
+    # to the Outcome of its own Intent's Claim.  Claims, nonces, Outcomes and
+    # the inverse gate stay global.
     f"""CREATE TRIGGER action_intents_insert BEFORE INSERT ON action_intents
 WHEN {_gate(_K.R18_INTENT_ISSUE)}
     OR (NEW.direction = 'INVERSE' AND NOT (
         EXISTS (SELECT 1 FROM action_intents f
             WHERE f.obligation_group_key = NEW.obligation_group_key
-                AND f.direction = 'FORWARD' AND f.operation_key = NEW.forward_operation_key
-                AND f.incarnation_id = NEW.incarnation_id)
+                AND f.direction = 'FORWARD' AND f.operation_key = NEW.forward_operation_key)
         AND EXISTS (SELECT 1 FROM verified_outcomes v
             WHERE v.operation_key = NEW.forward_operation_key
                 AND v.outcome_state IN ('ACTIVE_VERIFIED_AUTHORIZED', 'UNAUTHORIZED_EFFECT'))
@@ -291,12 +294,14 @@ BEGIN SELECT RAISE(ABORT, 'action intent is not admissible here'); END""",
 WHEN {_gate(_K.R17_EXPECTATION_COMMIT)}
     OR NOT EXISTS (SELECT 1 FROM action_intents i
         WHERE i.record_id = NEW.action_intent_id AND i.direction = 'FORWARD'
-            AND i.operation_key = NEW.forward_key)
+            AND i.operation_key = NEW.forward_key
+            AND i.incarnation_id = NEW.incarnation_id)
 BEGIN SELECT RAISE(ABORT, 'forecast is not admissible here'); END""",
     f"""CREATE TRIGGER policy_verdicts_insert BEFORE INSERT ON policy_verdicts
 WHEN {_gate(_K.R18_POLICY_COMMIT)}
     OR NOT EXISTS (SELECT 1 FROM action_intents i
-        WHERE i.record_id = NEW.intent_id AND i.direction = NEW.direction)
+        WHERE i.record_id = NEW.intent_id AND i.direction = NEW.direction
+            AND i.incarnation_id = NEW.incarnation_id)
     OR (NEW.direction = 'FORWARD' AND NOT EXISTS (
         SELECT 1 FROM action_forecasts f WHERE f.action_intent_id = NEW.intent_id))
 BEGIN SELECT RAISE(ABORT, 'policy verdict is not admissible here'); END""",
@@ -306,7 +311,8 @@ WHEN {_gate(_K.R18_CHALLENGE_ISSUE)}
         WHERE p.intent_id = NEW.intent_id AND p.verdict = 'ALLOW')
     OR NOT EXISTS (SELECT 1 FROM action_intents i
         WHERE i.record_id = NEW.intent_id AND i.direction = NEW.direction
-            AND i.operation_key = NEW.operation_key)
+            AND i.operation_key = NEW.operation_key
+            AND i.incarnation_id = NEW.incarnation_id)
     OR (SELECT count(*) FROM approval_challenges c WHERE c.intent_id = NEW.intent_id)
         IS NOT NEW.attempt - 1
     OR (SELECT count(*) FROM approval_challenges c JOIN approval_expirations e
@@ -348,7 +354,9 @@ WHEN {_gate(_K.R17_ASSESSMENT_COMMIT)}
             AND v.outcome_revision = NEW.outcome_revision AND v.direction = 'FORWARD')
     OR NOT EXISTS (SELECT 1 FROM action_forecasts f JOIN verified_outcomes v
         ON v.operation_key = f.forward_key
-        WHERE f.record_id = NEW.forecast_id
+        JOIN execution_claims c ON c.operation_key = v.operation_key AND c.direction = 'FORWARD'
+        JOIN approval_challenges ch ON ch.record_id = c.challenge_digest
+        WHERE f.record_id = NEW.forecast_id AND ch.intent_id = f.action_intent_id
             AND v.verified_outcome_id = NEW.verified_outcome_id
             AND v.outcome_revision = NEW.outcome_revision)
 BEGIN SELECT RAISE(ABORT, 'outcome assessment is not admissible here'); END""",

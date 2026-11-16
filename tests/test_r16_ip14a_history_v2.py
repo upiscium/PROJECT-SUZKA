@@ -543,6 +543,7 @@ def _prepare(store: SubjectHistoryStore, operation: HistoryRecordOperationV1) ->
 
 K = HistoryOperationKind
 R = RecordKind
+OTHER = "2" * 64
 
 
 def _steps(chain: Chain) -> list[HistoryRecordOperationV1]:
@@ -614,20 +615,54 @@ def test_uniqueness_is_reserved_at_prepare_and_across_incarnations(tmp_path: Pat
     again = replace(first, event_id=_uuid("again"), processing_sequence=500, record=replace(chain.intent, admitting_event_id=_uuid("again"), admitting_sequence=500))
     with pytest.raises(HistoryStoreConflict):
         _prepare(store, again)
-    other = replace(again, incarnation_id="2" * 64, record=replace(again.record, incarnation_id="2" * 64))
+    other = replace(again, incarnation_id=OTHER, record=replace(again.record, incarnation_id=OTHER))
     _prepare(store, other)  # another incarnation's Intent is not blocked
-    # Claims are global: the same operation key cannot be claimed twice.
+    # Claims are global: the same operation key cannot be claimed twice, even
+    # through another incarnation's own challenge and nonce.
     claim = steps[4]
     _prepare(store, claim)
-    other_claim = replace(
-        claim,
-        incarnation_id="2" * 64,
-        event_id=_uuid("other-claim"),
-        processing_sequence=700,
-        record=replace(chain.claim, claim_event_id=_uuid("other-claim"), claim_sequence=700),
-    )
+    other_claim = _steps(Chain(chain.decision, incarnation=OTHER, base=300))[4]
+    shared = set(other_claim.reserved_keys) & set(claim.reserved_keys)
+    assert shared == {f"claim:{chain.intent.forward_key}"}
     with pytest.raises(HistoryStoreConflict):
         _prepare(store, other_claim)
+
+
+def _in(incarnation: str, kind: HistoryOperationKind, record_kind: RecordKind, record: object, event_id: str, sequence: int, attempt: int | None = None) -> HistoryRecordOperationV1:
+    return HistoryRecordOperationV1(kind, incarnation, event_id, sequence, "EVENT_MUTATION", record_kind, record, attempt)
+
+
+def test_each_incarnation_finalizes_its_own_intent_and_forecast(tmp_path: Path) -> None:
+    """IP-16 §9 at the table level: B issues its own Intent and forecast for
+    the obligation A already executed, but B's forecast is never assessed
+    against A's Outcome, and A's own assessment still lands."""
+
+    store = _v2_store(tmp_path)
+    a = Chain(_decision(store))
+    b = Chain(a.decision, incarnation=OTHER, base=300)
+    steps_a, steps_b = _steps(a), _steps(b)
+    for operation in steps_a[:6]:
+        _apply(store, operation)
+    _apply(store, steps_b[0])
+    _apply(store, steps_b[1])
+    stolen = OutcomeAssessmentV1.issue(b.forecast, a.outcome.to_r17_view(), b.event("stolen"), b.seq(6))
+    _refused_at_finalize(store, b.operation(K.R17_ASSESSMENT_COMMIT, R.OUTCOME_ASSESSMENT, stolen, 6))
+    _apply(store, steps_a[6])
+    _apply(store, steps_a[7])
+
+
+def test_a_record_cannot_attach_to_another_incarnations_intent(tmp_path: Path) -> None:
+    store = _v2_store(tmp_path)
+    a = Chain(_decision(store))
+    steps = _steps(a)
+    _apply(store, steps[0])
+    forecast = replace(a.forecast, incarnation_id=OTHER)
+    _refused_at_finalize(store, _in(OTHER, K.R17_EXPECTATION_COMMIT, R.ACTION_FORECAST, forecast, forecast.admitting_event_id, a.seq(1)))
+    _apply(store, steps[1])
+    _refused_at_finalize(store, _in(OTHER, K.R18_POLICY_COMMIT, R.POLICY_VERDICT, a.verdict, a.verdict.policy_event_id, a.seq(2)))
+    _apply(store, steps[2])
+    _refused_at_finalize(store, _in(OTHER, K.R18_CHALLENGE_ISSUE, R.APPROVAL_CHALLENGE, a.challenges[0], a.event("x-challenge"), a.seq(3), attempt=1))
+    _apply(store, steps[3])
 
 
 def test_abort_releases_the_reservation(tmp_path: Path) -> None:
@@ -757,6 +792,31 @@ def test_an_inverse_needs_a_verified_forward_effect(tmp_path: Path) -> None:
         verifier_event_id=chain.event("inverse-outcome"), verifier_sequence=chain.seq(14),
     )
     _apply(store, chain.operation(K.R18_OUTCOME_COMMIT, R.VERIFIED_OUTCOME, reverted, 14))
+
+
+def test_a_successor_incarnation_can_invert_a_verified_forward_effect(tmp_path: Path) -> None:
+    """The inverse gate stays global: after a rollback past A's Intent, B can
+    still compensate A's verified effect (B never re-claims the forward)."""
+
+    store = _v2_store(tmp_path)
+    chain = Chain(_decision(store))
+    for step in _steps(chain)[:6]:
+        _apply(store, step)
+    inverse = InverseIntentV1(
+        incarnation_id=OTHER,
+        admitting_event_id=chain.event("successor-inverse"),
+        admitting_sequence=chain.seq(9),
+        obligation_group_key=GROUP,
+        target_instance_id=TARGET,
+        target_namespace="review-artifact",
+        target_expected_revision=1,
+        forward_outcome_id=chain.outcome.verified_outcome_id,
+        forward_outcome_revision=1,
+        forward_outcome_digest=chain.outcome.outcome_digest,
+        forward_outcome_state=VerifiedState.ACTIVE_VERIFIED_AUTHORIZED,
+        forward_payload_digest=chain.intent.payload_digest,
+    )
+    _apply(store, _in(OTHER, K.R18_INTENT_ISSUE, R.INVERSE_INTENT, inverse, inverse.admitting_event_id, chain.seq(9)))
 
 
 def test_records_are_immutable_and_finalize_is_complete(tmp_path: Path) -> None:

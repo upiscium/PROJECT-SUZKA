@@ -32,12 +32,12 @@ def initialize(path: Path) -> tuple[str, Path]:
         raise ObligationSecretError("the obligation secret already exists; it is never replaced")
     store = TargetStore.create(path, target_namespace=TARGET_NAMESPACE)
     try:
-        instance = store.meta().target_instance_id
-    finally:
-        store.close()
-    try:
+        try:
+            instance = store.meta().target_instance_id
+        finally:
+            store.close()
         secret = create_obligation_secret(path.parent)
-    except (ObligationSecretError, OSError) as error:
+    except (TargetError, ObligationSecretError, OSError) as error:
         # The target is empty; the operator removes it and runs this again.
         raise ObligationSecretError(
             f"target {path} was created but its obligation secret was not ({error}); "
