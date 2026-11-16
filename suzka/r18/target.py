@@ -69,8 +69,9 @@ from suzka.r18.contracts import (
 )
 
 TARGET_SCHEMA_VERSION: Final = 1
-# Proposed bounds (IP-15; HP-2 asks the PR to state them). One forward effect
-# adds about three 4 KiB pages (an 8 KiB artifact and one ledger row).
+# Proposed bounds (IP-15; HP-2 asks the PR to state them). Measured: one
+# forward effect adds about 0.64 pages (a ~1.3 KiB artifact and its ledger
+# row) plus its inverse room; the defaults hold 4264 forward effects.
 DEFAULT_MAX_PAGE_COUNT: Final = 4096  # 16 MiB with 4 KiB pages
 DEFAULT_RESERVE_PAGES: Final = 256  # 1 MiB kept for fences
 # Measured (IP-15): one inverse adds about 0.13 pages on average and at most
