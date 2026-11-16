@@ -447,8 +447,9 @@ def test_cp7_registered_http_get_routes_match_source_audited_inventory(
             "/api/chat/commands/{ticket_id}",
             # Display-only Chat transcript (suzka/chat_log.py): its own store,
             # never subject state, so no committed-read path is involved.
-            # Exposure is the same as POST /api/chat (the default proposed in
-            # #416); it shows past conversations to any client that can chat.
+            # Exposure is the same as POST /api/chat: any client that can chat
+            # can list, read and delete past conversations (Human decision
+            # 2026-11-16, #416 review P2-2).
             "/api/chat/sessions",
             "/api/chat/sessions/{session_id}",
         }
