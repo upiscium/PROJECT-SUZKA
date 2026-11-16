@@ -222,6 +222,8 @@ def test_cause_ref_and_origin_refs_follow_the_cause() -> None:
         _wake(origin_refs=(OUTCOME, COMMITMENT))
     with pytest.raises(ValueError):
         _wake(origin_refs=(COMMITMENT,) * 2 + (OUTCOME,))
+    with pytest.raises(ValueError, match="at most one Commitment"):
+        _wake(WakeCause.COMMITMENT_ADMITTED, origin_refs=(COMMITMENT, PolicyRef("commitment", "commitment-2", 1, H)))
     assert _wake().verified_outcome_key == ("outcome-1", 1)
     assert _wake(WakeCause.GOAL_ADMITTED).verified_outcome_key is None
 
@@ -288,6 +290,13 @@ def test_wake_window_follows_the_hp5_numbers() -> None:
         "2026-11-16T01:00:00Z",
         "2026-11-23T05:00:00Z",
     )
+    # GOAL / COMMITMENT keep the literal rule: a late materialize near the
+    # deadline is still made, already due.
+    assert window(
+        WakeCause.GOAL_ADMITTED, created_utc="2026-11-16T02:00:00Z", goal_deadline_utc="2026-11-16T02:05:00Z"
+    ) == ("2026-11-16T01:00:00Z", "2026-11-16T02:05:00Z")
+    # The extra rule applies to the two Outcome causes only.
+    assert window(WakeCause.OUTCOME_VERIFIED_NO_FEEDBACK, commitment_deadline_utc="2026-11-16T00:05:00Z") is None
     with pytest.raises(ValueError, match="at or after"):
         window(WakeCause.GOAL_ADMITTED, cause_utc="2026-11-16T05:00:00Z")
 
@@ -449,51 +458,64 @@ def test_outbox_reason_codes_are_coarse() -> None:
         outbox_reason_for(ResultKind.HOLD, PolicyRow.ROW_3)
 
 
+def _held(wake: WakeV1 | None = None) -> LogicalCycleResolutionV1:
+    return LogicalCycleResolutionV1.of_hold(INC, _hold(_claim(wake)))
+
+
+def _message(wake: WakeV1 | None = None, **kw: Any) -> OutboxMessageV1:
+    wake = wake or _wake()
+    args: dict[str, Any] = {"created_utc": CREATED, "expires_utc": EXPIRES}
+    args.update(kw)
+    return OutboxMessageV1.for_completion(wake, _held(wake), None, **args)
+
+
 def test_outbox_message_carries_no_row_or_hold_reason() -> None:
-    claim = _claim()
-    resolution = LogicalCycleResolutionV1.of_hold(INC, _hold(claim))
-    message = OutboxMessageV1.for_completion(
-        resolution, None, context_id="context-1", created_utc=CREATED, expires_utc=EXPIRES
-    )
+    message = _message()
     payload = message.canonical_bytes()
     assert OutboxMessageV1.from_json(payload) == message
     assert (message.template, message.reason_code) == (OutboxTemplate.DECISION_HELD, OutboxReason.HELD)
+    assert (message.context_id, message.incarnation_id) == ("context-1", INC)  # from the Wake
     assert b"STALE_SOURCE" not in payload and b"policy_row" not in payload
     assert message.message_id.startswith("outbox-")
 
 
+def test_outbox_message_belongs_to_the_wakes_cycle() -> None:
+    other = _wake(evidence_fingerprint="e" * 64)
+    with pytest.raises(ValueError, match="this Wake's cycle"):
+        OutboxMessageV1.for_completion(other, _held(), None, created_utc=CREATED, expires_utc=EXPIRES)
+    failed = WakeTerminalV1(_wake().wakeup_id, WakeTerminalKind.FAILED_TERMINAL, TerminalReason.EXPIRED_WAKE, None, EVENT_T, 30)
+    with pytest.raises(ValueError, match="this Wake's"):
+        OutboxMessageV1.for_failed_cycle(other, failed, created_utc=CREATED, expires_utc=EXPIRES)
+
+
 def test_outbox_dedupe_is_stable_and_separates_results() -> None:
-    claim = _claim()
-    resolution = LogicalCycleResolutionV1.of_hold(INC, _hold(claim))
-
-    def make(res: LogicalCycleResolutionV1, row: PolicyRow | None = None, **kw: Any) -> OutboxMessageV1:
-        args: dict[str, Any] = {"context_id": "context-1", "created_utc": CREATED, "expires_utc": EXPIRES}
-        args.update(kw)
-        return OutboxMessageV1.for_completion(res, row, **args)
-
-    first = make(resolution)
+    wake = _wake()
+    claim = _claim(wake)
+    first = _message(wake)
     # A crash-and-rescan rebuild later has the same dedupe key and id.
-    again = make(resolution, created_utc="2026-11-16T05:00:00Z", expires_utc="2026-11-23T05:00:00Z")
+    again = _message(wake, created_utc="2026-11-16T05:00:00Z", expires_utc="2026-11-23T05:00:00Z")
     assert (again.dedupe_key, again.message_id) == (first.dedupe_key, first.message_id)
-    assert make(resolution, context_id="context-2").dedupe_key != first.dedupe_key
+    assert _message(_wake(context_id="context-2")).dedupe_key != first.dedupe_key
+    key = _held(wake).review_intent_key
     issued = LogicalCycleResolutionV1(
-        INC, claim.logical_cycle_id, resolution.review_intent_key, claim.claim_id, claim.claim_digest,
+        INC, wake.logical_cycle_id, key, claim.claim_id, claim.claim_digest,
         ResultKind.DECISION_ISSUED, "decision-" + "d" * 64, "1" * 64,
     )
     confirmed = LogicalCycleResolutionV1(
-        INC, "2" * 64, resolution.review_intent_key, claim.claim_id, claim.claim_digest,
+        INC, wake.logical_cycle_id, key, claim.claim_id, claim.claim_digest,
         ResultKind.EXISTING_DECISION, "cycle-existing-" + "e" * 64, "3" * 64,
     )
+
+    def make(res: LogicalCycleResolutionV1, row: PolicyRow | None = None) -> OutboxMessageV1:
+        return OutboxMessageV1.for_completion(wake, res, row, created_utc=CREATED, expires_utc=EXPIRES)
+
     # An EXISTING confirmation is never absorbed by the original DECISION_ISSUED.
     assert make(issued, PolicyRow.ROW_4).dedupe_key != make(confirmed).dedupe_key
+    assert make(issued, PolicyRow.ROW_5).reason_code is OutboxReason.NO_ACTION
 
 
 def test_outbox_message_validates_template_and_ttl() -> None:
-    claim = _claim()
-    message = OutboxMessageV1.for_completion(
-        LogicalCycleResolutionV1.of_hold(INC, _hold(claim)), None,
-        context_id="context-1", created_utc=CREATED, expires_utc=EXPIRES,
-    )
+    message = _message()
     with pytest.raises(ValueError, match="reason code"):
         replace(message, reason_code=OutboxReason.PLAN_SELECTED)
     for expires in (CREATED, "2026-11-23T00:00:01Z"):
@@ -501,12 +523,12 @@ def test_outbox_message_validates_template_and_ttl() -> None:
             replace(message, expires_utc=expires)
     wake = _wake()
     failed = WakeTerminalV1(wake.wakeup_id, WakeTerminalKind.FAILED_TERMINAL, TerminalReason.ATTEMPTS_EXHAUSTED, None, EVENT_T, 30)
-    cycle_failed = OutboxMessageV1.for_failed_cycle(failed, INC, context_id="context-1", created_utc=CREATED, expires_utc=EXPIRES)
+    cycle_failed = OutboxMessageV1.for_failed_cycle(wake, failed, created_utc=CREATED, expires_utc=EXPIRES)
     assert (cycle_failed.source_id, cycle_failed.reason_code) == (failed.terminal_id, OutboxReason.FAILED)
     assert OutboxMessageV1.from_json(cycle_failed.canonical_bytes()) == cycle_failed
     cancelled = replace(failed, terminal=WakeTerminalKind.CANCELLED, reason=TerminalReason.SUPERSEDED, superseding_wakeup_id=_wake(evidence_fingerprint="e" * 64).wakeup_id)
     with pytest.raises(ValueError, match="FAILED_TERMINAL"):
-        OutboxMessageV1.for_failed_cycle(cancelled, INC, context_id="context-1", created_utc=CREATED, expires_utc=EXPIRES)
+        OutboxMessageV1.for_failed_cycle(wake, cancelled, created_utc=CREATED, expires_utc=EXPIRES)
     with pytest.raises(ValueError):
         replace(message, template=OutboxTemplate.CYCLE_FAILED, reason_code=OutboxReason.FAILED)
 
@@ -515,11 +537,7 @@ def test_outbox_message_validates_template_and_ttl() -> None:
 
 
 def _message_id() -> str:
-    claim = _claim()
-    return OutboxMessageV1.for_completion(
-        LogicalCycleResolutionV1.of_hold(INC, _hold(claim)), None,
-        context_id="context-1", created_utc=CREATED, expires_utc=EXPIRES,
-    ).message_id
+    return _message().message_id
 
 
 def test_ack_is_one_state_transition_per_message() -> None:
@@ -544,6 +562,50 @@ def test_reply_is_an_observation_reference() -> None:
     assert reply.reply_id != replace(reply, received_event_id=EVENT_R).reply_id
     with pytest.raises(ValueError, match="observation"):
         replace(reply, observation_ref=PolicyRef("goal", "goal-1", 1, H))
+
+
+# ------------------------------------------------------- domain separation
+
+
+def test_every_id_and_digest_is_distinct() -> None:
+    """D-R19 §7: each type has its own id and digest domain."""
+
+    wake = _wake()
+    claim = _claim(wake)
+    hold = _hold(claim)
+    resolution = LogicalCycleResolutionV1.of_hold(INC, hold)
+    completion = WakeCompletionV1.for_resolution(wake, claim, resolution, notification_required=True)
+    terminal = WakeTerminalV1(wake.wakeup_id, WakeTerminalKind.FAILED_TERMINAL, TerminalReason.EXPIRED_WAKE, None, EVENT_T, 30)
+    attempt = WakeAttemptOutcomeV1(claim.claim_id, AttemptOutcome.REFUSED, RefuseReason.CLOCK_UNVERIFIABLE)
+    message = _message(wake)
+    ack = InboxAckV1(message.message_id, "context-1", "session-1", AckStatus.ACKNOWLEDGED, EVENT_T, 40, CREATED)
+    reply = InboxReplyV1(message.message_id, "context-1", "session-1", EVENT_T, 40, PolicyRef("observation", "obs-1", 1, H))
+    hexes = [
+        wake.wakeup_id, wake.logical_cycle_id, wake.wake_digest,
+        claim.claim_id, claim.claim_digest, attempt.attempt_digest,
+        hold.hold_id, hold.hold_digest, hold.review_intent_key,
+        resolution.resolution_id, resolution.resolution_digest,
+        completion.completion_id, completion.completion_digest,
+        terminal.terminal_id, terminal.terminal_digest,
+        message.message_id, message.message_digest, message.dedupe_key,
+        ack.ack_id, ack.ack_digest, reply.reply_id, reply.reply_digest,
+    ]
+    tails = [value[-64:] for value in hexes]
+    assert len(set(tails)) == len(tails)
+
+
+@pytest.mark.parametrize(
+    "decode",
+    [
+        WakeV1.from_json, WakeClaimV1.from_json, WakeAttemptOutcomeV1.from_json, WakeTerminalV1.from_json,
+        WakeCompletionV1.from_json, OutboxMessageV1.from_json, InboxAckV1.from_json, InboxReplyV1.from_json,
+    ],
+)
+def test_every_decoder_refuses_oversize_and_non_bytes(decode: Any) -> None:
+    with pytest.raises(ValueError, match="byte bound"):
+        decode(b"{" + b" " * MAX_RECORD_BYTES + b"}")
+    with pytest.raises(TypeError):
+        decode("{}")
 
 
 # ------------------------------------------------------------------ purity

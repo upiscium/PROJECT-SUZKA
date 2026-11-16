@@ -246,3 +246,25 @@ def test_cycle_contracts_stay_pure_and_do_not_import_r19() -> None:
         "suzka.r16.successor_policy",
     }
     assert not any(isinstance(node, ast.Import) for node in ast.walk(tree))
+
+
+@pytest.mark.parametrize(
+    "decode",
+    [HoldReceiptV1.from_json, ExistingDecisionReceiptV1.from_json, LogicalCycleResolutionV1.from_json],
+)
+def test_every_decoder_refuses_oversize_and_non_bytes(decode: Any) -> None:
+    with pytest.raises(ValueError, match="byte bound"):
+        decode(b"{" + b" " * MAX_RECORD_BYTES + b"}")
+    with pytest.raises(TypeError):
+        decode("{}")
+
+
+def test_r16_ids_and_digests_are_distinct() -> None:
+    hold, existing = _hold(), _existing()
+    resolution = LogicalCycleResolutionV1.of_hold(H, hold)
+    values = [
+        KEY, hold.hold_id, hold.hold_digest, existing.receipt_id, existing.receipt_digest,
+        resolution.resolution_id, resolution.resolution_digest,
+    ]
+    tails = [value[-64:] for value in values]
+    assert len(set(tails)) == len(tails)

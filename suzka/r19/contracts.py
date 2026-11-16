@@ -358,10 +358,12 @@ def wake_window(
       expires − margin.
     - expires = min(created + 7 days, Goal deadline, Commitment deadline).
 
-    No Wake is made when not_before is later than expires − margin, or when
-    expires − margin is already before the creation time (no due time with
-    the margin left): the deadline is not silently lost (#369 D2-A3); the
-    caller records ``wake_not_schedulable``.
+    No Wake is made when not_before is later than expires − margin: the
+    deadline is not silently lost (#369 D2-A3); the caller records
+    ``wake_not_schedulable``. For FEEDBACK / OUTCOME the cap makes that
+    literal rule unreachable, so for those two causes no Wake is made either
+    when expires − margin is already before the creation time. GOAL /
+    COMMITMENT keep the literal rule (a late materialize may be due at once).
     """
 
     if type(cause) is not WakeCause:
@@ -390,7 +392,9 @@ def wake_window(
             not_before = min(not_before, utc(commitment_deadline_utc, "commitment_deadline_utc") - margin)
     else:
         not_before = min(created + timedelta(seconds=timing.feedback_wake_delay_s), expires - margin)
-    if not_before > expires - margin or expires - margin < created:
+    if not_before > expires - margin:
+        return None
+    if cause in _OUTCOME_CAUSES and expires - margin < created:
         return None
     return _stamp(not_before), _stamp(expires)
 
@@ -479,6 +483,8 @@ class WakeV1:
             OUTCOME_REF_KIND
         ) > 1:
             raise ValueError("exactly the Outcome causes cite one verified Outcome")
+        if kinds.count(COMMITMENT_REF_KIND) > 1:
+            raise ValueError("a Wake cites at most one Commitment")
         if self.cause is WakeCause.COMMITMENT_ADMITTED and COMMITMENT_REF_KIND not in kinds:
             raise ValueError("a COMMITMENT_ADMITTED Wake cites its Commitment")
         if type(self.frozen_predecessor) is not FrozenPredecessor:
@@ -1071,22 +1077,32 @@ class OutboxMessageV1:
     @classmethod
     def for_completion(
         cls,
+        wake: WakeV1,
         resolution: LogicalCycleResolutionV1,
         decision_row: PolicyRow | None,
         *,
-        context_id: str,
         created_utc: str,
         expires_utc: str,
     ) -> Self:
+        """Context and incarnation come from the Wake, which must own the
+        cycle. ``decision_row`` is the issued Decision's ``policy_row``; the
+        caller (IP-21) reads it from that Decision."""
+        if type(wake) is not WakeV1:
+            raise TypeError("wake must be a WakeV1")
         if type(resolution) is not LogicalCycleResolutionV1:
             raise TypeError("resolution must be a LogicalCycleResolutionV1")
+        if (resolution.incarnation_id, resolution.logical_cycle_id) != (
+            wake.incarnation_id,
+            wake.logical_cycle_id,
+        ):
+            raise ValueError("the resolution is not this Wake's cycle")
         return cls(
             resolution.logical_cycle_id,
             resolution.result_digest,
             _RESULT_TEMPLATE[resolution.result_kind],
             outbox_reason_for(resolution.result_kind, decision_row),
-            resolution.incarnation_id,
-            context_id,
+            wake.incarnation_id,
+            wake.context_id,
             created_utc,
             expires_utc,
         )
@@ -1094,15 +1110,18 @@ class OutboxMessageV1:
     @classmethod
     def for_failed_cycle(
         cls,
+        wake: WakeV1,
         terminal: WakeTerminalV1,
-        incarnation_id: str,
         *,
-        context_id: str,
         created_utc: str,
         expires_utc: str,
     ) -> Self:
+        if type(wake) is not WakeV1:
+            raise TypeError("wake must be a WakeV1")
         if type(terminal) is not WakeTerminalV1:
             raise TypeError("terminal must be a WakeTerminalV1")
+        if terminal.wakeup_id != wake.wakeup_id:
+            raise ValueError("the terminal is not this Wake's")
         if terminal.terminal is not WakeTerminalKind.FAILED_TERMINAL:
             raise ValueError("only a FAILED_TERMINAL cycle is reported as failed")
         return cls(
@@ -1110,8 +1129,8 @@ class OutboxMessageV1:
             terminal.terminal_digest,
             OutboxTemplate.CYCLE_FAILED,
             OutboxReason.FAILED,
-            incarnation_id,
-            context_id,
+            wake.incarnation_id,
+            wake.context_id,
             created_utc,
             expires_utc,
         )
