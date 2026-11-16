@@ -151,7 +151,7 @@ def open_or_create_store(
 ) -> SubjectHistoryStore:
     """Open the store, creating it PROVISIONAL only before adoption.
 
-    IP-14a: a v1 store stops startup until the explicit migration ran
+    IP-14a: a v1 or v2 store stops startup until the explicit migration ran
     (§11-1), and a store holding R17 / R18 records refuses to start while
     ``r18.enabled`` is false (§11-2, until IP-16 / IP-18)."""
 
@@ -168,7 +168,7 @@ def open_or_create_store(
         )
     except HistoryStoreMigrationRequired as error:
         raise HistoryAdoptionError(
-            "SubjectHistory is schema v1: back up .suzka/ and run "
+            f"{error}; back up .suzka/ and run "
             "python -m suzka.r16.history_migration on it"
         ) from error
     except HistoryStoreUnavailable as error:

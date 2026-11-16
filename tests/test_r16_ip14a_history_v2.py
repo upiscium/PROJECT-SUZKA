@@ -1,4 +1,4 @@
-"""IP-14a-1: SubjectHistory v2 schema, v1 -> v2 migration, record operations.
+"""IP-14a-1 / IP-16a-1: SubjectHistory v3 schema, v1 / v2 -> v3 migration, record operations.
 
 Design: #411 comment 6910958369 (IP-14a D1 r3). Every R17 / R18 value here
 is a FIXTURE ONLY; nothing comes from a real Decision, operator or target.
@@ -17,7 +17,7 @@ import pytest
 
 from suzka.r16 import history_migration
 from suzka.r16.history_codec import PolicyKind, PostcommitReceiptV1
-from suzka.r16.history_migration import HistoryMigrationError, migrate_v1_to_v2
+from suzka.r16.history_migration import HistoryMigrationError, migrate
 from suzka.r16.history_records import (
     MAX_CHALLENGES_PER_INTENT,
     ApprovalExpirationV1,
@@ -27,8 +27,10 @@ from suzka.r16.history_records import (
     RecordKind,
 )
 from suzka.r16.history_schema_v1 import SCHEMA_HASH_V1, SCHEMA_STATEMENTS_V1
+from suzka.r16.history_schema_v2 import SCHEMA_HASH_V2, SCHEMA_STATEMENTS_V2
 from suzka.r16.history_store import (
     _SCHEMA_QUERY,
+    HISTORY_SCHEMA_VERSION,
     SCHEMA_STATEMENTS,
     HistoryStoreConflict,
     HistoryStoreCorrupt,
@@ -135,11 +137,22 @@ def _decision(
 
 
 def _downgrade_to_v1(path: Path) -> None:
-    """Rewrite a v2 store that holds only v1 rows as an exact v1 file (a
+    """Rewrite a current store that holds only v1 rows as an exact v1 file (a
     stand-in for a production v1 store, with real IP-9 rows)."""
 
+    _downgrade(path, 1, SCHEMA_STATEMENTS_V1, SCHEMA_HASH_V1)
+
+
+def _downgrade_to_v2(path: Path) -> None:
+    """Rewrite a current store as an exact v2 file (a stand-in for the store
+    eve migrated at 6ed2361). Rows go in before the triggers, as in v1."""
+
+    _downgrade(path, 2, SCHEMA_STATEMENTS_V2, SCHEMA_HASH_V2)
+
+
+def _downgrade(path: Path, version: int, statements: tuple[str, ...], schema_hash: str) -> None:
     source = sqlite3.connect(path)
-    tables = ("history_meta", "history_operations", "history_decisions", "history_source_refs", "history_postcommit_receipts")
+    tables = tuple(s.split()[2] for s in statements if s.startswith("CREATE TABLE"))
     rows = {table: source.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() for table in tables}
     source.close()
     os.unlink(path)
@@ -148,16 +161,16 @@ def _downgrade_to_v1(path: Path) -> None:
     target = sqlite3.connect(path, isolation_level=None)
     target.execute("PRAGMA journal_mode = DELETE")
     target.execute("BEGIN")
-    creates = [s for s in SCHEMA_STATEMENTS_V1 if s.startswith("CREATE TABLE")]
+    creates = [s for s in statements if s.startswith("CREATE TABLE")]
     for statement in creates:
         target.execute(statement)
     for table in tables:
         for row in rows[table]:
             values = list(row)
             if table == "history_meta":
-                values[1], values[2] = 1, SCHEMA_HASH_V1
+                values[1], values[2] = version, schema_hash
             target.execute(f"INSERT INTO {table} VALUES ({', '.join('?' for _ in values)})", values)
-    for statement in SCHEMA_STATEMENTS_V1:
+    for statement in statements:
         if not statement.startswith("CREATE TABLE"):
             target.execute(statement)
     target.execute("COMMIT")
@@ -178,7 +191,7 @@ def _v1_store_with_decisions(tmp_path: Path) -> tuple[Path, list[Any]]:
 # ------------------------------------------------------------------ schema
 
 
-def test_a_fresh_store_is_exactly_v2(tmp_path: Path) -> None:
+def test_a_fresh_store_is_exactly_v3(tmp_path: Path) -> None:
     store = _v2_store(tmp_path)
     connection = sqlite3.connect(store.path)
     assert connection.execute(_SCHEMA_QUERY).fetchall() == _expected_schema(SCHEMA_STATEMENTS)
@@ -188,7 +201,7 @@ def test_a_fresh_store_is_exactly_v2(tmp_path: Path) -> None:
         "approval_challenges", "approval_expirations", "approval_nonce_consumptions",
         "execution_claims", "verified_outcomes", "outcome_assessments", "decision_feedback",
     } <= names
-    assert store.meta().schema_version == 2
+    assert store.meta().schema_version == HISTORY_SCHEMA_VERSION == 3
 
 
 def test_a_v1_file_requires_migration_and_a_tampered_file_is_corrupt(tmp_path: Path) -> None:
@@ -224,11 +237,11 @@ def test_migration_keeps_every_v1_row_and_the_decisions_replay(tmp_path: Path) -
     before = sqlite3.connect(path)
     rows = {t: before.execute(f"SELECT * FROM {t} ORDER BY rowid").fetchall() for t in ("history_operations", "history_decisions", "history_source_refs", "history_postcommit_receipts")}
     before.close()
-    result = migrate_v1_to_v2(path)
+    result = migrate(path)
     backup = result.backup
     assert result.compacted and os.stat(backup).st_mode & 0o777 == 0o600
     store = SubjectHistoryStore.open(path, max_page_count=PAGES)
-    assert store.meta().schema_version == 2
+    assert store.meta().schema_version == HISTORY_SCHEMA_VERSION == 3
     after = sqlite3.connect(path)
     assert after.execute(_SCHEMA_QUERY).fetchall() == _expected_schema(SCHEMA_STATEMENTS)
     for table, expected in rows.items():
@@ -257,14 +270,14 @@ def test_a_killed_process_leaves_v1_and_a_rerun_migrates(tmp_path: Path, stage: 
         "from pathlib import Path\n"
         "from suzka.r16 import history_migration as m\n"
         f"m._STAGE_HOOK = lambda name: os._exit(9) if name == {stage!r} else None\n"
-        f"m.migrate_v1_to_v2(Path({str(path)!r}))\n"
+        f"m.migrate(Path({str(path)!r}))\n"
     )
     completed = subprocess.run([sys.executable, "-c", script], cwd=Path(__file__).parents[1], check=False)
     assert completed.returncode == 9
     with pytest.raises(HistoryStoreMigrationRequired):
         SubjectHistoryStore.open(path, max_page_count=PAGES)
     assert history_migration.main([str(path)]) == 0  # no manual cleanup needed
-    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == 2
+    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == HISTORY_SCHEMA_VERSION == 3
 
 
 def test_a_failed_compaction_after_commit_is_not_a_refusal(
@@ -285,19 +298,19 @@ def test_a_failed_compaction_after_commit_is_not_a_refusal(
     monkeypatch.setattr(history_migration, "_STAGE_HOOK", hold_a_read_lock)
     assert history_migration.main([str(path)]) == 0
     out = capsys.readouterr().out
-    assert "migrated to SubjectHistory v2" in out and "compaction (VACUUM) failed" in out
+    assert "migrated SubjectHistory v1 to v3" in out and "compaction (VACUUM) failed" in out
     readers[0].close()
-    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == 2
+    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == HISTORY_SCHEMA_VERSION == 3
 
 
 def test_migration_refuses_a_store_too_close_to_its_cap(tmp_path: Path) -> None:
     path, _ = _v1_store_with_decisions(tmp_path)
     pages = sqlite3.connect(path).execute("PRAGMA page_count").fetchone()[0]
     with pytest.raises(HistoryMigrationError, match="max_page_count"):
-        migrate_v1_to_v2(path, max_page_count=pages + 10)
+        migrate(path, max_page_count=pages + 10)
     with pytest.raises(HistoryStoreMigrationRequired):
         SubjectHistoryStore.open(path, max_page_count=PAGES)
-    assert migrate_v1_to_v2(path, max_page_count=PAGES).compacted
+    assert migrate(path, max_page_count=PAGES).compacted
 
 
 def test_prepared_aborted_and_provisional_stores_migrate(tmp_path: Path) -> None:
@@ -319,7 +332,7 @@ def test_prepared_aborted_and_provisional_stores_migrate(tmp_path: Path) -> None
     path = store.path
     store.close()
     _downgrade_to_v1(path)
-    migrate_v1_to_v2(path)
+    migrate(path)
     phases = sorted(row.phase.value for row in SubjectHistoryStore.open(path, max_page_count=PAGES).operations(INCARNATION))
     assert phases == ["FINALIZED", "PREPARED"]
 
@@ -330,7 +343,7 @@ def test_prepared_aborted_and_provisional_stores_migrate(tmp_path: Path) -> None
     provisional_path = provisional.path
     provisional.close()
     _downgrade_to_v1(provisional_path)
-    migrate_v1_to_v2(provisional_path)
+    migrate(provisional_path)
     assert SubjectHistoryStore.open(provisional_path, max_page_count=PAGES).meta().phase.value == "PROVISIONAL"
 
 
@@ -347,7 +360,7 @@ def test_a_crash_before_commit_leaves_the_v1_file(tmp_path: Path, monkeypatch: p
 
     monkeypatch.setattr(history_migration, "_STAGE_HOOK", crash)
     with pytest.raises(KeyboardInterrupt):
-        migrate_v1_to_v2(path)
+        migrate(path)
     monkeypatch.setattr(history_migration, "_STAGE_HOOK", None)
     check = sqlite3.connect(path)
     assert (check.execute(_SCHEMA_QUERY).fetchall(), check.execute("SELECT * FROM history_decisions").fetchall()) == snapshot
@@ -357,8 +370,8 @@ def test_a_crash_before_commit_leaves_the_v1_file(tmp_path: Path, monkeypatch: p
     # It can still be migrated afterwards (a fresh backup name).
     from datetime import UTC, datetime
 
-    migrate_v1_to_v2(path, now=datetime(2030, 1, 1, tzinfo=UTC))
-    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == 2
+    migrate(path, now=datetime(2030, 1, 1, tzinfo=UTC))
+    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == HISTORY_SCHEMA_VERSION == 3
 
 
 def test_a_record_row_must_be_in_its_operations_envelope(tmp_path: Path) -> None:
@@ -380,26 +393,145 @@ def test_a_record_row_must_be_in_its_operations_envelope(tmp_path: Path) -> None
         )
 
 
-def test_migration_refuses_what_is_not_exactly_v1(tmp_path: Path) -> None:
+def test_migration_refuses_what_is_not_exactly_v1_or_v2(tmp_path: Path) -> None:
     store = _v2_store(tmp_path)
     store.close()
-    with pytest.raises(HistoryMigrationError, match="not exactly schema v1"):
-        migrate_v1_to_v2(store.path)
+    with pytest.raises(HistoryMigrationError, match="already schema v3"):
+        migrate(store.path)
     path, _ = _v1_store_with_decisions(tmp_path / "other")
     connection = sqlite3.connect(path)
     connection.execute("DROP TRIGGER history_decisions_no_delete")
     connection.commit()
     connection.close()
     with pytest.raises(HistoryMigrationError):
-        migrate_v1_to_v2(path)
+        migrate(path)
 
 
 def test_the_migration_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     path, _ = _v1_store_with_decisions(tmp_path)
     assert history_migration.main([str(path)]) == 0
-    assert "v1 backup" in capsys.readouterr().out
-    assert history_migration.main([str(path)]) == 1  # already v2: refused
+    assert "migrated SubjectHistory v1 to v3; backup:" in capsys.readouterr().out
+    assert history_migration.main([str(path)]) == 1  # already v3: refused
     assert history_migration.main([]) == 2
+
+
+# ------------------------------------------------- v2 -> v3 (IP-16a-1 §9)
+
+
+def _v2_store_with_decisions(tmp_path: Path) -> tuple[Path, list[Any]]:
+    """A stand-in for eve's store after 6ed2361: Decisions, no records."""
+
+    store = _v2_store(tmp_path, r18=False)
+    decisions: list[Any] = []
+    for index in range(3):
+        decisions.append(_decision(store, f"decision-{index}", 3 + index, decisions[-1] if decisions else None))
+    path = store.path
+    store.close()
+    _downgrade_to_v2(path)
+    return path, decisions
+
+
+def _all_rows(path: Path) -> dict[str, list[tuple[object, ...]]]:
+    connection = sqlite3.connect(path)
+    tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_schema WHERE type = 'table' AND name != 'history_meta'")]
+    rows = {table: connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() for table in tables}
+    connection.close()
+    return rows
+
+
+def test_a_v2_store_requires_migration_and_startup_names_it(tmp_path: Path) -> None:
+    from suzka.r16 import history_adoption
+    from suzka.r16.history_adoption import HistoryAdoptionError, open_or_create_store
+
+    path, _ = _v2_store_with_decisions(tmp_path)
+    with pytest.raises(HistoryStoreMigrationRequired, match="v2"):
+        SubjectHistoryStore.open(path, max_page_count=PAGES)
+
+    class Journal:
+        def inspect(self):  # noqa: ANN202
+            from types import SimpleNamespace
+
+            return SimpleNamespace(journal_lineage_id="lineage-1")
+
+    original = history_adoption.adopted_history_baseline
+    history_adoption.adopted_history_baseline = lambda inspection: object()  # type: ignore[assignment]
+    try:
+        with pytest.raises(HistoryAdoptionError, match="v2.*history_migration"):
+            open_or_create_store(Journal(), path, subject_id="suzka", max_page_count=PAGES)  # type: ignore[arg-type]
+    finally:
+        history_adoption.adopted_history_baseline = original  # type: ignore[assignment]
+
+
+def test_a_v2_store_migrates_to_v3_and_keeps_every_row(tmp_path: Path) -> None:
+    path, decisions = _v2_store_with_decisions(tmp_path)
+    before = _all_rows(path)
+    meta_before = sqlite3.connect(path).execute("SELECT * FROM history_meta").fetchall()
+    result = migrate(path)
+    assert result.from_version == 2 and result.compacted
+    assert ".v2-" in result.backup.name and os.stat(result.backup).st_mode & 0o777 == 0o600
+    assert _all_rows(path) == before
+    after = sqlite3.connect(path)
+    assert after.execute(_SCHEMA_QUERY).fetchall() == _expected_schema(SCHEMA_STATEMENTS)
+    meta_after = after.execute("SELECT * FROM history_meta").fetchall()
+    assert [(r[0], *r[3:]) for r in meta_after] == [(r[0], *r[3:]) for r in meta_before]
+    after.close()
+    store = SubjectHistoryStore.open(path, max_page_count=PAGES, r18_enabled=True)
+    assert store.meta().schema_version == HISTORY_SCHEMA_VERSION == 3
+    for decision in decisions:
+        operations = {row.event_id: row for row in store.operations(INCARNATION)}
+        finalized = store.finalized_decision(INCARNATION, operations[decision.issuer_event_id].transaction_id)
+        assert finalized is not None and finalized.committed_bytes == decision.canonical_bytes()
+    # The migrated store has the IP-16 §9 scope: two incarnations each
+    # finalize their own Intent for the same obligation.
+    a = Chain(decisions[-1])
+    b = Chain(decisions[-1], incarnation=OTHER, base=300)
+    _apply(store, _steps(a)[0])
+    _apply(store, _steps(b)[0])
+    store.close()
+    with pytest.raises(HistoryStoreMigrationRequired, match="v2"):
+        SubjectHistoryStore.open(result.backup, max_page_count=PAGES)
+
+
+def test_a_v2_store_with_records_is_refused(tmp_path: Path) -> None:
+    store = _v2_store(tmp_path)
+    _apply(store, _steps(Chain(_decision(store)))[0])
+    path = store.path
+    store.close()
+    _downgrade_to_v2(path)
+    before = path.read_bytes()
+    with pytest.raises(HistoryMigrationError, match="R17 / R18 records"):
+        migrate(path)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("stage", ["backed-up", "dropped", "rebuilt:history_meta", "rebuilt:action_intents", "rebuilt:action_forecasts", "created", "verified"])
+def test_a_crash_before_commit_leaves_the_v2_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str) -> None:
+    path, _ = _v2_store_with_decisions(tmp_path)
+    snapshot = sqlite3.connect(path).execute(_SCHEMA_QUERY).fetchall(), _all_rows(path)
+
+    def crash(name: str) -> None:
+        if name == stage:
+            raise KeyboardInterrupt(name)
+
+    monkeypatch.setattr(history_migration, "_STAGE_HOOK", crash)
+    with pytest.raises(KeyboardInterrupt):
+        migrate(path)
+    monkeypatch.setattr(history_migration, "_STAGE_HOOK", None)
+    assert (sqlite3.connect(path).execute(_SCHEMA_QUERY).fetchall(), _all_rows(path)) == snapshot
+    with pytest.raises(HistoryStoreMigrationRequired):
+        SubjectHistoryStore.open(path, max_page_count=PAGES)
+    from datetime import UTC, datetime
+
+    migrate(path, now=datetime(2030, 1, 1, tzinfo=UTC))
+    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == HISTORY_SCHEMA_VERSION
+
+
+def test_the_migration_command_on_v2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path, _ = _v2_store_with_decisions(tmp_path)
+    assert history_migration.main(["--max-page-count", str(PAGES), str(path)]) == 0
+    assert "migrated SubjectHistory v2 to v3; backup:" in capsys.readouterr().out
+    assert history_migration.main([str(path)]) == 1
+    assert "already schema v3" in capsys.readouterr().err
 
 
 # --------------------------------------------------------- record fixtures
@@ -945,7 +1077,7 @@ def test_a_real_v1_store_migrates_and_keeps_its_head(tmp_path: Path, monkeypatch
     with pytest.raises(Exception, match="history_migration"):
         with TestClient(_app(settings)):
             pass
-    migrate_v1_to_v2(path)
+    migrate(path)
     with TestClient(_app(settings)) as client:
         state = client.app.state
         head = _reader_head(state, issued)

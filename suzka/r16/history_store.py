@@ -1,4 +1,4 @@
-"""R16 U4-1 / IP-14a-1: the SubjectHistoryDB SQLite file, schema v2, trusted opener.
+"""R16 U4-1 / IP-14a-1 / IP-16a-1: the SubjectHistoryDB SQLite file, schema v3, trusted opener.
 
 v1 (#376 §A/§B, #376 6738757841 / 6752207008): five tables (``history_meta``,
 ``history_operations``, ``history_decisions``, ``history_source_refs``,
@@ -6,10 +6,16 @@ v1 (#376 §A/§B, #376 6738757841 / 6752207008): five tables (``history_meta``,
 
 v2 (IP-14a D1 r3, #411 comment 6910958369): the R17 / R18 source-side record
 tables, the PREPARE-time key reservations (§2a), the record operation kinds
-and ``SUCCESSOR_POLICY_V3``. A v1 file is never opened: it raises
-``HistoryStoreMigrationRequired`` and is migrated only by the explicit
-``suzka.r16.history_migration`` command (Human decision §11-1). HOLD receipts
-and R19 cycle resolution are IP-14b.
+and ``SUCCESSOR_POLICY_V3``.
+
+v3 (IP-16 D1 r3 §9, #411 comment 6916372789): Intent and forecast uniqueness
+and their PREPARE reservations are per incarnation; Claim, nonce and Outcome
+stay global. v2 was already deployed on eve (6ed2361), so this is a new
+version, not an edit of v2.
+
+A v1 or v2 file is never opened: it raises ``HistoryStoreMigrationRequired``
+and is migrated only by the explicit ``suzka.r16.history_migration`` command
+(Human decision §11-1). HOLD receipts and R19 cycle resolution are IP-14b.
 
 Authority boundary: this module is storage only.  The single writer authority
 for the file is the ``subject.history`` R07 participant; SQL CHECKs and
@@ -54,11 +60,12 @@ from suzka.r16.history_records import (
     HistoryRecordOperationV1,
 )
 from suzka.r16.history_schema_v1 import SCHEMA_HASH_V1, SCHEMA_STATEMENTS_V1
+from suzka.r16.history_schema_v2 import SCHEMA_HASH_V2, SCHEMA_STATEMENTS_V2
 from suzka.r17.contracts import MAX_RECORD_BYTES as _R17_RECORD_BYTES
 from suzka.r18.contracts import MAX_RECORD_BYTES as _R18_RECORD_BYTES
 
 
-HISTORY_SCHEMA_VERSION: Final = 2
+HISTORY_SCHEMA_VERSION: Final = 3
 _SQLITE_BUSY_TIMEOUT_SECONDS: Final = 5.0
 # Conservative bytes a FINALIZE may add for one pending operation: the
 # committed envelope, inner U1 bytes, policy input, source rows, receipt and
@@ -663,7 +670,7 @@ class HistoryStoreConflict(HistoryStoreError):
 
 
 class HistoryStoreMigrationRequired(HistoryStoreError):
-    """The file is a valid v1 store: run the explicit v1 -> v2 migration.
+    """The file is a valid v1 or v2 store: run the explicit migration to v3.
 
     Not corruption and not retryable by waiting; startup stops (§11-1)."""
 
@@ -1092,11 +1099,12 @@ class SubjectHistoryStore:
     def _verify_schema(connection: sqlite3.Connection) -> None:
         actual = connection.execute(_SCHEMA_QUERY).fetchall()
         if actual != _expected_schema(SCHEMA_STATEMENTS):
-            if actual == _expected_schema(SCHEMA_STATEMENTS_V1):
-                raise HistoryStoreMigrationRequired(
-                    "SubjectHistory is schema v1: run suzka.r16.history_migration"
-                )
-            raise HistoryStoreCorrupt("SubjectHistory schema is not schema v2")
+            for version, statements in ((1, SCHEMA_STATEMENTS_V1), (2, SCHEMA_STATEMENTS_V2)):
+                if actual == _expected_schema(statements):
+                    raise HistoryStoreMigrationRequired(
+                        f"SubjectHistory is schema v{version}: run suzka.r16.history_migration"
+                    )
+            raise HistoryStoreCorrupt("SubjectHistory schema is not schema v3")
         check = connection.execute("PRAGMA quick_check").fetchall()
         if check != [("ok",)]:
             raise HistoryStoreCorrupt("SubjectHistory integrity check failed")
@@ -1163,10 +1171,12 @@ class SubjectHistoryStore:
             )
         except (TypeError, ValueError) as error:
             raise HistoryStoreCorrupt("SubjectHistory meta is invalid") from error
-        if (meta.schema_version, meta.schema_hash) == (1, SCHEMA_HASH_V1):
-            raise HistoryStoreMigrationRequired("SubjectHistory meta is schema v1")
+        if (meta.schema_version, meta.schema_hash) in ((1, SCHEMA_HASH_V1), (2, SCHEMA_HASH_V2)):
+            raise HistoryStoreMigrationRequired(
+                f"SubjectHistory meta is schema v{meta.schema_version}"
+            )
         if meta.schema_version != HISTORY_SCHEMA_VERSION or meta.schema_hash != SCHEMA_HASH:
-            raise HistoryStoreCorrupt("SubjectHistory meta schema is not v2")
+            raise HistoryStoreCorrupt("SubjectHistory meta schema is not v3")
         return meta
 
     def activate(
