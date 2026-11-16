@@ -36,6 +36,10 @@ from pydantic import (
 
 from suzka.r15.contracts import NarrativeSelfState, RelationshipState, SelfModelState
 from suzka.attention.contracts import AttentionContinuity
+from suzka.runtime.conversation_trace import (
+    ConversationTrace,
+    ConversationTraceState,
+)
 from suzka.body import EmotionEngineAllostasis, EmotionState, EmotionTemporalState
 from suzka.belief import (
     BELIEF_MAX_COMPONENT_CODEPOINTS,
@@ -221,6 +225,9 @@ AGENT_STATE_V7_SCHEMA_VERSION: Literal[7] = 7
 AGENT_STATE_SCHEMA_VERSION_V8: Literal[8] = 8
 CURRENT_AGENT_STATE_SCHEMA_VERSION: Literal[9] = 9
 AGENT_STATE_V10_SCHEMA_VERSION: Literal[10] = 10
+# #417: V11 adds the reference-only ConversationTrace (written only once it is
+# enabled, or when the committed snapshot is already V11; D1-b).
+AGENT_STATE_V11_SCHEMA_VERSION: Literal[11] = 11
 
 
 class _StateModel(BaseModel):
@@ -1653,6 +1660,48 @@ class AgentStateSnapshotV10(AgentStateSnapshotV9):
         return self
 
 
+class AgentStateSnapshotV11(AgentStateSnapshotV10):
+    """#417: V10 plus the subject's reference-only ConversationTrace.
+
+    The trace holds DB1 episode references and retention numbers only, never
+    turn text (D1-a). It inherits every V10 validator; its own timestamps and
+    event sequences are fenced by ``saved_at`` and the processed sequence.
+    """
+
+    schema_version: Literal[11] = AGENT_STATE_V11_SCHEMA_VERSION  # type: ignore[assignment]
+    conversation_trace: dict[str, Any]
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_exact_schema_version(cls, value: object) -> object:
+        if isinstance(value, Mapping) and "schema_version" in value:
+            schema_version = value["schema_version"]
+            if type(schema_version) is not int or schema_version != 11:
+                raise ValueError("schema_version must be the exact integer 11")
+        return value
+
+    @model_validator(mode="after")
+    def validate_conversation_trace(self) -> AgentStateSnapshotV11:
+        try:
+            state = ConversationTraceState.from_value(self.conversation_trace)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError("invalid ConversationTrace state") from exc
+        for trace in state.contexts:
+            for item in trace.items:
+                if (
+                    # last_reinforced_event_sequence >= event_sequence holds
+                    # per item, so fencing it fences both (#423 review).
+                    item.last_reinforced_event_sequence
+                    > self.last_processed_event_sequence
+                    or item.requested_at > self.saved_at
+                    or item.last_reinforced_at > self.saved_at
+                ):
+                    raise ValueError(
+                        "ConversationTrace item is in the future of its AgentState"
+                    )
+        return self
+
+
 # The unqualified name denotes the current schema; retained callers should use
 # the versioned shape when they intentionally construct an older schema.
 AgentStateSnapshot = AgentStateSnapshotV9
@@ -1668,7 +1717,8 @@ CompatibleAgentStateSnapshot = Annotated[
     | AgentStateSnapshotV7
     | AgentStateSnapshotV8
     | AgentStateSnapshotV9
-    | AgentStateSnapshotV10,
+    | AgentStateSnapshotV10
+    | AgentStateSnapshotV11,
     Field(discriminator="schema_version"),
 ]
 _COMPATIBLE_SNAPSHOT_ADAPTER: TypeAdapter[CompatibleAgentStateSnapshot] = TypeAdapter(
@@ -2202,6 +2252,35 @@ def project_agent_state_v10_schema_max_bytes() -> int:
     )
     if projected > AGENT_STATE_MAX_SERIALIZED_BYTES:
         raise RuntimeError("AgentState V10 exceeds 128MiB with full reserve")
+    return projected
+
+
+def project_agent_state_v11_schema_max_bytes() -> int:
+    """V10's full-legal projection plus the full-legal ConversationTrace (#417).
+
+    The full 16 MiB future-state reserve is kept; a test-only preflight must
+    agree exactly.
+    """
+    from suzka.r15.bounds import derive_r15_schema_budget
+    from suzka.r15.continuity_state import MAX_CHECKPOINT_BYTES, checkpoint_max_bytes
+    from suzka.runtime.conversation_trace import conversation_trace_schema_max_bytes
+
+    budget = derive_r15_schema_budget()
+    if checkpoint_max_bytes() != MAX_CHECKPOINT_BYTES:
+        raise RuntimeError("R15 continuation worst-case bound changed")
+    projected = project_agent_state_schema_max_bytes(
+        schema_version=11,
+        base_schema_version=9,
+        added_field_maxima={
+            "relationship_state": budget.relationship_bytes,
+            "narrative_self_state": budget.narrative_bytes,
+            "self_model_state": budget.self_model_bytes,
+            "narrative_admission_checkpoint": checkpoint_max_bytes(),
+            "conversation_trace": conversation_trace_schema_max_bytes(),
+        },
+    )
+    if projected > AGENT_STATE_MAX_SERIALIZED_BYTES:
+        raise RuntimeError("AgentState V11 exceeds 128MiB with full reserve")
     return projected
 
 
@@ -3113,6 +3192,17 @@ def _r13_state_ports(
     )
 
 
+def _conversation_trace_owner(main_loop: SuzkaMainLoop) -> ConversationTrace | None:
+    """The main loop's ConversationTrace owner, when one is attached (#417)."""
+
+    owner = getattr(main_loop, "conversation_trace", None)
+    if owner is None:
+        return None
+    if type(owner) is not ConversationTrace:
+        raise ValueError("ConversationTrace owner is malformed")
+    return owner
+
+
 def _attention_state_port(main_loop: SuzkaMainLoop) -> AttentionStatePort | None:
     """Resolve only the explicitly attached concrete Attention owner port."""
 
@@ -3415,6 +3505,18 @@ class AgentStateStore:
                     "AgentState snapshot schema is invalid"
                 )
             raise schema_failure
+        if version == AGENT_STATE_V11_SCHEMA_VERSION:
+            try:
+                loaded_v11 = AgentStateSnapshotV11.model_validate(raw)
+                self._validate_value_configuration(loaded_v11)
+                _domain_value_system(loaded_v11.value_state)
+                _domain_belief_system(loaded_v11.belief_state)
+                validated_attention_continuity(loaded_v11.attention_state)
+                return loaded_v11
+            except AgentStateLoadError:
+                raise
+            except Exception:
+                raise AgentStateLoadError("AgentState v11 schema is invalid") from None
         if version == AGENT_STATE_V10_SCHEMA_VERSION:
             try:
                 loaded_v10 = AgentStateSnapshotV10.model_validate(raw)
@@ -3738,6 +3840,7 @@ class AgentStateStore:
         | AgentStateSnapshotV8
         | AgentStateSnapshotV9
         | AgentStateSnapshotV10
+        | AgentStateSnapshotV11
     ):
         capture_failure: AgentStateSaveError | None = None
         try:
@@ -3812,6 +3915,9 @@ class AgentStateStore:
                 or belief_snapshot is None
             ):
                 raise ValueError("R15 capture requires complete V9 owner topology")
+            trace_owner = _conversation_trace_owner(main_loop)
+            if trace_owner is not None and trace_owner.persists and r15_port is None:
+                raise ValueError("ConversationTrace capture requires V10 owner topology")
             common: dict[str, Any] = dict(
                 saved_at=self._now(),
                 last_processed_event_sequence=sequence,
@@ -3905,6 +4011,21 @@ class AgentStateStore:
                     )
                 if r15_port is not None:
                     r15 = r15_port._capture_for_agent_state()
+                    if trace_owner is not None and trace_owner.persists:
+                        return AgentStateSnapshotV11(
+                            **common,
+                            value_state=value_state,
+                            belief_state=_belief_state_snapshot(belief_snapshot),
+                            r13_state=r13_state,
+                            attention_state=attention_snapshot,
+                            relationship_state=r15.relationship.canonical_value(),
+                            narrative_self_state=r15.narrative.canonical_value(),
+                            self_model_state=r15.self_model.canonical_value(),
+                            narrative_admission_checkpoint=(
+                                r15.continuation.canonical_value(r15.narrative)
+                            ),
+                            conversation_trace=trace_owner.state.canonical_value(),
+                        )
                     return AgentStateSnapshotV10(
                         **common,
                         value_state=value_state,
@@ -3963,6 +4084,9 @@ class AgentStateStore:
         previous_r15: R15TechnicalSnapshot | None = None
         restored_r15: R15TechnicalSnapshot | None = None
         r15_rollback_failed = False
+        trace_owner: ConversationTrace | None = None
+        restored_trace: ConversationTraceState | None = None
+        previous_trace: tuple[ConversationTraceState, bool] | None = None
         attention_restore_transaction: AttentionRestoreTransaction | None = None
         prepared_read_views: object | None = None
         publish_read_views: Callable[[object], object] | None = None
@@ -4036,6 +4160,15 @@ class AgentStateStore:
                 # V9 and older have no R15 source evidence. Bootstrap UNKNOWN;
                 # never infer any biography from the previous Chat transcript.
                 restored_r15 = R15TechnicalSnapshot.empty()
+            trace_owner = _conversation_trace_owner(main_loop)
+            if isinstance(validated, AgentStateSnapshotV11):
+                if trace_owner is None:
+                    raise AgentStateLoadError(
+                        "AgentState V11 restore requires the ConversationTrace owner"
+                    )
+                restored_trace = ConversationTraceState.from_value(
+                    validated.conversation_trace
+                )
             r13_state = (
                 validated.r13_state
                 if isinstance(validated, (AgentStateSnapshotV8, AgentStateSnapshotV9))
@@ -4327,6 +4460,8 @@ class AgentStateStore:
             previous_temporal = current_temporal
             if r15_port is not None:
                 previous_r15 = r15_port._capture_for_agent_state()
+            if trace_owner is not None:
+                previous_trace = trace_owner.committed_marker()
             if attention_port is not None:
                 try:
                     attention_restore_transaction = (
@@ -4382,6 +4517,10 @@ class AgentStateStore:
             if restored_r15 is not None:
                 assert r15_port is not None
                 r15_port._restore_for_agent_state(restored_r15)
+            if trace_owner is not None:
+                # Older committed schemas carry no trace: clear it and the V11
+                # flag, so a failure restore to V10 never leaves it set.
+                trace_owner.restore_committed(restored_trace)
             if attention_restore_transaction is not None:
                 attention_restore_transaction.publish()
             if read_views_prepared:
@@ -4409,6 +4548,11 @@ class AgentStateStore:
                     r15_port._restore_for_agent_state(previous_r15)
                 except Exception:
                     r15_rollback_failed = True
+            if trace_owner is not None and previous_trace is not None:
+                try:
+                    trace_owner.rollback_to(previous_trace)
+                except Exception:
+                    pass
             for domain, port, previous_snapshot in reversed(attempted_r13_restores):
                 try:
                     if domain == "motivation":
@@ -4538,7 +4682,10 @@ class AgentStateStore:
             _validated_r13_state_snapshot(snapshot.r13_state)
         if isinstance(snapshot, AgentStateSnapshotV9):
             validated_attention_continuity(snapshot.attention_state)
-        if isinstance(snapshot, AgentStateSnapshotV10):
+        if isinstance(snapshot, AgentStateSnapshotV11):
+            # The same recheck for V11, which also revalidates the trace.
+            AgentStateSnapshotV11.model_validate(snapshot.model_dump(mode="python"))
+        elif isinstance(snapshot, AgentStateSnapshotV10):
             # Pydantic model_copy(update=...) and mutable nested dicts are
             # NOT authority. Recheck all V10 R15 root digests and event fences.
             AgentStateSnapshotV10.model_validate(snapshot.model_dump(mode="python"))
