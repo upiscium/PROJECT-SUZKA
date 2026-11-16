@@ -22,6 +22,7 @@ from suzka.runtime.conversation_trace import (
     TraceParameters,
     TraceRemovalReason,
     TraceTurnKind,
+    conversation_trace_schema_max_bytes,
     render_trace,
 )
 
@@ -81,7 +82,7 @@ def test_being_shown_alone_never_reinforces() -> None:
     trace = _trace()
     episode = _add(trace, 1)
     now = T0 + timedelta(minutes=10)  # R ≈ 0.85, above verbatim_above
-    assert trace.reinforce(CTX, now, shown_episode_ids=[episode], double_recall_episode_ids=[]) == ()
+    assert trace.reinforce(CTX, now, turn_sequence=100, shown_episode_ids=[episode], double_recall_episode_ids=[]) == ()
     [item] = trace.state.items_for(CTX)
     assert item.last_reinforced_at == T0
     assert item.recall_count == 0
@@ -91,7 +92,7 @@ def test_faint_recall_reinforces_by_spacing() -> None:
     trace = _trace()
     episode = _add(trace, 1)
     now = T0 + timedelta(hours=1)  # R = e^-1 ≈ 0.37 < 0.5
-    assert trace.reinforce(CTX, now, shown_episode_ids=[episode], double_recall_episode_ids=[]) == (episode,)
+    assert trace.reinforce(CTX, now, turn_sequence=100, shown_episode_ids=[episode], double_recall_episode_ids=[]) == (episode,)
     [item] = trace.state.items_for(CTX)
     assert item.stability_hours == pytest.approx(1.0 * (1 + 0.5 * (1 - math.exp(-1))))
     assert item.last_reinforced_at == now
@@ -99,26 +100,45 @@ def test_faint_recall_reinforces_by_spacing() -> None:
     assert item.double_recall_count == 0
 
 
-def test_double_recall_reinforces_more_and_only_once_per_turn() -> None:
+def test_double_recall_grows_stability_without_restarting_the_clock() -> None:
     trace = _trace()
     episode = _add(trace, 1)
     now = T0 + timedelta(minutes=30)
     retention = math.exp(-0.5)
-    trace.reinforce(CTX, now, shown_episode_ids=[], double_recall_episode_ids=[episode])
+    trace.reinforce(CTX, now, turn_sequence=10, shown_episode_ids=[], double_recall_episode_ids=[episode])
     [item] = trace.state.items_for(CTX)
     assert item.stability_hours == pytest.approx(1.0 * (1 + 2.0 * (1 - retention)))
     assert item.double_recall_count == 1
-    # The turn that added an item does not count it as recalled.
-    fresh = _add(trace, 2, at=now)
-    assert trace.reinforce(CTX, now, shown_episode_ids=[], double_recall_episode_ids=[fresh]) == (fresh,)
+    assert item.recall_count == 0
+    # An item DB1 keeps retrieving still fades: the clock is not restarted.
+    assert item.last_reinforced_at == T0
+    assert item.last_reinforced_event_sequence == 10
+
+
+def test_an_item_is_reinforced_at_most_once_per_turn() -> None:
+    trace = _trace()
+    episode = _add(trace, 1)
+    now = T0 + timedelta(hours=1)
+    args = dict(shown_episode_ids=[episode], double_recall_episode_ids=[episode])
+    assert trace.reinforce(CTX, now, turn_sequence=5, **args) == (episode,)  # type: ignore[arg-type]
+    once = trace.state.items_for(CTX)[0]
+    # A retry of the same turn changes nothing.
+    assert trace.reinforce(CTX, now, turn_sequence=5, **args) == ()  # type: ignore[arg-type]
+    assert trace.state.items_for(CTX)[0] == once
+    assert once.recall_count == 1 and once.double_recall_count == 1
 
 
 def test_the_turn_of_addition_is_not_a_recall() -> None:
     trace = _trace()
-    revision_before = trace.state.revision
-    _add(trace, 1)
+    fresh = _add(trace, 7)
+    # Same turn (sequence 7): neither a faint recall nor a double recall counts.
+    assert trace.reinforce(
+        CTX, T0 + timedelta(hours=1), turn_sequence=7,
+        shown_episode_ids=[fresh], double_recall_episode_ids=[fresh],
+    ) == ()
     [item] = trace.state.items_for(CTX)
-    assert item.last_reinforced_revision == revision_before + 1 == trace.state.revision
+    assert item.last_reinforced_event_sequence == 7
+    assert item.recall_count == item.double_recall_count == 0
 
 
 def test_stability_is_capped() -> None:
@@ -182,9 +202,87 @@ def test_state_rejects_text_like_fields_and_bad_shapes() -> None:
         ContextTrace(CTX, ())
 
 
-def test_total_capacity_constant_fits_the_v11_budget() -> None:
-    # D1 §2: 512 items at roughly 430 bytes each stay under the 487,834-byte room.
-    assert MAX_TRACE_ITEMS_TOTAL * 430 + MAX_TRACE_CONTEXTS * 300 < 487_834
+def test_full_legal_trace_fits_the_room_above_v10() -> None:
+    # D1 §2: the worst case must stay under the 487,834 bytes left above V10.
+    worst = conversation_trace_schema_max_bytes()
+    assert worst < 487_834
+    # About 500 bytes per item at the bounds, not the 430 first estimated.
+    assert worst > MAX_TRACE_ITEMS_TOTAL * 480
+
+
+def test_field_names_avoid_both_private_key_lists() -> None:
+    from suzka.runtime.agent_state import _PRIVATE_STATE_KEYS
+    from suzka.runtime.state_wal import _FORBIDDEN
+    from suzka.privacy import normalize_private_key
+
+    trace = _trace()
+    _add(trace, 1)
+    value = trace.state.canonical_value()
+    keys = set(value) | set(value["contexts"][0]) | set(value["contexts"][0]["items"][0])  # type: ignore[index]
+    for key in keys:
+        assert normalize_private_key(key) not in _PRIVATE_STATE_KEYS
+        assert normalize_private_key(key) not in _FORBIDDEN
+
+
+def test_total_item_bound_evicts_the_weakest_across_contexts() -> None:
+    trace = _trace(max_items_per_context=32)
+    n = 0
+    for c in range(16):
+        for _ in range(32):
+            _add(trace, n, context=f"conversation.c{c:04d}", at=T0 + timedelta(seconds=n))
+            n += 1
+    assert trace.state.item_count == MAX_TRACE_ITEMS_TOTAL
+    removals = trace.add("conversation.extra", episode_id="episode-extra",
+                         turn_kind=TraceTurnKind.CHAT, requested_at=T0 + timedelta(seconds=n),
+                         event_sequence=n, surprise=1.0)
+    assert len(removals) == 1 and removals[0].reason is TraceRemovalReason.CAPACITY
+    assert removals[0].episode_id == "episode-0000-0000"
+    assert trace.state.item_count == MAX_TRACE_ITEMS_TOTAL
+
+
+def test_an_episode_is_unique_across_the_whole_trace() -> None:
+    trace = _trace()
+    trace.add("conversation.a", episode_id="episode-x", turn_kind=TraceTurnKind.CHAT,
+              requested_at=T0, event_sequence=1, surprise=0.0)
+    with pytest.raises(ValueError):
+        trace.add("conversation.b", episode_id="episode-x", turn_kind=TraceTurnKind.CHAT,
+                  requested_at=T0, event_sequence=2, surprise=0.0)
+
+
+def test_an_older_turn_is_inserted_in_order() -> None:
+    trace = _trace()
+    _add(trace, 2, at=T0 + timedelta(minutes=5))
+    _add(trace, 1, at=T0)
+    assert [item.event_sequence for item in trace.state.items_for(CTX)] == [1, 2]
+
+
+def test_forget_applies_a_lowered_per_context_cap() -> None:
+    big = _trace(max_items_per_context=5)
+    for n in range(5):
+        _add(big, n, at=T0 + timedelta(minutes=n))
+    small = _trace(max_items_per_context=2)
+    small.restore_exact(big.state)
+    removals = small.forget(T0 + timedelta(minutes=5))
+    assert len(removals) == 3
+    assert len(small.state.items_for(CTX)) == 2
+
+
+def test_from_value_rejects_z_timestamps_int_floats_and_bool_ints() -> None:
+    trace = _trace()
+    _add(trace, 1)
+    value = trace.state.canonical_value()
+
+    def mutated(**changes: object) -> dict[str, object]:
+        item = {**value["contexts"][0]["items"][0], **changes}  # type: ignore[index]
+        return {**value, "contexts": [{"context_id": CTX, "items": [item]}]}
+
+    for bad in (
+        mutated(requested_at="2026-11-16T12:00:00Z", last_reinforced_at="2026-11-16T12:00:00Z"),
+        mutated(stability_hours=1),
+        mutated(event_sequence=True),
+    ):
+        with pytest.raises((ValueError, TypeError)):
+            ConversationTraceState.from_value(bad)
 
 
 def test_render_picks_by_retention_within_budget_then_orders_by_time() -> None:
@@ -194,13 +292,27 @@ def test_render_picks_by_retention_within_budget_then_orders_by_time() -> None:
     huge = _turn(3, T0 + timedelta(minutes=40), retention=0.9, user="x" * 400, reply="y")
     rendered = render_trace([old, new, huge], T0 + timedelta(hours=1), params)
     assert rendered.text.startswith(RECENT_CONVERSATION_HEADING)
-    assert rendered.shown_episode_ids == ("episode-0001", "episode-0002")
-    assert rendered.faint_episode_ids == ("episode-0001",)
+    # The two strongest fit (the long one shortened); the faint one does not.
+    assert rendered.shown_episode_ids == ("episode-0003", "episode-0002")
     lines = rendered.text.splitlines()
-    assert lines[1].startswith("- about 1 h ago (faint) — User: ")
-    assert "old question old question old question old question old ques… / You: old answer" in lines[1]
+    assert lines[1].startswith("- about 20 min ago (shortened) — User: xxx")
     assert lines[2] == "- about 10 min ago — User: new question / You: new answer"
     assert len(rendered.text.encode()) <= 300
+    # With room, the faint turn shows as an excerpt and is reported as faint.
+    roomy = render_trace([old, new], T0 + timedelta(hours=1), TraceParameters())
+    assert roomy.shown_episode_ids == ("episode-0001", "episode-0002")
+    assert roomy.faint_episode_ids == ("episode-0001",)
+    assert "old question old question old question old question old ques… / You: old answer" in roomy.text
+
+
+def test_render_shortens_a_strong_turn_that_does_not_fit() -> None:
+    params = TraceParameters(max_rendered_bytes=400)
+    long_turn = _turn(1, T0, retention=0.95, user="q", reply="a" * 2000)
+    rendered = render_trace([long_turn], T0 + timedelta(minutes=3), params)
+    assert rendered.shown_episode_ids == ("episode-0001",)
+    assert rendered.faint_episode_ids == ()
+    assert "(shortened)" in rendered.text
+    assert len(rendered.text.encode()) <= 400
 
 
 def test_render_command_turns_as_a_fixed_note_without_ids() -> None:
@@ -252,12 +364,13 @@ def _item_kwargs() -> dict[str, object]:
         surprise_measured=True,
         stability_hours=1.0,
         last_reinforced_at=T0,
-        last_reinforced_revision=1,
+        last_reinforced_event_sequence=1,
     )
 
 
 def _turn(n: int, at: datetime, *, retention: float, user: str, reply: str,
           kind: TraceTurnKind = TraceTurnKind.CHAT) -> RecalledTurn:
     item = TraceItem(**{**_item_kwargs(), "episode_id": f"episode-{n:04d}", "requested_at": at,
-                        "last_reinforced_at": at, "event_sequence": n, "turn_kind": kind})  # type: ignore[arg-type]
+                        "last_reinforced_at": at, "event_sequence": n,
+                        "last_reinforced_event_sequence": n, "turn_kind": kind})  # type: ignore[arg-type]
     return RecalledTurn(item=item, retention=retention, user_text=user, response_text=reply)

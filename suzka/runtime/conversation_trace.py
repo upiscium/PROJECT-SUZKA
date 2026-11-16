@@ -8,6 +8,10 @@ turn starts with a larger stability ``S`` (decision 6 (i)). Only a double recall
 turn; being shown alone never does (D1 v2 review P2-1). Items below
 ``forget_below`` are forgotten across all Contexts on every turn.
 
+Timestamps are serialized as ``isoformat()`` (``+00:00``); AgentState must
+carry the canonical value as an opaque dict, never as pydantic datetimes
+(which would write ``Z`` and fail the canonical check).
+
 This module is pure: it neither reads DB1 nor touches AgentState. The main
 loop resolves text and decides when to mutate; AgentState captures
 ``ConversationTrace.state`` (#417 PR-B/PR-C).
@@ -17,19 +21,22 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import math
 from threading import RLock
 
 from suzka.identifiers import validate_identifier
-from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE, MAX_PERSISTED_REVISION
+from suzka.limits import (
+    MAX_PERSISTED_EVENT_SEQUENCE,
+    MAX_PERSISTED_REVISION,
+    MAX_TRACE_CONTEXTS as MAX_TRACE_CONTEXTS,
+    MAX_TRACE_ITEMS_PER_CONTEXT as MAX_TRACE_ITEMS_PER_CONTEXT,
+    MAX_TRACE_ITEMS_TOTAL as MAX_TRACE_ITEMS_TOTAL,
+    MAX_TRACE_STABILITY_HOURS as MAX_TRACE_STABILITY_HOURS,
+)
 
 
-MAX_TRACE_ITEMS_TOTAL = 512
-MAX_TRACE_ITEMS_PER_CONTEXT = 32
-MAX_TRACE_CONTEXTS = 64
-MAX_TRACE_STABILITY_HOURS = 720.0
 MAX_TRACE_COUNTER = MAX_PERSISTED_REVISION
 
 RECENT_CONVERSATION_HEADING = (
@@ -119,7 +126,7 @@ class TraceItem:
     surprise_measured: bool
     stability_hours: float
     last_reinforced_at: datetime
-    last_reinforced_revision: int
+    last_reinforced_event_sequence: int
     recall_count: int = 0
     double_recall_count: int = 0
 
@@ -144,7 +151,13 @@ class TraceItem:
             high=MAX_TRACE_STABILITY_HOURS,
             open_low=True,
         )
-        _bounded_int(self.last_reinforced_revision, "last_reinforced_revision", MAX_TRACE_COUNTER)
+        _bounded_int(
+            self.last_reinforced_event_sequence,
+            "last_reinforced_event_sequence",
+            MAX_PERSISTED_EVENT_SEQUENCE,
+        )
+        if self.last_reinforced_event_sequence < self.event_sequence:
+            raise ValueError("an item cannot be reinforced before its turn")
         _bounded_int(self.recall_count, "recall_count", MAX_TRACE_COUNTER)
         _bounded_int(self.double_recall_count, "double_recall_count", MAX_TRACE_COUNTER)
 
@@ -191,14 +204,11 @@ class ConversationTraceState:
         context_ids = [trace.context_id for trace in self.contexts]
         if context_ids != sorted(set(context_ids)):
             raise ValueError("Context traces must be unique and sorted")
-        total = 0
-        for trace in self.contexts:
-            total += len(trace.items)
-            for item in trace.items:
-                if item.last_reinforced_revision > self.revision:
-                    raise ValueError("an item is reinforced after the trace revision")
-        if total > MAX_TRACE_ITEMS_TOTAL:
+        episode_ids = [item.episode_id for trace in self.contexts for item in trace.items]
+        if len(episode_ids) > MAX_TRACE_ITEMS_TOTAL:
             raise ValueError("too many trace items")
+        if len(set(episode_ids)) != len(episode_ids):
+            raise ValueError("an episode appears twice in the trace")
 
     @property
     def item_count(self) -> int:
@@ -349,16 +359,31 @@ class ConversationTrace:
         context_id: str,
         now: datetime,
         *,
+        turn_sequence: int,
         shown_episode_ids: Iterable[str],
         double_recall_episode_ids: Iterable[str],
     ) -> tuple[str, ...]:
-        """Reinforce faint recalls and double recalls once; return reinforced ids."""
+        """Reinforce faint recalls and double recalls of one turn; return reinforced ids.
 
+        ``turn_sequence`` is the reinforcing CHAT event's sequence. An item is
+        reinforced at most once per turn and never by the turn that added it
+        (both keyed on that sequence, so a retry cannot double-reinforce).
+
+        - Faint recall (shown while ``R < verbatim_above``): S grows by
+          ``recall_gain × (1 − R)``, the decay clock restarts, ``recall_count``
+          counts it.
+        - Double recall (also retrieved from DB1): S grows by
+          ``double_recall_gain × (1 − R)`` and ``double_recall_count`` counts
+          it; the decay clock does not restart unless it is also a faint
+          recall, so an item DB1 keeps retrieving still fades (#421 P3-2).
+        """
+
+        validate_identifier(context_id)
+        _bounded_int(turn_sequence, "turn_sequence", MAX_PERSISTED_EVENT_SEQUENCE)
         shown = set(shown_episode_ids)
         double = set(double_recall_episode_ids)
         reinforced: list[str] = []
         with self._lock:
-            revision = self._state.revision + 1
             traces = {t.context_id: list(t.items) for t in self._state.contexts}
             updated = []
             for item in traces.get(context_id, []):
@@ -367,7 +392,11 @@ class ConversationTrace:
                 is_faint_recall = (
                     item.episode_id in shown and retention < self._parameters.verbatim_above
                 )
-                if item.last_reinforced_revision >= revision or not (is_double or is_faint_recall):
+                if (
+                    item.event_sequence >= turn_sequence
+                    or item.last_reinforced_event_sequence >= turn_sequence
+                    or not (is_double or is_faint_recall)
+                ):
                     updated.append(item)
                     continue
                 gain = self._parameters.double_recall_gain if is_double else self._parameters.recall_gain
@@ -379,9 +408,16 @@ class ConversationTrace:
                     replace(
                         item,
                         stability_hours=stability,
-                        last_reinforced_at=max(now, item.last_reinforced_at),
-                        last_reinforced_revision=revision,
-                        recall_count=min(item.recall_count + 1, MAX_TRACE_COUNTER),
+                        last_reinforced_at=(
+                            max(now, item.last_reinforced_at)
+                            if is_faint_recall
+                            else item.last_reinforced_at
+                        ),
+                        last_reinforced_event_sequence=turn_sequence,
+                        recall_count=min(
+                            item.recall_count + (1 if is_faint_recall else 0),
+                            MAX_TRACE_COUNTER,
+                        ),
                         double_recall_count=min(
                             item.double_recall_count + (1 if is_double else 0),
                             MAX_TRACE_COUNTER,
@@ -425,14 +461,18 @@ class ConversationTrace:
                     parameters.max_stability_hours,
                 ),
                 last_reinforced_at=requested_at,
-                # Not a reinforcement; it only keeps the turn of addition from
-                # also counting as a recall (D1 §3: recalls start next turn).
-                last_reinforced_revision=revision,
+                # Not a reinforcement: the turn of addition never counts as a
+                # recall (D1 §3), because reinforce skips sequences <= this.
+                last_reinforced_event_sequence=event_sequence,
             )
             traces = {t.context_id: list(t.items) for t in self._state.contexts}
-            items = traces.setdefault(context_id, [])
-            if any(existing.episode_id == episode_id for existing in items):
+            if any(
+                existing.episode_id == episode_id
+                for others in traces.values()
+                for existing in others
+            ):
                 raise ValueError("the episode is already in the trace")
+            items = traces.setdefault(context_id, [])
             items.append(item)
             items.sort(key=lambda entry: (entry.requested_at, entry.event_sequence))
             removals = self._enforce_capacity(traces, requested_at)
@@ -512,7 +552,10 @@ def render_trace(
     )
     chosen: list[tuple[RecalledTurn, str]] = []
     for turn in ordered:
-        line = _render_line(turn, now, parameters)
+        line = _render_line(turn, now, parameters, shorten=False)
+        if len(line.encode()) + 1 > budget:
+            # A long verbatim turn is shortened rather than hidden (#421 P3-1).
+            line = _render_line(turn, now, parameters, shorten=True)
         size = len(line.encode()) + 1
         if size > budget:
             continue
@@ -533,14 +576,17 @@ def render_trace(
     )
 
 
-def _render_line(turn: RecalledTurn, now: datetime, parameters: TraceParameters) -> str:
+def _render_line(
+    turn: RecalledTurn, now: datetime, parameters: TraceParameters, *, shorten: bool
+) -> str:
     age = _age_text(now - turn.item.requested_at)
     faint = turn.retention < parameters.verbatim_above
-    label = f"{age} (faint)" if faint else age
+    label = f"{age} (faint)" if faint else f"{age} (shortened)" if shorten else age
     if turn.item.turn_kind is TraceTurnKind.COMMAND:
         return f"- {label} — {COMMAND_TURN_TEXT}"
-    user = _excerpt(turn.user_text) if faint else _one_line(turn.user_text)
-    reply = _excerpt(turn.response_text) if faint else _one_line(turn.response_text)
+    brief = faint or shorten
+    user = _excerpt(turn.user_text) if brief else _one_line(turn.user_text)
+    reply = _excerpt(turn.response_text) if brief else _one_line(turn.response_text)
     return f"- {label} — User: {user} / You: {reply}"
 
 
@@ -575,7 +621,7 @@ def _item_value(item: TraceItem) -> dict[str, object]:
         "surprise_measured": item.surprise_measured,
         "stability_hours": item.stability_hours,
         "last_reinforced_at": item.last_reinforced_at.isoformat(),
-        "last_reinforced_revision": item.last_reinforced_revision,
+        "last_reinforced_event_sequence": item.last_reinforced_event_sequence,
         "recall_count": item.recall_count,
         "double_recall_count": item.double_recall_count,
     }
@@ -591,7 +637,7 @@ _ITEM_FIELDS = frozenset(
         "surprise_measured",
         "stability_hours",
         "last_reinforced_at",
-        "last_reinforced_revision",
+        "last_reinforced_event_sequence",
         "recall_count",
         "double_recall_count",
     }
@@ -611,7 +657,7 @@ def _item_from_value(value: object) -> TraceItem:
             surprise_measured=value["surprise_measured"],
             stability_hours=value["stability_hours"],
             last_reinforced_at=_parse_utc(value["last_reinforced_at"]),
-            last_reinforced_revision=value["last_reinforced_revision"],
+            last_reinforced_event_sequence=value["last_reinforced_event_sequence"],
             recall_count=value["recall_count"],
             double_recall_count=value["double_recall_count"],
         )
@@ -652,3 +698,51 @@ def _finite(
         raise ValueError(f"{name} is out of range")
     if high is not None and (value > high or (open_high and value == high)):
         raise ValueError(f"{name} is out of range")
+
+
+def conversation_trace_schema_max_bytes() -> int:
+    """Worst-case canonical JSON bytes of a legal trace (AgentState V11 field).
+
+    Built from a full-legal instance: every bound at its maximum, the longest
+    identifiers, the longest float repr in range (23 characters), the largest
+    integers, and microsecond UTC timestamps. AgentState serializes with sorted
+    keys and compact separators, as here.
+    """
+
+    import json
+
+    from suzka.identifiers import MAX_IDENTIFIER_CODEPOINTS
+
+    longest_float = 2.2250738585072014e-308
+    at = datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    per_context = MAX_TRACE_ITEMS_TOTAL // MAX_TRACE_CONTEXTS
+    contexts = []
+    for c in range(MAX_TRACE_CONTEXTS):
+        context_id = f"c{c:04d}".ljust(MAX_IDENTIFIER_CODEPOINTS, "x")
+        items = tuple(
+            TraceItem(
+                episode_id=f"e{c:04d}{i:04d}".ljust(MAX_IDENTIFIER_CODEPOINTS, "x"),
+                turn_kind=TraceTurnKind.COMMAND,
+                requested_at=at,
+                event_sequence=MAX_PERSISTED_EVENT_SEQUENCE,
+                surprise=longest_float,
+                surprise_measured=True,
+                stability_hours=longest_float,
+                last_reinforced_at=at,
+                last_reinforced_event_sequence=MAX_PERSISTED_EVENT_SEQUENCE,
+                recall_count=MAX_TRACE_COUNTER,
+                double_recall_count=MAX_TRACE_COUNTER,
+            )
+            for i in range(per_context)
+        )
+        contexts.append(ContextTrace(context_id, items))
+    state = ConversationTraceState(revision=MAX_TRACE_COUNTER, contexts=tuple(contexts))
+    return len(
+        json.dumps(
+            state.canonical_value(),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )

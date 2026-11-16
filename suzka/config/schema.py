@@ -18,6 +18,7 @@ from pydantic import (
 )
 
 from suzka.identifiers import validate_identifier
+from suzka.limits import MAX_TRACE_ITEMS_PER_CONTEXT, MAX_TRACE_STABILITY_HOURS
 from suzka.identity.value_system import ValueSeedDeclaration, ValueScope
 
 
@@ -118,10 +119,14 @@ class ConversationTraceSettings(StrictBaseModel):
     surprise_gain: StrictFloat = Field(default=2.0, ge=0.0, le=10.0)
     recall_gain: StrictFloat = Field(default=0.5, ge=0.0, le=5.0)
     double_recall_gain: StrictFloat = Field(default=2.0, ge=0.0, le=10.0)
-    max_stability_hours: StrictFloat = Field(default=168.0, gt=0.0, le=720.0)
+    max_stability_hours: StrictFloat = Field(
+        default=168.0, gt=0.0, le=MAX_TRACE_STABILITY_HOURS
+    )
     forget_below: StrictFloat = Field(default=0.2, gt=0.0, lt=1.0)
     verbatim_above: StrictFloat = Field(default=0.5, gt=0.0, lt=1.0)
-    max_items_per_context: StrictInt = Field(default=20, ge=1, le=32)
+    max_items_per_context: StrictInt = Field(
+        default=20, ge=1, le=MAX_TRACE_ITEMS_PER_CONTEXT
+    )
     max_rendered_bytes: StrictInt = Field(default=4096, ge=256, le=16384)
 
     @model_validator(mode="after")
