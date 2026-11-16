@@ -83,6 +83,9 @@ describe("ChatClient", () => {
     await userEvent.type(box, "line one{Enter}line two");
     expect(box).toHaveValue("line one\nline two");
     fireEvent.keyDown(box, { key: "Enter", ctrlKey: true, isComposing: true });
+    // A send would have cleared the composer and, a microtask later, called fetch.
+    expect(box).toHaveValue("line one\nline two");
+    await act(async () => {});
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
