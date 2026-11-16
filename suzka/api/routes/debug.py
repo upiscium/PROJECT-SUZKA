@@ -15,6 +15,8 @@ from suzka.api.routes.chat import (
 )
 from suzka.api.schemas.chat import ChatRequest
 from suzka.api.schemas.debug import (
+    ConversationTraceDiagnosticsSchema,
+    ConversationTraceItemSchema,
     AppraisalSchema,
     ArousalContributionsSchema,
     ChatDiagnosticsSchema,
@@ -99,6 +101,20 @@ def debug_chat(
             do_sample=settings.generation.do_sample,
         ),
         diagnostics=_diagnostics_response(trace.diagnostics),
+        conversation_trace=ConversationTraceDiagnosticsSchema(
+            state=trace.conversation_trace.state,
+            items=[
+                ConversationTraceItemSchema(
+                    episode_id=item.episode_id,
+                    retention=item.retention,
+                    stability_hours=item.stability_hours,
+                    display=item.display,
+                    double_recall=item.double_recall,
+                    read_status=item.read_status,
+                )
+                for item in trace.conversation_trace.items
+            ],
+        ),
     )
 
 

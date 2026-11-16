@@ -98,12 +98,13 @@ def test_enabled_commits_v11_and_restores_after_restart(tmp_path: Path) -> None:
         _chat(client, "second")
         snapshot = client.app.state.agent_state_store.load()
         assert type(snapshot) is AgentStateSnapshotV11
-        assert ConversationTraceState.from_value(snapshot.conversation_trace) == planted
+        saved = ConversationTraceState.from_value(snapshot.conversation_trace)
+        assert planted.contexts[0].items[0] in saved.items_for("conversation.default")
         raw = json.loads(settings.agent_state.path.read_text())
         assert raw["schema_version"] == 11
     with _restart(settings) as restarted:
         trace = restarted.app.state.main_loop.conversation_trace
-        assert trace.state == planted
+        assert trace.state == saved
         assert trace.persists and not trace.frozen
 
 
@@ -111,8 +112,11 @@ def test_disabling_after_v11_freezes_and_never_downgrades(tmp_path: Path) -> Non
     settings = _settings_with(tmp_path, enabled=True)
     with _client(tmp_path, settings=settings) as client:
         _chat(client)
-        planted = _plant_item(client)
+        _plant_item(client)
         _chat(client)
+        saved = ConversationTraceState.from_value(
+            client.app.state.agent_state_store.load().conversation_trace
+        )
     disabled = settings.model_copy(
         update={
             "conversation_trace": settings.conversation_trace.model_copy(
@@ -126,7 +130,8 @@ def test_disabling_after_v11_freezes_and_never_downgrades(tmp_path: Path) -> Non
         _chat(restarted, "still works")
         snapshot = restarted.app.state.agent_state_store.load()
         assert type(snapshot) is AgentStateSnapshotV11
-        assert ConversationTraceState.from_value(snapshot.conversation_trace) == planted
+        # Frozen: the trace is carried forward exactly, nothing added or forgotten.
+        assert ConversationTraceState.from_value(snapshot.conversation_trace) == saved
 
 
 def test_v11_restore_requires_the_trace_owner(tmp_path: Path) -> None:
@@ -173,7 +178,8 @@ def test_a_failed_restore_rolls_the_trace_back(tmp_path: Path, monkeypatch) -> N
             update={"conversation_trace": ConversationTraceState().canonical_value()}
         )
         marker = trace.committed_marker()
-        assert marker[0] == planted
+        # Chat also adds its own items; the planted one is among them.
+        assert planted.contexts[0].items[0] in marker[0].items_for("conversation.default")
         seen: dict[str, object] = {}
 
         def fail_after_trace_restore(_self: object) -> None:

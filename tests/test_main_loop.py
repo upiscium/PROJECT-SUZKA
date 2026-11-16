@@ -1184,6 +1184,7 @@ def test_ordinary_and_debug_apply_equivalent_working_memory_semantics(
         "memory_context",
         "working_memory_view",
         "diagnostics",
+        "conversation_trace",
     )
 
 
