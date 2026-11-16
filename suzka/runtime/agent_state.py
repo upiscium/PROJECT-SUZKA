@@ -1682,8 +1682,6 @@ class AgentStateSnapshotV11(AgentStateSnapshotV10):
 
     @model_validator(mode="after")
     def validate_conversation_trace(self) -> AgentStateSnapshotV11:
-        from suzka.runtime.conversation_trace import ConversationTraceState
-
         try:
             state = ConversationTraceState.from_value(self.conversation_trace)
         except (TypeError, ValueError, KeyError) as exc:
@@ -1691,7 +1689,10 @@ class AgentStateSnapshotV11(AgentStateSnapshotV10):
         for trace in state.contexts:
             for item in trace.items:
                 if (
-                    item.event_sequence > self.last_processed_event_sequence
+                    # last_reinforced_event_sequence >= event_sequence holds
+                    # per item, so fencing it fences both (#423 review).
+                    item.last_reinforced_event_sequence
+                    > self.last_processed_event_sequence
                     or item.requested_at > self.saved_at
                     or item.last_reinforced_at > self.saved_at
                 ):

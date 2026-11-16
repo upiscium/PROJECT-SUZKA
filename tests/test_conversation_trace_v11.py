@@ -159,6 +159,8 @@ def test_restoring_an_older_schema_clears_the_v11_flag(tmp_path: Path) -> None:
 
 
 def test_a_failed_restore_rolls_the_trace_back(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from suzka.runtime import agent_state
+
     with _client(tmp_path, settings=_settings_with(tmp_path, enabled=True)) as client:
         _chat(client)
         planted = _plant_item(client)
@@ -171,16 +173,68 @@ def test_a_failed_restore_rolls_the_trace_back(tmp_path: Path, monkeypatch) -> N
             update={"conversation_trace": ConversationTraceState().canonical_value()}
         )
         marker = trace.committed_marker()
+        assert marker[0] == planted
+        seen: dict[str, object] = {}
 
-        def explode(_state: object) -> None:
+        def fail_after_trace_restore(_self: object) -> None:
+            # The trace really was replaced before this later step failed.
+            seen["state"] = trace.state
             raise RuntimeError("boom")
 
-        monkeypatch.setattr(trace, "restore_committed", explode)
+        monkeypatch.setattr(
+            agent_state.AttentionRestoreTransaction, "publish", fail_after_trace_restore
+        )
         with pytest.raises(AgentStateLoadError):
             store.restore_into(main_loop, other)
         monkeypatch.undo()
+        assert seen["state"] == ConversationTraceState()
         assert trace.committed_marker() == marker
-        assert trace.state == planted
+
+
+def test_a_v11_commit_durable_before_a_crash_is_restored(tmp_path: Path) -> None:
+    """AGENTS crash boundary: committed but not finalized, then a restart."""
+
+    from typing import Any, NoReturn
+
+    from fastapi.testclient import TestClient
+
+    from suzka.runtime import AgentEventSource, AgentEventType
+
+    from test_fastapi_backend import RecordingRuntime
+
+    settings = _settings_with(tmp_path, enabled=True)
+
+    class FinalizationFailingRuntime(RecordingRuntime):
+        def configure_durability(self, **kwargs: Any) -> None:
+            def fail(_event: object, _value: object) -> NoReturn:
+                raise OSError("crash after the durable commit")
+
+            kwargs["finalization_checkpoint"] = fail
+            super().configure_durability(**kwargs)
+
+    app = create_app(settings)
+    app.state.model_provider = ThinkingProvider()
+    app.state.memory_system = DualMemorySystem(settings)
+    app.state.adapter_registry = AdapterRegistry(settings)
+    runtime = FinalizationFailingRuntime()
+    app.state.agent_runtime = runtime
+    with TestClient(app) as client:
+        planted = _plant_item(client)
+        future = runtime.submit(
+            AgentEventType.EMOTION_TICK,
+            AgentEventSource.RUNTIME_EMOTION_TIMER,
+            client.app.state.main_loop.emotion_tick,
+        )
+        with pytest.raises(Exception):
+            future.result(timeout=10)
+        committed = client.app.state.agent_state_store.load()
+        assert type(committed) is AgentStateSnapshotV11
+        assert ConversationTraceState.from_value(committed.conversation_trace) == planted
+    with _client(tmp_path, settings=settings) as restarted:
+        assert restarted.app.state.agent_state_store.load() == committed
+        assert restarted.app.state.main_loop.conversation_trace.state == planted
+        _chat(restarted)
+        assert type(restarted.app.state.agent_state_store.load()) is AgentStateSnapshotV11
 
 
 def test_v11_rejects_future_items_and_text_keys(tmp_path: Path) -> None:
@@ -203,6 +257,12 @@ def test_v11_rejects_future_items_and_text_keys(tmp_path: Path) -> None:
         AgentStateSnapshotV11.model_validate({**raw, "conversation_trace": texty})
     with pytest.raises(ValueError):
         AgentStateSnapshotV11.model_validate({**raw, "schema_version": 10})
+    ahead = json.loads(json.dumps(raw["conversation_trace"]))
+    ahead["contexts"][0]["items"][0]["last_reinforced_event_sequence"] = (
+        snapshot.last_processed_event_sequence + 1000
+    )
+    with pytest.raises(ValueError):
+        AgentStateSnapshotV11.model_validate({**raw, "conversation_trace": ahead})
 
 
 def test_v11_projection_matches_an_independent_preflight() -> None:
@@ -243,5 +303,5 @@ def test_v11_projection_matches_an_independent_preflight() -> None:
     v11 = project_agent_state_v11_schema_max_bytes()
     assert v11 == v10 + len('"conversation_trace":'.encode()) + preflight + len(b",")
     assert v11 <= AGENT_STATE_MAX_SERIALIZED_BYTES
-    # The 16 MiB future-state reserve is inside the projection, untouched.
-    assert v11 - AGENT_STATE_FUTURE_STATE_RESERVE_BYTES > v10 - AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
+    # Both projections include the same full 16 MiB future-state reserve.
+    assert v10 > AGENT_STATE_FUTURE_STATE_RESERVE_BYTES
