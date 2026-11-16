@@ -5,6 +5,11 @@ touches the target. Validation rejects internally inconsistent values only;
 whether a value came from the trusted issuer, a live operator or the real
 verifier is the job of IP-16 / IP-17 / IP-18.
 
+The values follow the #368 producer order: ActionIntent → (R17 expectation)
+→ PolicyVerdict → ApprovalChallenge → ExecutionClaim → ExecutionReceipt →
+VerifiedOutcome. A challenge can only be built from this intent's ALLOW, and
+the receipt is the executor's report, never the verifier's basis.
+
 Under Human decision H3 (#380) there is no signer, signature or owner epoch:
 the approval is a single-use server challenge bound to exact digests, and a
 code derived from it that the operator types back. The physical ReviewArtifact
@@ -58,15 +63,17 @@ _UTC_FORMAT: Final = "%Y-%m-%dT%H:%M:%SZ"
 
 _GROUP_DOMAIN: Final = b"PROJECT-SUZKA:R18:OBLIGATION-GROUP:V1\0"
 _OPERATION_DOMAIN: Final = b"PROJECT-SUZKA:R18:OPERATION-KEY:V1\0"
-_ARTIFACT_DOMAIN: Final = b"PROJECT-SUZKA:R18:REVIEW_ARTIFACT:V1\0"
+_ARTIFACT_DOMAIN: Final = b"PROJECT-SUZKA:R18:REVIEW-ARTIFACT:V1\0"
 _INTENT_ID_DOMAIN: Final = b"PROJECT-SUZKA:R18:INTENT-ID:V1\0"
 _INTENT_DOMAIN: Final = b"PROJECT-SUZKA:R18:INTENT:V1\0"
 _INVERSE_ID_DOMAIN: Final = b"PROJECT-SUZKA:R18:INVERSE-INTENT-ID:V1\0"
 _INVERSE_DOMAIN: Final = b"PROJECT-SUZKA:R18:INVERSE-INTENT:V1\0"
+_POLICY_DOMAIN: Final = b"PROJECT-SUZKA:R18:POLICY-VERDICT:V1\0"
 _CHALLENGE_DOMAIN: Final = b"PROJECT-SUZKA:R18:APPROVAL-CHALLENGE:V1\0"
 _CODE_DOMAIN: Final = b"PROJECT-SUZKA:R18:CONFIRMATION-CODE:V1\0"
 _CLAIM_ID_DOMAIN: Final = b"PROJECT-SUZKA:R18:CLAIM-ID:V1\0"
 _CLAIM_DOMAIN: Final = b"PROJECT-SUZKA:R18:CLAIM:V1\0"
+_RECEIPT_DOMAIN: Final = b"PROJECT-SUZKA:R18:EXECUTION-RECEIPT:V1\0"
 _OUTCOME_ID_DOMAIN: Final = b"PROJECT-SUZKA:R18:OUTCOME-ID:V1\0"
 _OUTCOME_DOMAIN: Final = b"PROJECT-SUZKA:R18:OUTCOME:V1\0"
 
@@ -186,6 +193,10 @@ def _prefixed(value: object, prefix: str, name: str) -> str:
         raise ValueError(f"{name} must be a {prefix}<sha256> identity")
     digest(value[len(prefix) :], name)
     return value
+
+
+def _intent_prefix(direction: Direction) -> str:
+    return INTENT_ID_PREFIX if direction is Direction.FORWARD else INVERSE_INTENT_ID_PREFIX
 
 
 def _bounded(payload: bytes, maximum: int, name: str) -> bytes:
@@ -712,6 +723,141 @@ class InverseIntentV1:
         return value
 
 
+# ------------------------------------------------------------------ policy
+
+
+class PolicyVerdict(str, Enum):
+    ALLOW = "ALLOW"
+    DENY = "DENY"
+
+
+class PolicyDenyReason(str, Enum):
+    """Closed deny reasons of the R18 Policy owner (deny by default, #368)."""
+
+    # The startup reconciliation sweep has not finished (#380 §2-6).
+    ADMISSION_BLOCKED = "ADMISSION_BLOCKED"
+    # A source, Goal, Value, Context or Commitment no longer matches the intent.
+    SOURCE_NOT_CURRENT = "SOURCE_NOT_CURRENT"
+    # The target is not the fixed namespace / instance / expected revision.
+    TARGET_MISMATCH = "TARGET_MISMATCH"
+
+
+_POLICY_BODY: Final = (
+    "deny_reason",
+    "direction",
+    "intent_digest",
+    "intent_id",
+    "operation_key",
+    "policy_event_id",
+    "policy_sequence",
+    "schema_version",
+    "verdict",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyVerdictV1:
+    """The private R18 Policy result for one intent (#368, #380 §2-2).
+
+    It is evaluated after the R17 expectation commit and before any
+    challenge. ALLOW only permits asking the operator; it is not an approval.
+    DENY is terminal (POLICY_DENIED / INVERSE_POLICY_DENIED, no reissue).
+    """
+
+    direction: Direction
+    intent_id: str
+    intent_digest: str
+    operation_key: str
+    verdict: PolicyVerdict
+    deny_reason: PolicyDenyReason | None
+    policy_event_id: str
+    policy_sequence: int
+
+    def __post_init__(self) -> None:
+        if type(self.direction) is not Direction:
+            raise TypeError("direction must be a Direction")
+        _prefixed(self.intent_id, _intent_prefix(self.direction), "intent_id")
+        digest(self.intent_digest, "intent_digest")
+        digest(self.operation_key, "operation_key")
+        if type(self.verdict) is not PolicyVerdict:
+            raise TypeError("verdict must be a PolicyVerdict")
+        if self.deny_reason is not None and type(self.deny_reason) is not PolicyDenyReason:
+            raise TypeError("deny_reason must be a PolicyDenyReason")
+        if (self.verdict is PolicyVerdict.DENY) != (self.deny_reason is not None):
+            raise ValueError("a deny reason exists exactly for DENY")
+        _event(self.policy_event_id, self.policy_sequence, "policy")
+
+    @property
+    def denied_state(self) -> LedgerState | None:
+        """The terminal ledger state of a DENY; None for ALLOW."""
+        if self.verdict is PolicyVerdict.ALLOW:
+            return None
+        if self.direction is Direction.FORWARD:
+            return LedgerState.POLICY_DENIED
+        return LedgerState.INVERSE_POLICY_DENIED
+
+    def canonical_value(self) -> dict[str, object]:
+        return {
+            "deny_reason": None if self.deny_reason is None else self.deny_reason.value,
+            "direction": self.direction.value,
+            "intent_digest": self.intent_digest,
+            "intent_id": self.intent_id,
+            "operation_key": self.operation_key,
+            "policy_event_id": self.policy_event_id,
+            "policy_sequence": self.policy_sequence,
+            "schema_version": SCHEMA_VERSION,
+            "verdict": self.verdict.value,
+        }
+
+    def canonical_bytes(self) -> bytes:
+        return canonical_json(self.canonical_value())
+
+    @property
+    def verdict_digest(self) -> str:
+        return checksum(_POLICY_DOMAIN, self.canonical_value())
+
+    @classmethod
+    def from_json(cls, payload: bytes) -> Self:
+        row = _parse(payload, MAX_RECORD_BYTES, _POLICY_BODY, "policy verdict")
+        reason = row["deny_reason"]
+        value = cls(
+            direction=parse_enum(row["direction"], Direction, "direction"),
+            intent_id=_str(row["intent_id"]),
+            intent_digest=_str(row["intent_digest"]),
+            operation_key=_str(row["operation_key"]),
+            verdict=parse_enum(row["verdict"], PolicyVerdict, "verdict"),
+            deny_reason=None
+            if reason is None
+            else parse_enum(reason, PolicyDenyReason, "deny_reason"),
+            policy_event_id=_str(row["policy_event_id"]),
+            policy_sequence=_int(row["policy_sequence"]),
+        )
+        if value.canonical_bytes() != payload:
+            raise ValueError("policy verdict bytes are not canonical")
+        return value
+
+
+def _require_allow(
+    policy: PolicyVerdictV1,
+    direction: Direction,
+    intent_id: str,
+    intent_digest: str,
+    key: str,
+) -> None:
+    """#368 producer order: a challenge only follows this intent's ALLOW."""
+    if type(policy) is not PolicyVerdictV1:
+        raise TypeError("policy must be a PolicyVerdictV1")
+    if policy.verdict is not PolicyVerdict.ALLOW:
+        raise ValueError("a denied intent gets no challenge")
+    if (policy.direction, policy.intent_id, policy.intent_digest, policy.operation_key) != (
+        direction,
+        intent_id,
+        intent_digest,
+        key,
+    ):
+        raise ValueError("the policy verdict is for another intent")
+
+
 # --------------------------------------------------------------- challenge
 
 _CHALLENGE_BODY: Final = (
@@ -758,8 +904,7 @@ class ApprovalChallengeV1:
         digest(self.nonce, "nonce")
         if type(self.direction) is not Direction:
             raise TypeError("direction must be a Direction")
-        prefix = INTENT_ID_PREFIX if self.direction is Direction.FORWARD else INVERSE_INTENT_ID_PREFIX
-        _prefixed(self.intent_id, prefix, "intent_id")
+        _prefixed(self.intent_id, _intent_prefix(self.direction), "intent_id")
         digest(self.intent_digest, "intent_digest")
         if self.direction is Direction.FORWARD:
             digest(self.expectation_digest, "expectation_digest")
@@ -780,12 +925,16 @@ class ApprovalChallengeV1:
         cls,
         intent: ActionIntentV1,
         expectation_digest: str,
+        policy: PolicyVerdictV1,
         *,
         nonce: str,
         issued_utc: str,
         expires_utc: str,
         boot_id: str,
     ) -> Self:
+        if type(intent) is not ActionIntentV1:
+            raise TypeError("intent must be an ActionIntentV1")
+        _require_allow(policy, Direction.FORWARD, intent.intent_id, intent.intent_digest, intent.forward_key)
         return cls(
             nonce,
             Direction.FORWARD,
@@ -805,12 +954,16 @@ class ApprovalChallengeV1:
     def for_inverse(
         cls,
         intent: InverseIntentV1,
+        policy: PolicyVerdictV1,
         *,
         nonce: str,
         issued_utc: str,
         expires_utc: str,
         boot_id: str,
     ) -> Self:
+        if type(intent) is not InverseIntentV1:
+            raise TypeError("intent must be an InverseIntentV1")
+        _require_allow(policy, Direction.INVERSE, intent.intent_id, intent.intent_digest, intent.inverse_key)
         return cls(
             nonce,
             Direction.INVERSE,
@@ -861,7 +1014,9 @@ class ApprovalChallengeV1:
     def is_live(self, now_utc: str, boot_id: str) -> bool:
         return (
             canonical_uuid(boot_id, "boot_id") == self.boot_id
-            and _utc(now_utc, "now_utc") < _utc(self.expires_utc, "expires_utc")
+            and _utc(self.issued_utc, "issued_utc")
+            <= _utc(now_utc, "now_utc")
+            < _utc(self.expires_utc, "expires_utc")
         )
 
     @classmethod
@@ -928,8 +1083,7 @@ class ExecutionClaimV1:
     def __post_init__(self) -> None:
         if type(self.direction) is not Direction:
             raise TypeError("direction must be a Direction")
-        prefix = INTENT_ID_PREFIX if self.direction is Direction.FORWARD else INVERSE_INTENT_ID_PREFIX
-        _prefixed(self.intent_id, prefix, "intent_id")
+        _prefixed(self.intent_id, _intent_prefix(self.direction), "intent_id")
         digest(self.intent_digest, "intent_digest")
         digest(self.operation_key, "operation_key")
         digest(self.challenge_digest, "challenge_digest")
@@ -1017,6 +1171,133 @@ class ExecutionClaimV1:
         )
         if value.canonical_bytes() != payload:
             raise ValueError("claim bytes are not canonical")
+        return value
+
+
+# ------------------------------------------------------------------ receipt
+
+
+class ExecutorResult(str, Enum):
+    """What the executor reports about its one CAS attempt."""
+
+    APPLIED = "APPLIED"
+    # The startup sweep fenced the operation key first: not executed.
+    FENCED = "FENCED"
+    # Expected revision or runtime_instance_id did not match: not executed
+    # (#380 D2 addendum 2; a definite result, not IN_DOUBT).
+    CAS_REJECTED = "CAS_REJECTED"
+
+
+_RECEIPT_BODY: Final = (
+    "claim_digest",
+    "claim_id",
+    "direction",
+    "executor_result",
+    "operation_key",
+    "reported_payload_digest",
+    "reported_revision",
+    "runtime_instance_id",
+    "schema_version",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionReceiptV1:
+    """The executor's own report after a Claim (#368 ``effect_receipts``).
+
+    It is an observation of the executor, never proof of an effect: the
+    verifier reads the target itself and never uses this as its basis (#380
+    §2-5). A missing receipt after a Claim is IN_DOUBT, not a failure.
+    """
+
+    claim_id: str
+    claim_digest: str
+    direction: Direction
+    operation_key: str
+    runtime_instance_id: str
+    executor_result: ExecutorResult
+    reported_revision: int | None
+    reported_payload_digest: str | None
+
+    def __post_init__(self) -> None:
+        _prefixed(self.claim_id, CLAIM_ID_PREFIX, "claim_id")
+        digest(self.claim_digest, "claim_digest")
+        if type(self.direction) is not Direction:
+            raise TypeError("direction must be a Direction")
+        digest(self.operation_key, "operation_key")
+        canonical_uuid(self.runtime_instance_id, "runtime_instance_id")
+        if type(self.executor_result) is not ExecutorResult:
+            raise TypeError("executor_result must be an ExecutorResult")
+        applied = self.executor_result is ExecutorResult.APPLIED
+        if applied != (self.reported_revision is not None):
+            raise ValueError("a reported revision exists exactly for APPLIED")
+        if self.reported_revision is not None:
+            _revision(self.reported_revision, "reported_revision", minimum=1)
+        forward_applied = applied and self.direction is Direction.FORWARD
+        if forward_applied != (self.reported_payload_digest is not None):
+            raise ValueError("a reported payload digest exists exactly for an applied forward")
+        if self.reported_payload_digest is not None:
+            digest(self.reported_payload_digest, "reported_payload_digest")
+
+    @classmethod
+    def for_claim(
+        cls,
+        claim: ExecutionClaimV1,
+        executor_result: ExecutorResult,
+        *,
+        reported_revision: int | None,
+        reported_payload_digest: str | None,
+    ) -> Self:
+        if type(claim) is not ExecutionClaimV1:
+            raise TypeError("claim must be an ExecutionClaimV1")
+        return cls(
+            claim.claim_id,
+            claim.claim_digest,
+            claim.direction,
+            claim.operation_key,
+            claim.runtime_instance_id,
+            executor_result,
+            reported_revision,
+            reported_payload_digest,
+        )
+
+    def canonical_value(self) -> dict[str, object]:
+        return {
+            "claim_digest": self.claim_digest,
+            "claim_id": self.claim_id,
+            "direction": self.direction.value,
+            "executor_result": self.executor_result.value,
+            "operation_key": self.operation_key,
+            "reported_payload_digest": self.reported_payload_digest,
+            "reported_revision": self.reported_revision,
+            "runtime_instance_id": self.runtime_instance_id,
+            "schema_version": SCHEMA_VERSION,
+        }
+
+    def canonical_bytes(self) -> bytes:
+        return canonical_json(self.canonical_value())
+
+    @property
+    def receipt_digest(self) -> str:
+        return checksum(_RECEIPT_DOMAIN, self.canonical_value())
+
+    @classmethod
+    def from_json(cls, payload: bytes) -> Self:
+        row = _parse(payload, MAX_RECORD_BYTES, _RECEIPT_BODY, "execution receipt")
+        revision = row["reported_revision"]
+        reported = row["reported_payload_digest"]
+        value = cls(
+            claim_id=_str(row["claim_id"]),
+            claim_digest=_str(row["claim_digest"]),
+            direction=parse_enum(row["direction"], Direction, "direction"),
+            operation_key=_str(row["operation_key"]),
+            runtime_instance_id=_str(row["runtime_instance_id"]),
+            executor_result=parse_enum(row["executor_result"], ExecutorResult, "executor_result"),
+            reported_revision=None if revision is None else _int(revision),
+            reported_payload_digest=None if reported is None else _str(reported),
+        )
+        if value.canonical_bytes() != payload:
+            raise ValueError("receipt bytes are not canonical")
         return value
 
 
@@ -1108,10 +1389,13 @@ class VerifiedOutcomeV1:
         ):
             raise ValueError("an observed effect is this operation's ACTIVE effect row")
         if (
-            self.outcome_state is VerifiedState.VERIFIED_ABSENT
+            self.outcome_state in (VerifiedState.VERIFIED_ABSENT, VerifiedState.REVERTED)
             and self.observed_state is not ObservedState.ABSENT
         ):
-            raise ValueError("VERIFIED_ABSENT observes ABSENT (FENCED, no effect row)")
+            raise ValueError("VERIFIED_ABSENT and REVERTED observe ABSENT")
+        if self.observed_state is ObservedState.UNKNOWN:
+            # An unreadable target stays IN_DOUBT; it is never a terminal Outcome.
+            raise ValueError("a terminal verified Outcome never observes UNKNOWN")
 
     def _body(self) -> dict[str, object]:
         return {
