@@ -156,17 +156,19 @@ V2_STATEMENTS: Final[tuple[str, ...]] = (
         "action_intents",
         f"""    {_DIRECTION}
     obligation_group_key TEXT NOT NULL CHECK {_hex("obligation_group_key")},
-    operation_key TEXT NOT NULL UNIQUE CHECK {_hex("operation_key")},
+    operation_key TEXT NOT NULL CHECK {_hex("operation_key")},
     forward_operation_key TEXT NOT NULL CHECK {_hex("forward_operation_key")},
     decision_id TEXT REFERENCES history_decisions (decision_id),
-    UNIQUE (obligation_group_key, direction),
+    UNIQUE (incarnation_id, operation_key),
+    UNIQUE (incarnation_id, obligation_group_key, direction),
     CHECK ((direction = 'FORWARD') = (decision_id IS NOT NULL)),
     CHECK (direction = 'INVERSE' OR forward_operation_key = operation_key),""",
     ),
     _record_table(
         "action_forecasts",
         f"""    action_intent_id TEXT NOT NULL UNIQUE REFERENCES action_intents (record_id),
-    forward_key TEXT NOT NULL UNIQUE CHECK {_hex("forward_key")},""",
+    forward_key TEXT NOT NULL CHECK {_hex("forward_key")},
+    UNIQUE (incarnation_id, forward_key),""",
     ),
     _record_table(
         "policy_verdicts",
@@ -278,7 +280,8 @@ WHEN {_gate(_K.R18_INTENT_ISSUE)}
     OR (NEW.direction = 'INVERSE' AND NOT (
         EXISTS (SELECT 1 FROM action_intents f
             WHERE f.obligation_group_key = NEW.obligation_group_key
-                AND f.direction = 'FORWARD' AND f.operation_key = NEW.forward_operation_key)
+                AND f.direction = 'FORWARD' AND f.operation_key = NEW.forward_operation_key
+                AND f.incarnation_id = NEW.incarnation_id)
         AND EXISTS (SELECT 1 FROM verified_outcomes v
             WHERE v.operation_key = NEW.forward_operation_key
                 AND v.outcome_state IN ('ACTIVE_VERIFIED_AUTHORIZED', 'UNAUTHORIZED_EFFECT'))

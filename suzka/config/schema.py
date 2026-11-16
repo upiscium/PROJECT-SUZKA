@@ -242,6 +242,10 @@ class R18Settings(StrictBaseModel):
     """
 
     enabled: StrictBool = False
+    # IP-16a (#411 D1 §3-5, Human decision §8-2): the fixed target and its
+    # obligation secret (``obligation.key`` in the same private directory).
+    # Only ``python -m suzka.r18.target_init`` creates them; startup never does.
+    target_path: Path = Path(".suzka/private/r18/target.sqlite3")
 
 
 class R19Settings(StrictBaseModel):

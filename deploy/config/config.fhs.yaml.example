@@ -115,6 +115,8 @@ subject_history:
 # Outbox (R19). Off in production until HP-6.
 r18:
   enabled: false
+  # Created only by `python -m suzka.r18.target_init` (IP-16a).
+  target_path: /var/lib/project-suzka/r18/target.sqlite3
 r19:
   enabled: false
 # IP-11 (#379): the subject's own Goal proposal from an INTEREST Motivation.

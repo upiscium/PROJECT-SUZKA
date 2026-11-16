@@ -572,9 +572,9 @@ def test_a_full_forward_chain_finalizes_every_record(tmp_path: Path) -> None:
             for name, value in row.columns:
                 assert stored[0][name] == value
     assert store.has_record_operations()
-    assert store.live_keys((f"operation:{chain.intent.forward_key}", f"claim:{chain.intent.forward_key}")) == {
-        f"operation:{chain.intent.forward_key}", f"claim:{chain.intent.forward_key}",
-    }
+    intent_key = f"operation:{INCARNATION}:{chain.intent.forward_key}"  # per incarnation (IP-16 §9)
+    claim_key = f"claim:{chain.intent.forward_key}"  # global
+    assert store.live_keys((intent_key, claim_key)) == {intent_key, claim_key}
 
 
 def test_the_envelope_round_trips_and_binds_its_event(tmp_path: Path) -> None:
@@ -601,19 +601,33 @@ def test_records_are_refused_while_r18_is_disabled(tmp_path: Path) -> None:
 
 
 def test_uniqueness_is_reserved_at_prepare_and_across_incarnations(tmp_path: Path) -> None:
-    """§2a: a second operation for the same key is refused at PREPARE, before
-    R07 could commit it, even from another incarnation."""
+    """§2a with IP-16 D1 §9 (#373 A1-5): a second Intent for the same key is
+    refused at PREPARE within one incarnation, but an unclaimed Intent of
+    another incarnation does not block; a Claim stays unique across
+    incarnations."""
 
     store = _v2_store(tmp_path)
     chain = Chain(_decision(store))
-    first = _steps(chain)[0]
+    steps = _steps(chain)
+    first = steps[0]
     _prepare(store, first)
     again = replace(first, event_id=_uuid("again"), processing_sequence=500, record=replace(chain.intent, admitting_event_id=_uuid("again"), admitting_sequence=500))
     with pytest.raises(HistoryStoreConflict):
         _prepare(store, again)
     other = replace(again, incarnation_id="2" * 64, record=replace(again.record, incarnation_id="2" * 64))
+    _prepare(store, other)  # another incarnation's Intent is not blocked
+    # Claims are global: the same operation key cannot be claimed twice.
+    claim = steps[4]
+    _prepare(store, claim)
+    other_claim = replace(
+        claim,
+        incarnation_id="2" * 64,
+        event_id=_uuid("other-claim"),
+        processing_sequence=700,
+        record=replace(chain.claim, claim_event_id=_uuid("other-claim"), claim_sequence=700),
+    )
     with pytest.raises(HistoryStoreConflict):
-        _prepare(store, other)
+        _prepare(store, other_claim)
 
 
 def test_abort_releases_the_reservation(tmp_path: Path) -> None:

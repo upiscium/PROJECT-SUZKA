@@ -43,6 +43,7 @@ PATH_FIELDS = (
     ("state_wal", "directory"),
     ("subject_history", "path"),
     ("chat_log", "path"),
+    ("r18", "target_path"),
 )
 
 

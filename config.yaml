@@ -136,6 +136,8 @@ subject_history:
 # Outbox (R19). Off in production until HP-6; write false explicitly.
 r18:
   enabled: false
+  # Created only by `python -m suzka.r18.target_init` (IP-16a).
+  target_path: .suzka/private/r18/target.sqlite3
 r19:
   enabled: false
 
