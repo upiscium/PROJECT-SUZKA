@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
@@ -43,7 +43,7 @@ async function send(text: string) {
   const user = vi.isFakeTimers()
     ? userEvent.setup({ advanceTimers: vi.advanceTimersByTime.bind(vi) })
     : userEvent.setup();
-  await user.type(screen.getByPlaceholderText("Send a message to PROJECT-SUZKA"), text);
+  await user.type(screen.getByPlaceholderText("Send a message to PROJECT-SUZKA (Ctrl+Enter to send)"), text);
   await user.click(screen.getByRole("button", { name: "Send" }));
   return user;
 }
@@ -66,6 +66,54 @@ describe("ChatClient", () => {
     expect(screen.queryByText(/retrieved memory/i)).not.toBeInTheDocument();
     // No driver: no review actions.
     expect(screen.queryByRole("button", { name: "Review this" })).not.toBeInTheDocument();
+  });
+
+  it("gives the draft back and marks the turn when a send fails", async () => {
+    fetchMock.mockResolvedValue({ ok: false, status: 500, statusText: "Server Error", text: async () => "boom" });
+    renderWithQuery();
+    await send("long message");
+
+    expect(await screen.findByText(/Not sent: 500 Server Error/)).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Send a message to PROJECT-SUZKA (Ctrl+Enter to send)")).toHaveValue("long message");
+  });
+
+  it("keeps plain Enter as a newline and ignores Ctrl+Enter while an IME is composing", async () => {
+    renderWithQuery();
+    const box = screen.getByPlaceholderText("Send a message to PROJECT-SUZKA (Ctrl+Enter to send)");
+    await userEvent.type(box, "line one{Enter}line two");
+    expect(box).toHaveValue("line one\nline two");
+    fireEvent.keyDown(box, { key: "Enter", ctrlKey: true, isComposing: true });
+    // A send would have cleared the composer and, a microtask later, called fetch.
+    expect(box).toHaveValue("line one\nline two");
+    await act(async () => {});
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not clear a draft when a review button sends a command", async () => {
+    fetchMock.mockResolvedValue(chatResponse({ experience_id: EXPERIENCE, incarnation: "inc-1" }));
+    renderWithQuery();
+    const user = await send("hello");
+    const box = screen.getByPlaceholderText("Send a message to PROJECT-SUZKA (Ctrl+Enter to send)");
+    await user.type(box, "half-written");
+    await user.click(await screen.findByRole("button", { name: "Review this" }));
+    await waitFor(() => expect(sentBodies()).toContain(`REVIEW_EXPERIENCE:${EXPERIENCE}`));
+    expect(box).toHaveValue("half-written");
+  });
+
+  it("shows the user's turn and a spinner while waiting, and sends with Ctrl+Enter", async () => {
+    let resolve: (value: unknown) => void = () => {};
+    fetchMock.mockReturnValue(new Promise((r) => { resolve = r; }));
+    renderWithQuery();
+    const box = screen.getByPlaceholderText("Send a message to PROJECT-SUZKA (Ctrl+Enter to send)");
+    await userEvent.type(box, "hi there{Control>}{Enter}{/Control}");
+
+    expect(await screen.findByText("hi there")).toBeInTheDocument();
+    expect(box).toHaveValue("");
+    expect(screen.getByRole("status", { name: "SUZKA is responding" })).toBeInTheDocument();
+
+    await act(async () => resolve(chatResponse({ response: "Reply" })));
+    expect(await screen.findByText("Reply")).toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "SUZKA is responding" })).not.toBeInTheDocument();
   });
 
   it("builds the exact command text from a turn's experience", async () => {

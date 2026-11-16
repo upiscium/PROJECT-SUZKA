@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ApiError, api, type ChatResponse, type CommandKind, type CommandStatus } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardTitle } from "@/components/ui/card";
@@ -10,7 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { EmotionMeter } from "@/components/emotion-meter";
 
 type ChatTurn =
-  | { role: "user" | "assistant"; content: string; result?: ChatResponse }
+  | { role: "user" | "assistant"; content: string; result?: ChatResponse; turnId?: number; failed?: string }
   | { role: "system"; ticketId: string; kind: CommandKind; status: string };
 
 // #370 D1 2-4: poll from 1 s, doubling, for at most 60 s in total.
@@ -46,19 +46,42 @@ export function reviewCommand(kind: CommandKind, experienceId: string): string {
 export function ChatClient() {
   const [message, setMessage] = useState("");
   const [history, setHistory] = useState<ChatTurn[]>([]);
+  // The composer text that was just sent, so a failed send can put it back.
+  const sentDraft = useRef<string | null>(null);
+  const nextTurnId = useRef(0);
   const mutation = useMutation({
     mutationFn: api.chat,
-    onSuccess: (result, variables) => {
+    // The user's turn shows as soon as it is sent; the reply follows it.
+    onMutate: (variables) => {
+      const turnId = ++nextTurnId.current;
+      setHistory((current) => [...current, { role: "user", content: variables.message, turnId }]);
+      return { turnId };
+    },
+    onError: (error, variables, context) => {
+      // Mark the turn that did not get through, and give the draft back.
+      if (context) {
+        setHistory((current) =>
+          current.map((turn) =>
+            "turnId" in turn && turn.turnId === context.turnId ? { ...turn, failed: error.message } : turn,
+          ),
+        );
+      }
+      if (sentDraft.current === variables.message) {
+        setMessage((draft) => draft || variables.message);
+      }
+    },
+    onSettled: () => {
+      sentDraft.current = null;
+    },
+    onSuccess: (result) => {
       const ticket = result.command_ticket;
       setHistory((current) => [
         ...current,
-        { role: "user", content: variables.message },
         { role: "assistant", content: result.response, result },
         ...(ticket
           ? [{ role: "system" as const, ticketId: ticket.ticket_id, kind: ticket.kind, status: ticket.status }]
           : []),
       ]);
-      setMessage("");
     },
   });
 
@@ -70,6 +93,12 @@ export function ChatClient() {
   const incarnation = latest?.incarnation ?? null;
 
   const send = (text: string) => mutation.mutate({ message: text, attachments: [], debug: false });
+  const submitDraft = () => {
+    if (!message.trim() || mutation.isPending) return;
+    sentDraft.current = message;
+    send(message);
+    setMessage("");
+  };
 
   return (
     <div className="page">
@@ -103,6 +132,7 @@ export function ChatClient() {
             <div key={`${turn.role}-${index}`} className={`chat-bubble ${turn.role}`}>
               <strong>{turn.role === "user" ? "You" : "SUZKA"}</strong>
               <p>{turn.content}</p>
+              {turn.failed ? <span className="error">Not sent: {turn.failed}</span> : null}
               {turn.role === "assistant" && turn.result ? (
                 <ReviewActions
                   result={turn.result}
@@ -114,16 +144,35 @@ export function ChatClient() {
             </div>
           ),
         )}
+        {mutation.isPending ? (
+          <div className="chat-bubble assistant pending" role="status" aria-label="SUZKA is responding">
+            <strong>SUZKA</strong>
+            <span className="spinner" aria-hidden="true" />
+            <span className="sr-only">SUZKA is responding…</span>
+          </div>
+        ) : null}
       </Card>
 
       <form
         className="composer"
         onSubmit={(event) => {
           event.preventDefault();
-          if (message.trim()) send(message);
+          submitDraft();
         }}
       >
-        <Textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="Send a message to PROJECT-SUZKA" />
+        <Textarea
+          value={message}
+          onChange={(event) => setMessage(event.target.value)}
+          onKeyDown={(event) => {
+            // Ignore Enter while an IME is still composing (e.g. Japanese conversion).
+            if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+            if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+              event.preventDefault();
+              submitDraft();
+            }
+          }}
+          placeholder="Send a message to PROJECT-SUZKA (Ctrl+Enter to send)"
+        />
         <Button disabled={mutation.isPending || !message.trim()} type="submit">{mutation.isPending ? "Sending" : "Send"}</Button>
       </form>
 
