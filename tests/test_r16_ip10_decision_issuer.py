@@ -103,7 +103,7 @@ def test_initial_decision_is_committed_and_adopted(app) -> None:
         assert issued.row is SuccessorRow.ROW_3
         committed = issued.decision
         assert committed is not None
-        assert committed.policy_kind is PolicyKind.SUCCESSOR_POLICY_V2
+        assert committed.policy_kind is PolicyKind.SUCCESSOR_POLICY_V3  # IP-14a-3
         assert committed.policy_row is PolicyRow.ROW_3
         assert committed.predecessor_key == GENESIS
         selected = {c.candidate_id: c for c in committed.decision.candidates}[

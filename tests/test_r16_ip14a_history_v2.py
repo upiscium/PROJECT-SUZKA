@@ -839,13 +839,15 @@ def test_settings_default_off() -> None:
 # ------------------------------------------- end to end on the real server
 
 
-def test_a_real_v1_store_migrates_and_keeps_its_head(tmp_path: Path) -> None:
-    """§5 acceptance: a v1 store with an adopted, issued Decision stops
-    startup until migrated; afterwards the same head is adopted and the
-    issuer returns the existing Decision."""
+def test_a_real_v1_store_migrates_and_keeps_its_head(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """§5 acceptance, on the production path: a v1 store whose Decision was
+    sealed in V2 (before IP-14a-3) stops startup until migrated; afterwards
+    the same head is adopted and the V3 issuer returns the existing
+    Decision (D1 r3 §8 (a))."""
 
     from fastapi.testclient import TestClient
 
+    from suzka.r16 import decision_issuer as issuer_module
     from suzka.r16.decision_issuer import DecisionIssueStatus
     from suzka.r16.history_reader import HeadStatus
 
@@ -854,13 +856,16 @@ def test_a_real_v1_store_migrates_and_keeps_its_head(tmp_path: Path) -> None:
 
     root = tmp_path / "e2e"
     settings = _settings(root)
+    monkeypatch.setattr(issuer_module, "POLICY_KIND", PolicyKind.SUCCESSOR_POLICY_V2)
     with TestClient(_app(settings)) as client:
         state = client.app.state
         _x, gid = _qualified_goal(state)
         issued = _issue(state, gid)
         assert issued.status is DecisionIssueStatus.ISSUED
         committed = issued.decision
+        assert committed.policy_kind is PolicyKind.SUCCESSOR_POLICY_V2
         before = _reader_head(state, issued)
+    monkeypatch.setattr(issuer_module, "POLICY_KIND", PolicyKind.SUCCESSOR_POLICY_V3)
     path = settings.subject_history.path
     _downgrade_to_v1(path)
     with pytest.raises(Exception, match="history_migration"):
