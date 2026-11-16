@@ -14,12 +14,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import os
 import sqlite3
 import threading
 import uuid
 
 
 TITLE_MAX_CHARS = 60
+SCHEMA_VERSION = 1
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS chat_sessions (
     session_id TEXT PRIMARY KEY,
@@ -41,6 +43,10 @@ CREATE INDEX IF NOT EXISTS chat_turns_by_session ON chat_turns(session_id, turn_
 
 class ChatSessionNotFound(LookupError):
     """The requested Chat session does not exist."""
+
+
+class ChatLogUnavailable(RuntimeError):
+    """The transcript store cannot be opened or used."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,9 +71,20 @@ class ChatLogStore:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self._lock = threading.Lock()
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with self._connect() as connection:
-            connection.executescript(_SCHEMA)
+        try:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(self.path.parent, 0o700)
+            # Create the file owner-only before SQLite opens it.
+            os.close(os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600))
+            os.chmod(self.path, 0o600)
+            with self._connect() as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if version not in (0, SCHEMA_VERSION):
+                    raise ChatLogUnavailable(f"unknown chat log schema version {version}")
+                connection.executescript(_SCHEMA)
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        except (OSError, sqlite3.Error) as error:
+            raise ChatLogUnavailable(str(error)) from error
 
     def create_session(self, title: str = "") -> ChatSession:
         now = _now()
@@ -99,8 +116,11 @@ class ChatLogStore:
         return ChatSession(*row)
 
     def turns(self, session_id: str) -> list[ChatLogTurn]:
-        self.get_session(session_id)
         with self._connect() as connection:
+            if connection.execute(
+                "SELECT 1 FROM chat_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone() is None:
+                raise ChatSessionNotFound(session_id)
             rows = connection.execute(
                 "SELECT role, content, episode_id, created_at FROM chat_turns "
                 "WHERE session_id = ? ORDER BY turn_id",
@@ -154,11 +174,16 @@ class ChatLogStore:
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
-            connection = sqlite3.connect(self.path, timeout=5)
+            try:
+                connection = sqlite3.connect(self.path, timeout=5)
+            except sqlite3.Error as error:
+                raise ChatLogUnavailable(str(error)) from error
             try:
                 connection.execute("PRAGMA foreign_keys = ON")
                 with connection:
                     yield connection
+            except sqlite3.Error as error:
+                raise ChatLogUnavailable(str(error)) from error
             finally:
                 connection.close()
 

@@ -83,8 +83,11 @@ def get_agent_runtime(request: Request) -> AgentRuntime:
 _CHAT_LOG_LOCK = Lock()
 
 
-def get_chat_log(request: Request) -> ChatLogStore:
-    """The display-only Chat transcript store, opened on first use."""
+def open_chat_log(request: Request) -> ChatLogStore:
+    """The display-only Chat transcript store, opened on first use.
+
+    Raises ChatLogUnavailable; a failed open is retried on the next call.
+    """
 
     store = getattr(request.app.state, "chat_log", None)
     if store is None:
@@ -94,3 +97,9 @@ def get_chat_log(request: Request) -> ChatLogStore:
                 store = ChatLogStore(get_api_settings(request).chat_log.path)
                 request.app.state.chat_log = store
     return store
+
+
+def get_chat_log(request: Request) -> ChatLogStore:
+    """Dependency for the session routes; ChatLogUnavailable becomes a 503."""
+
+    return open_chat_log(request)

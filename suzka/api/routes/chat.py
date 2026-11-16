@@ -5,7 +5,12 @@ from typing import cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from suzka.api.dependencies import get_agent_runtime, get_chat_log, get_main_loop
+from suzka.api.dependencies import (
+    get_agent_runtime,
+    get_chat_log,
+    get_main_loop,
+    open_chat_log,
+)
 from suzka.api.runtime_execution import execute_with_event
 from suzka.api.schemas.chat import (
     ChatLogTurnSchema,
@@ -21,7 +26,7 @@ from suzka.api.schemas.chat import (
     EmotionSchema,
     ModelSchema,
 )
-from suzka.chat_log import ChatLogStore, ChatSession, ChatSessionNotFound
+from suzka.chat_log import ChatLogStore, ChatLogUnavailable, ChatSession, ChatSessionNotFound
 from suzka.r16.driver import R16Driver
 from suzka.runtime import (
     AgentEventSource,
@@ -43,12 +48,19 @@ def chat(
     http: Request,
     main_loop: SuzkaMainLoop = Depends(get_main_loop),
     runtime: AgentRuntime = Depends(get_agent_runtime),
-    chat_log: ChatLogStore = Depends(get_chat_log),
 ) -> ChatResponse:
     reject_unsupported_attachments(request)
+    # The transcript is opened only for a request that names a session, and
+    # an unusable store never blocks the turn (it is display-only).
+    chat_log: ChatLogStore | None = None
     if request.chat_session_id is not None:
-        # An unknown session fails before the turn is admitted.
-        _require_session(chat_log, request.chat_session_id)
+        try:
+            chat_log = open_chat_log(http)
+            # An unknown session fails before the turn is admitted.
+            _require_session(chat_log, request.chat_session_id)
+        except ChatLogUnavailable:
+            logger.warning("chat transcript unavailable; the turn runs unsaved", exc_info=True)
+            chat_log = None
     selectors = ChatContextSelectors(
         context_id=request.context_id,
         client_session_id=request.client_session_id,
@@ -65,9 +77,8 @@ def chat(
     if request.chat_session_id is not None:
         response = response.model_copy(
             update={
-                "transcript_saved": _save_exchange(
-                    chat_log, request.chat_session_id, request.message, result
-                )
+                "transcript_saved": chat_log is not None
+                and _save_exchange(chat_log, request.chat_session_id, request.message, result)
             }
         )
     driver = _driver(http)

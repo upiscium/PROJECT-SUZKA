@@ -19,7 +19,7 @@ import { Badge } from "@/components/ui/badge";
 import { EmotionMeter } from "@/components/emotion-meter";
 
 type ChatTurn =
-  | { role: "user" | "assistant"; content: string; result?: ChatResponse }
+  | { role: "user" | "assistant"; content: string; result?: ChatResponse; turnId?: number; failed?: string }
   | { role: "system"; ticketId: string; kind: CommandKind; status: string };
 
 // #370 D1 2-4: poll from 1 s, doubling, for at most 60 s in total.
@@ -80,6 +80,9 @@ export function reviewCommand(kind: CommandKind, experienceId: string): string {
 export function ChatClient() {
   const [message, setMessage] = useState("");
   const [history, setHistory] = useState<ChatTurn[]>([]);
+  // The composer text that was just sent, so a failed send can put it back.
+  const sentDraft = useRef<string | null>(null);
+  const nextTurnId = useRef(0);
   const [sessionId, setSessionId] = useState<string | null>(null);
   // The mutation reads the session through a ref so review buttons on an
   // already-rendered turn still post to the current session.
@@ -94,13 +97,20 @@ export function ChatClient() {
     storeSession(id);
   };
 
+  // Bumped by every load and every send: a load whose token is no longer
+  // current (a later click, or a message sent meanwhile) is dropped.
+  const loadToken = useRef(0);
+
   const openSession = async (id: string) => {
+    const token = ++loadToken.current;
     setLoadError(null);
     try {
       const detail = await api.chatSession(id);
+      if (token !== loadToken.current) return;
       selectSession(id);
       setHistory(turnsFromLog(detail.turns));
     } catch (error) {
+      if (token !== loadToken.current) return;
       if (error instanceof ApiError && error.status === 404) {
         if (storedSession() === id) storeSession(null);
         setLoadError("That chat no longer exists.");
@@ -117,6 +127,7 @@ export function ChatClient() {
   }, []);
 
   const startNewChat = () => {
+    loadToken.current += 1;
     selectSession(null);
     setHistory([]);
     setLoadError(null);
@@ -156,12 +167,29 @@ export function ChatClient() {
       const result = await api.chat(id ? { ...body, chat_session_id: id } : body);
       return unsaved ? { ...result, transcript_saved: false } : result;
     },
-    onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: ["chat-sessions"] });
-    },
     // The user's turn shows as soon as it is sent; the reply follows it.
     onMutate: (variables) => {
-      setHistory((current) => [...current, { role: "user", content: variables.message }]);
+      loadToken.current += 1;
+      const turnId = ++nextTurnId.current;
+      setHistory((current) => [...current, { role: "user", content: variables.message, turnId }]);
+      return { turnId };
+    },
+    onError: (error, variables, context) => {
+      // Mark the turn that did not get through, and give the draft back.
+      if (context) {
+        setHistory((current) =>
+          current.map((turn) =>
+            "turnId" in turn && turn.turnId === context.turnId ? { ...turn, failed: error.message } : turn,
+          ),
+        );
+      }
+      if (sentDraft.current === variables.message) {
+        setMessage((draft) => draft || variables.message);
+      }
+    },
+    onSettled: () => {
+      sentDraft.current = null;
+      void queryClient.invalidateQueries({ queryKey: ["chat-sessions"] });
     },
     onSuccess: (result) => {
       const ticket = result.command_ticket;
@@ -185,6 +213,7 @@ export function ChatClient() {
   const send = (text: string) => mutation.mutate({ message: text, attachments: [], debug: false });
   const submitDraft = () => {
     if (!message.trim() || mutation.isPending) return;
+    sentDraft.current = message;
     send(message);
     setMessage("");
   };
@@ -253,6 +282,7 @@ export function ChatClient() {
             <div key={`${turn.role}-${index}`} className={`chat-bubble ${turn.role}`}>
               <strong>{turn.role === "user" ? "You" : "SUZKA"}</strong>
               <p>{turn.content}</p>
+              {turn.failed ? <span className="error">Not sent: {turn.failed}</span> : null}
               {turn.role === "assistant" && turn.result?.transcript_saved === false ? (
                 <span className="muted">This turn was not saved to the chat history.</span>
               ) : null}
@@ -271,6 +301,7 @@ export function ChatClient() {
           <div className="chat-bubble assistant pending" role="status" aria-label="SUZKA is responding">
             <strong>SUZKA</strong>
             <span className="spinner" aria-hidden="true" />
+            <span className="sr-only">SUZKA is responding…</span>
           </div>
         ) : null}
       </Card>
@@ -286,6 +317,8 @@ export function ChatClient() {
           value={message}
           onChange={(event) => setMessage(event.target.value)}
           onKeyDown={(event) => {
+            // Ignore Enter while an IME is still composing (e.g. Japanese conversion).
+            if (event.nativeEvent.isComposing || event.keyCode === 229) return;
             if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
               event.preventDefault();
               submitDraft();

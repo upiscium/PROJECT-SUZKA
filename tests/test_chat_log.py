@@ -1,8 +1,9 @@
 from pathlib import Path
+import sqlite3
 
 import pytest
 
-from suzka.chat_log import TITLE_MAX_CHARS, ChatLogStore, ChatSessionNotFound
+from suzka.chat_log import TITLE_MAX_CHARS, ChatLogStore, ChatLogUnavailable, ChatSessionNotFound
 
 from test_fastapi_backend import _client, _settings
 
@@ -110,3 +111,47 @@ def test_unknown_session_is_rejected_before_the_turn_runs(tmp_path: Path) -> Non
         )
         assert reply.status_code == 404
         assert len(journal.records) == before
+
+
+def test_store_files_are_owner_only_and_unknown_schema_versions_are_refused(tmp_path: Path) -> None:
+    path = tmp_path / "private" / "log.sqlite3"
+    ChatLogStore(path)
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert path.parent.stat().st_mode & 0o777 == 0o700
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA user_version = 99")
+    connection.commit()
+    connection.close()
+    with pytest.raises(ChatLogUnavailable):
+        ChatLogStore(path)
+
+
+def _unwritable_chat_log_settings(tmp_path: Path):  # type: ignore[no-untyped-def]
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("x")
+    settings = _settings(tmp_path)
+    return settings.model_copy(
+        update={
+            "chat_log": settings.chat_log.model_copy(
+                update={"path": blocker / "chat_log.sqlite3"}
+            )
+        }
+    )
+
+
+def test_an_unusable_store_never_blocks_a_chat_turn(tmp_path: Path) -> None:
+    with _client(tmp_path, settings=_unwritable_chat_log_settings(tmp_path)) as client:
+        plain = client.post("/api/chat", json={"message": "plain", "attachments": []})
+        assert plain.status_code == 200
+        assert plain.json()["transcript_saved"] is None
+
+        named = client.post(
+            "/api/chat",
+            json={"message": "named", "attachments": [], "chat_session_id": "some-session"},
+        )
+        assert named.status_code == 200
+        assert named.json()["transcript_saved"] is False
+
+        assert client.get("/api/chat/sessions").status_code == 503
+        assert client.post("/api/chat/sessions", json={}).status_code == 503

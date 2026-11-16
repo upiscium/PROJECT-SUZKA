@@ -98,6 +98,11 @@ event_journal:
 state_wal:
   directory: .suzka/private/state_wal
 
+chat_log:
+  # Display-only Chat transcript for the Chat screen's sessions (#416). Never
+  # read by the runtime, prompts, memory or learning.
+  path: .suzka/private/chat_log/chat_log.sqlite3
+
 # IP-9 (#376): the subject.history R07 participant. Enabling it adopts a
 # five-participant baseline at the next clean startup; adoption is one-way.
 subject_history:
