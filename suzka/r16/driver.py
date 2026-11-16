@@ -55,6 +55,7 @@ from threading import Event, Lock, Thread, current_thread
 import time
 from typing import TYPE_CHECKING, Any
 
+from suzka.r16.commands import R16CommandKind as R16CommandKind, parse_command
 from suzka.r16.commitment_owner import _CommitmentSourceSelection
 from suzka.r16.decision_issuer import _DecisionIssueResult
 from suzka.r16.goal_owner import _GoalSourceSelection, _SelfGoalSelection
@@ -86,15 +87,7 @@ IDLE_POLL_SECONDS = 0.2
 IDLE_WAIT_LIMIT_SECONDS = 30.0
 RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
 
-_EXPERIENCE = r"experience-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-_REVIEW = re.compile(rf"REVIEW_EXPERIENCE:(?P<target>{_EXPERIENCE})")
-_COMMIT = re.compile(rf"COMMIT_REVIEW_EXPERIENCE:1:(?P<target>{_EXPERIENCE})")
 _TICKET = re.compile(r"(?P<incarnation>[0-9a-f]{16})\.(?P<token>[A-Za-z0-9_-]{22})")
-
-
-class R16CommandKind(str, Enum):
-    REVIEW_EXPERIENCE = "REVIEW_EXPERIENCE"
-    COMMIT_REVIEW_EXPERIENCE = "COMMIT_REVIEW_EXPERIENCE"
 
 
 class R16TicketStatus(str, Enum):
@@ -226,20 +219,6 @@ class _Rescan:
 
 
 _STOP = object()
-
-
-def parse_command(message: str) -> tuple[R16CommandKind, str] | None:
-    """The command a CHAT text is, by exact fullmatch only (#370 D0 §2)."""
-
-    if type(message) is not str:
-        return None
-    match = _REVIEW.fullmatch(message)
-    if match is not None:
-        return R16CommandKind.REVIEW_EXPERIENCE, match.group("target")
-    match = _COMMIT.fullmatch(message)
-    if match is not None:
-        return R16CommandKind.COMMIT_REVIEW_EXPERIENCE, match.group("target")
-    return None
 
 
 def _digest(value: str) -> str:

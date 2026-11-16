@@ -98,6 +98,21 @@ event_journal:
 state_wal:
   directory: .suzka/private/state_wal
 
+conversation_trace:
+  # #417: the subject's short-term trace of recent Chat turns. Enabling it
+  # moves AgentState to V11 one way; disabling it again later freezes the
+  # trace. Back up .suzka/ before enabling.
+  enabled: false
+  base_stability_hours: 1.0
+  surprise_gain: 2.0
+  recall_gain: 0.5
+  double_recall_gain: 2.0
+  max_stability_hours: 168.0
+  forget_below: 0.2
+  verbatim_above: 0.5
+  max_items_per_context: 20
+  max_rendered_bytes: 4096
+
 chat_log:
   # Display-only Chat transcript for the Chat screen's sessions (#416). Never
   # read by the runtime, prompts, memory or learning.
