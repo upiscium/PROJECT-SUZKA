@@ -332,6 +332,9 @@ def test_action_intent_refuses_self_origin_and_non_row_4() -> None:
                 _intent(policy_row=row)
     with pytest.raises(TypeError):
         _intent(goal_origin="USER_REQUEST")
+    with pytest.raises(ValueError, match="V2 or V3"):
+        _intent(policy_kind=PolicyKind.SUCCESSOR_POLICY_V1)
+    _intent(policy_kind=PolicyKind.SUCCESSOR_POLICY_V3)
 
 
 def test_action_intent_artifact_must_name_this_decision() -> None:
@@ -617,6 +620,19 @@ def test_outcome_observation_must_fit_the_state() -> None:
     for state in VerifiedState:
         with pytest.raises(ValueError):
             _outcome(state, observed_state=ObservedState.UNKNOWN, observed_payload_digest=None)
+    # An unapplied inverse leaves the forward row: never ABSENT (that is
+    # REVERTED) and never the inverse's own key.
+    with pytest.raises(ValueError, match="forward effect ACTIVE"):
+        _outcome(
+            VerifiedState.INVERSE_VERIFIED_ABSENT,
+            observed_state=ObservedState.ABSENT,
+            observed_payload_digest=None,
+            effect_operation_key=None,
+        )
+    with pytest.raises(ValueError, match="forward effect ACTIVE"):
+        _outcome(VerifiedState.INVERSE_VERIFIED_ABSENT, effect_operation_key=operation_key(GROUP, Direction.INVERSE))
+    with pytest.raises(ValueError, match="forward effect ACTIVE"):
+        _outcome(VerifiedState.INVERSE_VERIFIED_ABSENT, effect_operation_key=None)
 
 
 def test_forward_outcome_becomes_the_r17_view() -> None:
@@ -672,8 +688,6 @@ def test_forward_and_inverse_paths_and_terminals() -> None:
     for current, new in zip(path, path[1:], strict=False):
         assert transition(current, new) is new
     terminals = {
-        LedgerState.POLICY_DENIED,
-        LedgerState.APPROVAL_EXPIRED_UNCLAIMED,
         LedgerState.VERIFIED_ABSENT,
         LedgerState.INVERSE_POLICY_DENIED,
         LedgerState.INVERSE_APPROVAL_EXPIRED_UNCLAIMED,
@@ -683,6 +697,13 @@ def test_forward_and_inverse_paths_and_terminals() -> None:
     }
     for state in terminals:
         assert allowed_transitions(state) == {LedgerState.CORRUPT}, state
+    # Unclaimed terminals are never reissued, but the sweep may still find
+    # a prior-incarnation effect of the same group (#380 D1 P1-2).
+    for state in (LedgerState.POLICY_DENIED, LedgerState.APPROVAL_EXPIRED_UNCLAIMED):
+        assert allowed_transitions(state) == {
+            LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT,
+            LedgerState.CORRUPT,
+        }
     # The inverse has its own closed set of states (#380 D1 P1-5).
     assert allowed_transitions(LedgerState.INVERSE_INTENT_ISSUED) == {
         LedgerState.INVERSE_POLICY_DENIED,
@@ -702,7 +723,11 @@ def test_forward_and_inverse_paths_and_terminals() -> None:
         (LedgerState.IN_DOUBT, LedgerState.CLAIMED),  # no blind retry
         (LedgerState.VERIFIED_ABSENT, LedgerState.INTENT_ISSUED),  # a FENCED key is never reissued
         (LedgerState.VERIFIED_ABSENT, LedgerState.INVERSE_INTENT_ISSUED),
-        (LedgerState.INTENT_ISSUED, LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT),
+        (LedgerState.CLAIMED, LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT),  # a Claim exists
+        (LedgerState.IN_DOUBT, LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT),
+        (LedgerState.VERIFIED_ABSENT, LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT),
+        (LedgerState.INVERSE_INTENT_ISSUED, LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT),
+        (LedgerState.POLICY_DENIED, LedgerState.INTENT_ISSUED),
         (LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT, LedgerState.INVERSE_INTENT_ISSUED),
         (LedgerState.REVERTED, LedgerState.INVERSE_INTENT_ISSUED),
         (LedgerState.CORRUPT, LedgerState.NONE),
@@ -711,6 +736,21 @@ def test_forward_and_inverse_paths_and_terminals() -> None:
 def test_forbidden_transitions_are_refused(current: LedgerState, new: LedgerState) -> None:
     with pytest.raises(ValueError, match="cannot move"):
         transition(current, new)
+
+
+def test_prior_incarnation_effect_is_reachable_from_every_unclaimed_state() -> None:
+    """A restored source with no Claim: NONE, an issued intent, or one denied
+    or expired before any Claim."""
+
+    for state in (
+        LedgerState.NONE,
+        LedgerState.INTENT_ISSUED,
+        LedgerState.POLICY_DENIED,
+        LedgerState.APPROVAL_EXPIRED_UNCLAIMED,
+    ):
+        assert transition(state, LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT) is (
+            LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT
+        )
 
 
 def test_verified_outcomes_land_only_on_reachable_states() -> None:

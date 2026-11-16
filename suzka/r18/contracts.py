@@ -128,6 +128,10 @@ class VerifiedState(str, Enum):
     INVERSE_VERIFIED_ABSENT = "INVERSE_VERIFIED_ABSENT"
 
 
+# A V1 Decision predates the R18 ledger states (#371 V2).
+_INTENT_POLICY_KINDS: Final = frozenset(
+    {PolicyKind.SUCCESSOR_POLICY_V2, PolicyKind.SUCCESSOR_POLICY_V3}
+)
 _GATE_ROLE: Final = {
     ReviewGate.COMMITMENT_ACTIVE_SAME_X: SourceRole.COMMITMENT,
     ReviewGate.CONTEXT_CURRENT: SourceRole.CONTEXT,
@@ -487,6 +491,8 @@ class ActionIntentV1:
         digest(self.decision_committed_digest, "decision_committed_digest")
         if type(self.policy_kind) is not PolicyKind:
             raise TypeError("policy_kind must be a PolicyKind")
+        if self.policy_kind not in _INTENT_POLICY_KINDS:
+            raise ValueError("an ActionIntent follows a SuccessorPolicy V2 or V3 Decision")
         if type(self.policy_row) is not PolicyRow or self.policy_row is not PolicyRow.ROW_4:
             raise ValueError("only a row 4 (Plan B) Decision yields a forward ActionIntent")
         identifier(self.selected_candidate_id, "selected_candidate_id")
@@ -885,6 +891,9 @@ class ApprovalChallengeV1:
     operation key, payload digest, expiry and boot. Consuming the nonce is
     once-only in SubjectHistory and happens in the same event as the Claim
     (IP-17). A restart (new boot) voids every earlier challenge.
+
+    Build new challenges with ``for_forward`` / ``for_inverse``, which
+    require this intent's ALLOW; the plain constructor is for decoding.
     """
 
     nonce: str
@@ -1066,6 +1075,9 @@ class ExecutionClaimV1:
 
     The executor checks the same ``runtime_instance_id`` in the target CAS
     transaction (#380 D2 P2-1 / addendum 1).
+
+    Build new claims with ``claim``, which refuses a stale challenge; the
+    plain constructor is for decoding.
     """
 
     direction: Direction
@@ -1393,6 +1405,13 @@ class VerifiedOutcomeV1:
             and self.observed_state is not ObservedState.ABSENT
         ):
             raise ValueError("VERIFIED_ABSENT and REVERTED observe ABSENT")
+        if self.outcome_state is VerifiedState.INVERSE_VERIFIED_ABSENT and (
+            self.observed_state is not ObservedState.ACTIVE
+            or self.effect_operation_key is None
+            or self.effect_operation_key == self.operation_key
+        ):
+            # The inverse did not apply, so the forward effect row remains.
+            raise ValueError("INVERSE_VERIFIED_ABSENT observes the forward effect ACTIVE")
         if self.observed_state is ObservedState.UNKNOWN:
             # An unreadable target stays IN_DOUBT; it is never a terminal Outcome.
             raise ValueError("a terminal verified Outcome never observes UNKNOWN")
@@ -1508,17 +1527,20 @@ _FORWARD_VERIFIED: Final = frozenset(
 _INVERSE_VERIFIED: Final = frozenset(
     {LedgerState.REVERTED, LedgerState.INVERSE_VERIFIED_ABSENT}
 )
+# The startup sweep finds a target effect with no source-side Claim (#380
+# D1 P1-2) when the restored source state is unclaimed: NONE, an issued
+# intent, or one that was denied or expired before any Claim.
+_PRIOR: Final = frozenset({LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT})
 _TRANSITIONS: Final[dict[LedgerState, frozenset[LedgerState]]] = {
-    LedgerState.NONE: frozenset(
-        {LedgerState.INTENT_ISSUED, LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT}
-    ),
+    LedgerState.NONE: frozenset({LedgerState.INTENT_ISSUED}) | _PRIOR,
     LedgerState.INTENT_ISSUED: frozenset(
         {
             LedgerState.POLICY_DENIED,
             LedgerState.APPROVAL_EXPIRED_UNCLAIMED,
             LedgerState.CLAIMED,
         }
-    ),
+    )
+    | _PRIOR,
     LedgerState.CLAIMED: frozenset({LedgerState.IN_DOUBT} | _FORWARD_VERIFIED),
     LedgerState.IN_DOUBT: _FORWARD_VERIFIED,
     LedgerState.ACTIVE_VERIFIED_AUTHORIZED: frozenset({LedgerState.INVERSE_INTENT_ISSUED}),
@@ -1532,9 +1554,11 @@ _TRANSITIONS: Final[dict[LedgerState, frozenset[LedgerState]]] = {
     ),
     LedgerState.INVERSE_CLAIMED: frozenset({LedgerState.INVERSE_IN_DOUBT} | _INVERSE_VERIFIED),
     LedgerState.INVERSE_IN_DOUBT: _INVERSE_VERIFIED,
+    # Unclaimed terminals: never reissued, but a prior-incarnation effect
+    # of the same group can still be found by the sweep.
+    LedgerState.POLICY_DENIED: _PRIOR,
+    LedgerState.APPROVAL_EXPIRED_UNCLAIMED: _PRIOR,
     # Terminal: no re-write, no automatic reissue of a FENCED key (#380 D2 P1-A).
-    LedgerState.POLICY_DENIED: frozenset(),
-    LedgerState.APPROVAL_EXPIRED_UNCLAIMED: frozenset(),
     LedgerState.VERIFIED_ABSENT: frozenset(),
     LedgerState.INVERSE_POLICY_DENIED: frozenset(),
     LedgerState.INVERSE_APPROVAL_EXPIRED_UNCLAIMED: frozenset(),

@@ -7,7 +7,6 @@ schema string and fingerprint must stay exactly what IP-8b produced.
 from __future__ import annotations
 
 from dataclasses import replace
-from enum import Enum
 from hashlib import sha256
 from pathlib import Path
 import sys
@@ -41,7 +40,6 @@ from test_r16_ip8b_successor_policy import (  # noqa: E402
     FEEDBACK,
     LEDGER,
     OUTCOME,
-    STAGE_PAIRS,
     _active,
     _input,
     _verified,
@@ -238,30 +236,13 @@ def test_fingerprint_domain_is_per_version() -> None:
 
 @pytest.mark.parametrize("version", [V2, V3])
 def test_worst_case_input_fits_for_each_version(version: PolicyKind) -> None:
+    """The single-field size proof for both versions is the parametrized
+    IP-8b test; this checks the bound and the round trip."""
+
     worst = worst_case_input(version)
     assert worst.version is version
-    size = len(worst.canonical_bytes())
-    assert size <= MAX_POLICY_INPUT_BYTES
+    assert len(worst.canonical_bytes()) <= MAX_POLICY_INPUT_BYTES
     assert SuccessorPolicyInputV2.from_bytes(worst.canonical_bytes()) == worst
-    # The longest legal ledger state of this version is already used.
-    for ledger in LedgerState:
-        if version is V2 and ledger is PRIOR:
-            continue
-        assert len(replace(worst, ledger=ledger).canonical_bytes()) <= size
-    member: Enum
-    for field, kind in (
-        ("required_source", RequiredSourceState),
-        ("predecessor", PredecessorState),
-        ("lineage", LineageState),
-        ("commitment", CommitmentState),
-        ("feedback", FeedbackState),
-        ("inverse_authorization", InverseAuthorization),
-    ):
-        for member in kind:
-            assert len(replace(worst, **{field: member}).canonical_bytes()) <= size
-    for interpretation, stage in STAGE_PAIRS:
-        changed = replace(worst, interpretation=interpretation, interpretation_stage=stage)
-        assert len(changed.canonical_bytes()) <= size
 
 
 def test_v3_worst_case_is_no_longer_than_v2() -> None:
