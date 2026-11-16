@@ -20,10 +20,16 @@ the claim's ``runtime_instance_id`` must equal the one row the sweep rotates
 (#380 D2 P2-1 / addendum 1). A mismatch is a definite CAS_REJECTED, not
 IN_DOUBT. The executor's receipt is only its own report.
 
-Capacity (#378 V ``target_ledger_reserve``): a forward effect needs at least
-``reserve_pages`` free pages after it; a fence or an inverse may use the
-reserve, so the sweep can always fence and an effect can always be undone
-(the HP-8 rule: only capacity-increasing forward work is refused).
+Capacity (#378 V ``target_ledger_reserve``): a forward effect must leave at
+least ``reserve_pages`` free pages after it (checked before COMMIT). Fences
+may use the reserve down to an inverse floor (a quarter of it), and an
+inverse may use everything left, so fences can never take the room an undo
+needs (the HP-8 rule: only capacity-increasing forward work is refused).
+Fences above the floor fail as TargetCapacityError, which leaves the sweep
+BLOCKED; IP-16 / IP-18 keep unapplied intents bounded.
+
+A reverted effect keeps its bytes (only the state and revision change), so
+the verifier can recompute their digest for the inverse too.
 
 Nothing here is wired to R16, the runtime or any setting (IP-18 does that).
 A lost target is never replaced by a new empty one: ``open`` never creates.
@@ -95,8 +101,7 @@ SCHEMA_STATEMENTS: Final = (
     " obligation_group_key TEXT PRIMARY KEY CHECK (" + _HEX.format("obligation_group_key") + "),"
     " state TEXT NOT NULL CHECK (state IN ('ACTIVE', 'REVERTED')),"
     " revision INTEGER NOT NULL CHECK (revision > 0),"
-    f" payload BLOB CHECK (payload IS NULL OR length(payload) <= {MAX_ARTIFACT_BYTES}),"
-    " CHECK ((state = 'ACTIVE') = (payload IS NOT NULL))"
+    f" payload BLOB NOT NULL CHECK (length(payload) <= {MAX_ARTIFACT_BYTES})"
     ") STRICT",
     # Append-only ledger; the effect row moves only ACTIVE -> REVERTED once.
     "CREATE TRIGGER target_operations_no_update BEFORE UPDATE ON target_operations"
@@ -107,7 +112,7 @@ SCHEMA_STATEMENTS: Final = (
     " BEGIN SELECT RAISE(ABORT, 'target effects are not deleted'); END",
     "CREATE TRIGGER target_artifacts_revert_only BEFORE UPDATE ON target_artifacts"
     " WHEN NOT (OLD.state = 'ACTIVE' AND NEW.state = 'REVERTED'"
-    " AND NEW.revision = OLD.revision + 1 AND NEW.payload IS NULL"
+    " AND NEW.revision = OLD.revision + 1 AND NEW.payload = OLD.payload"
     " AND NEW.obligation_group_key = OLD.obligation_group_key)"
     " BEGIN SELECT RAISE(ABORT, 'a target effect only reverts once'); END",
     "CREATE TRIGGER target_meta_no_delete BEFORE DELETE ON target_meta"
@@ -167,7 +172,7 @@ class ArtifactRow:
     obligation_group_key: str
     state: ArtifactState
     revision: int
-    payload: bytes | None
+    payload: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,6 +404,22 @@ _LEDGER_COLUMNS: Final = (
 )
 
 
+_META_SQL: Final = "SELECT target_instance_id, target_namespace, runtime_instance_id FROM target_meta"
+
+
+def _meta(rows: list[tuple[object, ...]]) -> TargetMeta:
+    if len(rows) != 1:
+        raise TargetCorrupt("target meta is missing")
+    try:
+        return TargetMeta(
+            canonical_uuid(rows[0][0], "target_instance_id"),
+            identifier(rows[0][1], "target_namespace"),
+            canonical_uuid(rows[0][2], "runtime_instance_id"),
+        )
+    except (TypeError, ValueError) as error:
+        raise TargetCorrupt("target meta is invalid") from error
+
+
 class _Connection:
     def __init__(self, path: Path, connection: sqlite3.Connection) -> None:
         self.path = path
@@ -417,19 +438,7 @@ class _Connection:
                 raise _error(error, "read") from error
 
     def meta(self) -> TargetMeta:
-        rows = self._read(
-            "SELECT target_instance_id, target_namespace, runtime_instance_id FROM target_meta"
-        )
-        if len(rows) != 1:
-            raise TargetCorrupt("target meta is missing")
-        try:
-            return TargetMeta(
-                canonical_uuid(rows[0][0], "target_instance_id"),
-                identifier(rows[0][1], "target_namespace"),
-                canonical_uuid(rows[0][2], "runtime_instance_id"),
-            )
-        except (TypeError, ValueError) as error:
-            raise TargetCorrupt("target meta is invalid") from error
+        return _meta(self._read(_META_SQL))
 
     def ledger(self) -> tuple[LedgerRow, ...]:
         """Every ledger row, for the sweep's target → source direction."""
@@ -439,34 +448,38 @@ class _Connection:
         )
 
     def status(self, group_key: str) -> GroupStatus:
-        """``READ_REVIEW_ARTIFACT_STATUS_V1`` for one obligation group."""
+        """``READ_REVIEW_ARTIFACT_STATUS_V1`` for one obligation group, read
+        in one snapshot (one read transaction)."""
         digest(group_key, "obligation_group_key")
-        meta = self.meta()
-        rows = [
-            _ledger(row)
-            for row in self._read(
-                f"SELECT {_LEDGER_COLUMNS} FROM target_operations WHERE obligation_group_key = ?",
-                (group_key,),
-            )
-        ]
-        by_direction = {row.direction: row for row in rows}
-        artifact_rows = self._read(
-            "SELECT state, revision, payload FROM target_artifacts WHERE obligation_group_key = ?",
-            (group_key,),
-        )
+        with self._lock:
+            connection = self._connection
+            try:
+                connection.execute("BEGIN")
+                try:
+                    meta_rows = connection.execute(_META_SQL).fetchall()
+                    rows = connection.execute(
+                        f"SELECT {_LEDGER_COLUMNS} FROM target_operations WHERE obligation_group_key = ?",
+                        (group_key,),
+                    ).fetchall()
+                    artifact_rows = connection.execute(
+                        "SELECT state, revision, payload FROM target_artifacts WHERE obligation_group_key = ?",
+                        (group_key,),
+                    ).fetchall()
+                finally:
+                    connection.execute("COMMIT")
+            except sqlite3.Error as error:
+                raise _error(error, "read") from error
+        by_direction = {row.direction: row for row in (_ledger(row) for row in rows)}
         artifact = None
         if artifact_rows:
             state, revision, payload = artifact_rows[0]
             try:
-                artifact = ArtifactRow(
-                    group_key,
-                    ArtifactState(state),
-                    int(str(revision)),
-                    None if payload is None else _blob(payload),
-                )
+                artifact = ArtifactRow(group_key, ArtifactState(state), int(str(revision)), _blob(payload))
             except (TypeError, ValueError) as error:
                 raise TargetCorrupt("target artifact row is invalid") from error
-        return GroupStatus(meta, artifact, by_direction.get(Direction.FORWARD), by_direction.get(Direction.INVERSE))
+        return GroupStatus(
+            _meta(meta_rows), artifact, by_direction.get(Direction.FORWARD), by_direction.get(Direction.INVERSE)
+        )
 
 
 class TargetReader(_Connection):
@@ -491,6 +504,7 @@ class TargetStore(_Connection):
         super().__init__(path, connection)
         self._max_page_count = max_page_count
         self._reserve_pages = reserve_pages
+        self._inverse_floor = reserve_pages // 4
 
     @staticmethod
     def _bounds(max_page_count: int, reserve_pages: int) -> None:
@@ -617,6 +631,9 @@ class TargetStore(_Connection):
         """
         canonical_uuid(runtime_instance_id, "runtime_instance_id")
         with self._write("instance rotation") as connection:
+            current = connection.execute("SELECT runtime_instance_id FROM target_meta").fetchone()
+            if current is not None and current[0] == runtime_instance_id:
+                raise TargetBindingError("a rotation needs a new runtime_instance_id")
             connection.execute(
                 "UPDATE target_meta SET runtime_instance_id = ? WHERE id = 1", (runtime_instance_id,)
             )
@@ -626,7 +643,8 @@ class TargetStore(_Connection):
         that is already there (an EFFECT means: reconcile as an effect).
 
         A successful fence is not yet VERIFIED_ABSENT: the verifier decides
-        that from what it reads (#380 D2 P2-2). Fences may use the reserve.
+        that from what it reads (#380 D2 P2-2). Fences may use the reserve,
+        but never the inverse floor.
         """
         digest(group_key, "obligation_group_key")
         if type(direction) is not Direction:
@@ -645,6 +663,8 @@ class TargetStore(_Connection):
                 "VALUES (?, ?, ?, 'FENCED')",
                 (key, group_key, direction.value),
             )
+            if self._free_pages(connection) < self._inverse_floor:
+                raise TargetCapacityError("a fence may not use the inverse floor")
         return LedgerRow(key, group_key, direction, LedgerKind.FENCED, None, None, None, None)
 
     # ----------------------------------------------------------- effects
@@ -758,8 +778,6 @@ class TargetStore(_Connection):
             if direction is Direction.FORWARD:
                 if artifact is not None or expected_revision != 0:
                     return receipt(ExecutorResult.CAS_REJECTED)
-                if self._free_pages(connection) < self._reserve_pages + 4:
-                    raise TargetCapacityError("no room for a forward effect above the reserve")
                 assert payload is not None
                 revision = 1
                 connection.execute(
@@ -783,7 +801,7 @@ class TargetStore(_Connection):
                     return receipt(ExecutorResult.CAS_REJECTED)
                 revision = expected_revision + 1
                 connection.execute(
-                    "UPDATE target_artifacts SET state = 'REVERTED', revision = ?, payload = NULL "
+                    "UPDATE target_artifacts SET state = 'REVERTED', revision = ? "
                     "WHERE obligation_group_key = ?",
                     (revision, group_key),
                 )
@@ -793,6 +811,9 @@ class TargetStore(_Connection):
                 "VALUES (?, ?, ?, 'EFFECT', ?, ?, ?, ?)",
                 (key, group_key, direction.value, approved_digest, claim.nonce, claim.runtime_instance_id, revision),
             )
+            if direction is Direction.FORWARD and self._free_pages(connection) < self._reserve_pages:
+                # Checked after the writes: the whole transaction rolls back.
+                raise TargetCapacityError("no room for a forward effect above the reserve")
         return receipt(ExecutorResult.APPLIED, revision)
 
 

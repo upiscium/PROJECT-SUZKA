@@ -6,13 +6,18 @@ from what is physically there:
 - It recomputes the payload digest from the stored effect bytes itself. The
   executor's ``payload_digest`` column and its receipt are never the basis.
 - AUTHORIZED needs the stored bytes, the approved digest and the ledger row
-  to agree, and the ledger's ``approval_ref`` to be the nonce SubjectHistory
-  recorded as consumed (the caller passes that record; IP-14a stores it).
+  to agree, and the ledger's ``approval_ref`` to be both this challenge's
+  nonce and the nonce SubjectHistory recorded as consumed (the caller passes
+  that record; IP-14a stores it). A reverted effect keeps its bytes, so the
+  inverse is checked against recomputed bytes as well.
 - VERIFIED_ABSENT needs a FENCED row and no effect row; a fence that the
   sweep merely inserted is not proof by itself (#380 D2 P2-2).
 - ``foreign_change`` is a target change that is not in the ledger, in the
   revision range (expected, observed] (R17 ``VerifiedOutcomeView``). It makes
   an effect UNAUTHORIZED (R20-F09: the effect cannot be attributed to SELF).
+- An artifact with no effect row of ours is never classified, even after a
+  fence: it stays None (BLOCKED for the operator), a deliberately
+  conservative reading of R20-F09's "UNKNOWN / mixed".
 
 Anything it cannot classify returns None: the operation stays IN_DOUBT (or
 BLOCKED) and is never retried or called ABSENT by default.
@@ -101,14 +106,14 @@ def verify_forward(
             effect_operation_key=None,
             foreign_change=False,
         )
-    if artifact is None or artifact.state is not ArtifactState.ACTIVE or artifact.payload is None:
+    if artifact is None or artifact.state is not ArtifactState.ACTIVE:
         return None  # an effect row whose effect is gone (or already reverted)
     stored = payload_digest(artifact.payload)
     foreign = artifact.revision != forward.revision_after or stored != forward.payload_digest
     authorized = (
         not foreign
         and consumed_nonce is not None
-        and consumed_nonce == forward.approval_ref
+        and consumed_nonce == challenge.nonce == forward.approval_ref
         and stored == challenge.payload_digest
         and forward.revision_after == _FORWARD_REVISION
     )
@@ -162,10 +167,10 @@ def verify_inverse(
             **fields,  # type: ignore[arg-type]
         )
 
+    stored = payload_digest(artifact.payload)
     if inverse.kind is LedgerKind.FENCED:
-        if artifact.state is not ArtifactState.ACTIVE or artifact.payload is None:
+        if artifact.state is not ArtifactState.ACTIVE:
             return None
-        stored = payload_digest(artifact.payload)
         return outcome(
             VerifiedState.INVERSE_VERIFIED_ABSENT,
             authorization=None,
@@ -177,10 +182,12 @@ def verify_inverse(
         )
     if artifact.state is not ArtifactState.REVERTED:
         return None  # an inverse effect row while the effect is still ACTIVE
+    foreign = artifact.revision != inverse.revision_after or stored != forward.payload_digest
     authorized = (
-        consumed_nonce is not None
-        and consumed_nonce == inverse.approval_ref
-        and inverse.payload_digest == challenge.payload_digest == intent.forward_payload_digest
+        not foreign
+        and consumed_nonce is not None
+        and consumed_nonce == challenge.nonce == inverse.approval_ref
+        and stored == challenge.payload_digest == intent.forward_payload_digest
     )
     return outcome(
         VerifiedState.REVERTED,
@@ -189,7 +196,7 @@ def verify_inverse(
         observed_payload_digest=None,
         observed_revision=artifact.revision,
         effect_operation_key=None,
-        foreign_change=artifact.revision != inverse.revision_after,
+        foreign_change=foreign,
     )
 
 

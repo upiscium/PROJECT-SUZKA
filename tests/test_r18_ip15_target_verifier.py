@@ -299,6 +299,38 @@ def test_fencing_an_applied_key_reports_the_effect(tmp_path: Path) -> None:
     assert store.fence(GROUP, Direction.FORWARD).kind is LedgerKind.EFFECT
 
 
+def test_a_late_cas_after_rotation_and_fence_is_definitely_not_executed(tmp_path: Path) -> None:
+    """The full sweep order: rotate, then fence. A CAS from the old process
+    is CAS_REJECTED (the instance check runs first), never IN_DOUBT, and the
+    verifier then sees VERIFIED_ABSENT."""
+
+    store = _store(tmp_path)
+    intent, challenge, claim = _forward(store)
+    store.rotate_runtime_instance(new_runtime_instance_id())
+    store.fence(GROUP, Direction.FORWARD)
+    assert store.forward_write(intent, challenge, claim).executor_result is ExecutorResult.CAS_REJECTED
+    outcome = _verify(store, intent, challenge)
+    assert outcome is not None and outcome.outcome_state is VerifiedState.VERIFIED_ABSENT
+
+
+def test_rotation_needs_a_new_value(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with pytest.raises(TargetBindingError, match="new runtime_instance_id"):
+        store.rotate_runtime_instance(RUNTIME)
+
+
+def test_two_connections_racing_apply_once(tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    store = _store(tmp_path)
+    other = TargetStore.open(store.path)
+    intent, challenge, claim = _forward(store)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda target: target.forward_write(intent, challenge, claim).executor_result, (store, other)))
+    assert sorted(results) == sorted([ExecutorResult.APPLIED, ExecutorResult.CAS_REJECTED])
+    assert [row.kind for row in store.ledger()] == [LedgerKind.EFFECT]
+
+
 def test_rotated_instance_rejects_an_older_process(tmp_path: Path) -> None:
     """#380 D2 P2-1: a CAS from before the sweep's rotation fails definitely."""
 
@@ -323,6 +355,20 @@ def test_without_a_consumed_nonce_the_effect_is_unauthorized(tmp_path: Path) -> 
         assert (outcome.outcome_state, outcome.authorization) == (
             VerifiedState.UNAUTHORIZED_EFFECT, InverseAuthorization.UNPROVEN,
         )
+
+
+def test_authorization_needs_this_challenges_nonce(tmp_path: Path) -> None:
+    """Review P2-1: the operation key is stable across Decisions, so a later
+    challenge for the same key must not inherit an earlier approval."""
+
+    store = _store(tmp_path)
+    intent, challenge, claim = _forward(store)
+    store.forward_write(intent, challenge, claim)
+    later = replace(challenge, nonce="9" * 64)
+    outcome = _verify(store, intent, later, consumed=NONCE)
+    assert outcome is not None and outcome.outcome_state is VerifiedState.UNAUTHORIZED_EFFECT
+    outcome = _verify(store, intent, later, consumed="9" * 64)
+    assert outcome is not None and outcome.outcome_state is VerifiedState.UNAUTHORIZED_EFFECT
 
 
 def test_receipt_says_applied_but_the_effect_is_gone(tmp_path: Path) -> None:
@@ -377,7 +423,10 @@ def test_inverse_reverts_once_and_verifies(tmp_path: Path) -> None:
     assert (receipt.executor_result, receipt.reported_revision, receipt.reported_payload_digest) == (ExecutorResult.APPLIED, 2, None)
     assert store.inverse_write(inverse, inverse_challenge, inverse_claim).executor_result is ExecutorResult.CAS_REJECTED
     status = store.status(GROUP)
-    assert status.artifact is not None and (status.artifact.state, status.artifact.payload) == (ArtifactState.REVERTED, None)
+    # The bytes are kept so the verifier can recompute their digest.
+    assert status.artifact is not None and (status.artifact.state, status.artifact.payload) == (
+        ArtifactState.REVERTED, intent.artifact.payload_bytes(),
+    )
     assert status.forward is not None and status.forward.kind is LedgerKind.EFFECT  # forward receipt kept
     reader = _reader(store)
     for consumed, authorization in ((inverse_claim.nonce, InverseAuthorization.AUTHORIZED), (None, InverseAuthorization.UNPROVEN)):
@@ -426,18 +475,28 @@ def test_inverse_needs_our_forward_effect(tmp_path: Path) -> None:
 # ----------------------------------------------------------------- capacity
 
 
-def test_forward_effects_stop_at_the_reserve_but_fences_continue(tmp_path: Path) -> None:
+def test_forward_stops_at_the_reserve_fences_at_the_floor_and_inverses_still_fit(tmp_path: Path) -> None:
     store = _store(tmp_path, max_page_count=64, reserve_pages=24)
-    applied = 0
+    applied: list[ActionIntentV1] = []
     with pytest.raises(TargetCapacityError):
         for index in range(200):
             group = payload_digest(index.to_bytes(4, "big"))
             intent, challenge, claim = _forward(store, group=group)
             store.forward_write(intent, challenge, claim)
-            applied += 1
-    assert applied > 0
-    # The sweep can still fence, and an applied effect can still be undone.
-    for index in range(10):
-        store.fence(payload_digest(b"fence" + index.to_bytes(2, "big")), Direction.FORWARD)
-    assert len([row for row in store.ledger() if row.kind is LedgerKind.FENCED]) == 10
+            applied.append(intent)
+    assert applied
+    effects = len(store.ledger())
+    # The refused forward left nothing behind (checked before COMMIT).
+    assert effects == len(applied)
+    # The sweep can fence into the reserve until the inverse floor.
+    fences = 0
+    with pytest.raises(TargetCapacityError, match="inverse floor"):
+        for index in range(5000):
+            store.fence(payload_digest(b"fence" + index.to_bytes(2, "big")), Direction.FORWARD)
+            fences += 1
+    assert fences > 0
+    # Every applied effect can still be undone.
+    for intent in applied:
+        inverse, inverse_challenge, inverse_claim = _inverse_for(store, intent)
+        assert store.inverse_write(inverse, inverse_challenge, inverse_claim).executor_result is ExecutorResult.APPLIED
     assert operation_key(GROUP, Direction.FORWARD) not in {row.operation_key for row in store.ledger()}
