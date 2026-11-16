@@ -20,13 +20,15 @@ the claim's ``runtime_instance_id`` must equal the one row the sweep rotates
 (#380 D2 P2-1 / addendum 1). A mismatch is a definite CAS_REJECTED, not
 IN_DOUBT. The executor's receipt is only its own report.
 
-Capacity (#378 V ``target_ledger_reserve``): a forward effect must leave at
-least ``reserve_pages`` free pages after it (checked before COMMIT). Fences
-may use the reserve down to an inverse floor (a quarter of it), and an
-inverse may use everything left, so fences can never take the room an undo
-needs (the HP-8 rule: only capacity-increasing forward work is refused).
-Fences above the floor fail as TargetCapacityError, which leaves the sweep
-BLOCKED; IP-16 / IP-18 keep unapplied intents bounded.
+Capacity (#378 V ``target_ledger_reserve``): every applied forward effect
+without an inverse row keeps room for its own inverse (``inverse_room``).
+Before COMMIT a forward must leave ``reserve_pages`` plus the inverse room of
+all such effects (itself included) free; a fence may use the reserve but not
+the inverse room; an inverse may use everything left. So every effect can
+always be undone, and fences can never take that room (the HP-8 rule: only
+capacity-increasing forward work is refused). A fence past the inverse room
+fails as TargetCapacityError, which leaves the sweep BLOCKED; IP-16 / IP-18
+keep the number of unapplied intents bounded.
 
 A reverted effect keeps its bytes (only the state and revision change), so
 the verifier can recompute their digest for the inverse too.
@@ -70,7 +72,11 @@ TARGET_SCHEMA_VERSION: Final = 1
 # Proposed bounds (IP-15; HP-2 asks the PR to state them). One forward effect
 # adds about three 4 KiB pages (an 8 KiB artifact and one ledger row).
 DEFAULT_MAX_PAGE_COUNT: Final = 4096  # 16 MiB with 4 KiB pages
-DEFAULT_RESERVE_PAGES: Final = 256  # 1 MiB kept for fences and inverses
+DEFAULT_RESERVE_PAGES: Final = 256  # 1 MiB kept for fences
+# Measured (IP-15): one inverse adds about 0.13 pages on average and at most
+# 3 in a single B-tree split. The room keeps twice the average plus slack.
+INVERSE_ROWS_PER_PAGE: Final = 4
+INVERSE_SLACK_PAGES: Final = 8
 _SQLITE_BUSY_TIMEOUT_SECONDS: Final = 5.0
 _HEX = "length({0}) = 64 AND {0} NOT GLOB '*[^0-9a-f]*'"
 
@@ -504,7 +510,6 @@ class TargetStore(_Connection):
         super().__init__(path, connection)
         self._max_page_count = max_page_count
         self._reserve_pages = reserve_pages
-        self._inverse_floor = reserve_pages // 4
 
     @staticmethod
     def _bounds(max_page_count: int, reserve_pages: int) -> None:
@@ -615,6 +620,17 @@ class TargetStore(_Connection):
         except sqlite3.Error:
             pass
 
+    @staticmethod
+    def _inverse_room(connection: sqlite3.Connection) -> int:
+        """Pages kept so that every applied effect without an inverse row can
+        still be undone."""
+        row = connection.execute(
+            "SELECT count(*) FROM target_operations AS f WHERE f.direction = 'FORWARD' "
+            "AND f.kind = 'EFFECT' AND NOT EXISTS (SELECT 1 FROM target_operations AS i "
+            "WHERE i.obligation_group_key = f.obligation_group_key AND i.direction = 'INVERSE')"
+        ).fetchone()
+        return int(row[0]) // INVERSE_ROWS_PER_PAGE + INVERSE_SLACK_PAGES
+
     def _free_pages(self, connection: sqlite3.Connection) -> int:
         page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
         freelist = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
@@ -644,7 +660,7 @@ class TargetStore(_Connection):
 
         A successful fence is not yet VERIFIED_ABSENT: the verifier decides
         that from what it reads (#380 D2 P2-2). Fences may use the reserve,
-        but never the inverse floor.
+        but never the room kept for inverses.
         """
         digest(group_key, "obligation_group_key")
         if type(direction) is not Direction:
@@ -663,8 +679,8 @@ class TargetStore(_Connection):
                 "VALUES (?, ?, ?, 'FENCED')",
                 (key, group_key, direction.value),
             )
-            if self._free_pages(connection) < self._inverse_floor:
-                raise TargetCapacityError("a fence may not use the inverse floor")
+            if self._free_pages(connection) < self._inverse_room(connection):
+                raise TargetCapacityError("a fence may not use the room kept for inverses")
         return LedgerRow(key, group_key, direction, LedgerKind.FENCED, None, None, None, None)
 
     # ----------------------------------------------------------- effects
@@ -811,7 +827,9 @@ class TargetStore(_Connection):
                 "VALUES (?, ?, ?, 'EFFECT', ?, ?, ?, ?)",
                 (key, group_key, direction.value, approved_digest, claim.nonce, claim.runtime_instance_id, revision),
             )
-            if direction is Direction.FORWARD and self._free_pages(connection) < self._reserve_pages:
+            if direction is Direction.FORWARD and self._free_pages(connection) < (
+                self._reserve_pages + self._inverse_room(connection)
+            ):
                 # Checked after the writes: the whole transaction rolls back.
                 raise TargetCapacityError("no room for a forward effect above the reserve")
         return receipt(ExecutorResult.APPLIED, revision)
@@ -847,6 +865,8 @@ def new_runtime_instance_id() -> str:
 __all__ = [
     "DEFAULT_MAX_PAGE_COUNT",
     "DEFAULT_RESERVE_PAGES",
+    "INVERSE_ROWS_PER_PAGE",
+    "INVERSE_SLACK_PAGES",
     "SCHEMA_STATEMENTS",
     "TARGET_SCHEMA_VERSION",
     "ArtifactRow",

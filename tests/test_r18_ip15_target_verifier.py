@@ -475,11 +475,14 @@ def test_inverse_needs_our_forward_effect(tmp_path: Path) -> None:
 # ----------------------------------------------------------------- capacity
 
 
-def test_forward_stops_at_the_reserve_fences_at_the_floor_and_inverses_still_fit(tmp_path: Path) -> None:
-    store = _store(tmp_path, max_page_count=64, reserve_pages=24)
+@pytest.mark.parametrize(("max_page_count", "reserve_pages"), [(64, 24), (512, 64)])
+def test_forward_stops_at_the_reserve_fences_keep_the_inverse_room_and_every_undo_fits(
+    tmp_path: Path, max_page_count: int, reserve_pages: int
+) -> None:
+    store = _store(tmp_path, max_page_count=max_page_count, reserve_pages=reserve_pages)
     applied: list[ActionIntentV1] = []
     with pytest.raises(TargetCapacityError):
-        for index in range(200):
+        for index in range(10_000):
             group = payload_digest(index.to_bytes(4, "big"))
             intent, challenge, claim = _forward(store, group=group)
             store.forward_write(intent, challenge, claim)
@@ -490,9 +493,9 @@ def test_forward_stops_at_the_reserve_fences_at_the_floor_and_inverses_still_fit
     assert effects == len(applied)
     # The sweep can fence into the reserve until the inverse floor.
     fences = 0
-    with pytest.raises(TargetCapacityError, match="inverse floor"):
-        for index in range(5000):
-            store.fence(payload_digest(b"fence" + index.to_bytes(2, "big")), Direction.FORWARD)
+    with pytest.raises(TargetCapacityError, match="room kept for inverses"):
+        for index in range(100_000):
+            store.fence(payload_digest(b"fence" + index.to_bytes(4, "big")), Direction.FORWARD)
             fences += 1
     assert fences > 0
     # Every applied effect can still be undone.
