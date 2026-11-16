@@ -113,8 +113,8 @@ def test_v2_bytes_and_fingerprints_are_unchanged() -> None:
         assert f'"schema":"{INPUT_SCHEMA}"'.encode() in payload
 
 
-def test_the_issuer_still_seals_v2() -> None:
-    assert POLICY_KIND is V2
+def test_the_issuer_seals_v3_since_ip14a3() -> None:
+    assert POLICY_KIND is V3
     assert INPUT_SCHEMA == "SUCCESSOR_POLICY_INPUT_V2"
     assert INPUT_SCHEMA_V3 == "SUCCESSOR_POLICY_INPUT_V3"
 
@@ -252,12 +252,16 @@ def test_v3_worst_case_is_no_longer_than_v2() -> None:
 # ------------------------------------------------------- issuer head check
 
 
-def test_v2_head_still_verifies_and_a_kind_mismatch_does_not(tmp_path) -> None:
-    """#411 IP-13 acceptance: an existing V2 head decodes and replays."""
+def test_v2_head_still_verifies_and_a_kind_mismatch_does_not(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """#411 IP-13 acceptance: an existing V2 head decodes and replays (the
+    V2 head is issued as before IP-14a-3 switched the issuer to V3)."""
+
+    from suzka.r16 import decision_issuer as issuer_module
 
     from test_r16_ip10_decision_issuer import _app, _issue, _reader_head, _settings
     from test_r16_u3a_plan_preview import _qualified_goal
 
+    monkeypatch.setattr(issuer_module, "POLICY_KIND", V2)
     with TestClient(_app(_settings(tmp_path / "ip13"))) as client:
         state = client.app.state
         _x, gid = _qualified_goal(state)
@@ -269,6 +273,8 @@ def test_v2_head_still_verifies_and_a_kind_mismatch_does_not(tmp_path) -> None:
         assert issuer._head_verified(committed, committed.incarnation_id, head.transaction_id)
         relabelled = replace(committed, policy_kind=V3)
         assert not issuer._head_verified(relabelled, committed.incarnation_id, head.transaction_id)
-        # The next issue sees the V2 head as an existing, verified predecessor.
+        # The next issue sees the V2 head as an existing, verified predecessor,
+        # also with the V3 issuer of IP-14a-3.
+        monkeypatch.setattr(issuer_module, "POLICY_KIND", V3)
         again = _issue(state, gid)
         assert again.decision is not None and again.decision.decision_id == committed.decision_id

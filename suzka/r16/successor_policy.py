@@ -76,8 +76,9 @@ from suzka.r16.contracts import (
 from suzka.r16.history_codec import MAX_POLICY_INPUT_BYTES, PolicyKind, PolicyRow
 
 INPUT_SCHEMA: Final = "SUCCESSOR_POLICY_INPUT_V2"
-# The version the issuer seals today; it moves to V3 with IP-14a.
-POLICY_KIND: Final = PolicyKind.SUCCESSOR_POLICY_V2
+# The version the issuer seals. IP-14a-3 (#411 comment 6910958369 §8): V3.
+# Existing V2 heads stay comparable through ``as_version`` (decision (a)).
+POLICY_KIND: Final = PolicyKind.SUCCESSOR_POLICY_V3
 INPUT_SCHEMA_V3: Final = "SUCCESSOR_POLICY_INPUT_V3"
 _INPUT_SCHEMAS: Final[Mapping[PolicyKind, str]] = {
     PolicyKind.SUCCESSOR_POLICY_V2: INPUT_SCHEMA,

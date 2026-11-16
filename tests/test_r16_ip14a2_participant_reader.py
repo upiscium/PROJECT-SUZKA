@@ -253,10 +253,18 @@ def test_as_version_converts_both_ways_when_representable() -> None:
         as_version(v2, PolicyKind.SUCCESSOR_POLICY_V1)
 
 
-def test_a_v2_head_stays_existing_when_the_issuer_seals_v3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """D1 r3 §8 (a): the switch in IP-14a-3 keeps unchanged lineages EXISTING.
-    The reverse leg (a V3 head under a rolled-back V2 issuer) is IP-14a-3's
-    acceptance (D1 §10); ``as_version`` covers its conversion here."""
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (PolicyKind.SUCCESSOR_POLICY_V2, PolicyKind.SUCCESSOR_POLICY_V3),  # the IP-14a-3 switch
+        (PolicyKind.SUCCESSOR_POLICY_V3, PolicyKind.SUCCESSOR_POLICY_V2),  # a rollback to a V2 issuer
+    ],
+)
+def test_an_unchanged_lineage_stays_existing_across_the_policy_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, before: PolicyKind, after: PolicyKind
+) -> None:
+    """D1 r3 §8 (a) / §10 IP-14a-3: a head sealed in one version stays
+    EXISTING when the issuer seals the other one, in both directions."""
 
     from fastapi.testclient import TestClient
 
@@ -266,14 +274,15 @@ def test_a_v2_head_stays_existing_when_the_issuer_seals_v3(tmp_path: Path, monke
     from test_r16_ip10_decision_issuer import _app, _issue, _settings
     from test_r16_u3a_plan_preview import _qualified_goal
 
-    settings = _settings(tmp_path / "v3")
+    settings = _settings(tmp_path / "switch")
     with TestClient(_app(settings)) as client:
         state = client.app.state
         _x, gid = _qualified_goal(state)
+        monkeypatch.setattr(issuer_module, "POLICY_KIND", before)
         first = _issue(state, gid)
         assert first.status is DecisionIssueStatus.ISSUED
-        assert first.decision.policy_kind is PolicyKind.SUCCESSOR_POLICY_V2
-        monkeypatch.setattr(issuer_module, "POLICY_KIND", PolicyKind.SUCCESSOR_POLICY_V3)
+        assert first.decision.policy_kind is before
+        monkeypatch.setattr(issuer_module, "POLICY_KIND", after)
         again = _issue(state, gid)
         assert again.status is DecisionIssueStatus.EXISTING
         assert again.decision.decision_id == first.decision.decision_id

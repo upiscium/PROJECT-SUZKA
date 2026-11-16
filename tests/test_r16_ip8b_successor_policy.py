@@ -495,17 +495,21 @@ def test_sealed_bytes_are_strict() -> None:
 
 
 def test_sealed_input_fits_a_committed_decision() -> None:
-    """The V2 kind and every Decision row are valid in SubjectHistory."""
+    """Both sealable kinds and every Decision row are valid in SubjectHistory
+    (the issuer seals V3 since IP-14a-3; existing heads are V2)."""
+
+    from dataclasses import replace as _replace
 
     from test_r16_ip9_subject_history import _committed, _event
 
-    assert POLICY_KIND is PolicyKind.SUCCESSOR_POLICY_V2
-    for value in (_input(), _active(), _active(interpretation=Interpretation.UNCERTAIN), _verified(), _verified(interpretation=Interpretation.UNCERTAIN), _verified(feedback=FeedbackState.UNKNOWN)):
+    assert POLICY_KIND is PolicyKind.SUCCESSOR_POLICY_V3
+    values = (_input(), _active(), _active(interpretation=Interpretation.UNCERTAIN), _verified(), _verified(interpretation=Interpretation.UNCERTAIN), _verified(feedback=FeedbackState.UNKNOWN))
+    for value in (*values, *(_replace(item, version=PolicyKind.SUCCESSOR_POLICY_V3) for item in values)):
         result = evaluate(value)
         decision = _committed(
             _event(f"row-{result.row.value}", 3),
             row=result.history_row,
-            kind=POLICY_KIND,
+            kind=value.version,
             policy_input=value.canonical_bytes(),
         )
         assert decision.policy_row is result.history_row
