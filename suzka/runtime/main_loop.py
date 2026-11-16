@@ -1377,7 +1377,7 @@ class SuzkaMainLoop:
                     proposed.status_class,
                 )
 
-        raw_response = self.agent.generate(prompt)
+        raw_response = self.agent.generate(prompt, user_input=user_input)
         if scoped_interaction is not None:
             if (
                 self._r15_state_port is None

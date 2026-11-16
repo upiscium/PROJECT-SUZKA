@@ -8,6 +8,8 @@ import torch
 from suzka.config import load_settings
 from suzka.models.dummy_provider import DummyProvider
 from suzka.models.model_loader import load_model_provider
+from suzka.persona import ConsciousAgent
+from suzka.persona.prompt_builder import RUNTIME_DATA_HEADING
 from suzka.models.transformers_provider import (
     TransformersProvider,
     is_registry_approved_adapter,
@@ -157,6 +159,42 @@ def test_transformers_generate_uses_chat_template_for_instruction_models() -> No
     assert kwargs["enable_thinking"] is False
     assert fake_model.generate_kwargs is not None
     assert "attention_mask" in fake_model.generate_kwargs
+
+
+def test_transformers_generate_chat_puts_instructions_in_the_system_role() -> None:
+    fake_model = FakeModel()
+    processor = FakeChatProcessor()
+    settings = load_settings(CONFIG_PATH)
+    provider = TransformersProvider(settings, model=fake_model, processor=processor)
+
+    generated = provider.generate_chat("Context: private", "hello")
+
+    assert generated == "4 5"
+    assert processor.plain_calls == []
+    [(messages, kwargs)] = processor.chat_calls
+    assert messages == [
+        {"role": "system", "content": [{"type": "text", "text": "Context: private"}]},
+        {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+    ]
+    assert kwargs["add_generation_prompt"] is True
+    assert kwargs["enable_thinking"] is False
+
+
+def test_agent_sends_the_built_prompt_unchanged_without_a_chat_template() -> None:
+    fake_model = FakeModel()
+    processor = FakeChatProcessor()
+    processor.chat_template = None
+    settings = load_settings(CONFIG_PATH)
+    provider = TransformersProvider(settings, model=fake_model, processor=processor)
+    prompt = f"Context: fixed\n{RUNTIME_DATA_HEADING}\n\nEmotion:\n\nUser: hello\nAssistant:"
+
+    assert provider.uses_chat_roles() is False
+    ConsciousAgent(provider).generate(prompt, user_input="hello")
+
+    assert processor.chat_calls == []
+    assert processor.plain_calls == [prompt]
+    with pytest.raises(ValueError):
+        provider.generate_chat("Context: fixed", "hello")
 
 
 def test_transformers_loss_keeps_plain_text_with_chat_template() -> None:
