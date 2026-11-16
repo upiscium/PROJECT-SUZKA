@@ -51,6 +51,7 @@ from suzka.r16.history_codec import (
     PostcommitReceiptV1,
     history_operation_digest,
 )
+from suzka.r16.history_records import RECORD_OPERATION_KINDS, HistoryRecordOperationV1
 from suzka.r16.history_store import (
     HistoryOperationKind,
     HistoryOperationRow,
@@ -237,8 +238,11 @@ class SubjectHistoryParticipant:
         incarnation_id: str,
         proof_source: CommitProofSource,
         binding: TransactionBinding,
-    ) -> SubjectHistoryParticipant:
-        """Rebuild only from the exact retained PREPARED/FINALIZED bytes."""
+    ) -> SubjectHistoryParticipant | SubjectHistoryRecordParticipant:
+        """Rebuild only from the exact retained PREPARED/FINALIZED bytes.
+
+        IP-14a-2: an R17 / R18 record operation is rebuilt as a
+        ``SubjectHistoryRecordParticipant`` from its envelope."""
 
         _require_binding(binding)
         row = _load(store, incarnation_id, binding.transaction_id)
@@ -246,6 +250,8 @@ class SubjectHistoryParticipant:
             # A committed transaction whose pending bytes are lost cannot be
             # reconstructed from a model/handler replay (#376 §B).
             raise ParticipantDivergedError("SubjectHistory pending operation is absent")
+        if row.operation_kind in RECORD_OPERATION_KINDS:
+            return SubjectHistoryRecordParticipant.from_row(store, incarnation_id, proof_source, binding, row)
         if (
             row.operation_kind is not HistoryOperationKind.R16_DECISION_ISSUE
             or row.phase is HistoryPhase.ABORTED
@@ -413,8 +419,166 @@ class SubjectHistoryParticipant:
             raise ParticipantDivergedError("Finalized SubjectHistory evidence conflicts")
 
 
+class SubjectHistoryRecordParticipant:
+    """IP-14a-2: the same R07 authority for one R17 / R18 record operation.
+
+    Ordering, abort, tombstone and reconcile follow ``SubjectHistoryParticipant``
+    exactly; only the pending bytes are a ``HistoryRecordOperationV1`` envelope,
+    whose incarnation, event, sequence and transaction kind must equal the R07
+    binding. PREPARE reserves the record's keys (D1 §2a) and needs
+    ``r18.enabled``; FINALIZE and reconcile do not, so a store with pending
+    records still settles while R18 is disabled.
+    """
+
+    participant_id = SUBJECT_HISTORY_PARTICIPANT_ID
+    capabilities = SubjectHistoryParticipant.capabilities
+
+    def __init__(
+        self,
+        store: SubjectHistoryStore,
+        incarnation_id: str,
+        operation: HistoryRecordOperationV1,
+        proof_source: CommitProofSource,
+    ) -> None:
+        if type(operation) is not HistoryRecordOperationV1:
+            raise TypeError("SubjectHistory record operation must be a HistoryRecordOperationV1")
+        operation.__post_init__()
+        if operation.incarnation_id != digest(incarnation_id, "incarnation_id"):
+            raise ValueError("record incarnation is not the current incarnation")
+        self.store = store
+        self.incarnation_id = incarnation_id
+        self.operation = operation
+        self.proof_source = proof_source
+        self.operation_digest = operation.operation_digest
+
+    @classmethod
+    def from_row(
+        cls,
+        store: SubjectHistoryStore,
+        incarnation_id: str,
+        proof_source: CommitProofSource,
+        binding: TransactionBinding,
+        row: HistoryOperationRow,
+    ) -> SubjectHistoryRecordParticipant:
+        if (
+            row.operation_kind not in RECORD_OPERATION_KINDS
+            or row.phase is HistoryPhase.ABORTED
+            or row.pending_bytes is None
+            or not _row_matches_binding(row, binding)
+        ):
+            raise ParticipantDivergedError("SubjectHistory pending record operation conflicts")
+        try:
+            operation = HistoryRecordOperationV1.from_bytes(row.pending_bytes)
+            participant = cls(store, incarnation_id, operation, proof_source)
+        except (TypeError, ValueError):
+            raise ParticipantDivergedError("SubjectHistory pending record bytes are invalid") from None
+        if participant.operation_digest != binding.operation_digest or operation.operation_kind is not row.operation_kind:
+            raise ParticipantDivergedError("SubjectHistory pending record digest conflicts")
+        return participant
+
+    def prepare(self, binding: TransactionBinding) -> None:
+        self._validate(binding)
+        row = _load(self.store, self.incarnation_id, binding.transaction_id)
+        if row is not None:
+            if row.phase is HistoryPhase.PREPARED and self._row_is_operation(row, binding):
+                return
+            raise ParticipantDivergedError("SubjectHistory transaction was already used")
+        try:
+            self.store.insert_prepared_record(
+                transaction_id=binding.transaction_id,
+                operation_digest=self.operation_digest,
+                operation=self.operation,
+            )
+        except HistoryStoreError as error:
+            raise _diverged(error) from None
+
+    def finalize(self, binding: TransactionBinding) -> ParticipantOutcome:
+        self._validate(binding)
+        row = _load(self.store, self.incarnation_id, binding.transaction_id)
+        if row is None:
+            raise ParticipantDivergedError("SubjectHistory pending operation is absent")
+        if not self._row_is_operation(row, binding):
+            raise ParticipantDivergedError("SubjectHistory operation conflicts")
+        if row.phase is HistoryPhase.ABORTED:
+            raise ParticipantDivergedError("An aborted SubjectHistory operation cannot finalize")
+        if row.phase is HistoryPhase.FINALIZED:
+            self._verify_finalized(binding)
+            return ParticipantOutcome.ALREADY_CONSISTENT
+        receipt = self.proof_source.postcommit_receipt(binding)
+        if (
+            type(receipt) is not PostcommitReceiptV1
+            or receipt.transaction_id != binding.transaction_id
+            or receipt.event_id != binding.event_id
+            or receipt.processing_sequence != binding.processing_sequence
+        ):
+            raise ParticipantDivergedError("Postcommit receipt does not match")
+        try:
+            self.store.finalize_record(
+                transaction_id=binding.transaction_id, operation=self.operation, receipt=receipt
+            )
+        except HistoryStoreError as error:
+            raise _diverged(error) from None
+        return ParticipantOutcome.FINALIZED
+
+    def abort(self, binding: TransactionBinding) -> AbortOutcome:
+        self._validate(binding)
+        return SubjectHistoryParticipant.abort_pending(self.store, self.incarnation_id, binding)
+
+    def inspect_reconciliation(self, binding: TransactionBinding) -> StartupParticipantOutcome:
+        self._validate(binding)
+        row = _load(self.store, self.incarnation_id, binding.transaction_id)
+        if row is None or not self._row_is_operation(row, binding):
+            raise ParticipantDivergedError("SubjectHistory operation conflicts")
+        if row.phase is HistoryPhase.PREPARED:
+            raise ParticipantUnavailableError("SubjectHistory operation needs roll-forward")
+        if row.phase is not HistoryPhase.FINALIZED:
+            raise ParticipantDivergedError("An aborted SubjectHistory operation is committed")
+        self._verify_finalized(binding)
+        return StartupParticipantOutcome.VERIFIED_CONSISTENT
+
+    def reconcile(self, binding: TransactionBinding) -> StartupParticipantOutcome:
+        outcome = self.finalize(binding)
+        if outcome is ParticipantOutcome.ALREADY_CONSISTENT:
+            return StartupParticipantOutcome.VERIFIED_CONSISTENT
+        return StartupParticipantOutcome.ROLLED_FORWARD
+
+    def _validate(self, binding: TransactionBinding) -> None:
+        _require_binding(binding)
+        if (
+            binding.operation_digest != self.operation_digest
+            or binding.event_id != self.operation.event_id
+            or binding.processing_sequence != self.operation.processing_sequence
+            or binding.transaction_kind.value != self.operation.transaction_kind
+        ):
+            raise ParticipantDivergedError("SubjectHistory binding does not match its record operation")
+
+    def _row_is_operation(self, row: HistoryOperationRow, binding: TransactionBinding) -> bool:
+        return (
+            row.operation_kind is self.operation.operation_kind
+            and _row_matches_binding(row, binding)
+            and row.pending_bytes == self.operation.canonical_bytes()
+        )
+
+    def _verify_finalized(self, binding: TransactionBinding) -> None:
+        try:
+            receipt = self.store.finalized_receipt(self.incarnation_id, binding.transaction_id)
+            matches = self.store.record_rows_match(self.incarnation_id, binding.transaction_id, self.operation)
+        except HistoryStoreError as error:
+            raise _diverged(error) from None
+        if (
+            receipt is None
+            or not matches
+            or receipt[0].transaction_id != binding.transaction_id
+            or receipt[0].event_id != binding.event_id
+            or receipt[0].processing_sequence != binding.processing_sequence
+            or receipt[1] != receipt[0].receipt_digest
+        ):
+            raise ParticipantDivergedError("Finalized SubjectHistory record evidence conflicts")
+
+
 __all__ = [
     "CommitProofSource",
     "JournalCommitProofSource",
     "SubjectHistoryParticipant",
+    "SubjectHistoryRecordParticipant",
 ]

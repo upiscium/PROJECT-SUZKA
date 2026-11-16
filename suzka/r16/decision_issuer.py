@@ -87,6 +87,7 @@ from suzka.r16.history_store import (
 )
 from suzka.r16.outcomes import R16OwnerReason
 from suzka.r16.successor_policy import (
+    as_version,
     NO_PREDECESSOR_HORIZON_KIND,
     POLICY_KIND,
     PREDECESSOR_DECISION_KIND,
@@ -626,7 +627,11 @@ class _DecisionIssuer:
         """D2 P1-1: identical -> existing; same witness, moved sources -> HOLD."""
 
         sealed = SuccessorPolicyInputV2.from_bytes(head.policy_input_bytes)
-        if sealed.evidence_fingerprint() == value.evidence_fingerprint():
+        # IP-14a-2 (D1 r3 §8): compare in the head's own version, in both
+        # directions, so a V2 head under a V3 issuer (or a V3 head after a
+        # rollback to a V2 issuer) is not mistaken for new evidence.
+        comparable = as_version(value, sealed.version)
+        if comparable is not None and sealed.evidence_fingerprint() == comparable.evidence_fingerprint():
             if result.is_hold or result.history_row is not head.policy_row:
                 # Same evidence, different row: only the predecessor/as_of
                 # changed the table's answer, so the head is not reproducible

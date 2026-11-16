@@ -45,6 +45,7 @@ from suzka.r16.history_codec import SUBJECT_HISTORY_PARTICIPANT_ID
 from suzka.r16.history_participant import (
     JournalCommitProofSource,
     SubjectHistoryParticipant,
+    SubjectHistoryRecordParticipant,
 )
 from suzka.r16.history_store import SubjectHistoryStore
 from suzka.runtime.agent_runtime import AgentEvent
@@ -868,7 +869,7 @@ class StartupReconciliationCoordinator:
         self,
         transaction: EventJournalTransaction,
         requirement: ParticipantRequirement,
-    ) -> SubjectHistoryParticipant:
+    ) -> SubjectHistoryParticipant | SubjectHistoryRecordParticipant:
         if requirement.participant_id != SUBJECT_HISTORY_PARTICIPANT_ID:
             raise UnsupportedParticipantReconciliationError(
                 "SubjectHistory participant resolver is not registered"

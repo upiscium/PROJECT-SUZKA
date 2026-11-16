@@ -48,6 +48,12 @@ from suzka.r16.history_codec import (
     PostcommitReceiptV1,
     history_operation_digest,
 )
+from suzka.r16.history_records import (
+    RECORD_OPERATION_KINDS,
+    HistoryOperationKind as _RecordOperationKind,
+    HistoryRecordOperationV1,
+    RecordKind,
+)
 from suzka.r16.history_store import (
     HistoryOperationKind,
     HistoryOperationRow,
@@ -216,6 +222,33 @@ class ReaderClassification:
     heads: dict[str, HistoryHead]
     chains: dict[str, tuple[ChainNode, ...]]
     rows: tuple[HistoryOperationRow, ...]
+    # IP-14a-2: R17 / R18 records that are adopted (terminal or attested).
+    records: tuple[AdoptedRecord, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AdoptedRecord:
+    """One R17 / R18 record whose operation is adopted (D1 r3 §6).
+
+    Live rows: FINALIZED, their R07 transaction terminal with an adopted
+    subject.history outcome, and the event terminal matching the receipt.
+    Attested rows (<= the C10 high-water): SQLite-internal checks. A record
+    that is FINALIZED but not yet terminal is never returned."""
+
+    operation_kind: _RecordOperationKind
+    record_kind: RecordKind
+    record: object
+    transaction_id: str
+    event_id: str
+    processing_sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class AdoptedRecords:
+    """The adopted-only read API's result: the records, or a block."""
+
+    blocked: HeadBlockReason | None
+    records: tuple[AdoptedRecord, ...]
 
 
 class SubjectHistoryReader:
@@ -384,9 +417,81 @@ class SubjectHistoryReader:
             prefix_tips(prefixes, high_water)
         ) != (attestation.scope_count, attestation.scopes_digest):
             raise _Blocked(HeadBlockReason.DIVERGED)
+        records = self._records(incarnation, rows, high_water, view)
         return ReaderClassification(
-            incarnation, horizon, high_water, None, heads, chains, rows
+            incarnation, horizon, high_water, None, heads, chains, rows, records
         )
+
+    def adopted_records(self) -> AdoptedRecords:
+        """IP-14a-2: the only read path for R17 / R18 writers and the ledger
+        reader (IP-16..IP-19). Any whole-incarnation block returns no records."""
+
+        try:
+            result = self.classify()
+        except ReaderTransient as transient:
+            return AdoptedRecords(transient.reason, ())
+        if result.global_block is not None:
+            return AdoptedRecords(result.global_block, ())
+        return AdoptedRecords(None, result.records)
+
+    def _records(
+        self,
+        incarnation: str,
+        rows: tuple[HistoryOperationRow, ...],
+        high_water: int,
+        view: _JournalView,
+    ) -> tuple[AdoptedRecord, ...]:
+        adopted: list[AdoptedRecord] = []
+        for row in rows:
+            if row.operation_kind not in RECORD_OPERATION_KINDS or row.phase is not HistoryPhase.FINALIZED:
+                continue
+            if row.pending_bytes is None:
+                raise _Blocked(HeadBlockReason.DIVERGED)
+            operation = HistoryRecordOperationV1.from_bytes(row.pending_bytes)
+            found = self.store.finalized_receipt(incarnation, row.transaction_id)
+            if (
+                found is None
+                or operation.operation_digest != row.operation_digest
+                or operation.operation_kind.value != row.operation_kind.value
+                or operation.incarnation_id != incarnation
+                or operation.event_id != row.event_id
+                or operation.processing_sequence != row.processing_sequence
+                or operation.transaction_kind != row.transaction_kind
+                or found[1] != found[0].receipt_digest
+                or found[0].event_id != row.event_id
+                or found[0].processing_sequence != row.processing_sequence
+                or not self.store.record_rows_match(incarnation, row.transaction_id, operation)
+            ):
+                raise _Blocked(HeadBlockReason.DIVERGED)
+            if row.processing_sequence > high_water:
+                if row.transaction_id in view.open:
+                    continue  # FINALIZED but not yet terminal: not adopted
+                transaction = view.committed.get(row.transaction_id)
+                if transaction is None:
+                    raise _Blocked(HeadBlockReason.DIVERGED)
+                outcomes = [
+                    outcome
+                    for participant, outcome in transaction.participant_outcomes
+                    if participant == SUBJECT_HISTORY_PARTICIPANT_ID
+                ]
+                if len(outcomes) != 1 or outcomes[0] not in _ADOPTED_OUTCOMES:
+                    raise _Blocked(HeadBlockReason.DIVERGED)
+                terminals = view.event_terminals.get((row.event_id, row.processing_sequence), ())
+                if not terminals:
+                    raise _Blocked(HeadBlockReason.MISSING_JOURNAL_PROOF)
+                if len(terminals) != 1 or not _terminal_matches(terminals[0], found[0]):
+                    raise _Blocked(HeadBlockReason.DIVERGED)
+            adopted.append(
+                AdoptedRecord(
+                    operation.operation_kind,
+                    operation.record_kind,
+                    operation.record,
+                    row.transaction_id,
+                    row.event_id,
+                    row.processing_sequence,
+                )
+            )
+        return tuple(adopted)
 
     @staticmethod
     def _reconcile_all(
@@ -609,6 +714,8 @@ def project_head(head: HistoryHead) -> HistoryHeadProjection:
 
 
 __all__ = [
+    "AdoptedRecord",
+    "AdoptedRecords",
     "HeadBlockReason",
     "HeadStatus",
     "HistoryHead",

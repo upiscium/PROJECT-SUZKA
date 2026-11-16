@@ -408,9 +408,20 @@ def test_the_migration_command(tmp_path: Path, capsys: pytest.CaptureFixture[str
 class Chain:
     """One forward obligation through every R17 / R18 record kind."""
 
-    def __init__(self, decision: Any, group: str = GROUP, offset: int = 0) -> None:
+    def __init__(
+        self,
+        decision: Any,
+        group: str = GROUP,
+        offset: int = 0,
+        *,
+        incarnation: str = INCARNATION,
+        base: int = 100,
+        transaction_kind: str = "EVENT_MUTATION",
+    ) -> None:
         self.decision = decision
-        self.sequence = 100 + offset
+        self.incarnation = incarnation
+        self.transaction_kind = transaction_kind
+        self.sequence = base + offset
         sources = tuple(
             ReviewSourceRef(role, decision.decision_id, 1, decision.content_digest)
             if role is SourceRole.DECISION
@@ -422,7 +433,7 @@ class Chain:
         )
         self.intent = ActionIntentV1(
             lineage_scope="x-1",
-            incarnation_id=INCARNATION,
+            incarnation_id=incarnation,
             admitting_event_id=self.event("intent"),
             admitting_sequence=self.seq(0),
             decision_id=decision.decision_id,
@@ -438,7 +449,7 @@ class Chain:
         )
         self.forecast = ExpectedObservationV1(
             lineage_scope="x-1",
-            incarnation_id=INCARNATION,
+            incarnation_id=incarnation,
             admitting_event_id=self.event("forecast"),
             admitting_sequence=self.seq(1),
             as_of_r07_sequence=self.seq(0),
@@ -495,7 +506,9 @@ class Chain:
 
     def operation(self, kind: HistoryOperationKind, record_kind: RecordKind, record: object, step: int, attempt: int | None = None) -> HistoryRecordOperationV1:
         event_id = getattr(record, "admitting_event_id", None) or getattr(record, "policy_event_id", None) or getattr(record, "claim_event_id", None) or getattr(record, "verifier_event_id", None) or self.event(f"{record_kind.value}-{step}")
-        return HistoryRecordOperationV1(kind, INCARNATION, event_id, self.seq(step), "EVENT_MUTATION", record_kind, record, attempt)
+        return HistoryRecordOperationV1(
+            kind, self.incarnation, event_id, self.seq(step), self.transaction_kind, record_kind, record, attempt
+        )
 
 
 def _apply(store: SubjectHistoryStore, operation: HistoryRecordOperationV1) -> str:
