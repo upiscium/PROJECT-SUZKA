@@ -284,16 +284,65 @@ class RenderedTrace:
 class ConversationTrace:
     """Owner of the trace state; every mutation advances the revision once."""
 
-    def __init__(self, parameters: TraceParameters) -> None:
+    def __init__(self, parameters: TraceParameters, *, enabled: bool = False) -> None:
         if type(parameters) is not TraceParameters:
             raise TypeError("parameters must be TraceParameters")
+        if type(enabled) is not bool:
+            raise TypeError("enabled must be a bool")
         self._parameters = parameters
+        self._enabled = enabled
+        self._restored_from_v11 = False
         self._state = ConversationTraceState()
         self._lock = RLock()
 
     @property
     def parameters(self) -> TraceParameters:
         return self._parameters
+
+    @property
+    def enabled(self) -> bool:
+        """Configured on: the trace adds, recalls and forgets (D1 §1)."""
+
+        return self._enabled
+
+    @property
+    def frozen(self) -> bool:
+        """Disabled after V11 was committed: kept as is, never shown (D1-b)."""
+
+        return not self._enabled and self._restored_from_v11
+
+    @property
+    def persists(self) -> bool:
+        """Whether AgentState must carry the trace (V11): enabled, or already V11."""
+
+        return self._enabled or self._restored_from_v11
+
+    def restore_committed(self, state: ConversationTraceState | None) -> None:
+        """Restore from a committed AgentState: V11 state, or None for older schemas.
+
+        Called by ``AgentStateStore.restore_into`` at startup and on a failure
+        restore, so a V10 committed snapshot clears the V11 flag (D1 v3 §4).
+        """
+
+        with self._lock:
+            if state is None:
+                self._state = ConversationTraceState()
+                self._restored_from_v11 = False
+            else:
+                self.restore_exact(state)
+                self._restored_from_v11 = True
+
+    def committed_marker(self) -> tuple[ConversationTraceState, bool]:
+        """State and V11 flag, for rolling back a failed restore."""
+
+        with self._lock:
+            return self._state, self._restored_from_v11
+
+    def rollback_to(self, marker: tuple[ConversationTraceState, bool]) -> None:
+        state, restored_from_v11 = marker
+        with self._lock:
+            self.restore_exact(state)
+            self._restored_from_v11 = restored_from_v11
 
     @property
     def state(self) -> ConversationTraceState:

@@ -95,6 +95,7 @@ from suzka.runtime.session_participant import (
     SessionTurnParticipant,
 )
 from suzka.runtime.session_state import SessionState
+from suzka.runtime.conversation_trace import ConversationTrace, TraceParameters
 from suzka.runtime.context import (
     ContextFrame,
     ContextNotFound,
@@ -353,6 +354,13 @@ class SuzkaMainLoop:
         self._plan_preview_owner: _PlanPreviewOwner | None = None
         self.working_memory_resolver = MemoryWorkingMemoryResolver(memory_system)
         self.session_state = session_state or SessionState()
+        # #417: always present so a V11 snapshot can be restored; it only adds,
+        # recalls or forgets when enabled (wired into Chat in PR-C).
+        trace_settings = settings.conversation_trace
+        self.conversation_trace = ConversationTrace(
+            TraceParameters.from_settings(trace_settings),
+            enabled=trace_settings.enabled,
+        )
         self.working_memory = (
             working_memory
             if working_memory is not None

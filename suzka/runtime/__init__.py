@@ -19,6 +19,7 @@ from suzka.runtime.agent_state import (
     AGENT_STATE_MAX_SERIALIZED_BYTES,
     AGENT_STATE_SCHEMA_VERSION_V8,
     AGENT_STATE_V10_SCHEMA_VERSION,
+    AGENT_STATE_V11_SCHEMA_VERSION,
     AGENT_STATE_V7_BASE_MAX_SERIALIZED_BYTES,
     AGENT_STATE_V7_SCHEMA_FIELD_MAX_BYTES,
     AGENT_STATE_V7_SCHEMA_MAX_FLOAT_JSON_BYTES,
@@ -52,6 +53,7 @@ from suzka.runtime.agent_state import (
     AgentStateSnapshotV8,
     AgentStateSnapshotV9,
     AgentStateSnapshotV10,
+    AgentStateSnapshotV11,
     AgentStatePorts,
     AttentionAgentStatePorts,
     AppraisalStateSnapshot,
@@ -92,6 +94,7 @@ from suzka.runtime.agent_state import (
     default_agent_state_snapshot,
     project_agent_state_schema_max_bytes,
     project_agent_state_v10_schema_max_bytes,
+    project_agent_state_v11_schema_max_bytes,
 )
 from suzka.runtime.attention_state_port import AttentionStatePort
 from suzka.runtime.context import (
@@ -269,6 +272,7 @@ __all__ = [
     "AgentStateSnapshotV8",
     "AgentStateSnapshotV9",
     "AgentStateSnapshotV10",
+    "AgentStateSnapshotV11",
     "AgentStatePorts",
     "AttentionAgentStatePorts",
     "AttentionStatePort",
@@ -277,6 +281,7 @@ __all__ = [
     "AGENT_STATE_MAX_SERIALIZED_BYTES",
     "AGENT_STATE_SCHEMA_VERSION_V8",
     "AGENT_STATE_V10_SCHEMA_VERSION",
+    "AGENT_STATE_V11_SCHEMA_VERSION",
     "AGENT_STATE_FUTURE_STATE_RESERVE_BYTES",
     "AGENT_STATE_V7_BASE_MAX_SERIALIZED_BYTES",
     "AGENT_STATE_V7_SCHEMA_FIELD_MAX_BYTES",
@@ -426,6 +431,7 @@ __all__ = [
     "default_agent_state_snapshot",
     "project_agent_state_schema_max_bytes",
     "project_agent_state_v10_schema_max_bytes",
+    "project_agent_state_v11_schema_max_bytes",
     "validate_context_registry_state",
     "resolve_chat_context",
     "inspect_reset_session_operation",
