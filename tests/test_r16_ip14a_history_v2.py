@@ -224,8 +224,9 @@ def test_migration_keeps_every_v1_row_and_the_decisions_replay(tmp_path: Path) -
     before = sqlite3.connect(path)
     rows = {t: before.execute(f"SELECT * FROM {t} ORDER BY rowid").fetchall() for t in ("history_operations", "history_decisions", "history_source_refs", "history_postcommit_receipts")}
     before.close()
-    backup = migrate_v1_to_v2(path)
-    assert os.stat(backup).st_mode & 0o777 == 0o600
+    result = migrate_v1_to_v2(path)
+    backup = result.backup
+    assert result.compacted and os.stat(backup).st_mode & 0o777 == 0o600
     store = SubjectHistoryStore.open(path, max_page_count=PAGES)
     assert store.meta().schema_version == 2
     after = sqlite3.connect(path)
@@ -240,6 +241,97 @@ def test_migration_keeps_every_v1_row_and_the_decisions_replay(tmp_path: Path) -
     # The backup is the untouched v1 file.
     with pytest.raises(HistoryStoreMigrationRequired):
         SubjectHistoryStore.open(backup, max_page_count=PAGES)
+
+
+@pytest.mark.parametrize("stage", ["backed-up", "dropped", "rebuilt:history_meta", "created", "verified"])
+def test_a_killed_process_leaves_v1_and_a_rerun_migrates(tmp_path: Path, stage: str) -> None:
+    """Review P2-1: a real crash (os._exit, no ROLLBACK) leaves the v1 file
+    and possibly its journal; the next run migrates without manual cleanup."""
+
+    import subprocess
+    import sys
+
+    path, _ = _v1_store_with_decisions(tmp_path)
+    script = (
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "from suzka.r16 import history_migration as m\n"
+        f"m._STAGE_HOOK = lambda name: os._exit(9) if name == {stage!r} else None\n"
+        f"m.migrate_v1_to_v2(Path({str(path)!r}))\n"
+    )
+    completed = subprocess.run([sys.executable, "-c", script], cwd=Path(__file__).parents[1], check=False)
+    assert completed.returncode == 9
+    with pytest.raises(HistoryStoreMigrationRequired):
+        SubjectHistoryStore.open(path, max_page_count=PAGES)
+    assert history_migration.main([str(path)]) == 0  # no manual cleanup needed
+    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == 2
+
+
+def test_a_failed_compaction_after_commit_is_not_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review P2-2: after COMMIT the store is v2 even if VACUUM fails."""
+
+    path, _ = _v1_store_with_decisions(tmp_path)
+    readers: list[sqlite3.Connection] = []
+
+    def hold_a_read_lock(name: str) -> None:
+        if name == "committed":
+            reader = sqlite3.connect(path, isolation_level=None, timeout=0.1)
+            reader.execute("BEGIN")
+            reader.execute("SELECT count(*) FROM history_meta").fetchall()
+            readers.append(reader)
+
+    monkeypatch.setattr(history_migration, "_STAGE_HOOK", hold_a_read_lock)
+    assert history_migration.main([str(path)]) == 0
+    out = capsys.readouterr().out
+    assert "migrated to SubjectHistory v2" in out and "compaction (VACUUM) failed" in out
+    readers[0].close()
+    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == 2
+
+
+def test_migration_refuses_a_store_too_close_to_its_cap(tmp_path: Path) -> None:
+    path, _ = _v1_store_with_decisions(tmp_path)
+    pages = sqlite3.connect(path).execute("PRAGMA page_count").fetchone()[0]
+    with pytest.raises(HistoryMigrationError, match="max_page_count"):
+        migrate_v1_to_v2(path, max_page_count=pages + 10)
+    with pytest.raises(HistoryStoreMigrationRequired):
+        SubjectHistoryStore.open(path, max_page_count=PAGES)
+    assert migrate_v1_to_v2(path, max_page_count=PAGES).compacted
+
+
+def test_prepared_aborted_and_provisional_stores_migrate(tmp_path: Path) -> None:
+    from suzka.r16.history_participant import SubjectHistoryParticipant
+
+    store = _v2_store(tmp_path, r18=False)
+    first = _decision(store, "first", 3)
+    pending_event = _event("pending", 4)
+    pending = _committed(pending_event, intent="9" * 64, predecessor=(first.decision_id, first.content_digest))
+    SubjectHistoryParticipant(store, INCARNATION, pending, FakeProof()).prepare(_binding(pending_event, pending))
+    aborted_event = _event("aborted", 5)
+    aborted = _committed(aborted_event, intent="8" * 64, predecessor=(first.decision_id, first.content_digest))
+    binding = _binding(aborted_event, aborted)
+    store.insert_abort_tombstone(
+        incarnation_id="2" * 64, transaction_id=binding.transaction_id, event_id=binding.event_id,
+        processing_sequence=binding.processing_sequence, transaction_kind=binding.transaction_kind.value,
+        operation_digest=binding.operation_digest,
+    )
+    path = store.path
+    store.close()
+    _downgrade_to_v1(path)
+    migrate_v1_to_v2(path)
+    phases = sorted(row.phase.value for row in SubjectHistoryStore.open(path, max_page_count=PAGES).operations(INCARNATION))
+    assert phases == ["FINALIZED", "PREPARED"]
+
+    provisional = SubjectHistoryStore.create(
+        _private_dir(tmp_path / "provisional") / "subject_history.sqlite3",
+        subject_id="suzka", journal_lineage_id="lineage-1", max_page_count=PAGES,
+    )
+    provisional_path = provisional.path
+    provisional.close()
+    _downgrade_to_v1(provisional_path)
+    migrate_v1_to_v2(provisional_path)
+    assert SubjectHistoryStore.open(provisional_path, max_page_count=PAGES).meta().phase.value == "PROVISIONAL"
 
 
 @pytest.mark.parametrize("stage", ["backed-up", "dropped", "rebuilt:history_meta", "rebuilt:history_operations", "rebuilt:history_decisions", "created", "verified"])
@@ -267,6 +359,25 @@ def test_a_crash_before_commit_leaves_the_v1_file(tmp_path: Path, monkeypatch: p
 
     migrate_v1_to_v2(path, now=datetime(2030, 1, 1, tzinfo=UTC))
     assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == 2
+
+
+def test_a_record_row_must_be_in_its_operations_envelope(tmp_path: Path) -> None:
+    """Review P3-1: direct SQL cannot FINALIZE a record that is not the one its
+    PREPARED operation carries."""
+
+    store = _v2_store(tmp_path)
+    chain = Chain(_decision(store))
+    steps = _steps(chain)
+    _apply(store, steps[0])
+    _apply(store, steps[1])
+    transaction_id = _prepare(store, steps[2])
+    other = replace(chain.verdict, policy_sequence=chain.seq(2) + 50)
+    connection = sqlite3.connect(store.path, isolation_level=None)
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "INSERT INTO policy_verdicts (record_id, incarnation_id, transaction_id, record_bytes, record_digest, intent_id, direction, verdict) VALUES (?, ?, ?, ?, ?, ?, 'FORWARD', 'ALLOW')",
+            (other.verdict_digest, INCARNATION, transaction_id, other.canonical_bytes(), other.verdict_digest, chain.intent.intent_id),
+        )
 
 
 def test_migration_refuses_what_is_not_exactly_v1(tmp_path: Path) -> None:
@@ -532,6 +643,24 @@ def test_a_new_challenge_needs_every_earlier_one_expired(tmp_path: Path) -> None
         chain.operation(K.R18_CHALLENGE_ISSUE, R.APPROVAL_CHALLENGE, chain.challenges[3], 30, attempt=4)
 
 
+def test_a_later_challenge_can_be_claimed(tmp_path: Path) -> None:
+    store = _v2_store(tmp_path)
+    chain = Chain(_decision(store))
+    for operation in _steps(chain)[:4]:
+        _apply(store, operation)
+    _apply(store, chain.operation(K.R18_APPROVAL_EXPIRE, R.APPROVAL_EXPIRATION, ApprovalExpirationV1.for_challenge(chain.challenges[0], ExpirationReason.BOOT_CHANGED), 20))
+    _apply(store, chain.operation(K.R18_CHALLENGE_ISSUE, R.APPROVAL_CHALLENGE, chain.challenges[1], 21, attempt=2))
+    claim = ExecutionClaimV1.claim(
+        chain.challenges[1], runtime_instance_id=RUNTIME, boot_id=BOOT,
+        claim_event_id=chain.event("claim-2"), claim_sequence=chain.seq(22), claimed_utc="2026-11-16T00:05:00Z",
+    )
+    _apply(store, chain.operation(K.R18_EXECUTION_CLAIM, R.EXECUTION_CLAIM, claim, 22))
+    # The expired first challenge can no longer be claimed.
+    stale = chain.operation(K.R18_EXECUTION_CLAIM, R.EXECUTION_CLAIM, chain.claim, 4)
+    with pytest.raises(HistoryStoreConflict):
+        _prepare(store, stale)
+
+
 @pytest.mark.parametrize("skip", [1, 2, 3, 4, 5, 6, 7])
 def test_each_record_needs_its_previous_stage(tmp_path: Path, skip: int) -> None:
     """§2b: the FINALIZE-time gates refuse a record whose previous stage is
@@ -579,6 +708,28 @@ def test_an_inverse_needs_a_verified_forward_effect(tmp_path: Path) -> None:
         _apply(store, step)
     later = replace(inverse, admitting_event_id=chain.event("inverse-2"), admitting_sequence=chain.seq(10))
     _apply(store, chain.operation(K.R18_INTENT_ISSUE, R.INVERSE_INTENT, later, 10))
+    # The rest of the inverse chain: verdict (no forecast) -> challenge -> Claim -> REVERTED.
+    verdict = PolicyVerdictV1(
+        Direction.INVERSE, later.intent_id, later.intent_digest, later.inverse_key,
+        PolicyVerdict.ALLOW, None, chain.event("inverse-verdict"), chain.seq(11),
+    )
+    _apply(store, chain.operation(K.R18_POLICY_COMMIT, R.POLICY_VERDICT, verdict, 11))
+    challenge = ApprovalChallengeV1.for_inverse(
+        later, verdict, nonce="7" * 64, issued_utc="2026-11-16T01:00:00Z",
+        expires_utc="2026-11-16T01:10:00Z", boot_id=BOOT,
+    )
+    _apply(store, chain.operation(K.R18_CHALLENGE_ISSUE, R.APPROVAL_CHALLENGE, challenge, 12, attempt=1))
+    claim = ExecutionClaimV1.claim(
+        challenge, runtime_instance_id=RUNTIME, boot_id=BOOT,
+        claim_event_id=chain.event("inverse-claim"), claim_sequence=chain.seq(13), claimed_utc="2026-11-16T01:05:00Z",
+    )
+    _apply(store, chain.operation(K.R18_EXECUTION_CLAIM, R.EXECUTION_CLAIM, claim, 13))
+    reverted = replace(
+        _outcome(VerifiedState.REVERTED),
+        operation_key=later.inverse_key, target_instance_id=TARGET,
+        verifier_event_id=chain.event("inverse-outcome"), verifier_sequence=chain.seq(14),
+    )
+    _apply(store, chain.operation(K.R18_OUTCOME_COMMIT, R.VERIFIED_OUTCOME, reverted, 14))
 
 
 def test_records_are_immutable_and_finalize_is_complete(tmp_path: Path) -> None:

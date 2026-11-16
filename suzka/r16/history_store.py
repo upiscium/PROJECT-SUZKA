@@ -98,11 +98,14 @@ def _kind_exists(kind: HistoryOperationKind) -> str:
     )
 
 
-def _gate(kind: HistoryOperationKind) -> str:
+def _gate(kind: HistoryOperationKind, bound: str = "NEW.record_bytes") -> str:
+    """The row's operation is PREPARED, of this kind, and its pending envelope
+    contains the row's canonical bytes (the record is embedded verbatim)."""
     return (
         "NOT EXISTS (SELECT 1 FROM history_operations o"
         " WHERE o.incarnation_id = NEW.incarnation_id AND o.transaction_id = NEW.transaction_id"
-        f" AND o.phase = 'PREPARED' AND o.operation_kind = '{kind.value}')"
+        f" AND o.phase = 'PREPARED' AND o.operation_kind = '{kind.value}'"
+        f" AND instr(o.pending_bytes, {bound}) > 0)"
     )
 
 
@@ -317,7 +320,7 @@ WHEN {_gate(_K.R18_APPROVAL_EXPIRE)}
 BEGIN SELECT RAISE(ABORT, 'approval expiration is not admissible here'); END""",
     f"""CREATE TRIGGER approval_nonce_consumptions_insert
 BEFORE INSERT ON approval_nonce_consumptions
-WHEN {_gate(_K.R18_EXECUTION_CLAIM)}
+WHEN {_gate(_K.R18_EXECUTION_CLAIM, "CAST(NEW.claim_id AS BLOB)")}
     OR NOT EXISTS (SELECT 1 FROM approval_challenges c
         WHERE c.record_id = NEW.challenge_digest AND c.nonce = NEW.nonce)
     OR EXISTS (SELECT 1 FROM approval_expirations e WHERE e.record_id = NEW.challenge_digest)
@@ -340,7 +343,11 @@ WHEN {_gate(_K.R17_ASSESSMENT_COMMIT)}
     OR NOT EXISTS (SELECT 1 FROM verified_outcomes v
         WHERE v.verified_outcome_id = NEW.verified_outcome_id
             AND v.outcome_revision = NEW.outcome_revision AND v.direction = 'FORWARD')
-    OR NOT EXISTS (SELECT 1 FROM action_forecasts f WHERE f.record_id = NEW.forecast_id)
+    OR NOT EXISTS (SELECT 1 FROM action_forecasts f JOIN verified_outcomes v
+        ON v.operation_key = f.forward_key
+        WHERE f.record_id = NEW.forecast_id
+            AND v.verified_outcome_id = NEW.verified_outcome_id
+            AND v.outcome_revision = NEW.outcome_revision)
 BEGIN SELECT RAISE(ABORT, 'outcome assessment is not admissible here'); END""",
     f"""CREATE TRIGGER decision_feedback_insert BEFORE INSERT ON decision_feedback
 WHEN {_gate(_K.R17_FEEDBACK_COMMIT)}
@@ -537,7 +544,10 @@ WHEN NEW.phase = 'FINALIZED' AND (
     ))
 """
     + "".join(
-        f"    OR (OLD.operation_kind = '{kind.value}' AND NOT ({_kind_exists(kind)}))\n"
+        f"    OR (OLD.operation_kind = '{kind.value}' AND NOT ({_kind_exists(kind)}"
+        " AND EXISTS (SELECT 1 FROM history_operation_keys k"
+        " WHERE k.incarnation_id = OLD.incarnation_id"
+        " AND k.transaction_id = OLD.transaction_id AND k.live = 1)))\n"
         for kind in HistoryOperationKind
         if kind in RECORD_OPERATION_KINDS
     )
