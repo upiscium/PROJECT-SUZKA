@@ -443,7 +443,12 @@ class SubjectHistoryReader:
     ) -> tuple[AdoptedRecord, ...]:
         adopted: list[AdoptedRecord] = []
         for row in rows:
-            if row.operation_kind not in RECORD_OPERATION_KINDS or row.phase is not HistoryPhase.FINALIZED:
+            if row.operation_kind not in RECORD_OPERATION_KINDS:
+                continue
+            if row.phase is not HistoryPhase.FINALIZED:
+                if row.phase is HistoryPhase.PREPARED and row.processing_sequence <= high_water:
+                    # Attested rows are settled (as _internal_node requires).
+                    raise _Blocked(HeadBlockReason.DIVERGED)
                 continue
             if row.pending_bytes is None:
                 raise _Blocked(HeadBlockReason.DIVERGED)
@@ -478,7 +483,10 @@ class SubjectHistoryReader:
                     raise _Blocked(HeadBlockReason.DIVERGED)
                 terminals = view.event_terminals.get((row.event_id, row.processing_sequence), ())
                 if not terminals:
-                    raise _Blocked(HeadBlockReason.MISSING_JOURNAL_PROOF)
+                    # Not yet terminal (live window or before startup
+                    # classification): not adopted, and no R16 head is
+                    # affected (review P2; D1 r3 §6).
+                    continue
                 if len(terminals) != 1 or not _terminal_matches(terminals[0], found[0]):
                     raise _Blocked(HeadBlockReason.DIVERGED)
             adopted.append(

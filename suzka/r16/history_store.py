@@ -1510,19 +1510,28 @@ class SubjectHistoryStore:
     ) -> bool:
         """Whether the stored rows of one FINALIZED record operation are exactly
         the rows its envelope derives, and no record table holds any other row
-        of that operation (IP-14a D1 §6)."""
+        of that operation (IP-14a D1 §6). Two queries per table of the kind
+        plus one count over the other tables."""
 
         expected: dict[str, list[dict[str, object]]] = {}
         for row in operation.rows:
             expected.setdefault(row.table, []).append(dict(row.columns))
-        for table in RECORD_TABLES:
+        for table, wanted in expected.items():
             stored = self.record_rows(table, incarnation_id, transaction_id)
-            wanted = expected.get(table, [])
             if len(stored) != len(wanted):
                 return False
             for found, columns in zip(stored, wanted, strict=True):
                 if any(found.get(name) != value for name, value in columns.items()):
                     return False
+        others = [table for table in RECORD_TABLES if table not in expected]
+        if others:
+            total = " + ".join(
+                f"(SELECT count(*) FROM {table} WHERE incarnation_id = ? AND transaction_id = ?)"
+                for table in others
+            )
+            rows = self._read(f"SELECT {total}", tuple(v for _ in others for v in (incarnation_id, transaction_id)))
+            if _int(rows[0][0]) != 0:
+                return False
         return True
 
     def record_rows(

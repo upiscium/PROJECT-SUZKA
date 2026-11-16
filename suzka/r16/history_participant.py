@@ -426,8 +426,10 @@ class SubjectHistoryRecordParticipant:
     exactly; only the pending bytes are a ``HistoryRecordOperationV1`` envelope,
     whose incarnation, event, sequence and transaction kind must equal the R07
     binding. PREPARE reserves the record's keys (D1 §2a) and needs
-    ``r18.enabled``; FINALIZE and reconcile do not, so a store with pending
-    records still settles while R18 is disabled.
+    ``r18.enabled``; FINALIZE and reconcile do not. That is meant for IP-16 /
+    IP-18 (a disabled R18 still settles pending records); until then startup
+    refuses a store holding records while R18 is disabled (Human decision
+    §11-2), so the disabled-finalize path is not reachable in production.
     """
 
     participant_id = SUBJECT_HISTORY_PARTICIPANT_ID

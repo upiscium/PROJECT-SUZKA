@@ -171,11 +171,15 @@ def test_adopted_records_only_after_the_event_terminal(tmp_path: Path) -> None:
     adopted = reader.adopted_records()
     assert adopted.blocked is None
     assert [(item.operation_kind, item.record) for item in adopted.records] == [(K.R18_INTENT_ISSUE, chain.intent)]
-    # FINALIZED but the event is not terminal yet: not adopted (and the
-    # missing terminal blocks like an R16 Decision would).
+    # FINALIZED but the event is not terminal yet: simply not adopted, and
+    # neither the other records nor any R16 head are blocked (review P2).
+    head = reader.head("goal-lineage-1")
     world.commit_record(steps[1], complete=False)
     pending = reader.adopted_records()
-    assert pending.records == () and pending.blocked is HeadBlockReason.MISSING_JOURNAL_PROOF
+    assert pending.blocked is None
+    assert [item.record for item in pending.records] == [chain.intent]
+    later = reader.head("goal-lineage-1")
+    assert (later.status, later.decision) == (head.status, head.decision)
 
 
 def test_record_rows_that_differ_from_their_envelope_block_the_reader(tmp_path: Path) -> None:
@@ -250,8 +254,9 @@ def test_as_version_converts_both_ways_when_representable() -> None:
 
 
 def test_a_v2_head_stays_existing_when_the_issuer_seals_v3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """D1 r3 §8 (a): the switch in IP-14a-3 keeps unchanged lineages EXISTING,
-    and rolling back keeps a V3 head EXISTING under a V2 issuer."""
+    """D1 r3 §8 (a): the switch in IP-14a-3 keeps unchanged lineages EXISTING.
+    The reverse leg (a V3 head under a rolled-back V2 issuer) is IP-14a-3's
+    acceptance (D1 §10); ``as_version`` covers its conversion here."""
 
     from fastapi.testclient import TestClient
 
