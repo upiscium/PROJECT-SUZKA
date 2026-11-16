@@ -1,7 +1,7 @@
 """SubjectHistory schema v1, frozen (IP-14a, #411 comment 6910958369 §5).
 
 The exact v1 statements and hash, as created by ``rebuild/develop@ca54b6b``.
-v2 code uses them only to verify a v1 store before migrating it and to tell
+v3 code uses them only to verify a v1 store before migrating it and to tell
 "migration required" apart from corruption. Never edit: a change breaks the
 v1 hash and every v1 store would look corrupt.
 """

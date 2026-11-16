@@ -241,7 +241,12 @@ def _intent(value: ActionIntentV1) -> DecodedRecord:
         RecordKind.ACTION_INTENT,
         value,
         (row,),
-        (f"operation:{value.forward_key}", f"group:{value.obligation_group_key}:FORWARD"),
+        # IP-16 D1 §9 (#373 A1-5): Intents are unique per incarnation; only
+        # Claims, nonces and Outcomes are unique across incarnations.
+        (
+            f"operation:{value.incarnation_id}:{value.forward_key}",
+            f"group:{value.incarnation_id}:{value.obligation_group_key}:FORWARD",
+        ),
         (value.admitting_event_id, value.admitting_sequence),
     )
 
@@ -263,7 +268,10 @@ def _inverse(value: InverseIntentV1) -> DecodedRecord:
         RecordKind.INVERSE_INTENT,
         value,
         (row,),
-        (f"operation:{value.inverse_key}", f"group:{value.obligation_group_key}:INVERSE"),
+        (
+            f"operation:{value.incarnation_id}:{value.inverse_key}",
+            f"group:{value.incarnation_id}:{value.obligation_group_key}:INVERSE",
+        ),
         (value.admitting_event_id, value.admitting_sequence),
     )
 
@@ -281,7 +289,10 @@ def _forecast(value: ExpectedObservationV1) -> DecodedRecord:
         RecordKind.ACTION_FORECAST,
         value,
         (row,),
-        (f"forecast-intent:{value.action_intent_id}", f"forecast-key:{value.forward_key}"),
+        (
+            f"forecast-intent:{value.action_intent_id}",
+            f"forecast-key:{value.incarnation_id}:{value.forward_key}",
+        ),
         (value.admitting_event_id, value.admitting_sequence),
     )
 

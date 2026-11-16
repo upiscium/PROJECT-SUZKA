@@ -1,4 +1,4 @@
-"""R16 U4-1 / IP-14a-1: the SubjectHistoryDB SQLite file, schema v2, trusted opener.
+"""R16 U4-1 / IP-14a-1 / IP-16a-1: the SubjectHistoryDB SQLite file, schema v3, trusted opener.
 
 v1 (#376 §A/§B, #376 6738757841 / 6752207008): five tables (``history_meta``,
 ``history_operations``, ``history_decisions``, ``history_source_refs``,
@@ -6,10 +6,16 @@ v1 (#376 §A/§B, #376 6738757841 / 6752207008): five tables (``history_meta``,
 
 v2 (IP-14a D1 r3, #411 comment 6910958369): the R17 / R18 source-side record
 tables, the PREPARE-time key reservations (§2a), the record operation kinds
-and ``SUCCESSOR_POLICY_V3``. A v1 file is never opened: it raises
-``HistoryStoreMigrationRequired`` and is migrated only by the explicit
-``suzka.r16.history_migration`` command (Human decision §11-1). HOLD receipts
-and R19 cycle resolution are IP-14b.
+and ``SUCCESSOR_POLICY_V3``.
+
+v3 (IP-16 D1 r3 §9, #411 comment 6916372789): Intent and forecast uniqueness
+and their PREPARE reservations are per incarnation; Claim, nonce and Outcome
+stay global. v2 was already deployed on eve (6ed2361), so this is a new
+version, not an edit of v2.
+
+A v1 or v2 file is never opened: it raises ``HistoryStoreMigrationRequired``
+and is migrated only by the explicit ``suzka.r16.history_migration`` command
+(Human decision §11-1). HOLD receipts and R19 cycle resolution are IP-14b.
 
 Authority boundary: this module is storage only.  The single writer authority
 for the file is the ``subject.history`` R07 participant; SQL CHECKs and
@@ -54,11 +60,12 @@ from suzka.r16.history_records import (
     HistoryRecordOperationV1,
 )
 from suzka.r16.history_schema_v1 import SCHEMA_HASH_V1, SCHEMA_STATEMENTS_V1
+from suzka.r16.history_schema_v2 import SCHEMA_HASH_V2, SCHEMA_STATEMENTS_V2
 from suzka.r17.contracts import MAX_RECORD_BYTES as _R17_RECORD_BYTES
 from suzka.r18.contracts import MAX_RECORD_BYTES as _R18_RECORD_BYTES
 
 
-HISTORY_SCHEMA_VERSION: Final = 2
+HISTORY_SCHEMA_VERSION: Final = 3
 _SQLITE_BUSY_TIMEOUT_SECONDS: Final = 5.0
 # Conservative bytes a FINALIZE may add for one pending operation: the
 # committed envelope, inner U1 bytes, policy input, source rows, receipt and
@@ -156,17 +163,19 @@ V2_STATEMENTS: Final[tuple[str, ...]] = (
         "action_intents",
         f"""    {_DIRECTION}
     obligation_group_key TEXT NOT NULL CHECK {_hex("obligation_group_key")},
-    operation_key TEXT NOT NULL UNIQUE CHECK {_hex("operation_key")},
+    operation_key TEXT NOT NULL CHECK {_hex("operation_key")},
     forward_operation_key TEXT NOT NULL CHECK {_hex("forward_operation_key")},
     decision_id TEXT REFERENCES history_decisions (decision_id),
-    UNIQUE (obligation_group_key, direction),
+    UNIQUE (incarnation_id, operation_key),
+    UNIQUE (incarnation_id, obligation_group_key, direction),
     CHECK ((direction = 'FORWARD') = (decision_id IS NOT NULL)),
     CHECK (direction = 'INVERSE' OR forward_operation_key = operation_key),""",
     ),
     _record_table(
         "action_forecasts",
         f"""    action_intent_id TEXT NOT NULL UNIQUE REFERENCES action_intents (record_id),
-    forward_key TEXT NOT NULL UNIQUE CHECK {_hex("forward_key")},""",
+    forward_key TEXT NOT NULL CHECK {_hex("forward_key")},
+    UNIQUE (incarnation_id, forward_key),""",
     ),
     _record_table(
         "policy_verdicts",
@@ -273,6 +282,10 @@ BEGIN
 END""",
     # Record inserts: only inside the FINALIZE of their exact PREPARED
     # operation kind, and only after the previous stage exists (§2b).
+    # IP-16 §9: Intents repeat across incarnations, so a forecast, verdict or
+    # challenge belongs to its Intent's incarnation, and an assessment only
+    # to the Outcome of its own Intent's Claim.  Claims, nonces, Outcomes and
+    # the inverse gate stay global.
     f"""CREATE TRIGGER action_intents_insert BEFORE INSERT ON action_intents
 WHEN {_gate(_K.R18_INTENT_ISSUE)}
     OR (NEW.direction = 'INVERSE' AND NOT (
@@ -288,12 +301,14 @@ BEGIN SELECT RAISE(ABORT, 'action intent is not admissible here'); END""",
 WHEN {_gate(_K.R17_EXPECTATION_COMMIT)}
     OR NOT EXISTS (SELECT 1 FROM action_intents i
         WHERE i.record_id = NEW.action_intent_id AND i.direction = 'FORWARD'
-            AND i.operation_key = NEW.forward_key)
+            AND i.operation_key = NEW.forward_key
+            AND i.incarnation_id = NEW.incarnation_id)
 BEGIN SELECT RAISE(ABORT, 'forecast is not admissible here'); END""",
     f"""CREATE TRIGGER policy_verdicts_insert BEFORE INSERT ON policy_verdicts
 WHEN {_gate(_K.R18_POLICY_COMMIT)}
     OR NOT EXISTS (SELECT 1 FROM action_intents i
-        WHERE i.record_id = NEW.intent_id AND i.direction = NEW.direction)
+        WHERE i.record_id = NEW.intent_id AND i.direction = NEW.direction
+            AND i.incarnation_id = NEW.incarnation_id)
     OR (NEW.direction = 'FORWARD' AND NOT EXISTS (
         SELECT 1 FROM action_forecasts f WHERE f.action_intent_id = NEW.intent_id))
 BEGIN SELECT RAISE(ABORT, 'policy verdict is not admissible here'); END""",
@@ -303,7 +318,8 @@ WHEN {_gate(_K.R18_CHALLENGE_ISSUE)}
         WHERE p.intent_id = NEW.intent_id AND p.verdict = 'ALLOW')
     OR NOT EXISTS (SELECT 1 FROM action_intents i
         WHERE i.record_id = NEW.intent_id AND i.direction = NEW.direction
-            AND i.operation_key = NEW.operation_key)
+            AND i.operation_key = NEW.operation_key
+            AND i.incarnation_id = NEW.incarnation_id)
     OR (SELECT count(*) FROM approval_challenges c WHERE c.intent_id = NEW.intent_id)
         IS NOT NEW.attempt - 1
     OR (SELECT count(*) FROM approval_challenges c JOIN approval_expirations e
@@ -345,7 +361,9 @@ WHEN {_gate(_K.R17_ASSESSMENT_COMMIT)}
             AND v.outcome_revision = NEW.outcome_revision AND v.direction = 'FORWARD')
     OR NOT EXISTS (SELECT 1 FROM action_forecasts f JOIN verified_outcomes v
         ON v.operation_key = f.forward_key
-        WHERE f.record_id = NEW.forecast_id
+        JOIN execution_claims c ON c.operation_key = v.operation_key AND c.direction = 'FORWARD'
+        JOIN approval_challenges ch ON ch.record_id = c.challenge_digest
+        WHERE f.record_id = NEW.forecast_id AND ch.intent_id = f.action_intent_id
             AND v.verified_outcome_id = NEW.verified_outcome_id
             AND v.outcome_revision = NEW.outcome_revision)
 BEGIN SELECT RAISE(ABORT, 'outcome assessment is not admissible here'); END""",
@@ -652,7 +670,7 @@ class HistoryStoreConflict(HistoryStoreError):
 
 
 class HistoryStoreMigrationRequired(HistoryStoreError):
-    """The file is a valid v1 store: run the explicit v1 -> v2 migration.
+    """The file is a valid v1 or v2 store: run the explicit migration to v3.
 
     Not corruption and not retryable by waiting; startup stops (§11-1)."""
 
@@ -1081,11 +1099,12 @@ class SubjectHistoryStore:
     def _verify_schema(connection: sqlite3.Connection) -> None:
         actual = connection.execute(_SCHEMA_QUERY).fetchall()
         if actual != _expected_schema(SCHEMA_STATEMENTS):
-            if actual == _expected_schema(SCHEMA_STATEMENTS_V1):
-                raise HistoryStoreMigrationRequired(
-                    "SubjectHistory is schema v1: run suzka.r16.history_migration"
-                )
-            raise HistoryStoreCorrupt("SubjectHistory schema is not schema v2")
+            for version, statements in ((1, SCHEMA_STATEMENTS_V1), (2, SCHEMA_STATEMENTS_V2)):
+                if actual == _expected_schema(statements):
+                    raise HistoryStoreMigrationRequired(
+                        f"SubjectHistory is schema v{version}: run suzka.r16.history_migration"
+                    )
+            raise HistoryStoreCorrupt("SubjectHistory schema is not schema v3")
         check = connection.execute("PRAGMA quick_check").fetchall()
         if check != [("ok",)]:
             raise HistoryStoreCorrupt("SubjectHistory integrity check failed")
@@ -1152,10 +1171,12 @@ class SubjectHistoryStore:
             )
         except (TypeError, ValueError) as error:
             raise HistoryStoreCorrupt("SubjectHistory meta is invalid") from error
-        if (meta.schema_version, meta.schema_hash) == (1, SCHEMA_HASH_V1):
-            raise HistoryStoreMigrationRequired("SubjectHistory meta is schema v1")
+        if (meta.schema_version, meta.schema_hash) in ((1, SCHEMA_HASH_V1), (2, SCHEMA_HASH_V2)):
+            raise HistoryStoreMigrationRequired(
+                f"SubjectHistory meta is schema v{meta.schema_version}"
+            )
         if meta.schema_version != HISTORY_SCHEMA_VERSION or meta.schema_hash != SCHEMA_HASH:
-            raise HistoryStoreCorrupt("SubjectHistory meta schema is not v2")
+            raise HistoryStoreCorrupt("SubjectHistory meta schema is not v3")
         return meta
 
     def activate(
