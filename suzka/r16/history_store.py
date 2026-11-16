@@ -1473,6 +1473,67 @@ class SubjectHistoryStore:
                 )
             _finish(connection, operation.incarnation_id, transaction_id, receipt)
 
+    def finalized_receipt(
+        self, incarnation_id: str, transaction_id: str
+    ) -> tuple[PostcommitReceiptV1, str] | None:
+        """The postcommit receipt of one operation and its stored digest."""
+
+        rows = self._read(
+            "SELECT transaction_id, event_id, processing_sequence, "
+            "prepared_state_hash_before, prepared_state_hash_after, snapshot_sequence, "
+            "snapshot_hash, wal_generation_id, wal_record_id, wal_record_hash, receipt_digest "
+            "FROM history_postcommit_receipts WHERE incarnation_id = ? AND transaction_id = ?",
+            (incarnation_id, transaction_id),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        try:
+            receipt = PostcommitReceiptV1(
+                transaction_id=str(row[0]),
+                event_id=str(row[1]),
+                processing_sequence=_int(row[2]),
+                prepared_state_hash_before=str(row[3]),
+                prepared_state_hash_after=str(row[4]),
+                snapshot_sequence=_int(row[5]),
+                snapshot_hash=str(row[6]),
+                wal_generation_id=str(row[7]),
+                wal_record_id=str(row[8]),
+                wal_record_hash=str(row[9]),
+            )
+        except (TypeError, ValueError) as error:
+            raise HistoryStoreCorrupt("SubjectHistory receipt row is invalid") from error
+        return receipt, str(row[10])
+
+    def record_rows_match(
+        self, incarnation_id: str, transaction_id: str, operation: HistoryRecordOperationV1
+    ) -> bool:
+        """Whether the stored rows of one FINALIZED record operation are exactly
+        the rows its envelope derives, and no record table holds any other row
+        of that operation (IP-14a D1 §6). Two queries per table of the kind
+        plus one count over the other tables."""
+
+        expected: dict[str, list[dict[str, object]]] = {}
+        for row in operation.rows:
+            expected.setdefault(row.table, []).append(dict(row.columns))
+        for table, wanted in expected.items():
+            stored = self.record_rows(table, incarnation_id, transaction_id)
+            if len(stored) != len(wanted):
+                return False
+            for found, columns in zip(stored, wanted, strict=True):
+                if any(found.get(name) != value for name, value in columns.items()):
+                    return False
+        others = [table for table in RECORD_TABLES if table not in expected]
+        if others:
+            total = " + ".join(
+                f"(SELECT count(*) FROM {table} WHERE incarnation_id = ? AND transaction_id = ?)"
+                for table in others
+            )
+            rows = self._read(f"SELECT {total}", tuple(v for _ in others for v in (incarnation_id, transaction_id)))
+            if _int(rows[0][0]) != 0:
+                return False
+        return True
+
     def record_rows(
         self, table: str, incarnation_id: str, transaction_id: str
     ) -> tuple[dict[str, object], ...]:

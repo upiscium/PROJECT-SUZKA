@@ -52,7 +52,7 @@ of ``suzka.runtime.r15_interpretation_reader`` and is mapped here.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Final, Self
@@ -642,6 +642,27 @@ class SuccessorPolicyInputV2:
         return checksum(_FINGERPRINT_DOMAINS[self.version], body)
 
 
+def as_version(
+    value: SuccessorPolicyInputV2, version: PolicyKind
+) -> SuccessorPolicyInputV2 | None:
+    """The same evidence expressed in ``version``, or None when it cannot be.
+
+    IP-14a D1 r3 §8 (Human decision (a)): the issuer compares a head with the
+    current input in the head's own version. V2 -> V3 is always possible;
+    V3 -> V2 only without a V3-only ledger state.
+    """
+
+    if type(value) is not SuccessorPolicyInputV2:
+        raise TypeError("value must be a SuccessorPolicyInputV2")
+    if type(version) is not PolicyKind or version not in _INPUT_SCHEMAS:
+        raise ValueError("version must be SuccessorPolicy V2 or V3")
+    if value.version is version:
+        return value
+    if version is PolicyKind.SUCCESSOR_POLICY_V2 and value.ledger in _V3_ONLY_LEDGER:
+        return None
+    return replace(value, version=version)
+
+
 def _ref_value(value: PolicyRef | None) -> dict[str, object] | None:
     return None if value is None else value.canonical_value()
 
@@ -998,6 +1019,7 @@ def worst_case_input(
 
 __all__ = [
     "INPUT_SCHEMA",
+    "as_version",
     "INPUT_SCHEMA_V3",
     "MAX_LEDGER_REFS",
     "POLICY_KIND",
