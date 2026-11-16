@@ -202,10 +202,10 @@ def split_chat_prompt(prompt: str, user_input: str) -> tuple[str, str] | None:
 def _trace_lines(conversation_trace_text: str) -> list[str]:
     """The rendered ConversationTrace block and a blank line, or nothing (#417 D1 §5)."""
 
-    if not conversation_trace_text:
-        return []
     if type(conversation_trace_text) is not str:
         raise TypeError("conversation_trace_text must be a string")
+    if not conversation_trace_text:
+        return []
     return [conversation_trace_text, ""]
 
 

@@ -23,6 +23,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+import json
 import math
 from threading import RLock
 
@@ -636,7 +637,9 @@ def _render_line(
     brief = faint or shorten
     user = _excerpt(turn.user_text) if brief else _one_line(turn.user_text)
     reply = _excerpt(turn.response_text) if brief else _one_line(turn.response_text)
-    return f"- {label} — User: {user} / You: {reply}"
+    # JSON-quoted, like Working Memory evidence: past text cannot fake a new
+    # line, a speaker label or the end of its own quote (#425 review P3-6).
+    return f"- {label} — User: {_quote(user)} / You: {_quote(reply)}"
 
 
 def _age_text(elapsed: timedelta) -> str:
@@ -649,6 +652,10 @@ def _age_text(elapsed: timedelta) -> str:
     if hours < 48:
         return f"about {hours} h ago"
     return f"about {hours // 24} days ago"
+
+
+def _quote(text: str) -> str:
+    return json.dumps(text, ensure_ascii=False)
 
 
 def _one_line(text: str) -> str:
@@ -757,8 +764,6 @@ def conversation_trace_schema_max_bytes() -> int:
     integers, and microsecond UTC timestamps. AgentState serializes with sorted
     keys and compact separators, as here.
     """
-
-    import json
 
     from suzka.identifiers import MAX_IDENTIFIER_CODEPOINTS
 
