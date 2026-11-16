@@ -784,6 +784,10 @@ def test_r18_imports_stay_pure() -> None:
         "suzka.r17.contracts",
     }
     assert not any(isinstance(node, ast.Import) for node in ast.walk(tree))
+    # Submodules (contracts, and IP-15's target / verifier once imported)
+    # are attributes of the package but not part of its value exports.
     assert set(r18.__all__) == {
-        name for name in dir(r18) if not name.startswith("_") and name != "contracts"
+        name
+        for name in dir(r18)
+        if not name.startswith("_") and not inspect.ismodule(getattr(r18, name))
     }
