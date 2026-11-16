@@ -40,15 +40,20 @@ class TransformersProvider:
     def generate(self, prompt: str) -> str:
         return self._generate_from(self._generation_inputs(prompt))
 
-    def generate_chat(self, system_text: str, user_text: str) -> str:
-        """Generate with instructions in the system role and the user's text alone in the user role.
+    def uses_chat_roles(self) -> bool:
+        """Whether ``generate_chat`` can be used: only with a chat template."""
 
-        Plain checkpoints have no roles, so they get the same completion
-        prompt that ``PromptBuilder`` would have produced.
+        return self._uses_chat_template()
+
+    def generate_chat(self, system_text: str, user_text: str) -> str:
+        """Generate with fixed instructions as the system message and the rest as the user message.
+
+        Plain checkpoints have no roles; callers check ``uses_chat_roles``
+        and send them the built completion prompt through ``generate``.
         """
 
         if not self._uses_chat_template():
-            return self.generate(f"{system_text}\n\nUser: {user_text}{PLAIN_ASSISTANT_CUE}")
+            raise ValueError("this checkpoint has no chat template; use generate()")
         return self._generate_from(
             self._chat_inputs(
                 [

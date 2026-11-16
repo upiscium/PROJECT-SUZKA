@@ -8,6 +8,8 @@ import torch
 from suzka.config import load_settings
 from suzka.models.dummy_provider import DummyProvider
 from suzka.models.model_loader import load_model_provider
+from suzka.persona import ConsciousAgent
+from suzka.persona.prompt_builder import RUNTIME_DATA_HEADING
 from suzka.models.transformers_provider import (
     TransformersProvider,
     is_registry_approved_adapter,
@@ -178,17 +180,21 @@ def test_transformers_generate_chat_puts_instructions_in_the_system_role() -> No
     assert kwargs["enable_thinking"] is False
 
 
-def test_transformers_generate_chat_falls_back_to_the_plain_prompt() -> None:
+def test_agent_sends_the_built_prompt_unchanged_without_a_chat_template() -> None:
     fake_model = FakeModel()
     processor = FakeChatProcessor()
     processor.chat_template = None
     settings = load_settings(CONFIG_PATH)
     provider = TransformersProvider(settings, model=fake_model, processor=processor)
+    prompt = f"Context: fixed\n{RUNTIME_DATA_HEADING}\n\nEmotion:\n\nUser: hello\nAssistant:"
 
-    provider.generate_chat("Context: private", "hello")
+    assert provider.uses_chat_roles() is False
+    ConsciousAgent(provider).generate(prompt, user_input="hello")
 
     assert processor.chat_calls == []
-    assert processor.plain_calls == ["Context: private\n\nUser: hello\nAssistant:"]
+    assert processor.plain_calls == [prompt]
+    with pytest.raises(ValueError):
+        provider.generate_chat("Context: fixed", "hello")
 
 
 def test_transformers_loss_keeps_plain_text_with_chat_template() -> None:
