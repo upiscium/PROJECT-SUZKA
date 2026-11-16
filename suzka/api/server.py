@@ -29,6 +29,7 @@ from suzka.api.context_read_model import (
     CommittedContextReadModel,
     PublishedContextView,
 )
+from suzka.chat_log import ChatLogUnavailable
 from suzka.config import Settings, get_settings
 from suzka.identity import ValueConflictDefinition
 from suzka.learning import AdapterRegistry, SleepCycleManager
@@ -1006,6 +1007,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
         return {"status": "ok", "project": app_settings.project.name}
 
+    app.add_exception_handler(ChatLogUnavailable, _chat_log_unavailable)
     app.include_router(chat.router)
     app.include_router(contexts.router)
     app.include_router(debug.router)
@@ -1088,6 +1090,12 @@ def _open_subject_history(
         )
     except (HistoryAdoptionError, OSError) as error:
         raise StateRecoveryError(f"SubjectHistory is unavailable: {error}") from error
+
+
+async def _chat_log_unavailable(_request: Request, _error: Exception) -> JSONResponse:
+    """The display-only Chat transcript store failed; the session routes answer 503."""
+
+    return JSONResponse(status_code=503, content={"detail": "Chat history is unavailable"})
 
 
 if __name__ == "__main__":

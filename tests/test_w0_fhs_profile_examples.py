@@ -42,6 +42,7 @@ PATH_FIELDS = (
     ("event_journal", "path"),
     ("state_wal", "directory"),
     ("subject_history", "path"),
+    ("chat_log", "path"),
 )
 
 
@@ -49,7 +50,7 @@ def _example() -> dict:
     return yaml.safe_load(CONFIG_EXAMPLE.read_text(encoding="utf-8"))
 
 
-def test_example_preserves_base_settings_and_uses_ten_absolute_paths() -> None:
+def test_example_preserves_base_settings_and_uses_absolute_paths() -> None:
     example = _example()
     original = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
     changed = deepcopy(example)
@@ -75,6 +76,7 @@ def test_example_preserves_base_settings_and_uses_ten_absolute_paths() -> None:
         STATE_ROOT / "subject_history/subject_history.sqlite3"
     )
     assert typed.agent_state.path == STATE_ROOT / "agent_state.json"
+    assert typed.chat_log.path == STATE_ROOT / "chat_log/chat_log.sqlite3"
     assert typed.adapter_registry.eval_sets == [READ_ONLY_EVAL]
     assert typed.sleep.dream_dataset_path == STATE_ROOT / "dreams/dream_dataset.jsonl"
     assert typed.qlora.output_dir == STATE_ROOT / "adapters"

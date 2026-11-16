@@ -87,6 +87,9 @@ event_journal:
   soft_band_bytes: 16777216  # 16 MiB: above max - band, cognition only
 state_wal:
   directory: /var/lib/project-suzka/state_wal
+chat_log:
+  # Display-only Chat transcript (never read by the runtime).
+  path: /var/lib/project-suzka/chat_log/chat_log.sqlite3
 subject_history:
   # IP-10b (#376 H2, Human-approved 2026-11-14): one-way adoption at the next
   # clean startup.  Rows are never deleted; at max_page_count every later

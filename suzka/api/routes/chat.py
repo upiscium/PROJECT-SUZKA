@@ -1,19 +1,32 @@
 """Chat routes."""
 
+import logging
 from typing import cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from suzka.api.dependencies import get_agent_runtime, get_main_loop
+from suzka.api.dependencies import (
+    get_agent_runtime,
+    get_chat_log,
+    get_main_loop,
+    open_chat_log,
+)
 from suzka.api.runtime_execution import execute_with_event
 from suzka.api.schemas.chat import (
+    ChatLogTurnSchema,
     ChatRequest,
     ChatResponse,
+    ChatSessionCreateRequest,
+    ChatSessionDetailResponse,
+    ChatSessionListResponse,
+    ChatSessionRenameRequest,
+    ChatSessionSchema,
     CommandTicketSchema,
     CommandTicketStatusResponse,
     EmotionSchema,
     ModelSchema,
 )
+from suzka.chat_log import ChatLogStore, ChatLogUnavailable, ChatSession, ChatSessionNotFound
 from suzka.r16.driver import R16Driver
 from suzka.runtime import (
     AgentEventSource,
@@ -26,6 +39,7 @@ from suzka.runtime import (
 
 
 router = APIRouter(prefix="/api", tags=["chat"])
+logger = logging.getLogger(__name__)
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -36,6 +50,17 @@ def chat(
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> ChatResponse:
     reject_unsupported_attachments(request)
+    # The transcript is opened only for a request that names a session, and
+    # an unusable store never blocks the turn (it is display-only).
+    chat_log: ChatLogStore | None = None
+    if request.chat_session_id is not None:
+        try:
+            chat_log = open_chat_log(http)
+            # An unknown session fails before the turn is admitted.
+            _require_session(chat_log, request.chat_session_id)
+        except ChatLogUnavailable:
+            logger.warning("chat transcript unavailable; the turn runs unsaved", exc_info=True)
+            chat_log = None
     selectors = ChatContextSelectors(
         context_id=request.context_id,
         client_session_id=request.client_session_id,
@@ -49,6 +74,13 @@ def chat(
     )
     result = cast(ChatResult, outcome.value)
     response = chat_response_from_result(result)
+    if request.chat_session_id is not None:
+        response = response.model_copy(
+            update={
+                "transcript_saved": chat_log is not None
+                and _save_exchange(chat_log, request.chat_session_id, request.message, result)
+            }
+        )
     driver = _driver(http)
     if driver is None:
         return response
@@ -88,6 +120,95 @@ def command_status(ticket_id: str, http: Request) -> CommandTicketStatusResponse
     return CommandTicketStatusResponse(
         status=view.status.value,
         reason=None if view.reason is None else view.reason.value,
+    )
+
+
+@router.get("/chat/sessions", response_model=ChatSessionListResponse)
+def list_chat_sessions(
+    chat_log: ChatLogStore = Depends(get_chat_log),
+) -> ChatSessionListResponse:
+    return ChatSessionListResponse(
+        sessions=[_session_schema(session) for session in chat_log.list_sessions()]
+    )
+
+
+@router.post("/chat/sessions", response_model=ChatSessionSchema, status_code=201)
+def create_chat_session(
+    request: ChatSessionCreateRequest,
+    chat_log: ChatLogStore = Depends(get_chat_log),
+) -> ChatSessionSchema:
+    return _session_schema(chat_log.create_session(request.title))
+
+
+@router.get("/chat/sessions/{session_id}", response_model=ChatSessionDetailResponse)
+def get_chat_session(
+    session_id: str, chat_log: ChatLogStore = Depends(get_chat_log)
+) -> ChatSessionDetailResponse:
+    session = _require_session(chat_log, session_id)
+    return ChatSessionDetailResponse(
+        session=_session_schema(session),
+        turns=[
+            ChatLogTurnSchema(
+                role=turn.role,
+                content=turn.content,
+                episode_id=turn.episode_id,
+                created_at=turn.created_at,
+            )
+            for turn in chat_log.turns(session_id)
+        ],
+    )
+
+
+@router.patch("/chat/sessions/{session_id}", response_model=ChatSessionSchema)
+def rename_chat_session(
+    session_id: str,
+    request: ChatSessionRenameRequest,
+    chat_log: ChatLogStore = Depends(get_chat_log),
+) -> ChatSessionSchema:
+    try:
+        return _session_schema(chat_log.rename_session(session_id, request.title))
+    except ChatSessionNotFound:
+        raise HTTPException(status_code=404, detail="Chat session not found") from None
+
+
+@router.delete("/chat/sessions/{session_id}", status_code=204)
+def delete_chat_session(
+    session_id: str, chat_log: ChatLogStore = Depends(get_chat_log)
+) -> None:
+    """Delete a session's transcript only; what the subject remembers is untouched."""
+
+    try:
+        chat_log.delete_session(session_id)
+    except ChatSessionNotFound:
+        raise HTTPException(status_code=404, detail="Chat session not found") from None
+
+
+def _require_session(chat_log: ChatLogStore, session_id: str) -> ChatSession:
+    try:
+        return chat_log.get_session(session_id)
+    except ChatSessionNotFound:
+        raise HTTPException(status_code=404, detail="Chat session not found") from None
+
+
+def _save_exchange(
+    chat_log: ChatLogStore, session_id: str, message: str, result: ChatResult
+) -> bool:
+    """Record a committed turn; a failure here never fails the turn itself."""
+
+    try:
+        chat_log.append_exchange(session_id, message, result.response, result.episode_id)
+    except Exception:
+        logger.warning("chat transcript write failed", exc_info=True)
+        return False
+    return True
+
+
+def _session_schema(session: ChatSession) -> ChatSessionSchema:
+    return ChatSessionSchema(
+        session_id=session.session_id,
+        title=session.title,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
     )
 
 

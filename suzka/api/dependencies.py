@@ -1,10 +1,12 @@
 """FastAPI dependency wiring."""
 
 from hmac import compare_digest
+from threading import Lock
 import os
 
 from fastapi import Header, HTTPException, Request, status
 
+from suzka.chat_log import ChatLogStore
 from suzka.config import Settings
 from suzka.learning import AdapterRegistry, SleepCycleManager
 from suzka.memory import DualMemorySystem
@@ -76,3 +78,28 @@ def get_agent_runtime(request: Request) -> AgentRuntime:
     if runtime is None:
         raise RuntimeError("agent runtime is not initialized")
     return runtime
+
+
+_CHAT_LOG_LOCK = Lock()
+
+
+def open_chat_log(request: Request) -> ChatLogStore:
+    """The display-only Chat transcript store, opened on first use.
+
+    Raises ChatLogUnavailable; a failed open is retried on the next call.
+    """
+
+    store = getattr(request.app.state, "chat_log", None)
+    if store is None:
+        with _CHAT_LOG_LOCK:
+            store = getattr(request.app.state, "chat_log", None)
+            if store is None:
+                store = ChatLogStore(get_api_settings(request).chat_log.path)
+                request.app.state.chat_log = store
+    return store
+
+
+def get_chat_log(request: Request) -> ChatLogStore:
+    """Dependency for the session routes; ChatLogUnavailable becomes a 503."""
+
+    return open_chat_log(request)

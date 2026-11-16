@@ -5,7 +5,11 @@ export type Emotion = { valence: number; arousal: number; optimal_loss: number }
 export type ModelInfo = { model_id: string; adapter_id: string | null };
 export type Attachment = { type: string; url?: string; name?: string; content_type?: string };
 
-export type ChatRequest = { message: string; attachments?: Attachment[]; debug?: boolean };
+// chat_session_id names a display-only transcript session; it never selects a Context.
+export type ChatRequest = { message: string; attachments?: Attachment[]; debug?: boolean; chat_session_id?: string };
+export type ChatSession = { session_id: string; title: string; created_at: string; updated_at: string };
+export type ChatLogTurn = { role: "user" | "assistant"; content: string; episode_id: string | null; created_at: string };
+export type ChatSessionDetail = { session: ChatSession; turns: ChatLogTurn[] };
 export type CommandKind = "REVIEW_EXPERIENCE" | "COMMIT_REVIEW_EXPERIENCE";
 export type CommandTicket = { ticket_id: string; kind: CommandKind; status: string };
 export type CommandStatus = { status: string; reason: string | null };
@@ -19,6 +23,8 @@ export type ChatResponse = {
   experience_id?: string | null;
   command_ticket?: CommandTicket | null;
   incarnation?: string | null;
+  // Whether the turn reached the chat_session_id transcript; null without one.
+  transcript_saved?: boolean | null;
 };
 
 export type RetrievedMemory = {
@@ -108,11 +114,16 @@ async function requestUrl<T>(url: string, init?: RequestInit): Promise<T> {
     const detail = await response.text();
     throw new ApiError(response.status, `${response.status} ${response.statusText}: ${detail}`);
   }
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
 export const api = {
   chat: (body: ChatRequest) => request<ChatResponse>("/api/chat", { method: "POST", body: JSON.stringify(body) }),
+  chatSessions: () => request<{ sessions: ChatSession[] }>("/api/chat/sessions"),
+  createChatSession: () => request<ChatSession>("/api/chat/sessions", { method: "POST", body: JSON.stringify({}) }),
+  chatSession: (sessionId: string) => request<ChatSessionDetail>(`/api/chat/sessions/${encodeURIComponent(sessionId)}`),
+  deleteChatSession: (sessionId: string) => request<void>(`/api/chat/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" }),
   commandStatus: (ticketId: string) => request<CommandStatus>(`/api/chat/commands/${encodeURIComponent(ticketId)}`),
   debugChat: (body: ChatRequest) => adminRequest<DebugChatResponse>("/chat/debug", { method: "POST", body: JSON.stringify(body) }),
   emotion: () => adminRequest<Emotion>("/state/emotion"),
