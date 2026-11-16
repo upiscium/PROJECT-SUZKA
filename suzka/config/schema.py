@@ -18,6 +18,7 @@ from pydantic import (
 )
 
 from suzka.identifiers import validate_identifier
+from suzka.limits import MAX_TRACE_ITEMS_PER_CONTEXT, MAX_TRACE_STABILITY_HOURS
 from suzka.identity.value_system import ValueSeedDeclaration, ValueScope
 
 
@@ -103,6 +104,39 @@ class MemorySettings(StrictBaseModel):
 class WorkingMemorySettings(StrictBaseModel):
     item_capacity: int = Field(default=32, gt=0, le=4096)
     projection_max_bytes: int = Field(default=2048, gt=0, le=16 * 1024 * 1024)
+
+
+class ConversationTraceSettings(StrictBaseModel):
+    """#417 D1: the subject's short-term trace of recent Chat turns.
+
+    Disabled by default. Enabling it moves AgentState to V11 one way; turning
+    it off again afterwards freezes the trace instead (D1-b). The upper
+    bounds are the schema constants in ``suzka.runtime.conversation_trace``.
+    """
+
+    enabled: StrictBool = False
+    base_stability_hours: StrictFloat = Field(default=1.0, gt=0.0, le=168.0)
+    surprise_gain: StrictFloat = Field(default=2.0, ge=0.0, le=10.0)
+    recall_gain: StrictFloat = Field(default=0.5, ge=0.0, le=5.0)
+    double_recall_gain: StrictFloat = Field(default=2.0, ge=0.0, le=10.0)
+    max_stability_hours: StrictFloat = Field(
+        default=168.0, gt=0.0, le=MAX_TRACE_STABILITY_HOURS
+    )
+    forget_below: StrictFloat = Field(default=0.2, gt=0.0, lt=1.0)
+    verbatim_above: StrictFloat = Field(default=0.5, gt=0.0, lt=1.0)
+    max_items_per_context: StrictInt = Field(
+        default=20, ge=1, le=MAX_TRACE_ITEMS_PER_CONTEXT
+    )
+    # At least 1024 so a shortened CJK turn (~400 bytes) still fits (#421 review).
+    max_rendered_bytes: StrictInt = Field(default=4096, ge=1024, le=16384)
+
+    @model_validator(mode="after")
+    def validate_relations(self) -> "ConversationTraceSettings":
+        if self.forget_below >= self.verbatim_above:
+            raise ValueError("forget_below must be below verbatim_above")
+        if self.max_stability_hours < self.base_stability_hours:
+            raise ValueError("max_stability_hours must be at least base_stability_hours")
+        return self
 
 
 class SleepSettings(StrictBaseModel):
@@ -419,6 +453,9 @@ class Settings(StrictBaseModel):
     event_journal: EventJournalSettings = Field(default_factory=EventJournalSettings)
     state_wal: StateWALSettings = Field(default_factory=StateWALSettings)
     chat_log: ChatLogSettings = Field(default_factory=ChatLogSettings)
+    conversation_trace: ConversationTraceSettings = Field(
+        default_factory=ConversationTraceSettings
+    )
     subject_history: SubjectHistorySettings = Field(
         default_factory=SubjectHistorySettings
     )
