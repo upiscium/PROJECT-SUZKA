@@ -1,10 +1,15 @@
-"""R16 U4-1: the SubjectHistoryDB SQLite file, schema v1 and trusted opener.
+"""R16 U4-1 / IP-14a-1: the SubjectHistoryDB SQLite file, schema v2, trusted opener.
 
-#376 §A/§B with the v1 reduction of #376 6738757841 / 6752207008: five tables
-(``history_meta``, ``history_operations``, ``history_decisions``,
-``history_source_refs``, ``history_postcommit_receipts``) and the two partial
-UNIQUE indexes.  HOLD receipts and R19 cycle resolution are a later additive
-version at a clean R07 boundary.
+v1 (#376 §A/§B, #376 6738757841 / 6752207008): five tables (``history_meta``,
+``history_operations``, ``history_decisions``, ``history_source_refs``,
+``history_postcommit_receipts``) and the two R16 partial UNIQUE indexes.
+
+v2 (IP-14a D1 r3, #411 comment 6910958369): the R17 / R18 source-side record
+tables, the PREPARE-time key reservations (§2a), the record operation kinds
+and ``SUCCESSOR_POLICY_V3``. A v1 file is never opened: it raises
+``HistoryStoreMigrationRequired`` and is migrated only by the explicit
+``suzka.r16.history_migration`` command (Human decision §11-1). HOLD receipts
+and R19 cycle resolution are IP-14b.
 
 Authority boundary: this module is storage only.  The single writer authority
 for the file is the ``subject.history`` R07 participant; SQL CHECKs and
@@ -40,9 +45,20 @@ from suzka.r16.history_codec import (
     history_operation_digest,
 )
 from suzka.r16.contracts import MAX_JSON_BYTES, digest, identifier
+from suzka.r16.history_records import (
+    MAX_CHALLENGES_PER_INTENT,
+    OPERATION_TABLES,
+    RECORD_OPERATION_KINDS,
+    RECORD_TABLES,
+    HistoryOperationKind,
+    HistoryRecordOperationV1,
+)
+from suzka.r16.history_schema_v1 import SCHEMA_HASH_V1, SCHEMA_STATEMENTS_V1
+from suzka.r17.contracts import MAX_RECORD_BYTES as _R17_RECORD_BYTES
+from suzka.r18.contracts import MAX_RECORD_BYTES as _R18_RECORD_BYTES
 
 
-HISTORY_SCHEMA_VERSION: Final = 1
+HISTORY_SCHEMA_VERSION: Final = 2
 _SQLITE_BUSY_TIMEOUT_SECONDS: Final = 5.0
 # Conservative bytes a FINALIZE may add for one pending operation: the
 # committed envelope, inner U1 bytes, policy input, source rows, receipt and
@@ -66,9 +82,271 @@ def _decision(column: str) -> str:
     )
 
 
+_RECORD_BYTES: Final = max(_R17_RECORD_BYTES, _R18_RECORD_BYTES)
+_ALL_KINDS: Final = ",".join(f"'{kind.value}'" for kind in HistoryOperationKind)
+_RECORD_KINDS: Final = ",".join(
+    f"'{kind.value}'" for kind in HistoryOperationKind if kind in RECORD_OPERATION_KINDS
+)
+
+
+def _kind_exists(kind: HistoryOperationKind) -> str:
+    """Every table this record kind writes has the operation's row."""
+    return " AND ".join(
+        f"EXISTS (SELECT 1 FROM {table} t WHERE t.incarnation_id = OLD.incarnation_id"
+        " AND t.transaction_id = OLD.transaction_id)"
+        for table in OPERATION_TABLES[kind]
+    )
+
+
+def _gate(kind: HistoryOperationKind) -> str:
+    return (
+        "NOT EXISTS (SELECT 1 FROM history_operations o"
+        " WHERE o.incarnation_id = NEW.incarnation_id AND o.transaction_id = NEW.transaction_id"
+        f" AND o.phase = 'PREPARED' AND o.operation_kind = '{kind.value}')"
+    )
+
+
+def _record_table(name: str, columns: str, constraints: str = "") -> str:
+    return f"""CREATE TABLE {name} (
+    record_id TEXT PRIMARY KEY NOT NULL CHECK (length(record_id) BETWEEN 1 AND 192),
+    incarnation_id TEXT NOT NULL,
+    transaction_id TEXT NOT NULL,
+    record_bytes BLOB NOT NULL CHECK (length(record_bytes) BETWEEN 2 AND {_RECORD_BYTES}),
+    record_digest TEXT NOT NULL CHECK {_hex("record_digest")},
+{columns}
+    FOREIGN KEY (incarnation_id, transaction_id)
+        REFERENCES history_operations (incarnation_id, transaction_id){constraints}
+) STRICT"""
+
+
+def _immutable(table: str) -> tuple[str, str]:
+    return (
+        f"""CREATE TRIGGER {table}_no_update BEFORE UPDATE ON {table}
+BEGIN SELECT RAISE(ABORT, '{table} rows are immutable'); END""",
+        f"""CREATE TRIGGER {table}_no_delete BEFORE DELETE ON {table}
+BEGIN SELECT RAISE(ABORT, '{table} rows are immutable'); END""",
+    )
+
+
+_K = HistoryOperationKind
+_DIRECTION = "direction TEXT NOT NULL CHECK (direction IN ('FORWARD', 'INVERSE')),"
+
 _ROLES = (
     "'GOAL','VALUE','CONTEXT','EXPERIENCE','COMMITMENT','FEEDBACK','OUTCOME',"
     "'R15_NARRATIVE_REVISION','MOTIVATION'"
+)
+
+# ------------------------------------------------------------ v2 additions
+# IP-14a D1 r3 §2 / §2a / §2b / §4. Tables first, then indexes, then
+# triggers, so every trigger body names existing tables.
+V2_STATEMENTS: Final[tuple[str, ...]] = (
+    """CREATE TABLE history_operation_keys (
+    reserved_key TEXT NOT NULL CHECK (length(reserved_key) BETWEEN 1 AND 256),
+    incarnation_id TEXT NOT NULL,
+    transaction_id TEXT NOT NULL,
+    live INTEGER NOT NULL CHECK (live IN (0, 1)),
+    PRIMARY KEY (incarnation_id, transaction_id, reserved_key),
+    FOREIGN KEY (incarnation_id, transaction_id)
+        REFERENCES history_operations (incarnation_id, transaction_id)
+) STRICT""",
+    _record_table(
+        "action_intents",
+        f"""    {_DIRECTION}
+    obligation_group_key TEXT NOT NULL CHECK {_hex("obligation_group_key")},
+    operation_key TEXT NOT NULL UNIQUE CHECK {_hex("operation_key")},
+    forward_operation_key TEXT NOT NULL CHECK {_hex("forward_operation_key")},
+    decision_id TEXT REFERENCES history_decisions (decision_id),
+    UNIQUE (obligation_group_key, direction),
+    CHECK ((direction = 'FORWARD') = (decision_id IS NOT NULL)),
+    CHECK (direction = 'INVERSE' OR forward_operation_key = operation_key),""",
+    ),
+    _record_table(
+        "action_forecasts",
+        f"""    action_intent_id TEXT NOT NULL UNIQUE REFERENCES action_intents (record_id),
+    forward_key TEXT NOT NULL UNIQUE CHECK {_hex("forward_key")},""",
+    ),
+    _record_table(
+        "policy_verdicts",
+        f"""    intent_id TEXT NOT NULL UNIQUE REFERENCES action_intents (record_id),
+    {_DIRECTION}
+    verdict TEXT NOT NULL CHECK (verdict IN ('ALLOW', 'DENY')),""",
+    ),
+    _record_table(
+        "approval_challenges",
+        f"""    intent_id TEXT NOT NULL REFERENCES action_intents (record_id),
+    {_DIRECTION}
+    attempt INTEGER NOT NULL CHECK (attempt BETWEEN 1 AND {MAX_CHALLENGES_PER_INTENT}),
+    nonce TEXT NOT NULL UNIQUE CHECK {_hex("nonce")},
+    operation_key TEXT NOT NULL CHECK {_hex("operation_key")},
+    boot_id TEXT NOT NULL CHECK {_uuid("boot_id")},
+    expires_utc TEXT NOT NULL CHECK (length(expires_utc) = 20),
+    UNIQUE (intent_id, attempt),""",
+    ),
+    _record_table(
+        "approval_expirations",
+        f"""    intent_id TEXT NOT NULL REFERENCES action_intents (record_id),
+    {_DIRECTION}
+    reason TEXT NOT NULL CHECK (reason IN ('EXPIRED', 'BOOT_CHANGED')),""",
+        ",\n    FOREIGN KEY (record_id) REFERENCES approval_challenges (record_id)",
+    ),
+    """CREATE TABLE approval_nonce_consumptions (
+    nonce TEXT PRIMARY KEY NOT NULL REFERENCES approval_challenges (nonce),
+    incarnation_id TEXT NOT NULL,
+    transaction_id TEXT NOT NULL,
+    challenge_digest TEXT NOT NULL UNIQUE REFERENCES approval_challenges (record_id),
+    claim_id TEXT NOT NULL UNIQUE CHECK (length(claim_id) = 70),
+    FOREIGN KEY (incarnation_id, transaction_id)
+        REFERENCES history_operations (incarnation_id, transaction_id)
+) STRICT""",
+    _record_table(
+        "execution_claims",
+        f"""    {_DIRECTION}
+    operation_key TEXT NOT NULL UNIQUE CHECK {_hex("operation_key")},
+    nonce TEXT NOT NULL UNIQUE REFERENCES approval_nonce_consumptions (nonce),
+    challenge_digest TEXT NOT NULL UNIQUE CHECK {_hex("challenge_digest")},""",
+    ),
+    f"""CREATE TABLE verified_outcomes (
+    verified_outcome_id TEXT NOT NULL CHECK (length(verified_outcome_id) BETWEEN 1 AND 192),
+    outcome_revision INTEGER NOT NULL CHECK (outcome_revision > 0),
+    incarnation_id TEXT NOT NULL,
+    transaction_id TEXT NOT NULL,
+    record_bytes BLOB NOT NULL CHECK (length(record_bytes) BETWEEN 2 AND {_RECORD_BYTES}),
+    record_digest TEXT NOT NULL CHECK {_hex("record_digest")},
+    {_DIRECTION}
+    operation_key TEXT NOT NULL CHECK {_hex("operation_key")},
+    outcome_state TEXT NOT NULL CHECK (outcome_state IN (
+        'ACTIVE_VERIFIED_AUTHORIZED', 'VERIFIED_ABSENT', 'UNAUTHORIZED_EFFECT',
+        'REVERTED', 'INVERSE_VERIFIED_ABSENT')),
+    PRIMARY KEY (verified_outcome_id, outcome_revision),
+    UNIQUE (operation_key, outcome_revision),
+    FOREIGN KEY (incarnation_id, transaction_id)
+        REFERENCES history_operations (incarnation_id, transaction_id)
+) STRICT""",
+    _record_table(
+        "outcome_assessments",
+        """    verified_outcome_id TEXT NOT NULL,
+    outcome_revision INTEGER NOT NULL,
+    forecast_id TEXT NOT NULL REFERENCES action_forecasts (record_id),
+    UNIQUE (verified_outcome_id, outcome_revision),""",
+        ",\n    FOREIGN KEY (verified_outcome_id, outcome_revision)\n"
+        "        REFERENCES verified_outcomes (verified_outcome_id, outcome_revision)",
+    ),
+    _record_table(
+        "decision_feedback",
+        """    assessment_id TEXT NOT NULL UNIQUE REFERENCES outcome_assessments (record_id),""",
+    ),
+    """CREATE UNIQUE INDEX history_operation_keys_live
+    ON history_operation_keys (reserved_key) WHERE live = 1""",
+    # Reservations: inserted with their PREPARED record operation; released
+    # (live 1 -> 0) only when that operation aborts; never deleted.
+    f"""CREATE TRIGGER history_operation_keys_insert BEFORE INSERT ON history_operation_keys
+WHEN NEW.live IS NOT 1 OR NOT EXISTS (
+    SELECT 1 FROM history_operations o
+    WHERE o.incarnation_id = NEW.incarnation_id AND o.transaction_id = NEW.transaction_id
+        AND o.phase = 'PREPARED' AND o.operation_kind IN ({_RECORD_KINDS})
+)
+BEGIN SELECT RAISE(ABORT, 'a key reservation needs its PREPARED operation'); END""",
+    """CREATE TRIGGER history_operation_keys_release BEFORE UPDATE ON history_operation_keys
+WHEN NOT (
+    OLD.live = 1 AND NEW.live = 0
+    AND NEW.reserved_key IS OLD.reserved_key
+    AND NEW.incarnation_id IS OLD.incarnation_id
+    AND NEW.transaction_id IS OLD.transaction_id
+    AND EXISTS (
+        SELECT 1 FROM history_operations o
+        WHERE o.incarnation_id = OLD.incarnation_id AND o.transaction_id = OLD.transaction_id
+            AND o.phase = 'ABORTED'
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'a key reservation is released only by its abort'); END""",
+    """CREATE TRIGGER history_operation_keys_no_delete BEFORE DELETE ON history_operation_keys
+BEGIN SELECT RAISE(ABORT, 'key reservations are immutable'); END""",
+    """CREATE TRIGGER history_operations_release_keys
+AFTER UPDATE OF phase ON history_operations WHEN NEW.phase = 'ABORTED'
+BEGIN
+    UPDATE history_operation_keys SET live = 0
+    WHERE incarnation_id = NEW.incarnation_id AND transaction_id = NEW.transaction_id
+        AND live = 1;
+END""",
+    # Record inserts: only inside the FINALIZE of their exact PREPARED
+    # operation kind, and only after the previous stage exists (§2b).
+    f"""CREATE TRIGGER action_intents_insert BEFORE INSERT ON action_intents
+WHEN {_gate(_K.R18_INTENT_ISSUE)}
+    OR (NEW.direction = 'INVERSE' AND NOT (
+        EXISTS (SELECT 1 FROM action_intents f
+            WHERE f.obligation_group_key = NEW.obligation_group_key
+                AND f.direction = 'FORWARD' AND f.operation_key = NEW.forward_operation_key)
+        AND EXISTS (SELECT 1 FROM verified_outcomes v
+            WHERE v.operation_key = NEW.forward_operation_key
+                AND v.outcome_state IN ('ACTIVE_VERIFIED_AUTHORIZED', 'UNAUTHORIZED_EFFECT'))
+    ))
+BEGIN SELECT RAISE(ABORT, 'action intent is not admissible here'); END""",
+    f"""CREATE TRIGGER action_forecasts_insert BEFORE INSERT ON action_forecasts
+WHEN {_gate(_K.R17_EXPECTATION_COMMIT)}
+    OR NOT EXISTS (SELECT 1 FROM action_intents i
+        WHERE i.record_id = NEW.action_intent_id AND i.direction = 'FORWARD'
+            AND i.operation_key = NEW.forward_key)
+BEGIN SELECT RAISE(ABORT, 'forecast is not admissible here'); END""",
+    f"""CREATE TRIGGER policy_verdicts_insert BEFORE INSERT ON policy_verdicts
+WHEN {_gate(_K.R18_POLICY_COMMIT)}
+    OR NOT EXISTS (SELECT 1 FROM action_intents i
+        WHERE i.record_id = NEW.intent_id AND i.direction = NEW.direction)
+    OR (NEW.direction = 'FORWARD' AND NOT EXISTS (
+        SELECT 1 FROM action_forecasts f WHERE f.action_intent_id = NEW.intent_id))
+BEGIN SELECT RAISE(ABORT, 'policy verdict is not admissible here'); END""",
+    f"""CREATE TRIGGER approval_challenges_insert BEFORE INSERT ON approval_challenges
+WHEN {_gate(_K.R18_CHALLENGE_ISSUE)}
+    OR NOT EXISTS (SELECT 1 FROM policy_verdicts p
+        WHERE p.intent_id = NEW.intent_id AND p.verdict = 'ALLOW')
+    OR NOT EXISTS (SELECT 1 FROM action_intents i
+        WHERE i.record_id = NEW.intent_id AND i.direction = NEW.direction
+            AND i.operation_key = NEW.operation_key)
+    OR (SELECT count(*) FROM approval_challenges c WHERE c.intent_id = NEW.intent_id)
+        IS NOT NEW.attempt - 1
+    OR (SELECT count(*) FROM approval_challenges c JOIN approval_expirations e
+            ON e.record_id = c.record_id WHERE c.intent_id = NEW.intent_id)
+        IS NOT NEW.attempt - 1
+BEGIN SELECT RAISE(ABORT, 'approval challenge is not admissible here'); END""",
+    f"""CREATE TRIGGER approval_expirations_insert BEFORE INSERT ON approval_expirations
+WHEN {_gate(_K.R18_APPROVAL_EXPIRE)}
+    OR NOT EXISTS (SELECT 1 FROM approval_challenges c
+        WHERE c.record_id = NEW.record_id AND c.intent_id = NEW.intent_id
+            AND c.direction = NEW.direction)
+    OR EXISTS (SELECT 1 FROM approval_nonce_consumptions n
+        WHERE n.challenge_digest = NEW.record_id)
+BEGIN SELECT RAISE(ABORT, 'approval expiration is not admissible here'); END""",
+    f"""CREATE TRIGGER approval_nonce_consumptions_insert
+BEFORE INSERT ON approval_nonce_consumptions
+WHEN {_gate(_K.R18_EXECUTION_CLAIM)}
+    OR NOT EXISTS (SELECT 1 FROM approval_challenges c
+        WHERE c.record_id = NEW.challenge_digest AND c.nonce = NEW.nonce)
+    OR EXISTS (SELECT 1 FROM approval_expirations e WHERE e.record_id = NEW.challenge_digest)
+BEGIN SELECT RAISE(ABORT, 'nonce consumption is not admissible here'); END""",
+    f"""CREATE TRIGGER execution_claims_insert BEFORE INSERT ON execution_claims
+WHEN {_gate(_K.R18_EXECUTION_CLAIM)}
+    OR NOT EXISTS (SELECT 1 FROM approval_nonce_consumptions n
+        JOIN approval_challenges c ON c.record_id = n.challenge_digest
+        WHERE n.nonce = NEW.nonce AND n.claim_id = NEW.record_id
+            AND n.challenge_digest = NEW.challenge_digest
+            AND c.operation_key = NEW.operation_key AND c.direction = NEW.direction)
+BEGIN SELECT RAISE(ABORT, 'execution claim is not admissible here'); END""",
+    f"""CREATE TRIGGER verified_outcomes_insert BEFORE INSERT ON verified_outcomes
+WHEN {_gate(_K.R18_OUTCOME_COMMIT)}
+    OR NOT EXISTS (SELECT 1 FROM execution_claims c
+        WHERE c.operation_key = NEW.operation_key AND c.direction = NEW.direction)
+BEGIN SELECT RAISE(ABORT, 'verified outcome is not admissible here'); END""",
+    f"""CREATE TRIGGER outcome_assessments_insert BEFORE INSERT ON outcome_assessments
+WHEN {_gate(_K.R17_ASSESSMENT_COMMIT)}
+    OR NOT EXISTS (SELECT 1 FROM verified_outcomes v
+        WHERE v.verified_outcome_id = NEW.verified_outcome_id
+            AND v.outcome_revision = NEW.outcome_revision AND v.direction = 'FORWARD')
+    OR NOT EXISTS (SELECT 1 FROM action_forecasts f WHERE f.record_id = NEW.forecast_id)
+BEGIN SELECT RAISE(ABORT, 'outcome assessment is not admissible here'); END""",
+    f"""CREATE TRIGGER decision_feedback_insert BEFORE INSERT ON decision_feedback
+WHEN {_gate(_K.R17_FEEDBACK_COMMIT)}
+    OR NOT EXISTS (SELECT 1 FROM outcome_assessments a WHERE a.record_id = NEW.assessment_id)
+BEGIN SELECT RAISE(ABORT, 'decision feedback is not admissible here'); END""",
+    *(statement for table in RECORD_TABLES for statement in _immutable(table)),
 )
 
 # Order matters: it is also the schema hash input.  Every statement is
@@ -103,8 +381,7 @@ SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
     transaction_kind TEXT NOT NULL CHECK (length(transaction_kind) BETWEEN 1 AND 64),
     participant_id TEXT NOT NULL
         CHECK (participant_id = '{SUBJECT_HISTORY_PARTICIPANT_ID}'),
-    operation_kind TEXT NOT NULL
-        CHECK (operation_kind IN ('R16_DECISION_ISSUE', 'R07_BINDING_ONLY_ABORT')),
+    operation_kind TEXT NOT NULL CHECK (operation_kind IN ({_ALL_KINDS})),
     operation_digest TEXT NOT NULL CHECK {_hex("operation_digest")},
     phase TEXT NOT NULL CHECK (phase IN ('PREPARED', 'FINALIZED', 'ABORTED')),
     pending_bytes BLOB,
@@ -124,6 +401,12 @@ SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
             AND (predecessor_key = 'GENESIS' OR {_decision("predecessor_key")}))
         OR (operation_kind = 'R07_BINDING_ONLY_ABORT' AND phase = 'ABORTED'
             AND pending_bytes IS NULL AND pending_digest IS NULL
+            AND lineage_scope IS NULL AND review_intent_key IS NULL
+            AND predecessor_key IS NULL)
+        OR (operation_kind IN ({_RECORD_KINDS})
+            AND typeof(pending_bytes) = 'blob'
+            AND length(pending_bytes) BETWEEN 1 AND {MAX_PENDING_BYTES}
+            AND {_hex("pending_digest")}
             AND lineage_scope IS NULL AND review_intent_key IS NULL
             AND predecessor_key IS NULL)
     )
@@ -150,11 +433,13 @@ SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
     committed_bytes BLOB NOT NULL
         CHECK (length(committed_bytes) BETWEEN 1 AND {MAX_PENDING_BYTES}),
     committed_digest TEXT NOT NULL CHECK {_hex("committed_digest")},
-    policy_kind TEXT NOT NULL
-        CHECK (policy_kind IN ('SUCCESSOR_POLICY_V1', 'SUCCESSOR_POLICY_V2')),
+    policy_kind TEXT NOT NULL CHECK (
+        policy_kind IN ('SUCCESSOR_POLICY_V1', 'SUCCESSOR_POLICY_V2', 'SUCCESSOR_POLICY_V3')
+    ),
     policy_row TEXT NOT NULL CHECK (
         policy_row IN ('3', '4', '5', '6')
-        OR (policy_kind = 'SUCCESSOR_POLICY_V2' AND policy_row IN ('4b', '5b'))
+        OR (policy_kind IN ('SUCCESSOR_POLICY_V2', 'SUCCESSOR_POLICY_V3')
+            AND policy_row IN ('4b', '5b'))
     ),
     policy_input_bytes BLOB NOT NULL
         CHECK (length(policy_input_bytes) BETWEEN 2 AND {MAX_POLICY_INPUT_BYTES}),
@@ -211,11 +496,12 @@ BEGIN SELECT RAISE(ABORT, 'history_meta transition is not permitted'); END""",
     # history_operations: insert only while ACTIVE, only as PREPARED (or as a
     # binding-only ABORTED tombstone); later only PREPARED -> FINALIZED/ABORTED
     # with every bound column unchanged; never deleted.
-    """CREATE TRIGGER history_operations_insert BEFORE INSERT ON history_operations
+    f"""CREATE TRIGGER history_operations_insert BEFORE INSERT ON history_operations
 WHEN (SELECT phase FROM history_meta WHERE id = 1) IS NOT 'ACTIVE'
     OR NOT (
         (NEW.operation_kind = 'R16_DECISION_ISSUE' AND NEW.phase = 'PREPARED')
         OR (NEW.operation_kind = 'R07_BINDING_ONLY_ABORT' AND NEW.phase = 'ABORTED')
+        OR (NEW.operation_kind IN ({_RECORD_KINDS}) AND NEW.phase = 'PREPARED')
     )
 BEGIN SELECT RAISE(ABORT, 'history operation insert is not permitted'); END""",
     """CREATE TRIGGER history_operations_transition BEFORE UPDATE ON history_operations
@@ -244,12 +530,18 @@ WHEN NEW.phase = 'FINALIZED' AND (
         WHERE r.incarnation_id = OLD.incarnation_id
             AND r.transaction_id = OLD.transaction_id
     )
-    OR NOT EXISTS (
+    OR (OLD.operation_kind = 'R16_DECISION_ISSUE' AND NOT EXISTS (
         SELECT 1 FROM history_decisions d
         WHERE d.incarnation_id = OLD.incarnation_id
             AND d.transaction_id = OLD.transaction_id
+    ))
+"""
+    + "".join(
+        f"    OR (OLD.operation_kind = '{kind.value}' AND NOT ({_kind_exists(kind)}))\n"
+        for kind in HistoryOperationKind
+        if kind in RECORD_OPERATION_KINDS
     )
-)
+    + """)
 BEGIN SELECT RAISE(ABORT, 'history FINALIZE is incomplete'); END""",
     """CREATE TRIGGER history_operations_abort_clean
 BEFORE UPDATE OF phase ON history_operations
@@ -264,7 +556,13 @@ WHEN NEW.phase = 'ABORTED' AND (
         WHERE d.incarnation_id = OLD.incarnation_id
             AND d.transaction_id = OLD.transaction_id
     )
-)
+"""
+    + "".join(
+        f"    OR EXISTS (SELECT 1 FROM {table} t WHERE t.incarnation_id = OLD.incarnation_id"
+        " AND t.transaction_id = OLD.transaction_id)\n"
+        for table in RECORD_TABLES
+    )
+    + """)
 BEGIN SELECT RAISE(ABORT, 'an operation with finalize rows cannot abort'); END""",
     """CREATE TRIGGER history_operations_no_delete BEFORE DELETE ON history_operations
 BEGIN SELECT RAISE(ABORT, 'history operations are immutable'); END""",
@@ -315,6 +613,7 @@ BEGIN SELECT RAISE(ABORT, 'history receipt has no PREPARED operation'); END""",
 BEGIN SELECT RAISE(ABORT, 'history receipts are immutable'); END""",
     """CREATE TRIGGER history_receipts_no_delete BEFORE DELETE ON history_postcommit_receipts
 BEGIN SELECT RAISE(ABORT, 'history receipts are immutable'); END""",
+    *V2_STATEMENTS,
 )
 
 SCHEMA_HASH: Final = sha256(
@@ -342,15 +641,20 @@ class HistoryStoreConflict(HistoryStoreError):
     """A uniqueness or transition rule refused the write."""
 
 
+class HistoryStoreMigrationRequired(HistoryStoreError):
+    """The file is a valid v1 store: run the explicit v1 -> v2 migration.
+
+    Not corruption and not retryable by waiting; startup stops (§11-1)."""
+
+
+class HistoryStoreRecordsDisabled(HistoryStoreError):
+    """An R17 / R18 record write while ``r18.enabled`` is false (§7)."""
+
+
 class HistoryPhase(str, Enum):
     PREPARED = "PREPARED"
     FINALIZED = "FINALIZED"
     ABORTED = "ABORTED"
-
-
-class HistoryOperationKind(str, Enum):
-    R16_DECISION_ISSUE = "R16_DECISION_ISSUE"
-    R07_BINDING_ONLY_ABORT = "R07_BINDING_ONLY_ABORT"
 
 
 class HistoryMetaPhase(str, Enum):
@@ -544,6 +848,61 @@ _OPERATION_COLUMNS: Final = (
 )
 
 
+_SCHEMA_QUERY: Final = (
+    "SELECT type, name, tbl_name, sql FROM sqlite_schema "
+    "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+)
+
+
+def _expected_schema(statements: tuple[str, ...]) -> list[tuple[object, ...]]:
+    reference = sqlite3.connect(":memory:")
+    try:
+        for statement in statements:
+            reference.execute(statement)
+        return reference.execute(_SCHEMA_QUERY).fetchall()
+    finally:
+        reference.close()
+
+
+def _finish(
+    connection: sqlite3.Connection,
+    incarnation_id: str,
+    transaction_id: str,
+    receipt: PostcommitReceiptV1,
+) -> None:
+    """The receipt and the PREPARED -> FINALIZED step every FINALIZE ends with."""
+
+    connection.execute(
+        "INSERT INTO history_postcommit_receipts (incarnation_id, "
+        "transaction_id, event_id, processing_sequence, "
+        "prepared_state_hash_before, prepared_state_hash_after, "
+        "snapshot_sequence, snapshot_hash, wal_generation_id, wal_record_id, "
+        "wal_record_hash, receipt_digest) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            incarnation_id,
+            transaction_id,
+            receipt.event_id,
+            receipt.processing_sequence,
+            receipt.prepared_state_hash_before,
+            receipt.prepared_state_hash_after,
+            receipt.snapshot_sequence,
+            receipt.snapshot_hash,
+            receipt.wal_generation_id,
+            receipt.wal_record_id,
+            receipt.wal_record_hash,
+            receipt.receipt_digest,
+        ),
+    )
+    cursor = connection.execute(
+        "UPDATE history_operations SET phase = 'FINALIZED' "
+        "WHERE incarnation_id = ? AND transaction_id = ? AND phase = 'PREPARED'",
+        (incarnation_id, transaction_id),
+    )
+    if cursor.rowcount != 1:
+        raise HistoryStoreConflict("SubjectHistory operation is not PREPARED")
+
+
 class SubjectHistoryStore:
     """One trusted connection to the SubjectHistoryDB.
 
@@ -554,12 +913,18 @@ class SubjectHistoryStore:
     """
 
     def __init__(
-        self, path: Path, connection: sqlite3.Connection, max_page_count: int
+        self,
+        path: Path,
+        connection: sqlite3.Connection,
+        max_page_count: int,
+        *,
+        r18_enabled: bool = False,
     ) -> None:
         self.path = path
         self._connection = connection
         self._max_page_count = max_page_count
         self._lock = Lock()
+        self._r18_enabled = r18_enabled
 
     # ------------------------------------------------------------------ open
 
@@ -571,6 +936,7 @@ class SubjectHistoryStore:
         subject_id: str,
         journal_lineage_id: str,
         max_page_count: int,
+        r18_enabled: bool = False,
     ) -> SubjectHistoryStore:
         """Create a PROVISIONAL store; refuses an existing path."""
 
@@ -620,10 +986,12 @@ class SubjectHistoryStore:
             except FileNotFoundError:
                 pass
         _fsync_directory(path.parent)
-        return cls.open(path, max_page_count=max_page_count)
+        return cls.open(path, max_page_count=max_page_count, r18_enabled=r18_enabled)
 
     @classmethod
-    def open(cls, path: Path, *, max_page_count: int) -> SubjectHistoryStore:
+    def open(
+        cls, path: Path, *, max_page_count: int, r18_enabled: bool = False
+    ) -> SubjectHistoryStore:
         """Open an existing store read-write; never creates or migrates."""
 
         path = _trusted_path(path)
@@ -645,7 +1013,7 @@ class SubjectHistoryStore:
             if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
                 raise HistoryStoreCorrupt("SubjectHistory file was replaced")
             cls._verify_schema(connection)
-            store = cls(path, connection, max_page_count)
+            store = cls(path, connection, max_page_count, r18_enabled=r18_enabled)
             store.meta()
             return store
         except sqlite3.Error as error:
@@ -701,20 +1069,13 @@ class SubjectHistoryStore:
 
     @staticmethod
     def _verify_schema(connection: sqlite3.Connection) -> None:
-        reference = sqlite3.connect(":memory:")
-        try:
-            for statement in SCHEMA_STATEMENTS:
-                reference.execute(statement)
-            query = (
-                "SELECT type, name, tbl_name, sql FROM sqlite_schema "
-                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
-            )
-            expected = reference.execute(query).fetchall()
-        finally:
-            reference.close()
-        actual = connection.execute(query).fetchall()
-        if actual != expected:
-            raise HistoryStoreCorrupt("SubjectHistory schema is not schema v1")
+        actual = connection.execute(_SCHEMA_QUERY).fetchall()
+        if actual != _expected_schema(SCHEMA_STATEMENTS):
+            if actual == _expected_schema(SCHEMA_STATEMENTS_V1):
+                raise HistoryStoreMigrationRequired(
+                    "SubjectHistory is schema v1: run suzka.r16.history_migration"
+                )
+            raise HistoryStoreCorrupt("SubjectHistory schema is not schema v2")
         check = connection.execute("PRAGMA quick_check").fetchall()
         if check != [("ok",)]:
             raise HistoryStoreCorrupt("SubjectHistory integrity check failed")
@@ -781,8 +1142,10 @@ class SubjectHistoryStore:
             )
         except (TypeError, ValueError) as error:
             raise HistoryStoreCorrupt("SubjectHistory meta is invalid") from error
+        if (meta.schema_version, meta.schema_hash) == (1, SCHEMA_HASH_V1):
+            raise HistoryStoreMigrationRequired("SubjectHistory meta is schema v1")
         if meta.schema_version != HISTORY_SCHEMA_VERSION or meta.schema_hash != SCHEMA_HASH:
-            raise HistoryStoreCorrupt("SubjectHistory meta schema is not v1")
+            raise HistoryStoreCorrupt("SubjectHistory meta schema is not v2")
         return meta
 
     def activate(
@@ -995,35 +1358,134 @@ class SubjectHistoryStore:
                     for item in decision.source_refs
                 ],
             )
+            _finish(connection, decision.incarnation_id, transaction_id, receipt)
+
+    # -------------------------------------------------- v2 record operations
+
+    def has_record_operations(self) -> bool:
+        """Whether any R17 / R18 operation row exists (§7 startup check)."""
+
+        kinds = tuple(kind.value for kind in RECORD_OPERATION_KINDS)
+        marks = ", ".join("?" for _ in kinds)
+        return bool(
+            self._read(f"SELECT 1 FROM history_operations WHERE operation_kind IN ({marks}) LIMIT 1", kinds)
+        )
+
+    def live_keys(self, keys: tuple[str, ...]) -> frozenset[str]:
+        """The given keys that are currently reserved (writers' pre-check, §2a)."""
+
+        if not keys:
+            return frozenset()
+        marks = ", ".join("?" for _ in keys)
+        rows = self._read(
+            f"SELECT reserved_key FROM history_operation_keys WHERE live = 1 AND reserved_key IN ({marks})",
+            keys,
+        )
+        return frozenset(str(row[0]) for row in rows)
+
+    def _require_records_enabled(self) -> None:
+        if not self._r18_enabled:
+            raise HistoryStoreRecordsDisabled("R17 / R18 records are disabled (r18.enabled is false)")
+
+    def insert_prepared_record(
+        self,
+        *,
+        transaction_id: str,
+        operation_digest: str,
+        operation: HistoryRecordOperationV1,
+    ) -> None:
+        """PREPARE one record operation and reserve its keys (§2a), atomically.
+
+        The envelope carries the incarnation, event, sequence and transaction
+        kind; the caller (IP-14a-2 participant) checks them against R07.
+        """
+
+        self._require_records_enabled()
+        if type(operation) is not HistoryRecordOperationV1:
+            raise TypeError("operation must be a HistoryRecordOperationV1")
+        pending = operation.canonical_bytes()
+        if operation.operation_digest != operation_digest:
+            raise HistoryStoreConflict("SubjectHistory operation digest conflicts")
+        self._require_active()
+        self.check_headroom(len(pending))
+        with self._write("prepare") as connection:
             connection.execute(
-                "INSERT INTO history_postcommit_receipts (incarnation_id, "
-                "transaction_id, event_id, processing_sequence, "
-                "prepared_state_hash_before, prepared_state_hash_after, "
-                "snapshot_sequence, snapshot_hash, wal_generation_id, wal_record_id, "
-                "wal_record_hash, receipt_digest) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                f"INSERT INTO history_operations ({_OPERATION_COLUMNS}, participant_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, NULL, NULL, NULL, ?)",
                 (
-                    decision.incarnation_id,
-                    transaction_id,
-                    receipt.event_id,
-                    receipt.processing_sequence,
-                    receipt.prepared_state_hash_before,
-                    receipt.prepared_state_hash_after,
-                    receipt.snapshot_sequence,
-                    receipt.snapshot_hash,
-                    receipt.wal_generation_id,
-                    receipt.wal_record_id,
-                    receipt.wal_record_hash,
-                    receipt.receipt_digest,
+                    operation.incarnation_id,
+                    canonical_uuid(transaction_id, "transaction_id"),
+                    operation.event_id,
+                    operation.processing_sequence,
+                    operation.transaction_kind,
+                    operation.operation_kind.value,
+                    operation_digest,
+                    pending,
+                    sha256(pending).hexdigest(),
+                    SUBJECT_HISTORY_PARTICIPANT_ID,
                 ),
             )
-            cursor = connection.execute(
-                "UPDATE history_operations SET phase = 'FINALIZED' "
-                "WHERE incarnation_id = ? AND transaction_id = ? AND phase = 'PREPARED'",
-                (decision.incarnation_id, transaction_id),
+            connection.executemany(
+                "INSERT INTO history_operation_keys (reserved_key, incarnation_id, "
+                "transaction_id, live) VALUES (?, ?, ?, 1)",
+                [(key, operation.incarnation_id, transaction_id) for key in operation.reserved_keys],
             )
-            if cursor.rowcount != 1:
-                raise HistoryStoreConflict("SubjectHistory operation is not PREPARED")
+
+    def finalize_record(
+        self,
+        *,
+        transaction_id: str,
+        operation: HistoryRecordOperationV1,
+        receipt: PostcommitReceiptV1,
+    ) -> None:
+        """One ``BEGIN IMMEDIATE`` FINALIZE: the record rows, receipt and phase."""
+
+        if type(operation) is not HistoryRecordOperationV1:
+            raise TypeError("operation must be a HistoryRecordOperationV1")
+        with self._write("finalize") as connection:
+            stored = connection.execute(
+                "SELECT pending_bytes, operation_kind FROM history_operations "
+                "WHERE incarnation_id = ? AND transaction_id = ? AND phase = 'PREPARED'",
+                (operation.incarnation_id, transaction_id),
+            ).fetchone()
+            if stored is None or (_blob(stored[0]), str(stored[1])) != (
+                operation.canonical_bytes(),
+                operation.operation_kind.value,
+            ):
+                raise HistoryStoreConflict("SubjectHistory operation is not this PREPARED record")
+            for row in operation.rows:
+                names = (*(name for name, _ in row.columns), "incarnation_id", "transaction_id")
+                values = (*(value for _, value in row.columns), operation.incarnation_id, transaction_id)
+                connection.execute(
+                    f"INSERT INTO {row.table} ({', '.join(names)}) "
+                    f"VALUES ({', '.join('?' for _ in names)})",
+                    values,
+                )
+            _finish(connection, operation.incarnation_id, transaction_id, receipt)
+
+    def record_rows(
+        self, table: str, incarnation_id: str, transaction_id: str
+    ) -> tuple[dict[str, object], ...]:
+        """Raw rows of one record table for one operation (IP-14a-2 reader)."""
+
+        if table not in RECORD_TABLES:
+            raise ValueError("not a record table")
+        connection_rows = self._read_dicts(
+            f"SELECT * FROM {table} WHERE incarnation_id = ? AND transaction_id = ?",
+            (incarnation_id, transaction_id),
+        )
+        return connection_rows
+
+    def _read_dicts(
+        self, sql: str, parameters: tuple[object, ...] = ()
+    ) -> tuple[dict[str, object], ...]:
+        with self._lock:
+            try:
+                cursor = self._connection.execute(sql, parameters)
+                names = [column[0] for column in cursor.description]
+                return tuple(dict(zip(names, row, strict=True)) for row in cursor.fetchall())
+            except sqlite3.Error as error:
+                raise _error(error, "read") from error
 
     def finalized_decision(
         self, incarnation_id: str, transaction_id: str
@@ -1083,6 +1545,9 @@ __all__ = [
     "HistoryStoreConflict",
     "HistoryStoreCorrupt",
     "HistoryStoreError",
+    "HistoryStoreMigrationRequired",
+    "HistoryStoreRecordsDisabled",
     "HistoryStoreUnavailable",
+    "V2_STATEMENTS",
     "SubjectHistoryStore",
 ]

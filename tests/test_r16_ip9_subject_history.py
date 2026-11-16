@@ -597,7 +597,7 @@ def test_binding_mismatches_and_missing_pending_diverge(tmp_path: Path) -> None:
 
 
 def test_capacity_is_refused_before_prepare(tmp_path: Path) -> None:
-    store = _store(tmp_path, pages=32)
+    store = _store(tmp_path, pages=80)  # an empty v2 store takes 66 pages
     event = _event("capacity")
     decision = _committed(event)
     assert store.free_bytes() < store.required_headroom(len(decision.canonical_bytes()))

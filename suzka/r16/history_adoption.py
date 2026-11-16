@@ -30,6 +30,7 @@ from suzka.r16.history_store import (
     HistoryMetaPhase,
     HistoryStoreConflict,
     HistoryStoreCorrupt,
+    HistoryStoreMigrationRequired,
     HistoryStoreUnavailable,
     SubjectHistoryStore,
 )
@@ -146,8 +147,13 @@ def open_or_create_store(
     *,
     subject_id: str,
     max_page_count: int,
+    r18_enabled: bool = False,
 ) -> SubjectHistoryStore:
-    """Open the store, creating it PROVISIONAL only before adoption."""
+    """Open the store, creating it PROVISIONAL only before adoption.
+
+    IP-14a: a v1 store stops startup until the explicit migration ran
+    (§11-1), and a store holding R17 / R18 records refuses to start while
+    ``r18.enabled`` is false (§11-2, until IP-16 / IP-18)."""
 
     if not isinstance(path, Path):
         raise HistoryAdoptionError("SubjectHistory path must be a Path")
@@ -157,7 +163,14 @@ def open_or_create_store(
         raise HistoryAdoptionError("Journal lineage is unavailable")
     adopted = adopted_history_baseline(inspection)
     try:
-        store = SubjectHistoryStore.open(path, max_page_count=max_page_count)
+        store = SubjectHistoryStore.open(
+            path, max_page_count=max_page_count, r18_enabled=r18_enabled
+        )
+    except HistoryStoreMigrationRequired as error:
+        raise HistoryAdoptionError(
+            "SubjectHistory is schema v1: back up .suzka/ and run "
+            "python -m suzka.r16.history_migration on it"
+        ) from error
     except HistoryStoreUnavailable as error:
         if adopted is not None or path.exists() or path.is_symlink():
             # After adoption a missing store is lost authority, never recreated.
@@ -170,6 +183,11 @@ def open_or_create_store(
                 raise HistoryAdoptionError("SubjectHistory store belongs to another subject")
             if adopted is None:
                 require_adoptable(store, inspection)
+            if not r18_enabled and store.has_record_operations():
+                raise HistoryAdoptionError(
+                    "R18_RECORDS_PRESENT_BUT_DISABLED: SubjectHistory holds R17 / R18 "
+                    "records while r18.enabled is false"
+                )
         except BaseException:
             store.close()
             raise
@@ -180,6 +198,7 @@ def open_or_create_store(
             subject_id=subject_id,
             journal_lineage_id=lineage,
             max_page_count=max_page_count,
+            r18_enabled=r18_enabled,
         )
     except (HistoryStoreConflict, HistoryStoreCorrupt, HistoryStoreUnavailable) as error:
         raise HistoryAdoptionError("SubjectHistory store creation failed") from error

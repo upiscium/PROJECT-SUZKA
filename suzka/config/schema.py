@@ -199,6 +199,23 @@ class SelfGoalSettings(StrictBaseModel):
     stale_after_hours: StrictInt = Field(default=24, ge=1, le=24 * 30)
 
 
+class R18Settings(StrictBaseModel):
+    """IP-14a (#411 §1, HP-6): governed Actions. Off until HP-6 says otherwise.
+
+    While false, no R17 / R18 record (Intent, forecast, verdict, challenge,
+    claim, Outcome, Assessment, Feedback) is written. Until IP-16, a store that
+    already holds such records refuses to start with this off (§11-2).
+    """
+
+    enabled: StrictBool = False
+
+
+class R19Settings(StrictBaseModel):
+    """IP-14a (#411 §1, HP-6): Wakes, Scheduler and Outbox (IP-14b / IP-20)."""
+
+    enabled: StrictBool = False
+
+
 class SubjectHistorySettings(StrictBaseModel):
     """IP-9 U4-3 (#376 §A): the ``subject.history`` R07 participant.
 
@@ -211,7 +228,8 @@ class SubjectHistorySettings(StrictBaseModel):
     path: Path = Path(".suzka/private/subject_history/subject_history.sqlite3")
     # SQLite page cap.  #376 D1-9 (Human-approved 2026-11-14): 65536 pages,
     # 256 MiB when the SQLite page size is the usual 4096 bytes.
-    max_page_count: StrictInt = Field(default=65_536, ge=64, le=2_147_483_646)
+    # IP-14a: an empty v2 store already takes 66 pages.
+    max_page_count: StrictInt = Field(default=65_536, ge=128, le=2_147_483_646)
 
 
 class StateWALSettings(StrictBaseModel):
@@ -394,4 +412,6 @@ class Settings(StrictBaseModel):
         default_factory=SubjectHistorySettings
     )
     self_goal: SelfGoalSettings = Field(default_factory=SelfGoalSettings)
+    r18: R18Settings = Field(default_factory=R18Settings)
+    r19: R19Settings = Field(default_factory=R19Settings)
     values: ValueSystemSettings = Field(default_factory=ValueSystemSettings)
