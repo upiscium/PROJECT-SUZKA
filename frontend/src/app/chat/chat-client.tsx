@@ -164,7 +164,17 @@ export function ChatClient() {
           unsaved = true;
         }
       }
-      const result = await api.chat(id ? { ...body, chat_session_id: id } : body);
+      let result: ChatResponse;
+      try {
+        result = await api.chat(id ? { ...body, chat_session_id: id } : body);
+      } catch (error) {
+        // The session was deleted elsewhere: leave it, so the next send opens a new one.
+        if (id && error instanceof ApiError && error.status === 404) {
+          selectSession(null);
+          throw new Error("This chat was deleted elsewhere. Send again to start a new chat.");
+        }
+        throw error;
+      }
       return unsaved ? { ...result, transcript_saved: false } : result;
     },
     // The user's turn shows as soon as it is sent; the reply follows it.

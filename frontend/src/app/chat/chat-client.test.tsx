@@ -84,6 +84,9 @@ describe("ChatClient", () => {
     await userEvent.type(box, "line one{Enter}line two");
     expect(box).toHaveValue("line one\nline two");
     fireEvent.keyDown(box, { key: "Enter", ctrlKey: true, isComposing: true });
+    // A send would have cleared the composer and, a microtask later, called fetch.
+    expect(box).toHaveValue("line one\nline two");
+    await act(async () => {});
     expect(sentBodies()).toEqual([]);
   });
 
@@ -371,6 +374,24 @@ describe("ChatClient sessions", () => {
     expect(screen.getByText("new topic")).toBeInTheDocument();
     expect(chatBodies[0].chat_session_id).toBe("s-2");
     expect(window.localStorage.getItem(SESSION_STORAGE_KEY)).toBe("s-2");
+  });
+
+  it("leaves a session deleted elsewhere so the next send starts a new chat", async () => {
+    window.localStorage.setItem(SESSION_STORAGE_KEY, "s-1");
+    fetchMock.mockImplementation(async (url: string) => {
+      const path = String(url);
+      if (path.endsWith("/api/chat/sessions/s-1")) return json({ session: SESSION, turns: [] });
+      if (path.endsWith("/api/chat/sessions")) return json({ sessions: [SESSION] });
+      if (path.endsWith("/api/chat")) return json({ detail: "Chat session not found" }, 404);
+      throw new Error(`unexpected ${path}`);
+    });
+    renderWithQuery();
+    expect(await screen.findByRole("button", { name: "Earlier chat" })).toHaveAttribute("aria-current", "true");
+    await send("hello");
+
+    // Shown on the failed turn and in the error line.
+    expect((await screen.findAllByText(/This chat was deleted elsewhere/)).length).toBeGreaterThan(0);
+    expect(window.localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull();
   });
 
   it("says when a turn was not saved to the history", async () => {

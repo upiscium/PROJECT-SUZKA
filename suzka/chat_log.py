@@ -14,11 +14,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import logging
 import os
 import sqlite3
 import threading
 import uuid
 
+
+logger = logging.getLogger(__name__)
 
 TITLE_MAX_CHARS = 60
 SCHEMA_VERSION = 1
@@ -73,10 +76,20 @@ class ChatLogStore:
         self._lock = threading.Lock()
         try:
             self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.chmod(self.path.parent, 0o700)
-            # Create the file owner-only before SQLite opens it.
-            os.close(os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600))
-            os.chmod(self.path, 0o600)
+            parent = self.path.parent.stat()
+            if parent.st_uid == os.getuid() and parent.st_mode & 0o077:
+                if self.path.parent.name == "chat_log":
+                    # Our own dedicated directory: make it owner-only.
+                    os.chmod(self.path.parent, 0o700)
+                else:
+                    logger.warning("chat log directory %s is readable by others", self.path.parent)
+            # Create the file owner-only before SQLite opens it, without
+            # following a symlink planted at its path.
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
             with self._connect() as connection:
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
                 if version not in (0, SCHEMA_VERSION):

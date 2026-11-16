@@ -155,3 +155,13 @@ def test_an_unusable_store_never_blocks_a_chat_turn(tmp_path: Path) -> None:
 
         assert client.get("/api/chat/sessions").status_code == 503
         assert client.post("/api/chat/sessions", json={}).status_code == 503
+
+
+def test_store_refuses_a_symlink_at_its_path(tmp_path: Path) -> None:
+    target = tmp_path / "elsewhere.sqlite3"
+    target.write_text("")
+    link = tmp_path / "chat_log" / "chat_log.sqlite3"
+    link.parent.mkdir(mode=0o700)
+    link.symlink_to(target)
+    with pytest.raises(ChatLogUnavailable):
+        ChatLogStore(link)
