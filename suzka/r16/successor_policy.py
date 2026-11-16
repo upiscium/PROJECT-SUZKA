@@ -38,6 +38,13 @@ distinguishable from one after an authorized forward effect here, so a
 MATCH_SELF under INVERSE_*/REVERTED is row 2 (HOLD) rather than row 0; R18
 must check that the original forward effect was authorized.
 
+IP-13 adds SuccessorPolicyV3: the same table and input, plus the ledger state
+``PRIOR_INCARNATION_EFFECT_PRESENT`` (#373 A2-4, #378 II-4, R20-F12): a target
+effect whose source-side Claim was lost (e.g. by a true rollback). It is a row
+2 HOLD, carries no verified Outcome, and only a V3 input can hold it. A V2
+input keeps its exact bytes, schema string and fingerprint domain, so every
+existing V2 head still replays unchanged.
+
 R16 must not import ``suzka.r15``: the R15 read arrives as the closed strings
 of ``suzka.runtime.r15_interpretation_reader`` and is mapped here.
 """
@@ -69,9 +76,22 @@ from suzka.r16.contracts import (
 from suzka.r16.history_codec import MAX_POLICY_INPUT_BYTES, PolicyKind, PolicyRow
 
 INPUT_SCHEMA: Final = "SUCCESSOR_POLICY_INPUT_V2"
+# The version the issuer seals today; it moves to V3 with IP-14a.
 POLICY_KIND: Final = PolicyKind.SUCCESSOR_POLICY_V2
+INPUT_SCHEMA_V3: Final = "SUCCESSOR_POLICY_INPUT_V3"
+_INPUT_SCHEMAS: Final[Mapping[PolicyKind, str]] = {
+    PolicyKind.SUCCESSOR_POLICY_V2: INPUT_SCHEMA,
+    PolicyKind.SUCCESSOR_POLICY_V3: INPUT_SCHEMA_V3,
+}
+_SCHEMA_VERSIONS: Final[Mapping[str, PolicyKind]] = {
+    schema: kind for kind, schema in _INPUT_SCHEMAS.items()
+}
 MAX_LEDGER_REFS: Final = 4
 _FINGERPRINT_DOMAIN: Final = b"PROJECT-SUZKA:R16:SUCCESSOR-EVIDENCE-FINGERPRINT:V2\0"
+_FINGERPRINT_DOMAINS: Final[Mapping[PolicyKind, bytes]] = {
+    PolicyKind.SUCCESSOR_POLICY_V2: _FINGERPRINT_DOMAIN,
+    PolicyKind.SUCCESSOR_POLICY_V3: b"PROJECT-SUZKA:R16:SUCCESSOR-EVIDENCE-FINGERPRINT:V3\0",
+}
 _UTC_FORMAT: Final = "%Y-%m-%dT%H:%M:%SZ"
 _REQUIRED_KINDS: Final = ("context", "experience", "goal", "value")
 
@@ -125,6 +145,8 @@ class LedgerState(str, Enum):
     INVERSE_VERIFIED_ABSENT = "INVERSE_VERIFIED_ABSENT"
     REVERTED = "REVERTED"
     CORRUPT = "CORRUPT"
+    # V3 only: a target effect with no source-side Claim (prior incarnation).
+    PRIOR_INCARNATION_EFFECT_PRESENT = "PRIOR_INCARNATION_EFFECT_PRESENT"
 
 
 class InverseAuthorization(str, Enum):
@@ -198,15 +220,19 @@ _PENDING_LEDGER: Final = frozenset(
         LedgerState.INVERSE_APPROVAL_EXPIRED_UNCLAIMED,
         LedgerState.INVERSE_VERIFIED_ABSENT,
         LedgerState.REVERTED,
+        LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT,
     }
 )
+_V3_ONLY_LEDGER: Final = frozenset({LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT})
 # D6-2: no verified Outcome may accompany a ledger with no claimed effect.
+# A prior-incarnation effect has lost its source-side Claim, so no Outcome.
 _OUTCOME_FORBIDDEN: Final = frozenset(
     {
         LedgerState.NONE,
         LedgerState.INTENT_ISSUED,
         LedgerState.POLICY_DENIED,
         LedgerState.APPROVAL_EXPIRED_UNCLAIMED,
+        LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT,
     }
 )
 # Forward effect proven, then an inverse attempted or applied (A2-2/A2-3).
@@ -405,8 +431,12 @@ class SuccessorPolicyInputV2:
     event_id: str
     event_sequence: int
     now_utc: str
+    # IP-13: V2 (the issuer's current version) or V3.
+    version: PolicyKind = PolicyKind.SUCCESSOR_POLICY_V2
 
     def __post_init__(self) -> None:
+        if type(self.version) is not PolicyKind or self.version not in _INPUT_SCHEMAS:
+            raise ValueError("policy input version must be SuccessorPolicy V2 or V3")
         for name, kind in (
             ("required_source", RequiredSourceState),
             ("predecessor", PredecessorState),
@@ -434,6 +464,11 @@ class SuccessorPolicyInputV2:
             raise TypeError("lineage_ref must be an exact LineageRef")
         if self.commitment_deadline_utc is not None:
             _utc(self.commitment_deadline_utc, "commitment deadline")
+        if (
+            self.version is PolicyKind.SUCCESSOR_POLICY_V2
+            and self.ledger in _V3_ONLY_LEDGER
+        ):
+            raise ValueError("a V2 policy input cannot hold a V3-only ledger state")
         if self.interpretation not in _STAGE_INTERPRETATIONS[self.interpretation_stage]:
             raise ValueError("interpretation and stage are not a closed combination")
         integer(
@@ -496,7 +531,7 @@ class SuccessorPolicyInputV2:
                 "refs": [item.canonical_value() for item in self.source_refs],
                 "state": self.required_source.value,
             },
-            "schema": INPUT_SCHEMA,
+            "schema": _INPUT_SCHEMAS[self.version],
             "verified_outcome": _ref_value(self.verified_outcome_ref),
         }
 
@@ -535,8 +570,9 @@ class SuccessorPolicyInputV2:
             ),
             "policy input",
         )
-        if row["schema"] != INPUT_SCHEMA:
-            raise ValueError("policy input schema is not V2")
+        version = _SCHEMA_VERSIONS.get(row["schema"]) if type(row["schema"]) is str else None
+        if version is None:
+            raise ValueError("policy input schema is not V2 or V3")
         as_of = closed(
             row["as_of"],
             ("event_id", "event_sequence", "now_utc", "r07_sequence", "snapshot_hash"),
@@ -586,6 +622,7 @@ class SuccessorPolicyInputV2:
             event_id=_str(as_of["event_id"]),
             event_sequence=_int(as_of["event_sequence"]),
             now_utc=_str(as_of["now_utc"]),
+            version=version,
         )
         if value.canonical_bytes() != payload:
             raise ValueError("policy input bytes are not canonical")
@@ -602,7 +639,7 @@ class SuccessorPolicyInputV2:
         body = self.canonical_value()
         del body["as_of"]
         del body["predecessor"]
-        return checksum(_FINGERPRINT_DOMAIN, body)
+        return checksum(_FINGERPRINT_DOMAINS[self.version], body)
 
 
 def _ref_value(value: PolicyRef | None) -> dict[str, object] | None:
@@ -887,7 +924,9 @@ def interpretation_from_r15(
 # ------------------------------------------------------- byte-bound proof
 
 
-def worst_case_input() -> SuccessorPolicyInputV2:
+def worst_case_input(
+    version: PolicyKind = PolicyKind.SUCCESSOR_POLICY_V2,
+) -> SuccessorPolicyInputV2:
     """The largest encodable input: every bounded field at its maximum.
 
     Identifiers are ASCII (no JSON escaping), so maximal lengths and maximal
@@ -933,7 +972,14 @@ def worst_case_input() -> SuccessorPolicyInputV2:
         commitment=longest(CommitmentState),  # type: ignore[arg-type]
         commitment_ref=ref("commitment"),
         commitment_deadline_utc=deadline,
-        ledger=longest(LedgerState),  # type: ignore[arg-type]
+        ledger=max(
+            (
+                item
+                for item in LedgerState
+                if version is PolicyKind.SUCCESSOR_POLICY_V3 or item not in _V3_ONLY_LEDGER
+            ),
+            key=lambda member: len(member.value),
+        ),
         ledger_refs=refs("ledger", MAX_LEDGER_REFS),
         inverse_authorization=longest(InverseAuthorization),  # type: ignore[arg-type]
         feedback=longest(FeedbackState),  # type: ignore[arg-type]
@@ -946,11 +992,13 @@ def worst_case_input() -> SuccessorPolicyInputV2:
         event_id=ident("event"),
         event_sequence=MAX_PERSISTED_EVENT_SEQUENCE,
         now_utc=deadline,
+        version=version,
     )
 
 
 __all__ = [
     "INPUT_SCHEMA",
+    "INPUT_SCHEMA_V3",
     "MAX_LEDGER_REFS",
     "POLICY_KIND",
     "CommitmentState",

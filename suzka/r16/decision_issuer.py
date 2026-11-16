@@ -604,7 +604,8 @@ class _DecisionIssuer:
             # IP-11: Plan B is never a self-origin Goal's head.
             return False
         return (
-            decision.policy_kind is POLICY_KIND
+            # IP-13: a head sealed in V2 stays valid after the issuer moves on.
+            decision.policy_kind is sealed.version
             and replay.history_row is decision.policy_row
             and selected is not None
             and (selected.kind, selected.candidate_id) == expected_kind
