@@ -34,7 +34,17 @@ Stages (#370 D0 §2, D1, D2):
   once per Decision this incarnation, only when the Intent issuer is
   installed and ``r18.enabled`` is true (the server passes no issuer
   otherwise).  An ``in_flight`` HOLD is retried with the bounded retry delays
-  (at most 3 times); every other result only ends the stage.
+  (at most 3 times); every other result only ends the stage;
+- IP-16a-3 (#411 D1 §2): after any Intent result ISSUED or EXISTING, one
+  ``R17_EXPECTATION_COMMIT(intent_id)``; a transient HOLD
+  (``not_yet_terminal`` / ``in_flight``) is retried with the same bounded
+  delays.  Once per driver incarnation, when the driver is (or becomes)
+  active, ``R17_EXPECTATION_COMMIT(scan)``: the owner finds an adopted Intent
+  without a forecast; each COMMITTED submits the scan again, and the chain
+  stops at NONE_LEFT, a HOLD, or after ``MAX_SCANS_PER_STARTUP`` scans.  The
+  driver never counts pending Intents itself.  Only with the expectation
+  issuer installed and ``r18.enabled`` true (the server passes none
+  otherwise).
 
 Tickets (#370 D1 2-1, 2-2, D2 P1-3/P1-5, addendum P1-A): a 128-bit random
 capability per command, held in a bounded in-memory ring. Nothing about
@@ -68,7 +78,17 @@ from suzka.r16.goal_owner import _GoalSourceSelection, _SelfGoalSelection
 from suzka.r16.outcomes import R16OwnerOutcome, R16OwnerReason, R16OwnerStatus
 from suzka.r16.source_owner import INTEREST_APPLIED, _MotivationSourceRef
 from suzka.r16.successor_policy import SuccessorRow
-from suzka.r18.intent_issuer import R18IntentReason, _IntentIssueResult
+from suzka.r17.expectation_issuer import (
+    MAX_SCANS_PER_STARTUP,
+    TRANSIENT_REASONS,
+    ExpectationCommitStatus,
+    _ExpectationResult,
+)
+from suzka.r18.intent_issuer import (
+    IntentIssueStatus,
+    R18IntentReason,
+    _IntentIssueResult,
+)
 from suzka.runtime.agent_runtime import (
     AgentEventOutcome,
     AgentEventSource,
@@ -84,6 +104,7 @@ if TYPE_CHECKING:
     from suzka.r16.goal_owner import _GoalSourceOwner
     from suzka.r16.plan_preview import _PlanPreviewOwner
     from suzka.r16.source_owner import _MotivationSourceOwner
+    from suzka.r17.expectation_issuer import ExpectationIssuerV1
     from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
     from suzka.runtime.main_loop import ChatResult
 
@@ -184,6 +205,8 @@ class _Stage(str, Enum):
     GOAL_SELF_PROPOSAL = "goal_self_proposal"
     # IP-16a-2 (#411 D1 §2): the R18 forward Intent for a row-4 Decision.
     ACTION_INTENT = "action_intent"
+    # IP-16a-3 (#411 D1 §2): the R17 forecast for one Intent, or a scan.
+    EXPECTATION = "expectation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +215,18 @@ class _IntentTarget:
 
     decision_id: str
     lineage_scope: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ForecastTarget:
+    """One Intent's id (public-safe), or ``None`` for the owner's scan."""
+
+    intent_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ForecastScan:
+    """Queue item: start the once-per-incarnation forecast scan."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +295,7 @@ class R16Driver:
         self_goal_per_incarnation: int = 3,
         clock: Callable[[], float] = time.monotonic,
         intent_issuer: ReviewArtifactIntentIssuerV1 | None = None,
+        expectation_issuer: ExpectationIssuerV1 | None = None,
     ) -> None:
         self._runtime = runtime
         self._source = source_owner
@@ -272,6 +308,14 @@ class R16Driver:
         # Decisions whose Intent was submitted, and in_flight retries made.
         self._intended: dict[str, None] = {}
         self._intent_retries: dict[str, int] = {}
+        # IP-16a-3: present only when installed with r18.enabled (server).
+        self._expectation = expectation_issuer
+        # Intents whose forecast was submitted, transient retries made, and
+        # this incarnation's scan state (D1 §2, r3 P3-6).
+        self._forecasted: dict[str, None] = {}
+        self._forecast_retries: dict[str, int] = {}
+        self._scan_posted = False
+        self._scans = 0
         self.incarnation = secrets.token_hex(8)
         self._active = active
         # IP-11: the self path also needs its own unique activation marker.
@@ -321,6 +365,10 @@ class R16Driver:
         """Called after the unique activation event has completed."""
 
         self._active = True
+        with self._lifecycle:
+            started = self._thread is not None
+        if started:
+            self._post_forecast_scan()
 
     def activate_self_goal(self) -> None:
         """IP-11: called after the unique self-Goal activation has completed."""
@@ -336,6 +384,20 @@ class R16Driver:
             self._thread.start()
         if rescan is not None and self._active:
             self._post(rescan)
+        if self._active:
+            self._post_forecast_scan()
+
+    def _post_forecast_scan(self) -> None:
+        """IP-16a-3 (D1 §2): one forecast scan when the driver is active."""
+
+        if (
+            self._expectation is None
+            or not self._expectation.enabled
+            or self._scan_posted
+        ):
+            return
+        self._scan_posted = True
+        self._post(_ForecastScan())
 
     def stop(self) -> None:
         """Stop and join before the runtime shuts down (#370 D2 P2-3)."""
@@ -484,6 +546,8 @@ class R16Driver:
                     self._on_chat(item)
                 elif isinstance(item, _Rescan):
                     self._on_rescan(item)
+                elif isinstance(item, _ForecastScan):
+                    self._maybe_scan()
                 with self._tickets_lock:
                     finished, self._done = self._done, []
                 for result in finished:
@@ -694,6 +758,9 @@ class R16Driver:
         if stage is _Stage.ACTION_INTENT:
             assert isinstance(context, _IntentTarget) and self._intent is not None
             return _untyped(self._intent._submit_intent(context.lineage_scope))
+        if stage is _Stage.EXPECTATION:
+            assert isinstance(context, _ForecastTarget) and self._expectation is not None
+            return _untyped(self._expectation._submit_expectation(context.intent_id))
         assert isinstance(context, str)
         return _untyped(self._preview._submit_preview(context))
 
@@ -756,6 +823,10 @@ class R16Driver:
         if item.stage is _Stage.ACTION_INTENT:
             assert isinstance(item.context, _IntentTarget)
             self._intent_done(item.context, outcome.value)
+            return
+        if item.stage is _Stage.EXPECTATION:
+            assert isinstance(item.context, _ForecastTarget)
+            self._forecast_done(item.context, outcome.value)
             return
         value = outcome.value
         command = _command_of(item.context)
@@ -864,6 +935,12 @@ class R16Driver:
         )
 
     def _intent_done(self, target: _IntentTarget, value: object) -> None:
+        if (
+            isinstance(value, _IntentIssueResult)
+            and value.status in (IntentIssueStatus.ISSUED, IntentIssueStatus.EXISTING)
+            and value.intent_id is not None
+        ):
+            self._maybe_forecast(value.intent_id)
         if not (
             isinstance(value, _IntentIssueResult)
             and value.reason is R18IntentReason.IN_FLIGHT
@@ -882,6 +959,58 @@ class R16Driver:
                 self._clock() + RETRY_DELAYS_SECONDS[attempt],
                 0,
                 _Stage.ACTION_INTENT,
+                target,
+            )
+        )
+
+    def _maybe_forecast(self, intent_id: str) -> None:
+        """IP-16a-3 (D1 §2): one forecast request per Intent this incarnation."""
+
+        if (
+            self._expectation is None
+            or not self._expectation.enabled
+            or intent_id in self._forecasted
+        ):
+            return
+        self._forecasted[intent_id] = None
+        _bound(self._forecasted)
+        self._submit(_Stage.EXPECTATION, _ForecastTarget(intent_id))
+
+    def _maybe_scan(self) -> None:
+        """At most ``MAX_SCANS_PER_STARTUP`` scans per driver incarnation."""
+
+        if (
+            self._expectation is None
+            or not self._expectation.enabled
+            or self._scans >= MAX_SCANS_PER_STARTUP
+        ):
+            return
+        self._scans += 1
+        self._submit(_Stage.EXPECTATION, _ForecastTarget(None))
+
+    def _forecast_done(self, target: _ForecastTarget, value: object) -> None:
+        if not isinstance(value, _ExpectationResult):
+            return
+        if target.intent_id is None:
+            # The scan: only a COMMITTED continues it.
+            if value.status is ExpectationCommitStatus.COMMITTED:
+                self._maybe_scan()
+            return
+        if value.reason not in TRANSIENT_REASONS:
+            self._forecast_retries.pop(target.intent_id, None)
+            return
+        attempt = self._forecast_retries.get(target.intent_id, 0)
+        if attempt >= len(RETRY_DELAYS_SECONDS):
+            self._forecast_retries.pop(target.intent_id, None)
+            return
+        self._forecast_retries[target.intent_id] = attempt + 1
+        while len(self._forecast_retries) > OBSERVED_CAPACITY:
+            del self._forecast_retries[next(iter(self._forecast_retries))]
+        self._retries.append(
+            _Retry(
+                self._clock() + RETRY_DELAYS_SECONDS[attempt],
+                0,
+                _Stage.EXPECTATION,
                 target,
             )
         )
@@ -918,6 +1047,11 @@ def _result_code(value: object) -> str:
         return value.status.value
     if isinstance(value, _IntentIssueResult):
         # IP-16a-2: a closed status and reason only, never Intent contents.
+        if value.reason is not None:
+            return f"{value.status.value}:{value.reason.value}"
+        return value.status.value
+    if isinstance(value, _ExpectationResult):
+        # IP-16a-3: a closed status and reason only, never forecast contents.
         if value.reason is not None:
             return f"{value.status.value}:{value.reason.value}"
         return value.status.value

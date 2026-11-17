@@ -40,6 +40,9 @@ class AgentEventType(str, Enum):
     # IP-16a-2 (#411 D1 §1): the R18 forward ActionIntent issue for one review
     # lineage. Refused in the soft band (HP-8) by not being admitted there.
     R18_ACTION_INTENT_ISSUE = "r18_action_intent_issue"
+    # IP-16a-3 (#411 D1 §1): the R17 forecast for one terminal forward Intent
+    # (or a scan for one without). Refused in the soft band like the Intent.
+    R17_EXPECTATION_COMMIT = "r17_expectation_commit"
 
 
 class AgentEventSource(str, Enum):
@@ -75,6 +78,7 @@ class AgentEventSource(str, Enum):
     RUNTIME_GOAL_SELF_PROPOSAL_REVIEW = "runtime.goal_self_proposal_review"
     API_R16_SELF_GOAL_ACTIVATE = "api.r16.self_goal.activate"
     RUNTIME_R18_ACTION_INTENT_ISSUE = "runtime.r18.action_intent_issue"
+    RUNTIME_R17_EXPECTATION_COMMIT = "runtime.r17.expectation_commit"
 
 
 class AgentRuntimeStatus(str, Enum):
