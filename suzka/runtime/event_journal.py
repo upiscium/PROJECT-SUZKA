@@ -1282,7 +1282,8 @@ class EventJournalAdmissionBand(str, Enum):
 # #381 D2 P1-4: the soft band is an allow-list over the AgentEventTypes (16 at
 # the time of the table; IP-6 added R16_DRIVER_ACTIVATION, refused here; IP-11
 # added GOAL_SELF_PROPOSAL_REVIEW, admitted as cognition by Human decision
-# 2026-11-14, and R16_SELF_GOAL_ACTIVATION, refused like the driver's).
+# 2026-11-14, and R16_SELF_GOAL_ACTIVATION, refused like the driver's; IP-16a-2
+# added R18_ACTION_INTENT_ISSUE, refused by HP-8: the forward side only).
 # Cognition continues; DEBUG_CHAT, ADAPTER_EVALUATE and ADAPTER_UPDATE (Human
 # decision 2026-11-10) are refused, and so is every type not listed here,
 # including any type added later (R18/R19 external effects).

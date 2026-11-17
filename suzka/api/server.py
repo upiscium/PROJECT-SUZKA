@@ -83,6 +83,7 @@ from suzka.r16.source_owner import _MotivationSourceRef
 from suzka.runtime.event_journal import EventJournalAdmissionBand
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
 from suzka.r16.decision_issuer import _DecisionIssuer
+from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
 from suzka.r16.history_attestation import SubjectHistoryAttestationProvider
 from suzka.runtime.r15_interpretation_reader import R15InterpretationReader
 from suzka.runtime.journal_compaction import (
@@ -507,6 +508,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise StateRecoveryError("R16 Plan Preview owner unavailable")
             return owner
 
+        def _r18_intent_issuer_for_commit(
+            event: AgentEvent,
+        ) -> ReviewArtifactIntentIssuerV1 | None:
+            issuer = getattr(app.state, "intent_issuer", None)
+            if (
+                issuer is None
+                and event.event_type is AgentEventType.R18_ACTION_INTENT_ISSUE
+            ):
+                raise StateRecoveryError("R18 Intent issuer unavailable")
+            return issuer
+
         def _clear_r16_source(event: AgentEvent) -> None:
             owner = getattr(app.state, "_motivation_source_owner", None)
             if owner is not None:
@@ -520,6 +532,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             preview_owner = getattr(app.state, "_plan_preview_owner", None)
             if preview_owner is not None:
                 preview_owner._clear(event)
+            intent_issuer = getattr(app.state, "intent_issuer", None)
+            if intent_issuer is not None:
+                intent_issuer._clear()
 
         def _internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
             nonlocal committed_snapshot, committed_snapshot_hash
@@ -543,6 +558,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 preview_owner = _r16_plan_preview_for_commit(event)
                 if preview_owner is not None:
                     preview_owner._validate_commit(event)
+                intent_issuer = _r18_intent_issuer_for_commit(event)
+                if intent_issuer is not None:
+                    intent_issuer._validate_commit(event)
                 validate_belief_commit = getattr(
                     app.state.main_loop, "_validate_belief_event_commit", None
                 )
@@ -795,26 +813,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             except _PlanSourceUnavailable:
                 app.state._plan_preview_owner = None
-            # IP-6b (#370 R20-DRV): the R16 driver exists only with every
-            # owner bound; it runs only after the unique activation event.
             preview_owner = app.state._plan_preview_owner
-            if preview_owner is None:
-                app.state.r16_driver = None
-            else:
-                app.state.r16_driver = R16Driver(
-                    app.state.agent_runtime,
-                    app.state._motivation_source_owner,
-                    app.state._goal_source_owner,
-                    app.state._commitment_source_owner,
-                    preview_owner,
-                    active=driver_activation(app.state.event_journal.inspect())
-                    is not None,
-                    self_goal_active=self_goal_activation(
-                        app.state.event_journal.inspect()
-                    )
-                    is not None,
-                    self_goal_per_incarnation=app_settings.self_goal.per_incarnation,
-                )
             try:
                 narrative_reader = QualifiedNarrativeSourceGate(
                     app.state.agent_runtime,
@@ -846,6 +845,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # SubjectHistory store and a bound Plan preview owner; otherwise
             # PLAN_PREVIEW_REVIEW stays the unchanged U3-A preview.
             app.state.decision_issuer = None
+            app.state.intent_issuer = None
             history_store = getattr(app.state, "subject_history_store", None)
             if history_store is not None and preview_owner is not None:
                 interpretation_reader = R15InterpretationReader(
@@ -860,6 +860,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     interpretation_reader.read,
                 )
                 preview_owner._bind_issuer(app.state.decision_issuer)
+                # IP-16a-2 (#411 D1 §1/§3): the R18 Intent issuer lives beside
+                # the Decision issuer. With r18.enabled false it is installed
+                # but every event HOLDs R18_DISABLED, and the driver gets no
+                # issuer, so it never submits one.
+                app.state.intent_issuer = ReviewArtifactIntentIssuerV1(
+                    app.state.decision_issuer,
+                    app.state.agent_runtime,
+                    enabled=app_settings.r18.enabled,
+                    target_path=app_settings.r18.target_path,
+                )
+            # IP-6b (#370 R20-DRV): the R16 driver exists only with every
+            # owner bound; it runs only after the unique activation event.
+            if preview_owner is None:
+                app.state.r16_driver = None
+            else:
+                intent_issuer = app.state.intent_issuer
+                app.state.r16_driver = R16Driver(
+                    app.state.agent_runtime,
+                    app.state._motivation_source_owner,
+                    app.state._goal_source_owner,
+                    app.state._commitment_source_owner,
+                    preview_owner,
+                    active=driver_activation(app.state.event_journal.inspect())
+                    is not None,
+                    self_goal_active=self_goal_activation(
+                        app.state.event_journal.inspect()
+                    )
+                    is not None,
+                    self_goal_per_incarnation=app_settings.self_goal.per_incarnation,
+                    intent_issuer=(
+                        intent_issuer
+                        if intent_issuer is not None and intent_issuer.enabled
+                        else None
+                    ),
+                )
         except BaseException:
             app.state.event_journal.close()
             raise
