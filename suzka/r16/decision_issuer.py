@@ -25,10 +25,23 @@ row (D2 P1-2).  It cannot re-qualify the sources: source owners refuse to
 read while this event's own R07 transaction is open.
 Its failure is a runtime fail-stop, recovered at startup (IP-9 crash matrix).
 
-Known limits: ledger/Feedback/Outcome are NONE/ABSENT (no R17/R18); HOLD is
-not persisted (R19, #376 v2 §2); the R15 interpretation is sealed as its
-closed enum only; the Context ref is the frame's last-modified revision, not
-a digest of the Context's contents (#371 D6-3).
+IP-16b (#411 D1 r3 §5 / §10): the ledger witness comes from the operation
+ledger of this lineage's obligation group, read from the same classification
+as the head (``suzka.r18.ledger``).  While the store holds no R17 / R18 data
+at all (no record operation and no live ``claim:`` key in any incarnation,
+the production state with ``r18.enabled`` false) the ledger is NONE and no
+obligation key is computed: no secret or episode text is read, and the sealed
+input is byte-identical to the pre-IP-16b issuer's.  Otherwise the key is
+computed with the Intent issuer's shared helper; if it cannot be (no secret,
+an archived episode, ...) the Decision is the row-1 HOLD of an unavailable
+source.  A lineage with no Commitment yet keys on the review Commitment
+scope (the only one a review Commitment can have), so a second identical
+request is held on its first preview (row 0).
+
+Known limits: Feedback stays ABSENT (IP-19); HOLD is not persisted (R19,
+#376 v2 §2); the R15 interpretation is sealed as its closed enum only; the
+Context ref is the frame's last-modified revision, not a digest of the
+Context's contents (#371 D6-3).
 """
 
 from __future__ import annotations
@@ -39,6 +52,8 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from hashlib import sha256
 import logging
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from suzka.r16.contracts import (
@@ -76,6 +91,7 @@ from suzka.r16.history_reader import (
     HeadBlockReason,
     HeadStatus,
     HistoryHead,
+    ReaderClassification,
     ReaderTransient,
     SubjectHistoryReader,
 )
@@ -85,6 +101,7 @@ from suzka.r16.history_store import (
     HistoryStoreError,
     SubjectHistoryStore,
 )
+from suzka.r16.commitment_owner import REVIEW_COMMITMENT_SCOPE
 from suzka.r16.outcomes import R16OwnerReason
 from suzka.r16.successor_policy import (
     as_version,
@@ -108,6 +125,20 @@ from suzka.r16.successor_policy import (
     evaluate,
     interpretation_from_r15,
     utc_timestamp,
+)
+from suzka.r18.contracts import Direction, operation_key
+from suzka.r18.ledger import (
+    CORRUPT_LEDGER,
+    NO_LEDGER,
+    LedgerRead,
+    RecordAt,
+    derive_ledger,
+    prior_claim_ref,
+)
+from suzka.r18.obligation import (
+    ObligationSecretError,
+    ObligationSourceUnavailable,
+    identity_for_source,
 )
 from suzka.runtime.agent_runtime import AgentEvent
 from suzka.runtime.agent_state import AgentStateLoadError, AgentStateStore
@@ -225,6 +256,10 @@ class _IssuerHold(Exception):
         self.reason = reason
 
 
+class _LedgerSourceUnavailable(Exception):
+    """The obligation key cannot be computed: the row-1 path (§5)."""
+
+
 def lineage_scope_for(experience_id: str) -> str:
     """One review lineage per committed Experience X (66 characters)."""
 
@@ -270,6 +305,8 @@ class _DecisionIssuer:
         state_store: AgentStateStore,
         interpretation: InterpretationRead,
         clock: Callable[[], datetime] | None = None,
+        *,
+        target_path: Path | None = None,
     ) -> None:
         from suzka.r16.plan_preview import _PlanPreviewOwner
 
@@ -278,6 +315,7 @@ class _DecisionIssuer:
             or type(store) is not SubjectHistoryStore
             or preview._journal is not journal
             or not callable(interpretation)
+            or (target_path is not None and not isinstance(target_path, Path))
         ):
             raise TypeError("unqualified Decision issuer binding")
         self._preview = preview
@@ -288,6 +326,8 @@ class _DecisionIssuer:
         self._interpretation = interpretation
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._pending: _PendingIssue | None = None
+        # IP-16b: the obligation secret lives next to the R18 target (§3a).
+        self._target_path = None if target_path is None else _absolute(target_path)
 
     # ------------------------------------------------------------ handler
 
@@ -385,7 +425,7 @@ class _DecisionIssuer:
         snapshot_hash, as_of = self._snapshot()
         now_utc = utc_timestamp(event.requested_at)
         inspection = self._journal.inspect()
-        lineage, lineage_ref, incarnation, head, attested = self._lineage(
+        lineage, lineage_ref, incarnation, head, attested, classified = self._lineage(
             inspection, scope
         )
         commitment, commitment_ref, deadline = self._commitment(q)
@@ -393,6 +433,10 @@ class _DecisionIssuer:
         predecessor, predecessor_ref = self._predecessor(
             head, incarnation, scope, as_of, snapshot_hash, attested, q.self_origin
         )
+        try:
+            ledger = self._ledger(classified, predecessor, q)
+        except _LedgerSourceUnavailable:
+            return self._unqualified(event, RequiredSourceState.UNAVAILABLE)
         value = SuccessorPolicyInputV2(
             required_source=RequiredSourceState.QUALIFIED,
             source_refs=_required_refs(q),
@@ -403,12 +447,12 @@ class _DecisionIssuer:
             commitment=commitment,
             commitment_ref=commitment_ref,
             commitment_deadline_utc=deadline,
-            ledger=LedgerState.NONE,
-            ledger_refs=(),
-            inverse_authorization=None,
+            ledger=ledger.state,
+            ledger_refs=ledger.refs,
+            inverse_authorization=ledger.inverse_authorization,
             feedback=FeedbackState.ABSENT,
             feedback_ref=None,
-            verified_outcome_ref=None,
+            verified_outcome_ref=ledger.verified_outcome_ref,
             interpretation=interpretation,
             interpretation_stage=stage,
             as_of_r07_sequence=as_of,
@@ -475,16 +519,21 @@ class _DecisionIssuer:
     def _lineage(
         self, inspection: EventJournalInspection, scope: str
     ) -> tuple[
-        LineageState, LineageRef | None, str | None, HistoryHead | None, int
+        LineageState,
+        LineageRef | None,
+        str | None,
+        HistoryHead | None,
+        int,
+        ReaderClassification | None,
     ]:
         reader = SubjectHistoryReader(self._journal, self._store)
         try:
             classified = reader.classify((scope,), inspection=inspection)
         except ReaderTransient:
-            return LineageState.UNAVAILABLE, None, None, None, 0
+            return LineageState.UNAVAILABLE, None, None, None, 0, None
         adopted = adopted_history_baseline(inspection)
         if adopted is None or inspection.journal_lineage_id is None:
-            return LineageState.UNAVAILABLE, None, None, None, 0
+            return LineageState.UNAVAILABLE, None, None, None, 0, None
         clear = inspection.terminal_gate_clear
         cleared = (
             None
@@ -516,7 +565,81 @@ class _DecisionIssuer:
             classified.incarnation,
             head,
             classified.attested_high_water,
+            classified,
         )
+
+    def _ledger(
+        self,
+        classified: ReaderClassification | None,
+        predecessor: PredecessorState,
+        q: _QualifiedPreview,
+    ) -> LedgerRead:
+        """IP-16b §5: the ledger of this lineage's obligation group.
+
+        Read only when the predecessor is usable: a blocked, conflicting or
+        unavailable head is row 0 / row 1 whatever the ledger says.  With no
+        R17 / R18 data in the store (any incarnation, §10-1) nothing else is
+        read and the witness is exactly the pre-IP-16b one.
+        """
+
+        if (
+            classified is None
+            or classified.global_block is not None
+            or predecessor
+            not in (PredecessorState.ABSENT_INITIAL, PredecessorState.QUALIFIED)
+        ):
+            return NO_LEDGER
+        if not self._store.has_record_operations() and not self._store.has_live_claim_keys():
+            return NO_LEDGER
+        group_key = self._group_key(q)
+        forward_key = operation_key(group_key, Direction.FORWARD)
+        prior = None
+        owner = self._store.live_key_owner(f"claim:{forward_key}")
+        if owner is not None and owner[0] != classified.incarnation:
+            # Another incarnation claimed this obligation's forward effect.
+            rows = self._store.record_rows("execution_claims", owner[0], owner[1])
+            prior = prior_claim_ref(rows[0] if len(rows) == 1 else None, forward_key)
+            if prior is None:
+                LOGGER.info("R16 issuer ledger=CORRUPT reason=prior_claim_row")
+                return CORRUPT_LEDGER
+        return derive_ledger(
+            (
+                RecordAt(item.record, item.processing_sequence)
+                for item in classified.records
+            ),
+            group_key,
+            prior_claim=prior,
+        )
+
+    def _group_key(self, q: _QualifiedPreview) -> str:
+        """§3a through the Intent issuer's shared helper."""
+
+        scope: tuple[str, ...]
+        if q.commitment_id is None:
+            scope = REVIEW_COMMITMENT_SCOPE
+        else:
+            record = self._preview._loop._commitment_system.get(q.commitment_id)
+            if (
+                record is None
+                or record.revision != q.commitment_revision
+                or record.record_digest != q.commitment_digest
+            ):
+                raise _LedgerSourceUnavailable
+            scope = tuple(record.scope)
+        if self._target_path is None:
+            raise _LedgerSourceUnavailable
+        try:
+            identity = identity_for_source(
+                self._target_path.parent,
+                source=self._preview._source,
+                subject_id=self._store.meta().subject_id,
+                q=q,
+                scope=scope,
+            )
+        except (ObligationSecretError, ObligationSourceUnavailable):
+            LOGGER.info("R16 issuer ledger=unavailable reason=obligation_key")
+            raise _LedgerSourceUnavailable from None
+        return identity.group_key
 
     def _commitment(
         self, q: _QualifiedPreview
@@ -786,6 +909,11 @@ class _DecisionIssuer:
 
 
 # ------------------------------------------------------------------- values
+
+
+def _absolute(path: Path) -> Path:
+    path = path.expanduser()
+    return path if path.is_absolute() else Path(os.getcwd()) / path
 
 
 def _sequence(event: AgentEvent) -> int:

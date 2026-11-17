@@ -21,6 +21,7 @@ CLEARED record taken under a baseline that already registers
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Final
 
@@ -49,6 +50,9 @@ SUBJECT_HISTORY_BASELINE: Final = ParticipantBaseline(
     domain=ParticipantDomain.DURABLE_DOMAIN,
 )
 
+LOGGER = logging.getLogger(__name__)
+# IP-16b (#411 D1 r3 §6): the closed startup code of a switched-off store.
+R18_RECORDS_PRESENT_BUT_DISABLED: Final = "R18_RECORDS_PRESENT_BUT_DISABLED"
 _BASELINE_DOMAIN: Final = b"PROJECT-SUZKA:R16:SUBJECT-HISTORY-BASELINE:V1\0"
 _INCARNATION_DOMAIN: Final = b"PROJECT-SUZKA:R16:SUBJECT-HISTORY-INCARNATION:V1\0"
 
@@ -152,8 +156,9 @@ def open_or_create_store(
     """Open the store, creating it PROVISIONAL only before adoption.
 
     IP-14a: a v1 or v2 store stops startup until the explicit migration ran
-    (§11-1), and a store holding R17 / R18 records refuses to start while
-    ``r18.enabled`` is false (§11-2, until IP-16 / IP-18)."""
+    (§11-1).  IP-16b (#411 D1 r3 §6) replaced IP-14a-1's refusal of a store
+    holding R17 / R18 records while ``r18.enabled`` is false: it starts, logs
+    ``R18_RECORDS_PRESENT_BUT_DISABLED`` once, and stays switched off."""
 
     if not isinstance(path, Path):
         raise HistoryAdoptionError("SubjectHistory path must be a Path")
@@ -184,10 +189,13 @@ def open_or_create_store(
             if adopted is None:
                 require_adoptable(store, inspection)
             if not r18_enabled and store.has_record_operations():
-                raise HistoryAdoptionError(
-                    "R18_RECORDS_PRESENT_BUT_DISABLED: SubjectHistory holds R17 / R18 "
-                    "records while r18.enabled is false"
-                )
+                # IP-16b (#411 D1 r3 §6): start switched off.  Every new
+                # R17 / R18 creation is refused (the issuers HOLD
+                # R18_DISABLED, the store refuses PREPARE), a pending record
+                # still settles through R07's startup reconcile (FINALIZE is
+                # not gated), and the Decision issuer's ledger reader keeps
+                # reading, so row 4 is not issued again.  The sweep is IP-18.
+                LOGGER.warning(R18_RECORDS_PRESENT_BUT_DISABLED)
         except BaseException:
             store.close()
             raise
@@ -305,6 +313,7 @@ def current_incarnation(journal: EventJournal, store: SubjectHistoryStore) -> st
 
 
 __all__ = [
+    "R18_RECORDS_PRESENT_BUT_DISABLED",
     "SUBJECT_HISTORY_BASELINE",
     "HistoryAdoptionError",
     "activate_adopted_store",

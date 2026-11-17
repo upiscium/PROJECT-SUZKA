@@ -80,6 +80,9 @@ _REQUEST_PREFIX = "COMMIT_REVIEW_EXPERIENCE:1:"
 _SUBJECT = "Produce a source-checked review record"
 _BENEFICIARY = R13Reference(R13ReferenceKind.SUBJECT, "subject:self")
 _SCOPE = ("record_review_explanation", "record_source_qualification")
+# IP-16b: the only scope a review Commitment can have; the Decision issuer
+# keys the obligation of a lineage that has no Commitment yet on it.
+REVIEW_COMMITMENT_SCOPE = _SCOPE
 _OBLIGATION_WINDOW = timedelta(days=7)
 
 

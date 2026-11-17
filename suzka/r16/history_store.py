@@ -1414,6 +1414,29 @@ class SubjectHistoryStore:
         )
         return frozenset(str(row[0]) for row in rows)
 
+    def has_live_claim_keys(self) -> bool:
+        """Whether any ``claim:`` key is reserved, in any incarnation (IP-16
+        D1 r3 §5 / §10-1: the ledger reader's "no R18 data" check)."""
+
+        return bool(
+            self._read(
+                "SELECT 1 FROM history_operation_keys "
+                "WHERE live = 1 AND substr(reserved_key, 1, 6) = 'claim:' LIMIT 1"
+            )
+        )
+
+    def live_key_owner(self, key: str) -> tuple[str, str] | None:
+        """The (incarnation, transaction) holding one live key, if any (§5)."""
+
+        rows = self._read(
+            "SELECT incarnation_id, transaction_id FROM history_operation_keys "
+            "WHERE live = 1 AND reserved_key = ?",
+            (key,),
+        )
+        if not rows:
+            return None
+        return str(rows[0][0]), str(rows[0][1])
+
     def _require_records_enabled(self) -> None:
         if not self._r18_enabled:
             raise HistoryStoreRecordsDisabled("R17 / R18 records are disabled (r18.enabled is false)")
