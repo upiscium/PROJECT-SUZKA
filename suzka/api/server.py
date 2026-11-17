@@ -84,6 +84,7 @@ from suzka.runtime.event_journal import EventJournalAdmissionBand
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
 from suzka.r16.decision_issuer import _DecisionIssuer
 from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
+from suzka.r17.expectation_issuer import ExpectationIssuerV1
 from suzka.r16.history_attestation import SubjectHistoryAttestationProvider
 from suzka.runtime.r15_interpretation_reader import R15InterpretationReader
 from suzka.runtime.journal_compaction import (
@@ -519,6 +520,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise StateRecoveryError("R18 Intent issuer unavailable")
             return issuer
 
+        def _r17_expectation_issuer_for_commit(
+            event: AgentEvent,
+        ) -> ExpectationIssuerV1 | None:
+            issuer = getattr(app.state, "expectation_issuer", None)
+            if (
+                issuer is None
+                and event.event_type is AgentEventType.R17_EXPECTATION_COMMIT
+            ):
+                raise StateRecoveryError("R17 expectation issuer unavailable")
+            return issuer
+
         def _clear_r16_source(event: AgentEvent) -> None:
             owner = getattr(app.state, "_motivation_source_owner", None)
             if owner is not None:
@@ -535,6 +547,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             intent_issuer = getattr(app.state, "intent_issuer", None)
             if intent_issuer is not None:
                 intent_issuer._clear()
+            expectation_issuer = getattr(app.state, "expectation_issuer", None)
+            if expectation_issuer is not None:
+                expectation_issuer._clear()
 
         def _internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
             nonlocal committed_snapshot, committed_snapshot_hash
@@ -561,6 +576,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 intent_issuer = _r18_intent_issuer_for_commit(event)
                 if intent_issuer is not None:
                     intent_issuer._validate_commit(event)
+                expectation_issuer = _r17_expectation_issuer_for_commit(event)
+                if expectation_issuer is not None:
+                    expectation_issuer._validate_commit(event)
                 validate_belief_commit = getattr(
                     app.state.main_loop, "_validate_belief_event_commit", None
                 )
@@ -846,6 +864,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # PLAN_PREVIEW_REVIEW stays the unchanged U3-A preview.
             app.state.decision_issuer = None
             app.state.intent_issuer = None
+            app.state.expectation_issuer = None
             history_store = getattr(app.state, "subject_history_store", None)
             if history_store is not None and preview_owner is not None:
                 interpretation_reader = R15InterpretationReader(
@@ -870,12 +889,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     enabled=app_settings.r18.enabled,
                     target_path=app_settings.r18.target_path,
                 )
+                # IP-16a-3 (#411 D1 §1/§4): the R17 forecast issuer, installed
+                # and gated exactly like the Intent issuer.
+                app.state.expectation_issuer = ExpectationIssuerV1(
+                    app.state.decision_issuer,
+                    app.state.agent_runtime,
+                    enabled=app_settings.r18.enabled,
+                )
             # IP-6b (#370 R20-DRV): the R16 driver exists only with every
             # owner bound; it runs only after the unique activation event.
             if preview_owner is None:
                 app.state.r16_driver = None
             else:
                 intent_issuer = app.state.intent_issuer
+                expectation_issuer = app.state.expectation_issuer
                 app.state.r16_driver = R16Driver(
                     app.state.agent_runtime,
                     app.state._motivation_source_owner,
@@ -892,6 +919,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     intent_issuer=(
                         intent_issuer
                         if intent_issuer is not None and intent_issuer.enabled
+                        else None
+                    ),
+                    expectation_issuer=(
+                        expectation_issuer
+                        if expectation_issuer is not None
+                        and expectation_issuer.enabled
                         else None
                     ),
                 )

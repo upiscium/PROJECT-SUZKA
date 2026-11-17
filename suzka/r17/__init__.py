@@ -1,4 +1,4 @@
-"""R17 pure values only; no owner, persistence, admission or Action authority."""
+"""R17 pure values (contracts); the forecast owner lives in ``expectation_issuer`` (IP-16a-3)."""
 
 from suzka.r17.contracts import (
     Comparison,

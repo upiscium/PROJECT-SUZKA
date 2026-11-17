@@ -109,9 +109,11 @@ def test_soft_band_allow_list_matches_the_design_table() -> None:
         AgentEventType.R16_SELF_GOAL_ACTIVATION,
         # IP-16a-2 (HP-8): the R18 forward Intent issue is refused.
         AgentEventType.R18_ACTION_INTENT_ISSUE,
+        # IP-16a-3 (D1 §1): the R17 forecast commit is refused too.
+        AgentEventType.R17_EXPECTATION_COMMIT,
     }
     assert AgentEventType.GOAL_SELF_PROPOSAL_REVIEW in SOFT_BAND_ADMITTED_EVENT_TYPES
-    assert len(AgentEventType) == 20
+    assert len(AgentEventType) == 21
     assert SOFT_BAND_ADMITTED_EVENT_TYPES <= set(AgentEventType)
 
 
