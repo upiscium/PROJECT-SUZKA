@@ -28,7 +28,13 @@ Stages (#370 D0 §2, D1, D2):
 - a target is resolved only from CHAT turns this incarnation observed in
   the requester's own Context; anything else is
   ``unavailable(SOURCE_NOT_OBSERVED)`` (no cross-Context existence oracle,
-  D2 P2-2 / IP-5 P2-b).
+  D2 P2-2 / IP-5 P2-b);
+- IP-16a-2 (#411 D1 §2): a Plan preview whose value is a row-4 Decision
+  (ISSUED or EXISTING) gets one ``R18_ACTION_INTENT_ISSUE`` for its lineage,
+  once per Decision this incarnation, only when the Intent issuer is
+  installed and ``r18.enabled`` is true (the server passes no issuer
+  otherwise).  An ``in_flight`` HOLD is retried with the bounded retry delays
+  (at most 3 times); every other result only ends the stage.
 
 Tickets (#370 D1 2-1, 2-2, D2 P1-3/P1-5, addendum P1-A): a 128-bit random
 capability per command, held in a bounded in-memory ring. Nothing about
@@ -57,10 +63,12 @@ from typing import TYPE_CHECKING, Any
 
 from suzka.r16.commands import R16CommandKind as R16CommandKind, parse_command
 from suzka.r16.commitment_owner import _CommitmentSourceSelection
-from suzka.r16.decision_issuer import _DecisionIssueResult
+from suzka.r16.decision_issuer import DecisionIssueStatus, _DecisionIssueResult
 from suzka.r16.goal_owner import _GoalSourceSelection, _SelfGoalSelection
 from suzka.r16.outcomes import R16OwnerOutcome, R16OwnerReason, R16OwnerStatus
 from suzka.r16.source_owner import INTEREST_APPLIED, _MotivationSourceRef
+from suzka.r16.successor_policy import SuccessorRow
+from suzka.r18.intent_issuer import R18IntentReason, _IntentIssueResult
 from suzka.runtime.agent_runtime import (
     AgentEventOutcome,
     AgentEventSource,
@@ -76,6 +84,7 @@ if TYPE_CHECKING:
     from suzka.r16.goal_owner import _GoalSourceOwner
     from suzka.r16.plan_preview import _PlanPreviewOwner
     from suzka.r16.source_owner import _MotivationSourceOwner
+    from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
     from suzka.runtime.main_loop import ChatResult
 
 LOGGER = logging.getLogger(__name__)
@@ -173,6 +182,16 @@ class _Stage(str, Enum):
     PLAN_PREVIEW = "plan_preview"
     # IP-11 (#379): the subject's own Goal proposal after an INTEREST U2a.
     GOAL_SELF_PROPOSAL = "goal_self_proposal"
+    # IP-16a-2 (#411 D1 §2): the R18 forward Intent for a row-4 Decision.
+    ACTION_INTENT = "action_intent"
+
+
+@dataclass(frozen=True, slots=True)
+class _IntentTarget:
+    """A row-4 Decision's public-safe identity and lineage (no store read)."""
+
+    decision_id: str
+    lineage_scope: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +259,7 @@ class R16Driver:
         self_goal_active: bool = False,
         self_goal_per_incarnation: int = 3,
         clock: Callable[[], float] = time.monotonic,
+        intent_issuer: ReviewArtifactIntentIssuerV1 | None = None,
     ) -> None:
         self._runtime = runtime
         self._source = source_owner
@@ -247,6 +267,11 @@ class R16Driver:
         self._commitment = commitment_owner
         self._preview = preview_owner
         self._clock = clock
+        # IP-16a-2: present only when installed with r18.enabled (server).
+        self._intent = intent_issuer
+        # Decisions whose Intent was submitted, and in_flight retries made.
+        self._intended: dict[str, None] = {}
+        self._intent_retries: dict[str, int] = {}
         self.incarnation = secrets.token_hex(8)
         self._active = active
         # IP-11: the self path also needs its own unique activation marker.
@@ -666,6 +691,9 @@ class R16Driver:
         if stage is _Stage.COMMITMENT_REVIEW:
             command, subject = _review_context(context)
             return _untyped(self._commitment._submit_review(subject))
+        if stage is _Stage.ACTION_INTENT:
+            assert isinstance(context, _IntentTarget) and self._intent is not None
+            return _untyped(self._intent._submit_intent(context.lineage_scope))
         assert isinstance(context, str)
         return _untyped(self._preview._submit_preview(context))
 
@@ -723,6 +751,11 @@ class R16Driver:
             return
         if item.stage is _Stage.PLAN_PREVIEW:
             LOGGER.info("R16 driver preview completed")
+            self._maybe_intent(outcome.value)
+            return
+        if item.stage is _Stage.ACTION_INTENT:
+            assert isinstance(item.context, _IntentTarget)
+            self._intent_done(item.context, outcome.value)
             return
         value = outcome.value
         command = _command_of(item.context)
@@ -809,6 +842,50 @@ class R16Driver:
         _bound(self._previewed)
         self._submit(_Stage.PLAN_PREVIEW, goal_id)
 
+    def _maybe_intent(self, value: object) -> None:
+        """IP-16a-2 (D1 §2): one Intent per row-4 Decision this incarnation."""
+
+        if (
+            self._intent is None
+            or not self._intent.enabled
+            or not isinstance(value, _DecisionIssueResult)
+            or value.status
+            not in (DecisionIssueStatus.ISSUED, DecisionIssueStatus.EXISTING)
+            or value.row is not SuccessorRow.ROW_4
+            or value.decision_id is None
+            or value.lineage_scope is None
+            or value.decision_id in self._intended
+        ):
+            return
+        self._intended[value.decision_id] = None
+        _bound(self._intended)
+        self._submit(
+            _Stage.ACTION_INTENT, _IntentTarget(value.decision_id, value.lineage_scope)
+        )
+
+    def _intent_done(self, target: _IntentTarget, value: object) -> None:
+        if not (
+            isinstance(value, _IntentIssueResult)
+            and value.reason is R18IntentReason.IN_FLIGHT
+        ):
+            self._intent_retries.pop(target.decision_id, None)
+            return
+        attempt = self._intent_retries.get(target.decision_id, 0)
+        if attempt >= len(RETRY_DELAYS_SECONDS):
+            self._intent_retries.pop(target.decision_id, None)
+            return
+        self._intent_retries[target.decision_id] = attempt + 1
+        while len(self._intent_retries) > OBSERVED_CAPACITY:
+            del self._intent_retries[next(iter(self._intent_retries))]
+        self._retries.append(
+            _Retry(
+                self._clock() + RETRY_DELAYS_SECONDS[attempt],
+                0,
+                _Stage.ACTION_INTENT,
+                target,
+            )
+        )
+
     def _on_rescan(self, item: _Rescan) -> None:
         """#370 D0 §5: PROPOSED records left without a review, once each."""
 
@@ -838,6 +915,11 @@ def _result_code(value: object) -> str:
             return f"{value.status.value}:{value.row.value}"
         if value.owner_reason is not None:
             return f"{value.status.value}:{value.owner_reason.value}"
+        return value.status.value
+    if isinstance(value, _IntentIssueResult):
+        # IP-16a-2: a closed status and reason only, never Intent contents.
+        if value.reason is not None:
+            return f"{value.status.value}:{value.reason.value}"
         return value.status.value
     if isinstance(value, str) and value in {
         "interest_applied",

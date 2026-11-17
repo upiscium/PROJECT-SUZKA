@@ -37,6 +37,9 @@ class AgentEventType(str, Enum):
     # and the operator's one-time, unique self-Goal activation marker.
     GOAL_SELF_PROPOSAL_REVIEW = "goal_self_proposal_review"
     R16_SELF_GOAL_ACTIVATION = "r16_self_goal_activation"
+    # IP-16a-2 (#411 D1 §1): the R18 forward ActionIntent issue for one review
+    # lineage. Refused in the soft band (HP-8) by not being admitted there.
+    R18_ACTION_INTENT_ISSUE = "r18_action_intent_issue"
 
 
 class AgentEventSource(str, Enum):
@@ -71,6 +74,7 @@ class AgentEventSource(str, Enum):
     API_R16_DRIVER_ACTIVATE = "api.r16.driver.activate"
     RUNTIME_GOAL_SELF_PROPOSAL_REVIEW = "runtime.goal_self_proposal_review"
     API_R16_SELF_GOAL_ACTIVATE = "api.r16.self_goal.activate"
+    RUNTIME_R18_ACTION_INTENT_ISSUE = "runtime.r18.action_intent_issue"
 
 
 class AgentRuntimeStatus(str, Enum):

@@ -34,7 +34,7 @@ a digest of the Context's contents (#371 D6-3).
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from hashlib import sha256
@@ -175,6 +175,10 @@ class _DecisionIssueResult:
     hold: HoldAssessment | None
     owner_reason: R16OwnerReason | None
     decision: CommittedDecisionV1 | None = None
+    # IP-16a-2 (#411 D1 §2): the Decision's lineage scope (a digest of X's
+    # id, public-safe), so the driver can name the Intent stage's lineage
+    # without reading a store.  Derived from ``decision``; None on a HOLD.
+    lineage_scope: str | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if type(self.status) is not DecisionIssueStatus:
@@ -182,6 +186,13 @@ class _DecisionIssueResult:
         held = self.status is DecisionIssueStatus.HOLD
         if held != (self.decision_id is None) or held != (self.decision is None):
             raise ValueError("only a non-HOLD result carries a Decision")
+        if self.decision is not None and self.decision.decision_id != self.decision_id:
+            raise ValueError("the result's Decision ID is not its Decision's")
+        object.__setattr__(
+            self,
+            "lineage_scope",
+            None if self.decision is None else self.decision.lineage_scope,
+        )
         if held:
             # Either a policy HOLD row, or an issuer refusal before policy.
             by_policy = self.row is not None and self.hold is not None

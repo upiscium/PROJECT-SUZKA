@@ -107,9 +107,11 @@ def test_soft_band_allow_list_matches_the_design_table() -> None:
         # IP-11: the self-Goal activation is refused like the driver's;
         # GOAL_SELF_PROPOSAL_REVIEW is admitted (Human decision 2026-11-14).
         AgentEventType.R16_SELF_GOAL_ACTIVATION,
+        # IP-16a-2 (HP-8): the R18 forward Intent issue is refused.
+        AgentEventType.R18_ACTION_INTENT_ISSUE,
     }
     assert AgentEventType.GOAL_SELF_PROPOSAL_REVIEW in SOFT_BAND_ADMITTED_EVENT_TYPES
-    assert len(AgentEventType) == 19
+    assert len(AgentEventType) == 20
     assert SOFT_BAND_ADMITTED_EVENT_TYPES <= set(AgentEventType)
 
 
