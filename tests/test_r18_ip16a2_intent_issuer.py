@@ -235,7 +235,7 @@ def test_row_3_row_4b_and_an_empty_lineage_give_no_intent(app, monkeypatch) -> N
         _no_failed_events(state)
 
 
-def test_a_policy_hold_head_is_not_an_intent_source(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_an_unverifiable_head_is_a_head_conflict(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     with TestClient(app) as client:
         state = client.app.state
         _x, _gid, decision = _row4(state)
@@ -291,6 +291,83 @@ def test_drifted_sources_hold(app, monkeypatch) -> None:  # type: ignore[no-unty
         monkeypatch.setattr(decision_module, "_context_digest", lambda q: "e" * 64 if real(q) else real(q))
         held = _intent(state, decision.lineage_scope)
         assert held.reason is R18IntentReason.SOURCE_DRIFT
+        assert _intent_rows(state) == []
+
+
+def test_deadline_is_checked_again_after_the_slow_reads(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Review P2: the clock enters the margin while the target is opened."""
+
+    from suzka.r18 import intent_issuer as intent_module
+
+    with TestClient(app) as client:
+        state = client.app.state
+        x, gid = _qualified_goal(state)
+        _issue_decision(state, gid)
+        commitment_id = _qualified_commitment(state, x)
+        decision = _issue_decision(state, gid)
+        at = state.main_loop._commitment_system.get(commitment_id).deadline.at
+        if at is None:
+            pytest.skip("fixture Commitment has no deadline")
+        now = [at - decision_module.DEADLINE_MARGIN * 2]
+        issuer = state.intent_issuer
+        monkeypatch.setattr(issuer, "_clock", lambda: now[0])
+        real_open = intent_module.TargetReader.open
+
+        def slow_open(path):  # type: ignore[no-untyped-def]
+            now[0] = at - decision_module.DEADLINE_MARGIN / 2
+            return real_open(path)
+
+        monkeypatch.setattr(intent_module.TargetReader, "open", staticmethod(slow_open))
+        held = _intent(state, decision.lineage_scope)
+        assert (held.status, held.reason) == (
+            IntentIssueStatus.HOLD,
+            R18IntentReason.DEADLINE_ELAPSED,
+        )
+        assert _intent_rows(state) == []
+        assert issuer._pending is None
+        _no_failed_events(state)
+
+
+def test_a_real_value_revision_move_is_source_drift(app, _admin_token) -> None:  # type: ignore[no-untyped-def]
+    """Review P3: no patched digest; the review Value really moves (freeze
+    then unfreeze) after the row-4 Decision, so its sealed ref no longer
+    matches the requalified source."""
+
+    from suzka.r16.review_value import REVIEW_VALUE_ID
+
+    with TestClient(app) as client:
+        state = client.app.state
+        _x, _gid, decision = _row4(state)
+        before = [
+            ref for ref in decision.decision.source_refs if ref.kind == "value"
+        ][0].revision
+        for action in ("freeze", "unfreeze"):
+            response = client.post(f"/api/values/{REVIEW_VALUE_ID}/{action}", headers=ADMIN)
+            assert response.status_code == 200, response.text
+        assert response.json()["revision"] != before
+        held = _intent(state, decision.lineage_scope)
+        assert (held.status, held.reason) == (IntentIssueStatus.HOLD, R18IntentReason.SOURCE_DRIFT)
+        assert _intent_rows(state) == []
+        _no_failed_events(state)
+
+
+def test_a_suspended_and_resumed_context_is_unavailable(app, _admin_token) -> None:  # type: ignore[no-untyped-def]
+    """A real Context transition after the Decision: requalification through
+    the preview owner fails, so the real path is SOURCE_UNAVAILABLE (the
+    drift comparison is never reached)."""
+
+    with TestClient(app) as client:
+        state = client.app.state
+        _x, _gid, decision = _row4(state)
+        context_id = state.main_loop.context_registry.state.current_context_id
+        for action in ("suspend", "resume"):
+            response = client.post(f"/api/contexts/{context_id}/{action}", headers=ADMIN)
+            assert response.status_code == 200, response.text
+        held = _intent(state, decision.lineage_scope)
+        assert (held.status, held.reason) == (
+            IntentIssueStatus.HOLD,
+            R18IntentReason.SOURCE_UNAVAILABLE,
+        )
         assert _intent_rows(state) == []
 
 

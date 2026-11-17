@@ -31,14 +31,17 @@ R1-3), so a stored artifact always carries six PASS gates (r2 P3-11):
 7. the keys: this incarnation's Intent keys reserved but not adopted ->
    ``IN_FLIGHT`` (transient); adopted by another Decision, or the group's
    Claim key reserved at all -> ``PRIOR_OBLIGATION``;
-8. headroom, a last requalification, then a ``CoordinatedResult`` with one
+8. headroom, a last requalification and deadline check, then a
+   ``CoordinatedResult`` with one
    ``SubjectHistoryRecordParticipant`` carrying
    ``HistoryRecordOperationV1(R18_INTENT_ISSUE, ACTION_INTENT, ActionIntentV1)``.
 
 ``_validate_commit`` (after this event's own PREPARE) checks the unchanged
 domain snapshot, the incarnation, the R06 snapshot hash and that
 SubjectHistory is exactly the evaluated rows plus this transaction's PREPARED
-row, as the Decision issuer does.  Its failure is a runtime fail-stop,
+row, as the Decision issuer does; like it, it does not re-check the deadline
+(that would turn a near deadline into a fail-stop; the margin covers the
+handler -> ``_validate_commit`` window).  Its failure is a runtime fail-stop,
 recovered at startup (PREPARED -> tombstone, internally committed -> roll
 forward).
 
@@ -69,6 +72,7 @@ from suzka.memory.dual_memory_system import (
     EpisodicMemoryReadError,
 )
 from suzka.memory.experience_store import ExperienceStoreError
+from suzka.memory.memory_schema import MemoryRecordType
 from suzka.motivation.commitment import CommitmentLifecycle
 from suzka.r16.decision_issuer import (
     DEADLINE_MARGIN,
@@ -376,6 +380,10 @@ class ReviewArtifactIntentIssuerV1:
             raise _IntentHold(R18IntentReason.HISTORY_CAPACITY) from None
         if self._qualified(event, decision, initial) != q:
             raise _IntentHold(R18IntentReason.SOURCE_UNAVAILABLE)
+        # The secret, episode and target reads above can take seconds (the
+        # target's busy timeout): the deadline rule is applied again here,
+        # last before PREPARE, as the Decision issuer does (D2 P2-2).
+        self._active_commitment(q)
         snapshot_hash, _as_of = self._decision._snapshot()
         transaction_id = TransactionCoordinator.derive_transaction_id(
             event, TransactionKind.EVENT_MUTATION
@@ -486,6 +494,7 @@ class ReviewArtifactIntentIssuerV1:
             episode = committed.record
             if (
                 episode.id != record.source_episode_id
+                or episode.record_type is not MemoryRecordType.EPISODIC_LOG
                 or episode.archived
                 or episode.context_id != record.context_id
                 or record.context_id != q.context_id
