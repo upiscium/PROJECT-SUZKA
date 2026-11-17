@@ -118,21 +118,6 @@ def _second_goal(state) -> str:  # type: ignore[no-untyped-def]
     return proposed.subject_id
 
 
-def _second_row4(state):  # type: ignore[no-untyped-def]
-    """Another X with the same text (``_qualified_goal`` assumes a fresh state).
-
-    IP-16b: once the obligation has an Intent the Decision issuer holds this
-    new lineage (row 0); callers that need its row-4 Decision bypass the
-    ledger reader to reach the Intent issuer's own guard."""
-
-    gid = _second_goal(state)
-    assert _issue_decision(state, gid).row is SuccessorRow.ROW_3
-    _qualified_commitment(state, state._ip16_second_x)
-    second = _issue_decision(state, gid)
-    assert (second.status, second.row) == (DecisionIssueStatus.ISSUED, SuccessorRow.ROW_4)
-    return second
-
-
 def _intent(state, scope):  # type: ignore[no-untyped-def]
     return state.intent_issuer._submit_intent(scope).result(timeout=30).value
 

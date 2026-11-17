@@ -175,7 +175,12 @@ def _derive(
     if prior_claim is not None:
         # Another incarnation claimed this group's forward effect.  This
         # incarnation's writers refuse a second forward obligation for it, so
-        # any forward record here is inconsistent.
+        # any forward record here is inconsistent.  This incarnation's
+        # inverse records are deliberately ignored here (IP-16b
+        # interpretation 3): a successor incarnation may compensate the prior
+        # effect (the inverse gate is global), and CLAIMED holds the lineage at
+        # row 2 / row 0 just as CORRUPT would, so both are a HOLD.  Without a
+        # prior Claim, an inverse with no forward side is CORRUPT (below).
         if forward is not None:
             raise _Corrupt
         return LedgerRead(LedgerState.CLAIMED, (prior_claim,), None, None)
@@ -340,9 +345,16 @@ def _side(
     refs: list[PolicyRef] = [
         PolicyRef(INTENT_REF_KIND, intent.intent_id, _RECORD_REVISION, intent.intent_digest)
     ]
-    stages: list[tuple[object, int]] = [*verdicts, *challenges, *expiries]
+    # "Latest of (verdict, challenge, expiry)": the highest processing
+    # sequence; on an equal sequence the later stage wins, pinned as
+    # expiry > challenge > verdict.
+    stages: list[tuple[object, int, int]] = [
+        *((record, sequence, 0) for record, sequence in verdicts),
+        *((record, sequence, 1) for record, sequence in challenges),
+        *((record, sequence, 2) for record, sequence in expiries),
+    ]
     if stages:
-        refs.append(_stage_ref(max(stages, key=lambda pair: pair[1])[0]))
+        refs.append(_stage_ref(max(stages, key=lambda item: (item[1], item[2]))[0]))
     claim_ref = None
     if claim is not None:
         claim_ref = PolicyRef(CLAIM_REF_KIND, claim.claim_id, _RECORD_REVISION, claim.claim_digest)

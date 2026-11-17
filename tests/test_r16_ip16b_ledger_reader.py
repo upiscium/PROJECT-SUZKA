@@ -1142,3 +1142,44 @@ def test_prior_claim_ref_checks_the_raw_row() -> None:
     ):
         assert ledger_module.prior_claim_ref(broken, claim.operation_key) is None
     assert ledger_module.prior_claim_ref(row, "1" * 64) is None
+
+
+def test_latest_stage_ref_tie_break_is_expiry_then_challenge_then_verdict() -> None:
+    """Review P3-4: on an equal processing sequence the later stage wins."""
+
+    chain = _fixture_chain()
+    group = chain.intent.obligation_group_key
+    expiry = ApprovalExpirationV1.for_challenge(chain.challenges[0], ExpirationReason.EXPIRED)
+
+    def stage_kinds(*records: object) -> list[str]:
+        at = [RecordAt(chain.intent, 1), *(RecordAt(record, 5) for record in records)]
+        read = derive_ledger(at, group)
+        return [ref.kind for ref in read.refs if ref.kind != INTENT_REF_KIND]
+
+    for order in ((chain.verdict, chain.challenges[0], expiry), (expiry, chain.challenges[0], chain.verdict)):
+        assert stage_kinds(*order) == [EXPIRY_REF_KIND]
+    assert stage_kinds(chain.challenges[0], chain.verdict) == [CHALLENGE_REF_KIND]
+    assert stage_kinds(chain.verdict) == [VERDICT_REF_KIND]
+    # A higher sequence still wins over the stage order.
+    later = derive_ledger(
+        [RecordAt(chain.intent, 1), RecordAt(chain.challenges[0], 4), RecordAt(chain.verdict, 6)], group
+    )
+    assert [ref.kind for ref in later.refs if ref.kind != INTENT_REF_KIND] == [VERDICT_REF_KIND]
+
+
+def test_has_live_claim_keys_matches_only_live_claim_keys(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Review P3-5: the range predicate keeps the ``claim:`` prefix semantics."""
+
+    from test_r16_ip14a_history_v2 import _decision, _v2_store
+
+    store = _v2_store(tmp_path)
+    chain = Chain(_decision(store))
+    steps = _steps(chain)
+    for operation in steps[:4]:
+        _apply(store, operation)
+    assert store.live_keys((f"challenge:{chain.intent.intent_id}:1",))  # other live keys
+    assert store.has_live_claim_keys() is False
+    transaction_id = _prepare(store, steps[4])
+    assert store.has_live_claim_keys() is True
+    store.mark_aborted(chain.incarnation, transaction_id)
+    assert store.has_live_claim_keys() is False

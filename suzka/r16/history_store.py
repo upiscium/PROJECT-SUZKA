@@ -1421,7 +1421,10 @@ class SubjectHistoryStore:
         return bool(
             self._read(
                 "SELECT 1 FROM history_operation_keys "
-                "WHERE live = 1 AND substr(reserved_key, 1, 6) = 'claim:' LIMIT 1"
+                # A range on the key ("claim:" <= key < "claim;", ';' follows
+                # ':') so the live-key index can serve it.
+                "WHERE live = 1 AND reserved_key >= 'claim:' AND reserved_key < 'claim;' "
+                "LIMIT 1"
             )
         )
 
