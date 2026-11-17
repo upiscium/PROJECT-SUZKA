@@ -1007,10 +1007,13 @@ def test_record_capacity_refuses_before_prepare(tmp_path: Path) -> None:
 # ------------------------------------------------------------ startup check
 
 
-def test_startup_refuses_records_while_r18_is_disabled(tmp_path: Path) -> None:
-    """§11-2: until IP-16, R17 / R18 rows with r18.enabled false stop startup."""
+def test_startup_with_records_while_r18_is_disabled_starts_switched_off(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """IP-16b (#411 D1 r3 §6) replaced §11-2's refusal: the store opens, the
+    closed code is logged once, and PREPARE stays refused."""
 
-    from suzka.r16.history_adoption import HistoryAdoptionError, open_or_create_store
+    from suzka.r16.history_adoption import open_or_create_store
 
     store = _v2_store(tmp_path)
     chain = Chain(_decision(store))
@@ -1029,9 +1032,16 @@ def test_startup_refuses_records_while_r18_is_disabled(tmp_path: Path) -> None:
     original = history_adoption.adopted_history_baseline
     history_adoption.adopted_history_baseline = lambda inspection: object()  # type: ignore[assignment]
     try:
-        with pytest.raises(HistoryAdoptionError, match="R18_RECORDS_PRESENT_BUT_DISABLED"):
-            open_or_create_store(Journal(), path, subject_id="suzka", max_page_count=PAGES)  # type: ignore[arg-type]
-        reopened = open_or_create_store(Journal(), path, subject_id="suzka", max_page_count=PAGES, r18_enabled=True)  # type: ignore[arg-type]
+        with caplog.at_level("WARNING", logger="suzka.r16.history_adoption"):
+            switched_off = open_or_create_store(Journal(), path, subject_id="suzka", max_page_count=PAGES)  # type: ignore[arg-type]
+        assert [r.getMessage() for r in caplog.records].count("R18_RECORDS_PRESENT_BUT_DISABLED") == 1
+        with pytest.raises(HistoryStoreRecordsDisabled):
+            _prepare(switched_off, _steps(chain)[1])
+        switched_off.close()
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="suzka.r16.history_adoption"):
+            reopened = open_or_create_store(Journal(), path, subject_id="suzka", max_page_count=PAGES, r18_enabled=True)  # type: ignore[arg-type]
+        assert caplog.records == []
         reopened.close()
     finally:
         history_adoption.adopted_history_baseline = original  # type: ignore[assignment]

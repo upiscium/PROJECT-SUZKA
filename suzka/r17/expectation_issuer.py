@@ -45,8 +45,7 @@ plus this transaction's PREPARED row, as the Intent issuer does; its failure
 is a runtime fail-stop, recovered at startup (PREPARED -> tombstone,
 internally committed -> roll forward).
 
-Known limits (IP-16a-3): the ledger reader and the switching-off behaviour
-are IP-16b; the Policy that refuses an Intent without a forecast is IP-17.
+Known limits (IP-16a-3): the Policy that refuses an Intent without a forecast is IP-17.
 The result is public-safe: a status, the intent and forecast ids and a
 closed reason, never request text.
 """

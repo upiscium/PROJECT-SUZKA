@@ -237,8 +237,10 @@ class R18Settings(StrictBaseModel):
     """IP-14a (#411 §1, HP-6): governed Actions. Off until HP-6 says otherwise.
 
     While false, no R17 / R18 record (Intent, forecast, verdict, challenge,
-    claim, Outcome, Assessment, Feedback) is written. Until IP-16, a store that
-    already holds such records refuses to start with this off (§11-2).
+    claim, Outcome, Assessment, Feedback) is written. A store that already
+    holds such records starts switched off (IP-16b, #411 D1 r3 §6): it logs
+    ``R18_RECORDS_PRESENT_BUT_DISABLED``, refuses every new record and keeps
+    the Decision issuer's ledger reader running.
     """
 
     enabled: StrictBool = False

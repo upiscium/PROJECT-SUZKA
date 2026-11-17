@@ -9,7 +9,9 @@ operator's ``target_init`` writes next to the target, outside the history
 store's rollback domain (§3a). A lost or replaced secret is BLOCKED, never
 recreated (it would silently change every group key).
 
-The Intent issuer (IP-16a) and any later reader that needs the key use only
+The Intent issuer (IP-16a) and the Decision issuer's ledger reader (IP-16b)
+compute the key only through ``identity_for_source``, which reads the secret,
+the ``user_input`` of X's committed episode and then calls
 ``obligation_identity``.
 """
 
@@ -22,10 +24,21 @@ import os
 from pathlib import Path
 import stat
 from typing import Final
+from typing import TYPE_CHECKING, Any
 import unicodedata
 
+from suzka.experience import ExperienceLifecycle, experience_record_digest
+from suzka.memory.dual_memory_system import (
+    EpisodicMemoryFormatError,
+    EpisodicMemoryReadError,
+)
+from suzka.memory.experience_store import ExperienceStoreError
+from suzka.memory.memory_schema import MemoryRecordType
 from suzka.r16.contracts import canonical_json, identifier
 from suzka.r18.contracts import obligation_group_key
+
+if TYPE_CHECKING:
+    from suzka.r16.plan_preview import _QualifiedPreview
 
 TARGET_NAMESPACE: Final = "review-artifact"
 SECRET_FILE: Final = "obligation.key"
@@ -37,6 +50,10 @@ _SCOPE_DOMAIN: Final = b"PROJECT-SUZKA:R18:OBLIGATION-SCOPE:V1\0"
 
 class ObligationSecretError(Exception):
     """The obligation secret is missing or not trusted: BLOCKED (§3a)."""
+
+
+class ObligationSourceUnavailable(Exception):
+    """X's committed episode (the request text) cannot be read: HOLD (§3a)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +103,77 @@ def obligation_identity(
         scope_id,
         obligation_group_key(subject_id, content, scope_id, TARGET_NAMESPACE),
     )
+
+
+def request_text(source: Any, q: _QualifiedPreview) -> str:
+    """§3a: the ``user_input`` of X's committed episode (never logged).
+
+    ``source`` is the preview owner's source owner (its committed Experience
+    and episodic memory reads). Every mismatch with the qualified X, an
+    archived or missing episode, or a read failure is
+    ``ObligationSourceUnavailable``.
+    """
+
+    try:
+        record = source._experience.load_committed_current(q.experience_id).record
+        if (
+            record.experience_id != q.experience_id
+            or record.revision != q.experience_revision
+            or record.lifecycle is not ExperienceLifecycle.ACTIVE
+            or experience_record_digest(record) != q.experience_digest
+        ):
+            raise ObligationSourceUnavailable("X is not the qualified Experience")
+        committed = source._memory.get_committed_episodic(record.source_episode_id)
+        if committed is None:
+            raise ObligationSourceUnavailable("X's episode is missing")
+        episode = committed.record
+        if (
+            episode.id != record.source_episode_id
+            or episode.record_type is not MemoryRecordType.EPISODIC_LOG
+            or episode.archived
+            or episode.context_id != record.context_id
+            or record.context_id != q.context_id
+            or type(episode.user_input) is not str
+        ):
+            raise ObligationSourceUnavailable("X's episode is not current")
+        return episode.user_input
+    except (
+        ExperienceStoreError,
+        EpisodicMemoryReadError,
+        EpisodicMemoryFormatError,
+        ValueError,
+        OSError,
+    ):
+        raise ObligationSourceUnavailable("X's episode is unavailable") from None
+
+
+def identity_for_source(
+    secret_directory: Path,
+    *,
+    source: Any,
+    subject_id: str,
+    q: _QualifiedPreview,
+    scope: tuple[str, ...],
+) -> ObligationIdentity:
+    """The shared §3a computation: secret, then request text, then the key.
+
+    Raises ``ObligationSecretError`` (no / untrusted / wrong-size secret) or
+    ``ObligationSourceUnavailable`` (episode unavailable, or an input the key
+    refuses).
+    """
+
+    secret = load_obligation_secret(secret_directory)
+    text = request_text(source, q)
+    try:
+        return obligation_identity(
+            secret,
+            subject_id=subject_id,
+            context_id=q.context_id,
+            request_text=text,
+            scope=scope,
+        )
+    except (TypeError, ValueError):
+        raise ObligationSourceUnavailable("the obligation inputs are invalid") from None
 
 
 def check_secret_directory(directory: Path) -> None:
@@ -178,9 +266,12 @@ __all__ = [
     "TARGET_NAMESPACE",
     "ObligationIdentity",
     "ObligationSecretError",
+    "ObligationSourceUnavailable",
     "check_secret_directory",
     "create_obligation_secret",
     "load_obligation_secret",
+    "identity_for_source",
     "normalize_request_text",
     "obligation_identity",
+    "request_text",
 ]

@@ -45,8 +45,9 @@ handler -> ``_validate_commit`` window).  Its failure is a runtime fail-stop,
 recovered at startup (PREPARED -> tombstone, internally committed -> roll
 forward).
 
-Known limits (IP-16a-2): no forecast (IP-16a-3); the ledger reader and the
-switching-off behaviour are IP-16b.  A Claim key is unique across
+The forecast is IP-16a-3's; the Decision issuer's ledger reader (IP-16b)
+holds a re-issued PLAN_PREVIEW at row 2 once this Intent exists, and the
+obligation key is computed with the same shared helper.  A Claim key is unique across
 incarnations, and a Claim of this incarnation implies an Intent for the same
 group (refused by the Intent keys first), so any live Claim key is treated as
 a prior obligation without telling the incarnations apart.  The result is
@@ -66,13 +67,6 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Final
 
-from suzka.experience import ExperienceLifecycle, experience_record_digest
-from suzka.memory.dual_memory_system import (
-    EpisodicMemoryFormatError,
-    EpisodicMemoryReadError,
-)
-from suzka.memory.experience_store import ExperienceStoreError
-from suzka.memory.memory_schema import MemoryRecordType
 from suzka.motivation.commitment import CommitmentLifecycle
 from suzka.r16.decision_issuer import (
     DEADLINE_MARGIN,
@@ -122,8 +116,8 @@ from suzka.r18.obligation import (
     TARGET_NAMESPACE,
     ObligationIdentity,
     ObligationSecretError,
-    load_obligation_secret,
-    obligation_identity,
+    ObligationSourceUnavailable,
+    identity_for_source,
 )
 from suzka.r18.target import TargetError, TargetReader
 from suzka.runtime.agent_runtime import (
@@ -475,61 +469,23 @@ class ReviewArtifactIntentIssuerV1:
             raise _IntentHold(R18IntentReason.DEADLINE_ELAPSED)
         return tuple(record.scope)
 
-    def _request_text(self, q: _QualifiedPreview) -> str:
-        """§3a: the ``user_input`` of X's committed episode (never logged)."""
-
-        source = self._preview._source
-        try:
-            record = source._experience.load_committed_current(q.experience_id).record
-            if (
-                record.experience_id != q.experience_id
-                or record.revision != q.experience_revision
-                or record.lifecycle is not ExperienceLifecycle.ACTIVE
-                or experience_record_digest(record) != q.experience_digest
-            ):
-                raise _IntentHold(R18IntentReason.SOURCE_UNAVAILABLE)
-            committed = source._memory.get_committed_episodic(record.source_episode_id)
-            if committed is None:
-                raise _IntentHold(R18IntentReason.SOURCE_UNAVAILABLE)
-            episode = committed.record
-            if (
-                episode.id != record.source_episode_id
-                or episode.record_type is not MemoryRecordType.EPISODIC_LOG
-                or episode.archived
-                or episode.context_id != record.context_id
-                or record.context_id != q.context_id
-                or type(episode.user_input) is not str
-            ):
-                raise _IntentHold(R18IntentReason.SOURCE_UNAVAILABLE)
-            return episode.user_input
-        except (
-            ExperienceStoreError,
-            EpisodicMemoryReadError,
-            EpisodicMemoryFormatError,
-            ValueError,
-            OSError,
-        ):
-            raise _IntentHold(R18IntentReason.SOURCE_UNAVAILABLE) from None
-
     def _identity(
         self, q: _QualifiedPreview, obligation_scope: tuple[str, ...]
     ) -> ObligationIdentity:
+        """§3a through the shared helper (the Decision issuer's ledger reader
+        computes the same key with it, IP-16b)."""
+
         try:
-            secret = load_obligation_secret(self._target_path.parent)
-        except ObligationSecretError:
-            raise _IntentHold(R18IntentReason.OBLIGATION_SECRET_UNAVAILABLE) from None
-        text = self._request_text(q)
-        try:
-            return obligation_identity(
-                secret,
+            return identity_for_source(
+                self._target_path.parent,
+                source=self._preview._source,
                 subject_id=self._store.meta().subject_id,
-                context_id=q.context_id,
-                request_text=text,
+                q=q,
                 scope=obligation_scope,
             )
         except ObligationSecretError:
             raise _IntentHold(R18IntentReason.OBLIGATION_SECRET_UNAVAILABLE) from None
-        except (TypeError, ValueError):
+        except ObligationSourceUnavailable:
             raise _IntentHold(R18IntentReason.SOURCE_UNAVAILABLE) from None
 
     def _target(self, group_key: str) -> str:

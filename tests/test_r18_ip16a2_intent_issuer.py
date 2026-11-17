@@ -100,8 +100,8 @@ def _row4(state):  # type: ignore[no-untyped-def]
     return x, gid, second
 
 
-def _second_row4(state):  # type: ignore[no-untyped-def]
-    """Another X with the same text (``_qualified_goal`` assumes a fresh state)."""
+def _second_goal(state) -> str:  # type: ignore[no-untyped-def]
+    """Another adopted Goal on a new X with the same text."""
 
     from suzka.r16.goal_owner import _GoalSourceSelection
     from suzka.r16.outcomes import R16OwnerStatus
@@ -114,12 +114,8 @@ def _second_row4(state):  # type: ignore[no-untyped-def]
     proposed = owner._submit_proposal(_GoalSourceSelection(p, x)).result(timeout=30).value
     adopted = owner._submit_review(proposed.subject_id).result(timeout=30).value
     assert adopted.status is R16OwnerStatus.ADOPTED
-    gid = proposed.subject_id
-    assert _issue_decision(state, gid).row is SuccessorRow.ROW_3
-    _qualified_commitment(state, x)
-    second = _issue_decision(state, gid)
-    assert (second.status, second.row) == (DecisionIssueStatus.ISSUED, SuccessorRow.ROW_4)
-    return second
+    state._ip16_second_x = x
+    return proposed.subject_id
 
 
 def _intent(state, scope):  # type: ignore[no-untyped-def]
@@ -206,8 +202,10 @@ def test_row_4_issues_one_adopted_intent_then_existing(app) -> None:  # type: ig
         again = _intent(state, decision.lineage_scope)
         assert (again.status, again.intent_id) == (IntentIssueStatus.EXISTING, intent.intent_id)
         assert len(ip10._history_transactions(state)) == before + 1
-        # The PLAN_PREVIEW afterwards still reads the existing row-4 Decision.
-        assert _issue_decision(state, _gid).status is DecisionIssueStatus.EXISTING
+        # IP-16b: the PLAN_PREVIEW afterwards reads the ledger (INTENT_ISSUED)
+        # and holds at row 2; no Decision is issued.
+        after = _issue_decision(state, _gid)
+        assert (after.status, after.row) == (DecisionIssueStatus.HOLD, SuccessorRow.ROW_2)
         _no_failed_events(state)
 
 
@@ -467,7 +465,26 @@ def test_identical_request_is_one_obligation_across_restart(tmp_path) -> None:  
         assert again.intent.obligation_group_key == first.intent.obligation_group_key
         assert _expected_group(state) == first.intent.obligation_group_key
         # A new X with the same text: a new lineage, the same obligation.
-        other = _second_row4(state)
+        # IP-16b: the Decision issuer's ledger reader holds it at row 0 ...
+        gid = _second_goal(state)
+        first_preview = _issue_decision(state, gid)
+        assert (first_preview.status, first_preview.row) == (
+            DecisionIssueStatus.HOLD,
+            SuccessorRow.ROW_0,
+        )
+        # ... and behind it the Intent issuer's own guard still refuses a
+        # second Intent (a pre-IP-16b ledger witness reaches row 4 here).
+        from suzka.r18.ledger import NO_LEDGER
+
+        issuer = state.decision_issuer
+        issuer._ledger = lambda *args: NO_LEDGER  # type: ignore[method-assign]
+        try:
+            assert _issue_decision(state, gid).row is SuccessorRow.ROW_3
+            _qualified_commitment(state, state._ip16_second_x)
+            other = _issue_decision(state, gid)
+            assert other.row is SuccessorRow.ROW_4
+        finally:
+            del issuer._ledger
         assert other.lineage_scope != decision.lineage_scope
         held = _intent(state, other.lineage_scope)
         assert held.reason is R18IntentReason.PRIOR_OBLIGATION

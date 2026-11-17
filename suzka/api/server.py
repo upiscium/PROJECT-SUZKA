@@ -877,6 +877,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.state_recovery,
                     app.state.agent_state_store,
                     interpretation_reader.read,
+                    # IP-16b: the ledger reader keys the obligation with the
+                    # secret next to the R18 target (read only when the
+                    # store holds R17 / R18 data).
+                    target_path=app_settings.r18.target_path,
                 )
                 preview_owner._bind_issuer(app.state.decision_issuer)
                 # IP-16a-2 (#411 D1 §1/§3): the R18 Intent issuer lives beside
