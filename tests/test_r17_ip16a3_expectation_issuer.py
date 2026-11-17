@@ -456,6 +456,11 @@ def test_driver_chain_ends_in_one_forecast_only_when_enabled(tmp_path, _admin_to
             assert _settled(client, commit["command_ticket"]["ticket_id"])["status"] == "accepted"
             if enabled:
                 ip16a2._until(lambda: len(_forecast_rows(state)) == 1, timeout=30)
+                # The activation scan and the explicit forecast both settle
+                # (under load the scan may run after the Intent: then it
+                # commits, scans again to NONE_LEFT and the explicit one
+                # reads EXISTING).
+                ip16a2._until(lambda: _forecast_events(state) >= 2, timeout=30)
             else:
                 ip16a2._until(
                     lambda: sum(
@@ -468,8 +473,10 @@ def test_driver_chain_ends_in_one_forecast_only_when_enabled(tmp_path, _admin_to
                     timeout=30,
                 )
             time.sleep(0.5)
-            # Enabled: the activation scan (NONE_LEFT) and one explicit forecast.
-            assert _forecast_events(state) == (2 if enabled else 0)
+            if enabled:
+                assert _forecast_events(state) in (2, 3)
+            else:
+                assert _forecast_events(state) == 0
             assert len(_forecast_rows(state)) == (1 if enabled else 0)
             assert len(_intent_rows(state)) == (1 if enabled else 0)
             _no_failed_events(state)

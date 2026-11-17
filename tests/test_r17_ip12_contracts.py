@@ -671,5 +671,10 @@ def test_r17_imports_stay_pure() -> None:
     }
     assert not any(isinstance(node, ast.Import) for node in ast.walk(tree))
     assert set(r17.__all__) == {
-        name for name in dir(r17) if not name.startswith("_") and name != "contracts"
+        name
+        for name in dir(r17)
+        if not name.startswith("_")
+        # IP-16a-3: the forecast owner is a submodule (an attribute once it
+        # is imported); the package still exports only the pure values.
+        and name not in {"contracts", "expectation_issuer"}
     }
