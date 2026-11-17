@@ -447,6 +447,18 @@ def test_driver_chain_ends_in_one_forecast_only_when_enabled(tmp_path, _admin_to
     for enabled in (True, False):
         with TestClient(_app(_settings(tmp_path / f"chain-{enabled}", r18=enabled))) as client:
             state = client.app.state
+            results: list[object] = []
+            if enabled:
+                # Record every forecast result the driver receives.
+                issuer = state.expectation_issuer
+                real_submit = issuer._submit_expectation
+
+                def spy(intent_id):  # type: ignore[no-untyped-def]
+                    future = real_submit(intent_id)
+                    future.add_done_callback(lambda done: results.append(done.result().value))
+                    return future
+
+                issuer._submit_expectation = spy  # type: ignore[method-assign]
             assert client.post("/api/r16/driver/activate", headers=ADMIN).status_code == 200
             x = ip16a2._chat(client, "something wonderful happened today")
             _interest(client, x["experience_id"])
@@ -460,7 +472,7 @@ def test_driver_chain_ends_in_one_forecast_only_when_enabled(tmp_path, _admin_to
                 # (under load the scan may run after the Intent: then it
                 # commits, scans again to NONE_LEFT and the explicit one
                 # reads EXISTING).
-                ip16a2._until(lambda: _forecast_events(state) >= 2, timeout=30)
+                ip16a2._until(lambda: len(results) >= 2, timeout=30)
             else:
                 ip16a2._until(
                     lambda: sum(
@@ -474,7 +486,19 @@ def test_driver_chain_ends_in_one_forecast_only_when_enabled(tmp_path, _admin_to
                 )
             time.sleep(0.5)
             if enabled:
-                assert _forecast_events(state) in (2, 3)
+                assert all(type(value) is _ExpectationResult for value in results)
+                statuses = [value.status for value in results]
+                assert statuses.count(ExpectationCommitStatus.COMMITTED) == 1
+                assert all(
+                    status
+                    in (
+                        ExpectationCommitStatus.COMMITTED,
+                        ExpectationCommitStatus.NONE_LEFT,
+                        ExpectationCommitStatus.EXISTING,
+                    )
+                    for status in statuses
+                )
+                assert _forecast_events(state) == len(results)
             else:
                 assert _forecast_events(state) == 0
             assert len(_forecast_rows(state)) == (1 if enabled else 0)

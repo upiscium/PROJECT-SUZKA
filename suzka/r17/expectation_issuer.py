@@ -25,7 +25,10 @@ failure is a HOLD with a closed reason and writes nothing:
    the Decision with ``ExpectedObservationV1.check_binding`` (values read from
    the Decision and the Intent), plus the selected candidate and lineage.
    ``predicted_payload_digest`` is recomputed from the Intent's artifact bytes
-   and must equal ``intent.payload_digest`` (r2 P3-12).  Any mismatch is
+   and must equal ``intent.payload_digest`` (r2 P3-12).  That comparison is
+   defence in depth: ``ActionIntentV1.payload_digest`` is the artifact's own
+   digest, so with real data it always holds and is reachable only by
+   patching.  Any mismatch is
    ``BINDING_MISMATCH`` / ``PAYLOAD_MISMATCH``;
 4. ``as_of_r07_sequence`` is the committed R06 snapshot's last processed
    sequence, as the Decision issuer computes it (< this event's sequence,
@@ -554,7 +557,9 @@ def _bind(
         or intent.policy_row is not decision.policy_row
     ):
         raise _ExpectationHold(R17ExpectationReason.BINDING_MISMATCH, intent.intent_id)
-    # r2 P3-12: check_binding does not compare the payload digest.
+    # r2 P3-12: check_binding does not compare the payload digest.  Defence in
+    # depth: ActionIntentV1.payload_digest is the artifact's own digest, so
+    # with real data this is tautological and reachable only by patching.
     if forecast.predicted_payload_digest != intent.payload_digest:
         raise _ExpectationHold(R17ExpectationReason.PAYLOAD_MISMATCH, intent.intent_id)
 
