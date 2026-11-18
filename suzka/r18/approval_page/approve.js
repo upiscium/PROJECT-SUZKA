@@ -129,7 +129,10 @@
   function row(table, label, value) {
     var tr = document.createElement("tr");
     tr.appendChild(el("th", label));
-    tr.appendChild(el("td", value === null || value === undefined ? "none" : value));
+    // Digests and ids are shown whole: never truncated (only status text is).
+    var cell = document.createElement("td");
+    cell.textContent = value === null || value === undefined ? "none" : String(value);
+    tr.appendChild(cell);
     table.appendChild(tr);
   }
 

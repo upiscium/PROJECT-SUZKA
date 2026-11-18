@@ -95,6 +95,9 @@ def _r18_problems(settings: Any, lab: Path, port: int, prod_port: int) -> list[s
     if not settings.subject_history.enabled:
         problems.append("r18 needs subject.history in the lab config")
     target = settings.r18.target_path
+    # The shell extracts the path with sed: no control characters or newlines.
+    if any(ord(char) < 32 or ord(char) == 127 for char in str(target)):
+        problems.append("r18.target_path has control characters")
     if target.is_absolute() or target.parent == Path("."):
         problems.append(f"r18.target_path {target} is not a relative path inside a directory")
     elif not (lab / target).resolve().is_relative_to(lab):
@@ -117,7 +120,14 @@ def main(prod_config: str, lab_dir: str, port_text: str, *flags: str) -> int:
     r18_target = _r18_overrides(raw, port) if r18 else None
     lab_config = lab / "config.yaml"
     lab_config.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    settings = load_settings(lab_config)
+    try:
+        settings = load_settings(lab_config)
+    except ValueError as error:
+        if not r18:
+            raise
+        # e.g. r18.enabled with a non-loopback api.host (the settings refuse it).
+        print(f"lab_prepare: the lab settings are refused: api.host is not loopback or invalid ({error.__class__.__name__})", file=sys.stderr)
+        return 1
 
     problems = []
     if port == prod_port:

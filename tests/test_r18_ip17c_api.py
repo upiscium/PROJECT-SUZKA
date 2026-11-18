@@ -177,8 +177,13 @@ def test_a_trusted_network_origin_needs_a_loopback_listen_address() -> None:
         assert not is_loopback_host(host)
         with pytest.raises(ValueError, match="loopback"):
             require_approval_binding(host, lan)
-    # A localhost origin is fine on any host (the lab, a tunnel); R18 off asks nothing.
-    require_approval_binding("0.0.0.0", R18Settings(enabled=True))
+    # A localhost origin needs loopback too: on a wider listen address any LAN
+    # host could send ``Host: localhost:8000`` and pass the direct transport.
+    for host in ("0.0.0.0", "10.12.0.2", "::"):
+        with pytest.raises(ValueError, match="loopback"):
+            require_approval_binding(host, R18Settings(enabled=True))
+    require_approval_binding("127.0.0.1", R18Settings(enabled=True))
+    # R18 off asks nothing.
     require_approval_binding("0.0.0.0", R18Settings(enabled=False, approval_origins=[LAN]))
 
 
@@ -190,6 +195,15 @@ def test_startup_refuses_a_lan_origin_with_a_non_loopback_api_host(tmp_path) -> 
     # model_copy skips the validators, so the full Settings model re-checks it too.
     with pytest.raises(ValidationError):
         type(wide).model_validate(wide.model_dump(mode="json"))
+    # A localhost-only origin on a wide listen address is refused as well.
+    local_only = _settings(tmp_path / "bind-local", approval_origins=[LOCAL], approval_trusted_networks=[])
+    wide_local = local_only.model_copy(
+        update={"api": local_only.api.model_copy(update={"host": "0.0.0.0"})}
+    )
+    with pytest.raises(ValueError, match="loopback"):
+        create_app(wide_local)
+    with pytest.raises(ValidationError):
+        type(wide_local).model_validate(wide_local.model_dump(mode="json"))
     # Loopback is accepted; r18 off mounts nothing and asks nothing.
     create_app(settings)
     off = _settings(tmp_path / "bind-off", r18=False)
@@ -241,7 +255,12 @@ def test_the_static_page_and_its_headers(app) -> None:  # type: ignore[no-untype
             # Rule 1 only: no X-SUZKA-R18 and no Origin on a navigation / script load.
             response = client.get(path)
             assert response.status_code == 200
-            assert response.headers["content-security-policy"] == "frame-ancestors 'none'; script-src 'self'"
+            csp = response.headers["content-security-policy"]
+            for directive in (
+                "frame-ancestors 'none'", "script-src 'self'", "default-src 'none'",
+                "connect-src 'self'", "base-uri 'none'", "object-src 'none'",
+            ):
+                assert directive in csp
             assert response.headers["x-frame-options"] == "DENY"
             assert response.headers["x-content-type-options"] == "nosniff"
             assert response.headers["cache-control"] == "no-store"
@@ -324,6 +343,89 @@ def test_check_request_is_pure_and_uses_the_last_forwarded_entry() -> None:
     assert check_request(config, "OPTIONS", "/api/r18/approvals", _h("localhost:8000")) is Refusal.OPTIONS
     for method in ("PUT", "DELETE", "PATCH", "HEAD", "TRACE"):
         assert check_request(config, method, "/api/r18/approvals", _h("localhost:8000", **data)) is Refusal.METHOD
+
+
+def test_transfer_encoding_and_a_foreign_origin_authority_are_refused() -> None:
+    config = GuardConfig.from_settings(
+        R18Settings(approval_origins=[LOCAL, LAN], approval_trusted_networks=NETWORKS)
+    )
+    good = {"x-suzka-r18": "1", "origin": LOCAL, "content-type": "application/json", "content-length": "2"}
+    assert check_request(config, "POST", "/api/r18/x", _h("localhost:8000", **good)) is None
+    assert (
+        check_request(config, "POST", "/api/r18/x", _h("localhost:8000", **good, **{"transfer-encoding": "chunked"}))
+        is Refusal.BODY_SIZE
+    )
+    assert check_request(config, "GET", "/api/r18/approve", _h("localhost:8000", **{"transfer-encoding": "chunked"})) is Refusal.BODY_SIZE
+    # A listed Origin that is not this request's Host (LAN origin on a localhost Host and back).
+    assert check_request(config, "POST", "/api/r18/x", _h("localhost:8000", **{**good, "origin": LAN})) is Refusal.ORIGIN
+    lan = {**good, "origin": LAN, "x-forwarded-for": "10.12.5.5"}
+    assert check_request(config, "POST", "/api/r18/x", _h("10.12.0.2:8080", **lan)) is None
+    assert check_request(config, "POST", "/api/r18/x", _h("10.12.0.2:8080", **{**lan, "origin": LOCAL})) is Refusal.ORIGIN
+
+
+def test_a_root_path_cannot_bypass_the_guard_and_bodies_are_read_bounded() -> None:
+    import asyncio
+
+    config = GuardConfig.from_settings(R18Settings())
+    limits = approval_api.ApprovalLimits.create(config)
+    reached: list[str] = []
+
+    async def inner(scope, receive, send):  # type: ignore[no-untyped-def]
+        reached.append(scope["path"])
+
+    guard = R18RequestGuard(inner, config, limits)
+
+    def call(path: str, root_path: str, headers: dict[str, str]) -> int | None:
+        sent: list[dict[str, Any]] = []
+
+        async def send(message):  # type: ignore[no-untyped-def]
+            sent.append(message)
+
+        scope = {
+            "type": "http", "method": "GET", "path": path, "root_path": root_path,
+            "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+        }
+        asyncio.run(guard(scope, None, send))  # type: ignore[arg-type]
+        return int(sent[0]["status"]) if sent else None
+
+    bad = {"Host": "evil.example"}
+    assert call("/api/r18/approvals", "", bad) == 403
+    assert call("/app/api/r18/approvals", "/app", bad) == 403  # stripped path is r18
+    assert call("/api/r18/approvals", "/api", bad) == 403  # raw path is r18
+    assert call("/health", "", bad) is None and reached == ["/health"]
+    good = {"Host": "localhost:8000", **DATA}
+    assert call("/app/api/r18/approvals", "/app", good) is None
+
+
+def test_the_oversized_streamed_body_is_not_buffered(app) -> None:  # type: ignore[no-untyped-def]
+    import asyncio
+
+    from starlette.requests import Request
+
+    async def run() -> object:
+        chunks = [b"x" * 10_000, b"x" * 10_000]
+
+        async def receive():  # type: ignore[no-untyped-def]
+            if chunks:
+                return {"type": "http.request", "body": chunks.pop(0), "more_body": bool(chunks)}
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        request = Request({"type": "http", "method": "POST", "headers": []}, receive)
+        return await approval_api._json_body(request)
+
+    assert asyncio.run(run()) is None
+
+
+def test_mounting_logs_the_closed_warning_code(tmp_path, caplog) -> None:  # type: ignore[no-untyped-def]
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="suzka.r18.approval_api"):
+        create_app(_settings(tmp_path / "warn"))
+    assert "R18_ENABLED_BEFORE_EXECUTOR" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="suzka.r18.approval_api"):
+        create_app(_settings(tmp_path / "warn-off", r18=False))
+    assert "R18_ENABLED_BEFORE_EXECUTOR" not in caplog.text
 
 
 def test_check_request_data_header_origin_fetch_site_content_type_and_size() -> None:

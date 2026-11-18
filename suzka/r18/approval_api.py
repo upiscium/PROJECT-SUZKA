@@ -39,6 +39,19 @@ ASGI middleware mounted OUTSIDE the app-wide ``CORSMiddleware`` so that an
    API flood cannot delay cognition events (§8a).
 
 ``/health`` and every route outside ``/api/r18`` are untouched.
+
+**Shared origin (D1 §9 G1 precondition).**  The approval page is served from
+the same origin as the chat frontend (Caddy ``:8080``), so same-origin script
+would pass every guard.  This is accepted by the design: the guarantee that
+model output cannot create an approval holds only while the frontend never
+executes model output (React escaping; no HTML or markdown sink).  The
+frontend's no-sink lint / test is the guard, and "a frontend change that renders
+HTML" is a revisit trigger.  The page's own CSP forbids framing and foreign
+script.
+
+**Do not enable ``r18`` in production before IP-18** (HP-6 (a), R18 only in the
+lab): the executor does not exist, so a CLAIM stays CLAIMED.  Startup logs the
+closed code ``R18_ENABLED_BEFORE_EXECUTOR`` as a WARNING when r18 is on.
 """
 
 from __future__ import annotations
@@ -49,6 +62,7 @@ from dataclasses import dataclass
 from enum import Enum
 import ipaddress
 import json
+import logging
 from pathlib import Path
 import re
 import threading
@@ -58,6 +72,7 @@ from typing import Any, Final
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
+from starlette.routing import get_route_path
 
 from suzka.config.schema import (
     R18Settings,
@@ -76,6 +91,7 @@ from suzka.r18.approval_owner import (
 )
 from suzka.r16.history_records import MAX_CHALLENGES_PER_INTENT
 
+LOGGER = logging.getLogger(__name__)
 API_PREFIX: Final = "/api/r18"
 PAGE_PATH: Final = "/api/r18/approve"
 SCRIPT_PATH: Final = "/api/r18/approve.js"
@@ -87,7 +103,11 @@ MAX_BODY_BYTES: Final = 16 * 1024
 MAX_DATA_REQUESTS_PER_MINUTE: Final = 120
 MAX_CONFIRMS_PER_MINUTE: Final = 30
 PAGE_HEADERS: Final = {
-    "Content-Security-Policy": "frame-ancestors 'none'; script-src 'self'",
+    "Content-Security-Policy": (
+        "default-src 'none'; frame-ancestors 'none'; script-src 'self'; "
+        "connect-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; "
+        "object-src 'none'"
+    ),
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
     "Cache-Control": "no-store",
@@ -196,6 +216,9 @@ def check_request(
     if method not in ("GET", "POST"):
         return Refusal.METHOD
     headers = _headers(raw_headers)
+    if "transfer-encoding" in headers:
+        # Chunked bodies have no declared size: refused outright.
+        return Refusal.BODY_SIZE
     hosts = headers.get("host", [])
     if len(hosts) != 1:
         return Refusal.HOST
@@ -216,6 +239,9 @@ def check_request(
         return Refusal.DATA_HEADER
     origins = headers.get("origin", [])
     if len(origins) > 1 or (origins and origins[0] not in config.origins):
+        return Refusal.ORIGIN
+    # The Origin's authority must be the request's own Host.
+    if origins and origins[0].split("://", 1)[-1].lower() != host:
         return Refusal.ORIGIN
     if method == "POST" and not origins:
         return Refusal.ORIGIN
@@ -292,13 +318,20 @@ class R18RequestGuard:
         self._limits = limits
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or not is_r18_path(str(scope.get("path", ""))):
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        # The path the router matches is the one with ``root_path`` stripped:
+        # guard both spellings so a root_path cannot bypass the guard.
+        raw_path = str(scope.get("path", ""))
+        route_path = str(get_route_path(scope))
+        if not (is_r18_path(raw_path) or is_r18_path(route_path)):
             await self._app(scope, receive, send)
             return
         refusal = check_request(
             self._config,
             str(scope.get("method", "")),
-            str(scope["path"]),
+            route_path if is_r18_path(route_path) else raw_path,
             scope.get("headers", ()),
         )
         if refusal is None and not self._limits.data.allow():
@@ -377,12 +410,18 @@ def _review_body(result: ReviewResult) -> dict[str, object] | None:
 
 
 async def _json_body(request: Request) -> dict[str, object] | None:
+    # Bounded while reading: never buffer more than the limit.
+    chunks: list[bytes] = []
+    total = 0
     try:
-        body = await request.body()
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > MAX_BODY_BYTES:
+                return None
+            chunks.append(chunk)
     except Exception:
         return None
-    if len(body) > MAX_BODY_BYTES:
-        return None
+    body = b"".join(chunks)
     try:
         value = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
@@ -500,6 +539,8 @@ def mount_approval_api(app: FastAPI, r18: R18Settings) -> ApprovalLimits:
 
     config = GuardConfig.from_settings(r18)
     limits = ApprovalLimits.create(config)
+    # Operators must not enable r18 in production before IP-18 (HP-6 (a)).
+    LOGGER.warning("R18_ENABLED_BEFORE_EXECUTOR: the approval API is mounted; no executor exists")
     app.include_router(build_router(limits))
     app.add_middleware(R18RequestGuard, config=config, limits=limits)
     app.state.approval_guard_config = config

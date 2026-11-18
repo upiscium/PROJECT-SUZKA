@@ -138,6 +138,7 @@ def test_r18_keeps_a_production_target_path_when_it_stays_inside_the_lab(tmp_pat
         ({"api": {"host": "0.0.0.0"}}, "is not loopback"),
         ({"api": {"host": "10.12.0.2"}}, "is not loopback"),
         ({"subject_history": {"enabled": False}}, "needs subject.history"),
+        ({"r18": {"target_path": "a/b\nc/t.sqlite3"}}, "control characters"),
     ],
 )
 def test_r18_refuses_an_unsafe_lab(tmp_path, capsys, sections, message) -> None:  # type: ignore[no-untyped-def]
@@ -211,7 +212,8 @@ def test_the_lab_script_parses_and_wires_r18_with_todays_sudo_pattern() -> None:
     assert 'PREPARE_ARGS+=(--r18)' in text
     # Only the pattern the script already uses: sudo install -d / sudo -u, no new
     # users, groups, sockets or chown of anything outside the lab.
-    assert 'sudo install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 700 "${LAB}/${R18_DIR}"' in text
+    assert 'sudo -u "${SERVICE_USER}" mkdir -p -m 700 "${LAB}/${R18_DIR}"' in text
+    assert "sudo install -d" not in text.split("R18_DIR=")[1]
     assert '-m suzka.r18.target_init "${LAB}/${R18_TARGET}"' in text
     for forbidden in ("useradd", "groupadd", "adduser", "chown -R /", "usermod", "visudo", "sudoers", "ssh-", "systemctl enable", "nix"):
         assert forbidden not in text
@@ -249,6 +251,13 @@ def _node() -> str | None:
     return None
 
 
+def _node_missing() -> None:
+    # CI installs Node (actions/setup-node): there a missing node is a failure.
+    if os.environ.get("CI"):
+        pytest.fail("node is required in CI")
+    pytest.skip("node is not available")
+
+
 _DRIVER = r"""
 const fs = require("fs");
 eval(fs.readFileSync(process.argv[1], "utf8"));
@@ -268,7 +277,7 @@ const cases = JSON.parse(fs.readFileSync(0, "utf8"));
 def _verify_in_node(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     node = _node()
     if node is None:
-        pytest.skip("node is not available")
+        _node_missing()
     done = subprocess.run(
         [node, "-e", _DRIVER, str(PAGE)],
         input=json.dumps(cases),
@@ -341,6 +350,6 @@ def test_n5_the_page_aborts_on_every_mismatch_and_sends_nothing() -> None:
 def test_the_page_script_is_valid_javascript() -> None:
     node = _node()
     if node is None:
-        pytest.skip("node is not available")
+        _node_missing()
     done = subprocess.run([node, "--check", str(PAGE)], capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stderr

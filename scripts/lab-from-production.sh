@@ -131,8 +131,9 @@ if [[ "${R18}" == 1 ]]; then
   R18_DIR="$(dirname "${R18_TARGET}")"
   # The target's directory must be a private (0700) directory of the service
   # user (check_secret_directory); parents are created as that user.
-  sudo -u "${SERVICE_USER}" mkdir -p "$(dirname "${LAB}/${R18_DIR}")"
-  sudo install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 700 "${LAB}/${R18_DIR}"
+  # Done as the service user (never as root following a symlink).
+  sudo -u "${SERVICE_USER}" mkdir -p -m 700 "${LAB}/${R18_DIR}"
+  sudo -u "${SERVICE_USER}" chmod 700 "${LAB}/${R18_DIR}"
   # From the lab directory: `python -m` puts the working directory first on
   # the path, and the lab holds no suzka package, so the deployed code runs.
   (cd "${LAB}" && sudo -u "${SERVICE_USER}" env -i "${SERVICE_ENV[@]}" PYTHONPATH="${PROD_ROOT}" \

@@ -588,15 +588,12 @@ class Settings(StrictBaseModel):
 
 
 def require_approval_binding(api_host: str, r18: R18Settings) -> None:
-    """IP-17c (#411 D1 r7 §4 rule 1): with R18 on, a trusted-network origin
-    needs an API that listens on loopback only, so every TCP peer is local
-    (Caddy's).  Called by the Settings validator and again at startup, because
-    ``model_copy`` skips validators."""
+    """IP-17c (#411 D1 r7 §4 rule 1): with R18 on, the API must listen on
+    loopback only, whatever the origins are, so every TCP peer is local
+    (Caddy's, or a tunnel).  On a wider listen address any LAN host could send
+    ``Host: localhost:<port>`` and pass the direct-localhost transport.  Called
+    by the Settings validator and again at startup, because ``model_copy``
+    skips validators."""
 
-    if not r18.enabled:
-        return
-    for origin in r18.approval_origins:
-        if not is_localhost_origin(origin) and not is_loopback_host(api_host):
-            raise ValueError(
-                "a trusted-network approval origin needs api.host on loopback"
-            )
+    if r18.enabled and not is_loopback_host(api_host):
+        raise ValueError("r18.enabled needs api.host on loopback")
