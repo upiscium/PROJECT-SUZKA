@@ -135,8 +135,8 @@ def test_r18_keeps_a_production_target_path_when_it_stays_inside_the_lab(tmp_pat
         ({"r18": {"target_path": "/etc/suzka/target.sqlite3"}}, "is not relative"),
         ({"r18": {"target_path": "../../outside/t.sqlite3"}}, "leaves the lab"),
         ({"r18": {"target_path": "target.sqlite3"}}, "inside a directory"),
-        ({"api": {"host": "0.0.0.0"}}, "is not loopback"),
-        ({"api": {"host": "10.12.0.2"}}, "is not loopback"),
+        ({"api": {"host": "0.0.0.0"}}, "r18.enabled needs api.host on loopback"),
+        ({"api": {"host": "10.12.0.2"}}, "r18.enabled needs api.host on loopback"),
         ({"subject_history": {"enabled": False}}, "needs subject.history"),
         ({"r18": {"target_path": "a/b\nc/t.sqlite3"}}, "control characters"),
     ],
@@ -353,3 +353,13 @@ def test_the_page_script_is_valid_javascript() -> None:
         _node_missing()
     done = subprocess.run([node, "--check", str(PAGE)], capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stderr
+
+
+def test_r18_reports_the_real_reason_without_echoing_input_values(tmp_path, capsys) -> None:  # type: ignore[no-untyped-def]
+    """A settings refusal names where and why (not the class name only), and
+    never prints the offending input value."""
+
+    secret_host = "10.99.88.77"
+    code, out, err, _lab_dir, _prod = _run(tmp_path, capsys, "--r18", api={"host": secret_host})
+    assert code == 1 and "r18.enabled needs api.host on loopback" in err
+    assert secret_host not in err and "ValidationError" not in err and "r18_target" not in out

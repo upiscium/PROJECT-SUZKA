@@ -105,6 +105,24 @@ def _r18_problems(settings: Any, lab: Path, port: int, prod_port: int) -> list[s
     return problems
 
 
+
+def _refusal_reasons(error: ValueError) -> str:
+    """The location and message of each settings problem, without input values."""
+
+    errors = getattr(error, "errors", None)
+    if callable(errors):
+        try:
+            items = errors(include_input=False, include_url=False)
+        except TypeError:  # an older pydantic without those switches
+            items = [{"loc": item.get("loc", ()), "msg": item.get("msg", "")} for item in errors()]
+        lines = [
+            f"{'.'.join(str(part) for part in item.get('loc', ())) or 'settings'}: {item.get('msg', '')}"
+            for item in items
+        ]
+        return "; ".join(lines[:8]) or error.__class__.__name__
+    return str(error)[:200] or error.__class__.__name__
+
+
 def main(prod_config: str, lab_dir: str, port_text: str, *flags: str) -> int:
     if any(flag != "--r18" for flag in flags):
         print("usage: lab_prepare.py PROD_CONFIG LAB_DIR PORT [--r18]", file=sys.stderr)
@@ -126,7 +144,8 @@ def main(prod_config: str, lab_dir: str, port_text: str, *flags: str) -> int:
         if not r18:
             raise
         # e.g. r18.enabled with a non-loopback api.host (the settings refuse it).
-        print(f"lab_prepare: the lab settings are refused: api.host is not loopback or invalid ({error.__class__.__name__})", file=sys.stderr)
+        # Print where and why only, never the offending input values.
+        print(f"lab_prepare: the lab settings are refused: {_refusal_reasons(error)}", file=sys.stderr)
         return 1
 
     problems = []

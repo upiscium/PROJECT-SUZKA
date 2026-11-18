@@ -165,7 +165,15 @@ def test_origins_and_networks_are_closed_lists() -> None:
         "melchior:8080",
     ]
     assert approval_host_header("http://melchior") == "melchior"
-    assert approval_host_header("https://melchior:443") == "melchior"
+    # The default port is never spelled (a browser omits it), so such an origin is refused.
+    for spelled in ("https://melchior:443", "http://melchior:80"):
+        with pytest.raises(ValueError, match="default port"):
+            approval_host_header(spelled)
+        with pytest.raises(ValueError):
+            R18Settings(approval_origins=[spelled])  # type: ignore[list-item]
+    assert approval_host_header("https://melchior") == "melchior"
+    assert approval_host_header("https://melchior:8443") == "melchior:8443"
+    assert approval_host_header("http://melchior:443") == "melchior:443"
 
 
 def test_a_trusted_network_origin_needs_a_loopback_listen_address() -> None:

@@ -51,7 +51,12 @@ def parse_approval_origin(origin: str) -> tuple[str, int]:
     except ValueError as error:
         raise ValueError("an approval origin has an invalid port") from error
     host = parts.hostname
-    return host, (port if port is not None else (443 if parts.scheme == "https" else 80))
+    default = 443 if parts.scheme == "https" else 80
+    if port == default:
+        # A browser never writes the default port into an Origin or a Host, so
+        # an origin that spells it could never match (IP-17c review follow-up).
+        raise ValueError("write an approval origin without its scheme's default port")
+    return host, (port if port is not None else default)
 
 
 def approval_host_header(origin: str) -> str:
