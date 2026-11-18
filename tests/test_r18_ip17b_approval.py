@@ -967,8 +967,17 @@ def test_a_crash_after_prepare_is_tombstoned_and_the_confirm_can_retry(tmp_path)
                 raise RuntimeError("simulated pre-WAL failure")
 
         owner._validate_commit = crash  # type: ignore[method-assign]
-        with pytest.raises(AgentRuntimeDurabilityError):
-            owner.issue(intent.intent_id, review.challenge.nonce, review.challenge.confirmation_code)
+        # The runtime fail-stops; issue() itself never raises (a HOLD).
+        held = owner.issue(
+            intent.intent_id, review.challenge.nonce, review.challenge.confirmation_code
+        )
+        assert held.reason is R18ApprovalReason.JOURNAL_UNAVAILABLE
+        # The runtime stopped: a further submit is refused, never a crash.
+        from suzka.runtime.agent_runtime import AgentRuntimeStopped
+
+        with pytest.raises(AgentRuntimeStopped):
+            owner._submit_issue(review.challenge, review.challenge.confirmation_code)
+        assert AgentRuntimeDurabilityError
     with TestClient(_app(settings)) as client:
         state = client.app.state
         assert state.event_journal.inspect().open_transactions == ()
