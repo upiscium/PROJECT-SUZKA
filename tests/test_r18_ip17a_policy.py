@@ -925,8 +925,13 @@ def test_crash_between_forecast_and_policy_is_completed_by_the_restart_scan(tmp_
         state = client.app.state
         assert state.r16_driver.active
         ip16a2._until(lambda: len(_verdict_rows(state)) == 1, timeout=30)
-        time.sleep(0.5)
-        verdicts = [r.record for r in _adopted(state) if r.record_kind is RecordKind.POLICY_VERDICT]
+
+        def adopted_verdicts() -> list[Any]:
+            return [r.record for r in _adopted(state) if r.record_kind is RecordKind.POLICY_VERDICT]
+
+        # Review P3-1: poll until the verdict's event is terminal (adopted).
+        ip16a2._until(lambda: len(adopted_verdicts()) == 1, timeout=30)
+        verdicts = adopted_verdicts()
         assert [(v.intent_id, v.verdict) for v in verdicts] == [(intent.intent_id, PolicyVerdict.ALLOW)]
         _no_failed_events(state)
 

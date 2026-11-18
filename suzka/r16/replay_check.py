@@ -12,10 +12,18 @@ Nothing is migrated, written or created.  Run it on a copy::
 
     python -m suzka.r16.replay_check /path/to/copy/subject_history.sqlite3
 
+Make the copy with the SQLite backup API (``sqlite3 SRC ".backup DST"`` or
+``Connection.backup``), not ``cp``: a plain copy of a store with a hot
+journal or an uncheckpointed WAL fails closed (or misses rows).
+
 The report is JSON on stdout: counts per policy kind, the replayed and
 unchanged counts, and for each change or error only the Decision id, its
 kind, the stored row and the replayed row (no policy input, no source).  The
 exit status is 0 only when nothing changed and nothing failed to replay.
+
+An empty or wrong store also reports ``"ok": true`` (with 0 Decisions): the
+operator must check ``total`` and ``by_kind`` against the expected Decision
+counts of the real store before accepting the result.
 
 ``SUCCESSOR_POLICY_V1`` Decisions are counted but not replayed: V1 inputs are
 not SuccessorPolicy V2 / V3 bytes, and IP-17a changes V3 only.

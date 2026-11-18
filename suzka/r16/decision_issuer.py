@@ -614,7 +614,9 @@ class _DecisionIssuer:
             ),
             group_key,
             # IP-17a (§3a / §12-3): the issuer's clock closes an unclaimed
-            # forward Intent whose approval window has ended.
+            # forward Intent whose approval window has ended.  IP-20 note: a
+            # Wake-origin evaluation at a frozen time T must pass T here, not
+            # the live clock, or its closure would not match its sealed T.
             self._clock(),
             prior_claim=prior,
         )
