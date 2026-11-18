@@ -404,6 +404,7 @@ class ApprovalChallengeOwnerV1:
         boot_id: str | None = None,
         runtime_instance_id: str | None = None,
         timer_factory: TimerFactory = _thread_timer,
+        on_claimed: Callable[[ExecutionClaimV1], None] | None = None,
     ) -> None:
         if (
             type(policy_owner) is not ReviewArtifactPolicyV1
@@ -434,6 +435,8 @@ class ApprovalChallengeOwnerV1:
             runtime_instance_id if runtime_instance_id is not None else str(uuid4())
         )
         self._timer_factory = timer_factory
+        # IP-18a (§2-2): the executor's feeder; never changes an API result.
+        self._on_claimed = on_claimed
         self._inflight: tuple[object, _Target] | None = None
         self._pending: _PendingOperation | None = None
         self._lock = threading.Lock()
@@ -989,11 +992,17 @@ class ApprovalChallengeOwnerV1:
         if intent_id.startswith(INVERSE_INTENT_ID_PREFIX):
             return self._hold(R18ApprovalReason.INVERSE_DEFERRED, intent_id)
         try:
-            result = self._run(self._submit_claim(intent_id, nonce, code))
+            future = self._submit_claim(intent_id, nonce, code)
+            # §2-2 item 2: attached BEFORE the bounded wait, so a claim that
+            # commits after ``result(timeout=60)`` gave up is still fed.
+            self._feed_on_done(future)
+            result = self._run(future)
         except Exception:  # a refused band, a stopped Runtime, a timeout
             LOGGER.warning("R18 approval claim could not run its event")
             return self._hold(R18ApprovalReason.JOURNAL_UNAVAILABLE, intent_id)
         if result.status is ApprovalStatus.CLAIMED:
+            if result.claim is not None:
+                self._notify_claimed(result.claim)
             with self._lock:
                 self._pending_challenges.pop(intent_id, None)
                 timer = (
@@ -1009,6 +1018,45 @@ class ApprovalChallengeOwnerV1:
             with self._lock:
                 self._shown.pop(intent_id, None)
         return result
+
+    # ------------------------------------------------------- claim feeder
+
+    def _feed_on_done(self, future: Future[AgentEventOutcome[object]]) -> None:
+        """Done-callback of the claim future (IP-18a §2-2 item 2).
+
+        It runs where the future is resolved: on the Runtime thread inside
+        ``set_result``, or on the API thread when the future is already done.
+        So it does no I/O, never blocks and never raises: it unwraps the
+        value and calls ``on_claimed``, which is O(1)."""
+
+        if self._on_claimed is None:
+            return
+
+        def done(finished: Future[AgentEventOutcome[object]]) -> None:
+            try:
+                if finished.cancelled():
+                    return
+                outcome = finished.result(timeout=0)
+                value = outcome.value
+                if (
+                    type(value) is ApprovalResult
+                    and value.status is ApprovalStatus.CLAIMED
+                    and value.claim is not None
+                ):
+                    self._notify_claimed(value.claim)
+            except Exception:  # a callback never escapes
+                LOGGER.warning("R18 claim done-callback failed")
+
+        future.add_done_callback(done)
+
+    def _notify_claimed(self, claim: ExecutionClaimV1) -> None:
+        callback = self._on_claimed
+        if callback is None:
+            return
+        try:
+            callback(claim)
+        except Exception:
+            LOGGER.warning("R18 on_claimed hook failed")
 
     # ------------------------------------------------------- facts (no event)
 

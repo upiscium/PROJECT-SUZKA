@@ -86,10 +86,14 @@ from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinato
 from suzka.r16.decision_issuer import _DecisionIssuer
 from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
 from suzka.r17.expectation_issuer import ExpectationIssuerV1
-from suzka.r18.admission import ALWAYS_OPEN_UNTIL_IP18
 from suzka.r18.approval_api import mount_approval_api
 from suzka.r18.approval_owner import ApprovalChallengeOwnerV1
+from suzka.r18.executor import R18Executor
+from suzka.r18.outcome_owner import OutcomeOwnerV1
 from suzka.r18.policy_owner import ReviewArtifactPolicyV1
+from suzka.r18.sweep import SweepGate
+from suzka.r18.target import new_runtime_instance_id
+from suzka.r16.history_reader import SubjectHistoryReader
 from suzka.r16.history_attestation import SubjectHistoryAttestationProvider
 from suzka.runtime.r15_interpretation_reader import R15InterpretationReader
 from suzka.runtime.journal_compaction import (
@@ -556,6 +560,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise StateRecoveryError("R18 Approval owner unavailable")
             return owner
 
+        def _r18_outcome_owner_for_commit(
+            event: AgentEvent,
+        ) -> OutcomeOwnerV1 | None:
+            owner = getattr(app.state, "outcome_owner", None)
+            if owner is None and event.event_type is AgentEventType.R18_OUTCOME_COMMIT:
+                raise StateRecoveryError("R18 Outcome owner unavailable")
+            return owner
+
         def _clear_r16_source(event: AgentEvent) -> None:
             owner = getattr(app.state, "_motivation_source_owner", None)
             if owner is not None:
@@ -581,6 +593,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             approval_owner = getattr(app.state, "approval_owner", None)
             if approval_owner is not None:
                 approval_owner._clear()
+            outcome_owner = getattr(app.state, "outcome_owner", None)
+            if outcome_owner is not None:
+                outcome_owner._clear()
 
         def _internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
             nonlocal committed_snapshot, committed_snapshot_hash
@@ -616,6 +631,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 approval_owner = _r18_approval_owner_for_commit(event)
                 if approval_owner is not None:
                     approval_owner._validate_commit(event)
+                outcome_owner = _r18_outcome_owner_for_commit(event)
+                if outcome_owner is not None:
+                    outcome_owner._validate_commit(event)
                 validate_belief_commit = getattr(
                     app.state.main_loop, "_validate_belief_event_commit", None
                 )
@@ -904,6 +922,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.expectation_issuer = None
             app.state.policy_owner = None
             app.state.approval_owner = None
+            app.state.outcome_owner = None
+            app.state.r18_executor = None
+            # IP-18a: one runtime_instance_id per process; the SweepGate is
+            # closed from construction (DISABLED, never opened, with
+            # r18.enabled false) and is built BEFORE the Decision issuer.
+            runtime_instance_id = new_runtime_instance_id()
+            r18_gate = SweepGate(enabled=app_settings.r18.enabled)
+            app.state.r18_gate = r18_gate
             history_store = getattr(app.state, "subject_history_store", None)
             if history_store is not None and preview_owner is not None:
                 interpretation_reader = R15InterpretationReader(
@@ -920,6 +946,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     # secret next to the R18 target (read only when the
                     # store holds R17 / R18 data).
                     target_path=app_settings.r18.target_path,
+                    # IP-18a: a read-only view; always False until IP-18b.
+                    blocked_target=lambda: False,
                 )
                 preview_owner._bind_issuer(app.state.decision_issuer)
                 # IP-16a-2 (#411 D1 §1/§3): the R18 Intent issuer lives beside
@@ -933,8 +961,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     target_path=app_settings.r18.target_path,
                     # IP-17a (D1 r7 §3a): the Intent's approval window.
                     approval_window_seconds=app_settings.r18.approval_window_seconds,
-                    # IP-17a (§2-7): the real gate is IP-18's sweep.
-                    admission_gate=ALWAYS_OPEN_UNTIL_IP18,
+                    # IP-18a: the real gate (closed until the sweep ends).
+                    admission_gate=r18_gate,
                 )
                 # IP-16a-3 (#411 D1 §1/§4): the R17 forecast issuer, installed
                 # and gated exactly like the Intent issuer.
@@ -950,8 +978,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.agent_runtime,
                     enabled=app_settings.r18.enabled,
                     target_path=app_settings.r18.target_path,
-                    admission_gate=ALWAYS_OPEN_UNTIL_IP18,
+                    admission_gate=r18_gate,
                 )
+                # IP-18a (IP-18 D1 r4 §5): the Outcome owner, installed and
+                # gated like the others; the executor exists only with
+                # r18.enabled (no thread, no target access otherwise).
+                app.state.outcome_owner = OutcomeOwnerV1(
+                    app.state.policy_owner,
+                    app.state.agent_runtime,
+                    enabled=app_settings.r18.enabled,
+                    target_path=app_settings.r18.target_path,
+                )
+                # ``r18_executor_enabled`` is a test seam (default True): the
+                # IP-12..IP-17 harness runs the owners with no executor and
+                # opens the gate by hand. Production never sets it.
+                if app_settings.r18.enabled and getattr(
+                    app.state, "r18_executor_enabled", True
+                ):
+                    decision_issuer = app.state.decision_issuer
+
+                    def _read_adopted_records() -> Any:
+                        return SubjectHistoryReader(
+                            app.state.event_journal, decision_issuer._store
+                        ).adopted_records()
+
+                    app.state.r18_executor = R18Executor(
+                        target_path=app_settings.r18.target_path,
+                        runtime_instance_id=runtime_instance_id,
+                        gate=r18_gate,
+                        outcome_owner=app.state.outcome_owner,
+                        read_records=_read_adopted_records,
+                        has_exclusive_authority=lambda: bool(
+                            app.state.event_journal.has_exclusive_authority
+                        ),
+                    )
+                elif app_settings.r18.enabled:
+                    r18_gate.open()  # the test seam above: no executor, no sweep
                 # IP-17b (#411 D1 r7 §1/§3): the Approval owner (challenge
                 # issue and expiry).  Its boot id is a fresh UUID per API
                 # process (HD-10 (b)): this lifespan.
@@ -960,7 +1022,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.agent_runtime,
                     enabled=app_settings.r18.enabled,
                     ttl_seconds=app_settings.r18.approval_ttl_seconds,
-                    admission_gate=ALWAYS_OPEN_UNTIL_IP18,
+                    admission_gate=r18_gate,
+                    runtime_instance_id=runtime_instance_id,
+                    on_claimed=(
+                        None
+                        if app.state.r18_executor is None
+                        else app.state.r18_executor.enqueue
+                    ),
                 )
             # IP-6b (#370 R20-DRV): the R16 driver exists only with every
             # owner bound; it runs only after the unique activation event.
@@ -999,6 +1067,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         if policy_owner is not None and policy_owner.enabled
                         else None
                     ),
+                    gate=r18_gate if app_settings.r18.enabled else None,
                 )
         except BaseException:
             app.state.event_journal.close()
@@ -1041,9 +1110,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # IP-17b (§8): the BOOT_CHANGED expiry scan (r18.enabled only).
                 if app.state.approval_owner is not None:
                     app.state.approval_owner.start()
+                # IP-18a: the sweep (S1-S5) runs as the executor's first job;
+                # the gate stays closed until it ends.
+                if app.state.r18_executor is not None:
+                    app.state.r18_executor.start()
             except BaseException:
                 if getattr(app.state, "approval_owner", None) is not None:
                     app.state.approval_owner.stop()
+                if getattr(app.state, "r18_executor", None) is not None:
+                    app.state.r18_executor.stop()
                 if getattr(app.state, "r16_driver", None) is not None:
                     app.state.r16_driver.stop()
                 app.state.emotion_timer.stop()
@@ -1055,6 +1130,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             if getattr(app.state, "approval_owner", None) is not None:
                 app.state.approval_owner.stop()
+            # IP-18a: the executor submits Runtime events, so it stops before
+            # the driver and the Runtime.
+            if getattr(app.state, "r18_executor", None) is not None:
+                app.state.r18_executor.stop()
             # The driver stops and joins before the runtime (#370 D2 P2-3).
             if getattr(app.state, "r16_driver", None) is not None:
                 app.state.r16_driver.stop()

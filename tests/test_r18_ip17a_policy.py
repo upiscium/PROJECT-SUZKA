@@ -525,8 +525,8 @@ def test_holds_write_nothing(app, monkeypatch) -> None:  # type: ignore[no-untyp
 def test_the_intent_issuer_asks_the_admission_gate(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     with TestClient(app) as client:
         state = client.app.state
-        assert state.intent_issuer._gate is ALWAYS_OPEN_UNTIL_IP18
-        assert state.policy_owner._gate is ALWAYS_OPEN_UNTIL_IP18
+        assert state.intent_issuer._gate is state.r18_gate  # IP-18a: the SweepGate
+        assert state.policy_owner._gate is state.r18_gate
         assert gate_open(ALWAYS_OPEN_UNTIL_IP18)
 
         def broken() -> bool:

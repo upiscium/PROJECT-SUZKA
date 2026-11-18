@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     from suzka.r17.expectation_issuer import ExpectationIssuerV1
     from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
     from suzka.r18.policy_owner import ReviewArtifactPolicyV1
+    from suzka.r18.sweep import SweepGate
     from suzka.runtime.main_loop import ChatResult
 
 LOGGER = logging.getLogger(__name__)
@@ -266,6 +267,11 @@ class _PolicyScan:
 
 
 @dataclass(frozen=True, slots=True)
+class _GateOpen:
+    """Queue item: the AdmissionGate moved into OPEN (IP-18a, §3-6)."""
+
+
+@dataclass(frozen=True, slots=True)
 class _ChatTerminal:
     ref: _MotivationSourceRef
     experience_id: str | None
@@ -333,6 +339,7 @@ class R16Driver:
         intent_issuer: ReviewArtifactIntentIssuerV1 | None = None,
         expectation_issuer: ExpectationIssuerV1 | None = None,
         policy_owner: ReviewArtifactPolicyV1 | None = None,
+        gate: SweepGate | None = None,
     ) -> None:
         self._runtime = runtime
         self._source = source_owner
@@ -361,6 +368,13 @@ class R16Driver:
         self._policy_retries: dict[str, int] = {}
         self._policy_scan_posted = False
         self._policy_scans = 0
+        # IP-18a (#411 IP-18 D1 r4 §3-6): an Intent / Policy stage met a closed
+        # AdmissionGate and was dropped from ``_intended`` / ``_policed``;
+        # its target is remembered (bounded) and re-submitted on every
+        # transition of the gate into OPEN.
+        self._gate = gate
+        self._gate_waiting: dict[str, _IntentTarget] = {}
+        self._gate_subscribed = False
         self.incarnation = secrets.token_hex(8)
         self._active = active
         # IP-11: the self path also needs its own unique activation marker.
@@ -433,6 +447,22 @@ class R16Driver:
         if self._active:
             self._post_forecast_scan()
             self._post_policy_scan()
+        self._subscribe_gate()
+
+    def _subscribe_gate(self) -> None:
+        """The gate callback only posts to this driver's own queue (it runs on
+        the gate's thread, possibly at once on this one); it is a no-op after
+        ``stop()``."""
+
+        if self._gate is None or self._gate_subscribed:
+            return
+        self._gate_subscribed = True
+        self._gate.subscribe(self._on_gate_open_callback)
+
+    def _on_gate_open_callback(self) -> None:
+        if self._stop.is_set():
+            return
+        self._post(_GateOpen())
 
     def _post_policy_scan(self) -> None:
         """IP-17a (D1 r7 §2): one Policy scan when the driver is active,
@@ -606,6 +636,8 @@ class R16Driver:
                     self._maybe_scan()
                 elif isinstance(item, _PolicyScan):
                     self._maybe_policy_scan(None)
+                elif isinstance(item, _GateOpen):
+                    self._on_gate_open()
                 with self._tickets_lock:
                     finished, self._done = self._done, []
                 for result in finished:
@@ -996,13 +1028,45 @@ class R16Driver:
             or value.decision_id in self._intended
         ):
             return
-        self._intended[value.decision_id] = None
+        self._maybe_intent_target(_IntentTarget(value.decision_id, value.lineage_scope))
+
+    def _maybe_intent_target(self, target: _IntentTarget) -> None:
+        if target.decision_id in self._intended:
+            return
+        self._intended[target.decision_id] = None
         _bound(self._intended)
-        self._submit(
-            _Stage.ACTION_INTENT, _IntentTarget(value.decision_id, value.lineage_scope)
-        )
+        self._submit(_Stage.ACTION_INTENT, target)
+
+    def _on_gate_open(self) -> None:
+        """§3-6 item 2: on every transition into OPEN, re-submit each Intent
+        target that met a closed gate and re-post ONE Policy scan with
+        ``_policy_scans`` reset (so a flapping target cannot exhaust it): at
+        most one re-submit round per OPEN transition, each chain still capped
+        at ``MAX_POLICY_SCANS_PER_STARTUP`` links."""
+
+        waiting = list(self._gate_waiting.values())
+        self._gate_waiting.clear()
+        for target in waiting:
+            self._maybe_intent_target(target)
+        if self._active and self._policy is not None and self._policy.enabled:
+            self._policy_scans = 0
+            self._policy_scan_posted = True
+            self._maybe_policy_scan(None)
+
+    def _wait_for_gate(self, target: _IntentTarget) -> None:
+        self._intended.pop(target.decision_id, None)
+        self._intent_retries.pop(target.decision_id, None)
+        self._gate_waiting[target.decision_id] = target
+        while len(self._gate_waiting) > OBSERVED_CAPACITY:
+            del self._gate_waiting[next(iter(self._gate_waiting))]
 
     def _intent_done(self, target: _IntentTarget, value: object) -> None:
+        if (
+            isinstance(value, _IntentIssueResult)
+            and value.reason is R18IntentReason.ADMISSION_GATE_CLOSED
+        ):
+            self._wait_for_gate(target)
+            return
         if (
             isinstance(value, _IntentIssueResult)
             and value.status in (IntentIssueStatus.ISSUED, IntentIssueStatus.EXISTING)
@@ -1113,6 +1177,13 @@ class R16Driver:
 
     def _policy_done(self, target: _PolicyTarget, value: object) -> None:
         if not isinstance(value, _PolicyResult):
+            return
+        if value.reason is R18PolicyReason.ADMISSION_GATE_CLOSED:
+            # The gate opening re-posts one scan (§3-6); the target is
+            # forgotten so a later forecast result can ask again.
+            if target.intent_id is not None:
+                self._policed.pop(target.intent_id, None)
+                self._policy_retries.pop(target.intent_id, None)
             return
         if target.scan:
             # Chained on the result's intent id; a HOLD on one Intent is
