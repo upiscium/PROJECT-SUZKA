@@ -557,6 +557,11 @@ def _feedback(value: DecisionFeedbackV1) -> DecodedRecord:
 # ------------------------------------------------- v4 records (IP-14b-1)
 # Keys (D1 r2 §2-4). Wakes, cycles, messages and ACKs are cognition records
 # of one incarnation (IP-16 §9); their ids already hash the incarnation.
+# Note for the IP-20 / IP-21 writers (IP-14b-2 review P3-3): ``wake:``,
+# ``wake-attempt:`` and ``attempt-end:`` carry no incarnation prefix, only an
+# id. The key index is global, so a writer must derive every key component
+# (wakeup_id, attempt_index, claim_id) from raw / global store state, never
+# from an adopted-only or incarnation-filtered view, before its pre-check.
 
 
 def _same_incarnation(value: str, incarnation_id: str) -> None:

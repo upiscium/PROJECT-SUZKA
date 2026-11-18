@@ -479,6 +479,42 @@ def test_a_cycle_decision_envelope_mismatch_blocks_its_scope(tmp_path: Path) -> 
     assert world.reader().head(SCOPE).reason is HeadBlockReason.DIVERGED
 
 
+def test_a_substituted_cycle_decision_is_caught_by_the_head_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review P3-1: the stored Decision is replaced, consistently, by another
+    valid Decision with the same id, event, lineage and slots (only its source
+    refs differ), so every other head check passes and the R07 binding still
+    matches. Only the per-kind check (the envelope embeds exactly the stored
+    Decision) catches it in the head path: the scope is BLOCKED DIVERGED. The
+    adopted-record path diverges as well (``record_rows_match``)."""
+
+    from suzka.r16.history_codec import HistorySourceRef, SourceRole
+
+    world = _world(tmp_path)
+    _event_, root = world.commit("root", intent="a" * 64)
+    _cycle, operations = _cycle_to_decision(world, root)
+    world.commit_record(operations[-1])
+    decision = operations[-1].cycle_decision
+    assert decision is not None
+    other = replace(decision, source_refs=(HistorySourceRef(SourceRole.GOAL, "goal", "goal-9", 3, "e" * 64),))
+    assert (other.decision_id, other.review_intent_key, other.predecessor_key) == (
+        decision.decision_id, decision.review_intent_key, decision.predecessor_key,
+    ) and other.content_digest != decision.content_digest
+    connection = sqlite3.connect(world.store.path, isolation_level=None)
+    connection.execute("DROP TRIGGER history_decisions_no_update")
+    connection.execute(
+        "UPDATE history_decisions SET committed_bytes = ?, committed_digest = ? WHERE decision_id = ?",
+        (other.canonical_bytes(), other.content_digest, decision.decision_id),
+    )
+    connection.close()
+    assert world.reader().adopted_records().blocked is HeadBlockReason.DIVERGED
+    # Isolate the head path from the record-row check.
+    monkeypatch.setattr(SubjectHistoryStore, "record_rows_match", lambda *_args: True)
+    classified = world.reader().classify((SCOPE,))
+    assert classified.global_block is None
+    head = classified.heads[SCOPE]
+    assert (head.status, head.reason, head.decision) == (HeadStatus.BLOCKED, HeadBlockReason.DIVERGED, None)
+
+
 def test_startup_rolls_a_committed_cycle_decision_forward(tmp_path: Path) -> None:
     from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
 
@@ -706,7 +742,7 @@ if {gid!r} is None:
 else:
     # Reopen an existing root: settings_in makes a fresh root, so build them on
     # a probe root and point every path at the existing one (IP-14b-1's way).
-    probe = str(root) + "-probe-" + Path(sys.executable).name
+    probe = str(root) + "-probe-" + {tag!r}
     def move(value):
         if isinstance(value, Path) and str(value).startswith(probe):
             return Path(str(value).replace(probe, str(root), 1))
@@ -723,7 +759,7 @@ with TestClient(_app(settings)) as client:
     if gid is None:
         _x, gid = _qualified_goal(state)
         out["first"] = result(_issue(state, gid))
-    out["again"] = result(_issue(state, gid))
+    out["again"] = result(_issue(state, gid)) if {issue!r} else None
     store = state.subject_history_store
     reader = SubjectHistoryReader(state.event_journal, store)
     classified = reader.classify()
@@ -746,8 +782,8 @@ def _code(tmp_path: Path) -> Path:
     return target
 
 
-def _run(code: Path, root: Path, gid: str | None = None) -> dict[str, Any]:
-    script = _SCENARIO.format(code=str(code), tests=str(code / "tests"), root=str(root), gid=gid)
+def _run(code: Path, root: Path, gid: str | None = None, *, issue: bool = True, tag: str = "read") -> dict[str, Any]:
+    script = _SCENARIO.format(code=str(code), tests=str(code / "tests"), root=str(root), gid=gid, issue=issue, tag=tag)
     completed = subprocess.run([sys.executable, "-I", "-c", script], cwd=code, check=False, capture_output=True, text=True)
     assert completed.returncode == 0, completed.stderr[-4000:]
     return json.loads(completed.stdout.strip().splitlines()[-1])
@@ -765,10 +801,14 @@ def _without_ids(run: dict[str, Any]) -> dict[str, Any]:
 
 
 def test_r16_with_every_switch_off_is_identical_to_the_base(tmp_path: Path) -> None:
-    """The R16 path with R18 / R19 / plan-hold off behaves exactly as at
-    64e5bbe (IP-14b-1): the same results, heads, rows and r16 warning logs
-    for the same scenario, and each code reads the other's store to the same
-    head with the re-issue EXISTING and no SubjectHistory row added."""
+    """Happy-path equivalence with 64e5bbe (IP-14b-1) for R16 with R18 / R19 /
+    plan-hold off: the same results, heads, rows and r16 warning logs for the
+    same scenario (issue, then re-issue), and each code reads the other's
+    store to the same head with the re-issue EXISTING and no SubjectHistory
+    row added. One tampered case (review P3-2): a Decision row whose stored
+    digest no longer matches its bytes (the depth-1 head; a depth-2 chain is
+    not reachable cheaply through this scenario) gives the same heads and
+    block reasons in both versions, read only."""
 
     base = _code(tmp_path)
     here = Path(__file__).parents[1]
@@ -786,3 +826,15 @@ def test_r16_with_every_switch_off_is_identical_to_the_base(tmp_path: Path) -> N
         assert read["again"] == made["again"] and read["again"][-1] == made["first"][-1]
         assert read["rows"] == made["rows"] and read["logs"] == []
         assert _all_rows(path) == before
+    path = old_root / "history" / "subject_history.sqlite3"
+    connection = sqlite3.connect(path, isolation_level=None)
+    (trigger,) = connection.execute("SELECT sql FROM sqlite_schema WHERE name = 'history_decisions_no_update'").fetchone()
+    connection.execute("DROP TRIGGER history_decisions_no_update")
+    connection.execute("UPDATE history_decisions SET committed_digest = ?", ("0" * 64,))
+    connection.execute(trigger)  # the exact schema again: only the row is tampered
+    connection.close()
+    tampered_base = _run(base, old_root, old["gid"], issue=False, tag="tampered-base")
+    tampered_here = _run(here, old_root, old["gid"], issue=False, tag="tampered-here")
+    assert [head[:2] for head in tampered_base["heads"].values()] == [["BLOCKED", "DIVERGED"]]
+    for key in ("heads", "block", "rows", "records", "adopted", "logs"):
+        assert tampered_here[key] == tampered_base[key], key
