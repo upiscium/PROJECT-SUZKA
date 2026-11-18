@@ -439,6 +439,30 @@ def test_every_resolution_requires_one_notification() -> None:
     assert not hasattr(contracts, "WakeCompletionV1") and not hasattr(contracts, "COMPLETION_ID_PREFIX")
 
 
+def test_an_unknown_result_kind_has_no_notification_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review P3: a closed set; a kind without a template is an error, not False."""
+
+    resolution = LogicalCycleResolutionV1.of_hold(INC, _hold(_claim()))
+    monkeypatch.setattr(contracts, "_RESULT_TEMPLATE", {})
+    with pytest.raises(ValueError, match="no notification rule"):
+        notification_required(resolution)
+
+
+def test_a_terminal_built_for_a_wake_carries_its_cycle() -> None:
+    wake = _wake()
+    newer = _wake(evidence_fingerprint="e" * 64)
+    failed = WakeTerminalV1.for_wake(wake, WakeTerminalKind.FAILED_TERMINAL, TerminalReason.EXPIRED_WAKE, event_id=EVENT_T, event_sequence=30)
+    assert (failed.wakeup_id, failed.logical_cycle_id) == (wake.wakeup_id, wake.logical_cycle_id)
+    cancelled = WakeTerminalV1.for_wake(wake, WakeTerminalKind.CANCELLED, TerminalReason.SUPERSEDED, event_id=EVENT_T, event_sequence=30, superseding=newer)
+    assert cancelled.superseding_wakeup_id == newer.wakeup_id
+    with pytest.raises(ValueError, match="incarnation"):
+        WakeTerminalV1.for_wake(wake, WakeTerminalKind.CANCELLED, TerminalReason.SUPERSEDED, event_id=EVENT_T, event_sequence=30, superseding=_wake(evidence_fingerprint="e" * 64, incarnation_id=H))
+    with pytest.raises(ValueError):
+        WakeTerminalV1.for_wake(wake, WakeTerminalKind.CANCELLED, TerminalReason.EXPIRED_WAKE, event_id=EVENT_T, event_sequence=30)
+    with pytest.raises(TypeError):
+        WakeTerminalV1.for_wake(wake.wakeup_id, WakeTerminalKind.FAILED_TERMINAL, TerminalReason.EXPIRED_WAKE, event_id=EVENT_T, event_sequence=30)  # type: ignore[arg-type]
+
+
 def test_a_terminal_names_its_wakes_cycle() -> None:
     wake = _wake()
     failed = WakeTerminalV1(wake.wakeup_id, wake.logical_cycle_id, WakeTerminalKind.FAILED_TERMINAL, TerminalReason.EXPIRED_WAKE, None, EVENT_T, 30)

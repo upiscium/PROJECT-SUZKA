@@ -188,6 +188,25 @@ def _v3_store(tmp_path: Path, *, records: bool = False) -> tuple[Path, list[Any]
 
     path, decisions = _v4_store_with_decisions(tmp_path, records=records)
     _downgrade(path, 3, SCHEMA_STATEMENTS_V3, SCHEMA_HASH_V3)
+    if records:
+        # Review P3: every operation phase eve can hold migrates too: a
+        # binding-only tombstone, an ABORTED and a leftover PREPARED Decision.
+        connection = sqlite3.connect(path, isolation_level=None)
+        connection.execute(
+            "INSERT INTO history_operations VALUES (?, ?, ?, 900, 'K', 'subject.history', "
+            "'R07_BINDING_ONLY_ABORT', ?, 'ABORTED', NULL, NULL, NULL, NULL, NULL)",
+            (INCARNATION, str(uuid4()), str(uuid4()), H),
+        )
+        aborted = str(uuid4())
+        for transaction_id, sequence, scope, pending in ((aborted, 901, "Z", b"{}"), (str(uuid4()), 902, "Z2", b"{ }")):
+            connection.execute(
+                "INSERT INTO history_operations VALUES (?, ?, ?, ?, 'K', 'subject.history', "
+                "'R16_DECISION_ISSUE', ?, 'PREPARED', ?, ?, ?, ?, 'GENESIS')",
+                (INCARNATION, transaction_id, str(uuid4()), sequence, H, pending, H, scope, _h(scope)),
+            )
+        connection.execute("UPDATE history_operations SET phase = 'ABORTED' WHERE transaction_id = ?", (aborted,))
+        assert sorted(r[0] for r in connection.execute("SELECT phase FROM history_operations WHERE processing_sequence >= 900")) == ["ABORTED", "ABORTED", "PREPARED"]
+        connection.close()
     return path, decisions
 
 
@@ -625,6 +644,27 @@ def test_resolution_rules_kind_receipt_and_same_operation_decision(tmp_path: Pat
     raw.healthy()
 
 
+def test_a_cycle_decision_without_its_decision_row_is_refused(tmp_path: Path) -> None:
+    """Review P3: R16_CYCLE_DECISION cannot FINALIZE with the resolution alone."""
+
+    raw = Raw(tmp_path)
+    wid, lc = raw.wake("w1")
+    claim, _ = raw.claim(wid, lc, 1)
+    rik = _h("rik-alone")
+    did = "decision-" + _h("alone")
+    body = b'{"r":"alone"}'
+    tx, ev = raw.prep("R16_CYCLE_DECISION", b'{"e":{"d":{"c":1},"r":' + body + b"}}", (f"cycle:{INC}:{lc}", f"attempt-end:{claim}"), lineage=("X", rik, GENESIS))
+    row = dict(record_id="cycle-resolution-" + _h(lc), record_bytes=body, record_digest=H, logical_cycle_id=lc,
+               review_intent_key=rik, claim_id=claim, result_kind="DECISION_ISSUED", result_id=did,
+               result_digest=H, decision_id=did, receipt_bytes=None)
+    assert not raw.fin(tx, ev, [("logical_cycle_resolutions", row)])
+    # As a receipt row under the Decision kind, too (the gate's kind differs).
+    assert not raw.fin(tx, ev, [("logical_cycle_resolutions", {**row, "result_kind": "HOLD", "result_id": "cycle-hold-" + _h("x"), "decision_id": None, "receipt_bytes": b'{"c":1}'})])
+    # And FINALIZE with no row at all.
+    assert raw.refused("UPDATE history_operations SET phase = 'FINALIZED' WHERE transaction_id = ?", tx)
+    raw.healthy()
+
+
 def test_terminal_rules(tmp_path: Path) -> None:
     raw = Raw(tmp_path)
     wid, lc = raw.wake("w1")
@@ -750,7 +790,7 @@ class Cycle:
     def terminal(self, reason: TerminalReason, superseding: WakeV1 | None = None) -> HistoryRecordOperationV1:
         event_id, sequence = self.next()
         kind = WakeTerminalKind.CANCELLED if reason is TerminalReason.SUPERSEDED else WakeTerminalKind.FAILED_TERMINAL
-        terminal = WakeTerminalV1(self.wake.wakeup_id, self.wake.logical_cycle_id, kind, reason, None if superseding is None else superseding.wakeup_id, event_id, sequence)
+        terminal = WakeTerminalV1.for_wake(self.wake, kind, reason, event_id=event_id, event_sequence=sequence, superseding=superseding)
         return self.op(K.R19_WAKE_TERMINAL, R.WAKE_TERMINAL, terminal, (event_id, sequence))
 
     def message(self, closing: HistoryRecordOperationV1) -> HistoryRecordOperationV1:
@@ -1222,6 +1262,32 @@ def test_the_page_margin_is_always_enforced(tmp_path: Path, monkeypatch: pytest.
     raw["subject_history"]["max_page_count"] = 2 * pages + 64
     config.write_text(yaml.safe_dump(raw))
     assert history_migration.main([str(path)]) == 0
+    assert f"max_page_count {2 * pages + 64} from SUZKA_CONFIG_PATH={config}" in capsys.readouterr().out
+
+
+def test_the_config_source_of_the_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Review P3: SUZKA_CONFIG_PATH set but missing refuses; unset with no
+    config file uses the default; a non-ASCII digit is not a cap."""
+
+    from suzka.config import settings as config_settings
+
+    path, _ = _v3_store(tmp_path)
+    before = path.read_bytes()
+    monkeypatch.setenv("SUZKA_CONFIG_PATH", str(tmp_path / "missing.yaml"))
+    assert history_migration.main([str(path)]) == 1
+    assert "config is unreadable" in capsys.readouterr().err and path.read_bytes() == before
+    assert history_migration.main(["--max-page-count", "\u00b2", str(path)]) == 2
+    assert path.read_bytes() == before
+    monkeypatch.delenv("SUZKA_CONFIG_PATH")
+    monkeypatch.setattr(config_settings, "DEFAULT_CONFIG_PATH", tmp_path / "no-config.yaml")
+    assert history_migration.main([str(path)]) == 0
+    assert f"max_page_count {history_migration.DEFAULT_MAX_PAGE_COUNT} from the default" in capsys.readouterr().out
+
+
+def test_the_flag_is_named_as_the_cap_source(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path, _ = _v3_store(tmp_path)
+    assert history_migration.main(["--max-page-count", str(PAGES), str(path)]) == 0
+    assert f"max_page_count {PAGES} from --max-page-count" in capsys.readouterr().out
 
 
 def test_the_cap_is_set_on_the_migration_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

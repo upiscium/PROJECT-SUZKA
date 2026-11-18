@@ -400,23 +400,28 @@ def migrate(
         connection.close()
 
 
-def _configured_max_page_count() -> int:
-    """``subject_history.max_page_count`` of the SUZKA config
-    (``SUZKA_CONFIG_PATH`` or the repository ``config.yaml``); the setting's
-    default when there is no config file."""
+def _configured_max_page_count() -> tuple[int, str]:
+    """``subject_history.max_page_count`` of the SUZKA config and where it
+    came from. ``SUZKA_CONFIG_PATH``, when set, must name a readable config
+    (a missing file refuses); unset, the repository ``config.yaml`` is read,
+    and only its absence falls back to the setting's default."""
 
-    from suzka.config.settings import load_settings
+    from suzka.config.settings import CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH, load_settings
 
+    configured = os.environ.get(CONFIG_PATH_ENV)
+    if configured is not None:
+        return load_settings(configured).subject_history.max_page_count, f"{CONFIG_PATH_ENV}={configured}"
     try:
-        return load_settings().subject_history.max_page_count
+        return load_settings(DEFAULT_CONFIG_PATH).subject_history.max_page_count, str(DEFAULT_CONFIG_PATH)
     except FileNotFoundError:
-        return DEFAULT_MAX_PAGE_COUNT
+        return DEFAULT_MAX_PAGE_COUNT, "the default (no config file)"
 
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     max_page_count: int | None = None
-    if len(args) == 3 and args[0] == "--max-page-count" and args[1].isdigit():
+    source = "--max-page-count"
+    if len(args) == 3 and args[0] == "--max-page-count" and args[1].isascii() and args[1].isdigit():
         max_page_count = int(args[1])
         args = args[2:]
     if len(args) != 1:
@@ -428,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if max_page_count is None:
         try:
-            max_page_count = _configured_max_page_count()
+            max_page_count, source = _configured_max_page_count()
         except Exception as error:  # noqa: BLE001 - any unreadable config refuses
             print(
                 f"migration refused, the file is unchanged: the SUZKA config is unreadable ({error}); "
@@ -442,7 +447,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"migration refused, the file is unchanged: {error}", file=sys.stderr)
         return 1
     current = f"v{HISTORY_SCHEMA_VERSION}"
-    print(f"migrated SubjectHistory v{result.from_version} to {current}; backup: {result.backup}")
+    print(
+        f"migrated SubjectHistory v{result.from_version} to {current}; backup: {result.backup}; "
+        f"max_page_count {max_page_count} from {source}"
+    )
     if not result.compacted:
         print(f"note: the store is {current}, but compaction (VACUUM) failed: {result.compaction_error}")
     return 0

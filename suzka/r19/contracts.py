@@ -887,6 +887,37 @@ class WakeTerminalV1:
             "wakeup_id": self.wakeup_id,
         }
 
+    @classmethod
+    def for_wake(
+        cls,
+        wake: WakeV1,
+        terminal: WakeTerminalKind,
+        reason: TerminalReason,
+        *,
+        event_id: str,
+        event_sequence: int,
+        superseding: WakeV1 | None = None,
+    ) -> Self:
+        """The terminal of ``wake``: its id and its own logical cycle (whose
+        ``cycle:`` key the terminal reserves). A superseding Wake must be of
+        the same incarnation."""
+        if type(wake) is not WakeV1:
+            raise TypeError("wake must be a WakeV1")
+        if superseding is not None:
+            if type(superseding) is not WakeV1:
+                raise TypeError("superseding must be a WakeV1")
+            if superseding.incarnation_id != wake.incarnation_id:
+                raise ValueError("a Wake is superseded only within its incarnation")
+        return cls(
+            wake.wakeup_id,
+            wake.logical_cycle_id,
+            terminal,
+            reason,
+            None if superseding is None else superseding.wakeup_id,
+            event_id,
+            event_sequence,
+        )
+
     @property
     def terminal_id(self) -> str:
         """One terminal per Wake: built from the Wake only."""
@@ -932,7 +963,10 @@ def notification_required(resolution: LogicalCycleResolutionV1) -> bool:
 
     if type(resolution) is not LogicalCycleResolutionV1:
         raise TypeError("resolution must be a LogicalCycleResolutionV1")
-    return resolution.result_kind in _RESULT_TEMPLATE
+    if resolution.result_kind not in _RESULT_TEMPLATE:
+        # A closed set: a new result kind needs its own decision here.
+        raise ValueError("the resolution's result kind has no notification rule")
+    return True
 
 
 # ------------------------------------------------------------------- outbox

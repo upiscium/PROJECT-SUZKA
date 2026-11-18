@@ -87,6 +87,7 @@ SCHEMA_STATEMENTS_V3: Final[tuple[str, ...]] = (
 )
 
 SCHEMA_HASH_V3: Final = sha256("\0".join(SCHEMA_STATEMENTS_V3).encode("utf-8")).hexdigest()
-assert SCHEMA_HASH_V3 == "9bafb69205ad00d60aca03c6b7b591b40192b6a0485a55325840b508d15f3ed3"
+if SCHEMA_HASH_V3 != "9bafb69205ad00d60aca03c6b7b591b40192b6a0485a55325840b508d15f3ed3":
+    raise RuntimeError("the frozen SubjectHistory v3 schema text was changed")
 
 __all__ = ["SCHEMA_HASH_V3", "SCHEMA_STATEMENTS_V3", "SCHEMA_VERSION_V3"]
