@@ -1289,7 +1289,8 @@ class EventJournalAdmissionBand(str, Enum):
 # IP-17a added R18_POLICY_COMMIT, refused by HP-8 like the Intent: an
 # unattended Intent still closes at its window end with no event, §3a;
 # IP-17b added R18_CHALLENGE_ISSUE, refused, and R18_APPROVAL_EXPIRE, ADMITTED
-# by HD-6 (a): it only records that a challenge ended).
+# by HD-6 (a): it only records that a challenge ended;
+# IP-17c added R18_EXECUTION_CLAIM, refused by HP-8 like the challenge).
 # Cognition continues; DEBUG_CHAT, ADAPTER_EVALUATE and ADAPTER_UPDATE (Human
 # decision 2026-11-10) are refused, and so is every type not listed here,
 # including any type added later (R18/R19 external effects).
