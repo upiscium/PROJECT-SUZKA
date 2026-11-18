@@ -11,9 +11,16 @@ on:
 permissions:
   contents: read
 
+# A new push to the same pull request supersedes the running one.  Pushes to
+# main / develop / rebuild/develop are never cancelled, so every merge keeps
+# its own post-merge result.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  backend:
-    name: Backend
+  lint:
+    name: Lint (ruff, mypy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,12 +32,52 @@ jobs:
           enable-cache: true
       - name: Install locked dependencies
         run: uv sync --locked
-      - name: Backend tests
-        run: uv run pytest tests/ -v
       - name: Ruff
         run: uv run ruff check suzka tests
       - name: Mypy
         run: uv run mypy suzka
+
+  backend-tests:
+    name: Backend tests (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked
+      # The suite is split over the matrix size (scripts/ci_shard.py balances
+      # the files by measured seconds), so the shard count cannot drift from
+      # the matrix list.
+      - name: Backend tests
+        run: |
+          files="$(python3 scripts/ci_shard.py --shards "${{ strategy.job-total }}" --index "${{ matrix.shard }}")"
+          test -n "$files"
+          echo "$files"
+          mapfile -t paths <<<"$files"
+          uv run pytest "${paths[@]}" -q -ra --durations=10
+
+  # One stable name for the whole backend result.
+  backend:
+    name: Backend
+    needs: [lint, backend-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: All backend jobs passed
+        run: |
+          echo "lint: ${{ needs.lint.result }}"
+          echo "tests: ${{ needs.backend-tests.result }}"
+          test "${{ needs.lint.result }}" = success
+          test "${{ needs.backend-tests.result }}" = success
 
   frontend:
     name: Frontend
