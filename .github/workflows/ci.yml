@@ -11,15 +11,12 @@ on:
 permissions:
   contents: read
 
-# A new push to the same pull request / branch supersedes the running one.
+# A new push to the same pull request supersedes the running one.  Pushes to
+# main / develop / rebuild/develop are never cancelled, so every merge keeps
+# its own post-merge result.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
-env:
-  # The backend suite is split over this many parallel jobs
-  # (scripts/ci_shard.py balances the files by measured seconds).
-  BACKEND_SHARDS: 8
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
@@ -57,11 +54,16 @@ jobs:
           enable-cache: true
       - name: Install locked dependencies
         run: uv sync --locked
+      # The suite is split over the matrix size (scripts/ci_shard.py balances
+      # the files by measured seconds), so the shard count cannot drift from
+      # the matrix list.
       - name: Backend tests
         run: |
-          files="$(python3 scripts/ci_shard.py --shards "$BACKEND_SHARDS" --index "${{ matrix.shard }}")"
+          files="$(python3 scripts/ci_shard.py --shards "${{ strategy.job-total }}" --index "${{ matrix.shard }}")"
+          test -n "$files"
           echo "$files"
-          uv run pytest $files -q -ra --durations=10
+          mapfile -t paths <<<"$files"
+          uv run pytest "${paths[@]}" -q -ra --durations=10
 
   # One stable name for the whole backend result.
   backend:

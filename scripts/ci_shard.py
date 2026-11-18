@@ -34,9 +34,14 @@ _DURATION = re.compile(r"^\s*([0-9.]+)s\s+(?:setup|call|teardown)\s+(tests/\S+?)
 
 
 def test_files() -> list[str]:
-    """Every file pytest would collect from ``tests/`` (``test_*.py``), sorted."""
+    """Every file pytest would collect from ``tests/`` by default, sorted.
 
-    return sorted(path.relative_to(ROOT).as_posix() for path in TESTS.rglob("test_*.py"))
+    pytest's default ``python_files`` is ``test_*.py`` and ``*_test.py``; the
+    repository has no pytest configuration that changes it.
+    """
+
+    found = {path for pattern in ("test_*.py", "*_test.py") for path in TESTS.rglob(pattern)}
+    return sorted(path.relative_to(ROOT).as_posix() for path in found)
 
 
 def load_table(path: Path = TABLE) -> dict[str, float]:
