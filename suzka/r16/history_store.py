@@ -34,7 +34,7 @@ terminal in the retained Journal (read-time check, U4-4).
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -62,6 +62,7 @@ from suzka.r16.contracts import MAX_JSON_BYTES, digest, identifier
 from suzka.r16.cycle_contracts import MAX_PLAN_HOLD_BYTES
 from suzka.r16.cycle_contracts import MAX_RECORD_BYTES as _CYCLE_RECORD_BYTES
 from suzka.r16.history_records import (
+    DECISION_OPERATION_KINDS,
     LINEAGE_RECORD_KINDS,
     MAX_CHALLENGES_PER_INTENT,
     OPERATION_TABLES,
@@ -932,6 +933,46 @@ class HistoryOperationRow:
     predecessor_key: str | None
 
 
+def decision_slot_occupied(
+    rows: Iterable[HistoryOperationRow],
+    *,
+    lineage_scope: str,
+    review_intent_key: str,
+    predecessor_key: str,
+) -> bool:
+    """Whether a PREPARED or FINALIZED Decision operation of either kind
+    (``R16_DECISION_ISSUE`` or ``R16_CYCLE_DECISION``) already holds the
+    review-intent or the predecessor slot (the v4 partial UNIQUEs).
+
+    The raw-state pre-check of IP-14b D1 r2 §2-6 / §4-3: ``rows`` are the raw
+    ``operations(incarnation)``, PREPARED and FINALIZED-not-yet-terminal rows
+    included, so a collision is found before PREPARE (where it would be a
+    runtime fail-stop), not at it."""
+
+    for row in rows:
+        if row.operation_kind not in DECISION_OPERATION_KINDS or row.phase is HistoryPhase.ABORTED:
+            continue
+        if row.review_intent_key == review_intent_key or (
+            row.lineage_scope == lineage_scope and row.predecessor_key == predecessor_key
+        ):
+            return True
+    return False
+
+
+@dataclass(frozen=True, slots=True)
+class PrepareCollisions:
+    """What would make the PREPARE of one record operation collide, read from
+    raw store state (IP-14b D1 r2 §2-6): its reserved keys that are live, and
+    for ``R16_CYCLE_DECISION`` whether its Decision slots are held."""
+
+    live_keys: frozenset[str]
+    decision_slot_occupied: bool
+
+    @property
+    def clear(self) -> bool:
+        return not self.live_keys and not self.decision_slot_occupied
+
+
 @dataclass(frozen=True, slots=True)
 class HistoryDecisionRow:
     decision_id: str
@@ -1110,50 +1151,51 @@ def _insert_decision(
     """The Decision and source rows of one FINALIZE (``R16_DECISION_ISSUE``,
     and ``R16_CYCLE_DECISION`` before its resolution row)."""
 
-    committed = decision.canonical_bytes()
-    decision_bytes = decision.decision_bytes
+    columns = _decision_columns(transaction_id, decision)
     connection.execute(
-        "INSERT INTO history_decisions (decision_id, incarnation_id, "
-        "transaction_id, lineage_scope, review_intent_key, predecessor_key, "
-        "predecessor_digest, issuer_event_id, issuer_sequence, decision_bytes, "
-        "decision_digest, committed_bytes, committed_digest, policy_kind, "
-        "policy_row, policy_input_bytes, policy_input_digest) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            decision.decision_id,
-            decision.incarnation_id,
-            transaction_id,
-            decision.lineage_scope,
-            decision.review_intent_key,
-            decision.predecessor_key,
-            decision.predecessor_digest,
-            decision.issuer_event_id,
-            decision.issuer_sequence,
-            decision_bytes,
-            sha256(decision_bytes).hexdigest(),
-            committed,
-            decision.content_digest,
-            decision.policy_kind.value,
-            decision.policy_row.value,
-            decision.policy_input_bytes,
-            decision.policy_input_digest,
-        ),
+        f"INSERT INTO history_decisions ({', '.join(name for name, _ in columns)}) "
+        f"VALUES ({', '.join('?' for _ in columns)})",
+        tuple(value for _, value in columns),
     )
     connection.executemany(
         "INSERT INTO history_source_refs (decision_id, source_role, "
         "source_kind, ref_id, revision, digest) VALUES (?, ?, ?, ?, ?, ?)",
-        [
-            (
-                decision.decision_id,
-                item.role.value,
-                item.kind,
-                item.ref_id,
-                item.revision,
-                item.digest,
-            )
-            for item in decision.source_refs
-        ],
+        _source_values(decision),
     )
+
+
+def _decision_columns(
+    transaction_id: str, decision: CommittedDecisionV1
+) -> tuple[tuple[str, object], ...]:
+    """The ``history_decisions`` row one Decision FINALIZE writes."""
+
+    decision_bytes = decision.decision_bytes
+    return (
+        ("decision_id", decision.decision_id),
+        ("incarnation_id", decision.incarnation_id),
+        ("transaction_id", transaction_id),
+        ("lineage_scope", decision.lineage_scope),
+        ("review_intent_key", decision.review_intent_key),
+        ("predecessor_key", decision.predecessor_key),
+        ("predecessor_digest", decision.predecessor_digest),
+        ("issuer_event_id", decision.issuer_event_id),
+        ("issuer_sequence", decision.issuer_sequence),
+        ("decision_bytes", decision_bytes),
+        ("decision_digest", sha256(decision_bytes).hexdigest()),
+        ("committed_bytes", decision.canonical_bytes()),
+        ("committed_digest", decision.content_digest),
+        ("policy_kind", decision.policy_kind.value),
+        ("policy_row", decision.policy_row.value),
+        ("policy_input_bytes", decision.policy_input_bytes),
+        ("policy_input_digest", decision.policy_input_digest),
+    )
+
+
+def _source_values(decision: CommittedDecisionV1) -> list[tuple[str, str, str, str, int, str]]:
+    return [
+        (decision.decision_id, item.role.value, item.kind, item.ref_id, item.revision, item.digest)
+        for item in decision.source_refs
+    ]
 
 
 def _finish(
@@ -1870,7 +1912,48 @@ class SubjectHistoryStore:
             rows = self._read(f"SELECT {total}", tuple(v for _ in others for v in (incarnation_id, transaction_id)))
             if _int(rows[0][0]) != 0:
                 return False
-        return True
+        # IP-14b-2 (D1 r2 §4-3): an R16_CYCLE_DECISION's Decision and source
+        # rows are exactly its embedded Decision's; no other record operation
+        # has any Decision row.
+        return self._decision_rows_match(incarnation_id, transaction_id, operation.cycle_decision)
+
+    def _decision_rows_match(
+        self, incarnation_id: str, transaction_id: str, decision: CommittedDecisionV1 | None
+    ) -> bool:
+        stored = self._read_dicts(
+            "SELECT * FROM history_decisions WHERE incarnation_id = ? AND transaction_id = ?",
+            (incarnation_id, transaction_id),
+        )
+        if decision is None:
+            return not stored
+        if len(stored) != 1 or stored[0] != dict(_decision_columns(transaction_id, decision)):
+            return False
+        sources = self._read(
+            "SELECT decision_id, source_role, source_kind, ref_id, revision, digest "
+            "FROM history_source_refs WHERE decision_id = ?",
+            (decision.decision_id,),
+        )
+        return sorted(tuple(row) for row in sources) == sorted(_source_values(decision))
+
+    def prepare_collisions(self, operation: HistoryRecordOperationV1) -> PrepareCollisions:
+        """The raw-state collision pre-check of one record operation (IP-14b
+        D1 r2 §2-6): its reserved keys that are already live (in any
+        incarnation, as the key index is), and for ``R16_CYCLE_DECISION``
+        whether a PREPARED / FINALIZED Decision of this incarnation holds its
+        review-intent or predecessor slot. Read-only; a writer that finds a
+        collision HOLDs instead of PREPARing (a collision at PREPARE is a
+        runtime fail-stop). Capacity is ``check_headroom``'s."""
+
+        if type(operation) is not HistoryRecordOperationV1:
+            raise TypeError("operation must be a HistoryRecordOperationV1")
+        decision = operation.cycle_decision
+        occupied = decision is not None and decision_slot_occupied(
+            self.operations(operation.incarnation_id),
+            lineage_scope=decision.lineage_scope,
+            review_intent_key=decision.review_intent_key,
+            predecessor_key=decision.predecessor_key,
+        )
+        return PrepareCollisions(self.live_keys(operation.reserved_keys), occupied)
 
     def record_rows(
         self, table: str, incarnation_id: str, transaction_id: str
@@ -1945,6 +2028,7 @@ __all__ = [
     "SCHEMA_HASH",
     "SCHEMA_STATEMENTS",
     "HistoryDecisionRow",
+    "PrepareCollisions",
     "HistoryMeta",
     "HistoryMetaPhase",
     "HistoryOperationKind",
@@ -1960,4 +2044,5 @@ __all__ = [
     "V2_STATEMENTS",
     "V4_STATEMENTS",
     "SubjectHistoryStore",
+    "decision_slot_occupied",
 ]

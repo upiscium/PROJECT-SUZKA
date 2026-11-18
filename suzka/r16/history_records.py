@@ -136,6 +136,10 @@ PLAN_HOLD_GATED_KINDS: Final = frozenset({_K.R16_PLAN_HOLD})
 assert R18_GATED_KINDS | R19_GATED_KINDS | PLAN_HOLD_GATED_KINDS == RECORD_OPERATION_KINDS
 # The record kinds that also write R16 lineage columns and Decision rows.
 LINEAGE_RECORD_KINDS: Final = frozenset({_K.R16_CYCLE_DECISION})
+# IP-14b-2 (D1 r2 §4-3): the kinds whose FINALIZED rows are R16 Decisions,
+# i.e. the head chain nodes and the holders of the review-intent and
+# predecessor slots (the v4 partial UNIQUEs, §2-1 (c)).
+DECISION_OPERATION_KINDS: Final = frozenset({_K.R16_DECISION_ISSUE, _K.R16_CYCLE_DECISION})
 
 
 class RecordKind(str, Enum):
@@ -553,6 +557,11 @@ def _feedback(value: DecisionFeedbackV1) -> DecodedRecord:
 # ------------------------------------------------- v4 records (IP-14b-1)
 # Keys (D1 r2 §2-4). Wakes, cycles, messages and ACKs are cognition records
 # of one incarnation (IP-16 §9); their ids already hash the incarnation.
+# Note for the IP-20 / IP-21 writers (IP-14b-2 review P3-3): ``wake:``,
+# ``wake-attempt:`` and ``attempt-end:`` carry no incarnation prefix, only an
+# id. The key index is global, so a writer must derive every key component
+# (wakeup_id, attempt_index, claim_id) from raw / global store state, never
+# from an adopted-only or incarnation-filtered view, before its pre-check.
 
 
 def _same_incarnation(value: str, incarnation_id: str) -> None:
@@ -940,6 +949,7 @@ def record_operation_digest(pending_bytes: bytes) -> str:
 
 
 __all__ = [
+    "DECISION_OPERATION_KINDS",
     "ENVELOPE_SCHEMA_VERSION",
     "LINEAGE_RECORD_KINDS",
     "MAX_CHALLENGES_PER_INTENT",

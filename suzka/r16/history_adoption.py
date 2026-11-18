@@ -53,6 +53,11 @@ SUBJECT_HISTORY_BASELINE: Final = ParticipantBaseline(
 LOGGER = logging.getLogger(__name__)
 # IP-16b (#411 D1 r3 §6): the closed startup code of a switched-off store.
 R18_RECORDS_PRESENT_BUT_DISABLED: Final = "R18_RECORDS_PRESENT_BUT_DISABLED"
+# IP-14b-2 (IP-14b D1 r2 §6-1): the same rule for R19 / cycle rows with
+# r19.enabled false, and for plan-hold rows with
+# subject_history.plan_hold_receipts false.
+R19_RECORDS_PRESENT_BUT_DISABLED: Final = "R19_RECORDS_PRESENT_BUT_DISABLED"
+PLAN_HOLD_RECORDS_PRESENT_BUT_DISABLED: Final = "PLAN_HOLD_RECORDS_PRESENT_BUT_DISABLED"
 _BASELINE_DOMAIN: Final = b"PROJECT-SUZKA:R16:SUBJECT-HISTORY-BASELINE:V1\0"
 _INCARNATION_DOMAIN: Final = b"PROJECT-SUZKA:R16:SUBJECT-HISTORY-INCARNATION:V1\0"
 
@@ -160,7 +165,10 @@ def open_or_create_store(
     IP-14a: a v1, v2 or v3 store stops startup until the explicit migration ran
     (§11-1).  IP-16b (#411 D1 r3 §6) replaced IP-14a-1's refusal of a store
     holding R17 / R18 records while ``r18.enabled`` is false: it starts, logs
-    ``R18_RECORDS_PRESENT_BUT_DISABLED`` once, and stays switched off."""
+    ``R18_RECORDS_PRESENT_BUT_DISABLED`` once, and stays switched off.
+    IP-14b-2 (D1 r2 §6-1) applies the same rule, family by family, to R19 /
+    cycle rows (``R19_RECORDS_PRESENT_BUT_DISABLED``) and plan-hold rows
+    (``PLAN_HOLD_RECORDS_PRESENT_BUT_DISABLED``)."""
 
     if not isinstance(path, Path):
         raise HistoryAdoptionError("SubjectHistory path must be a Path")
@@ -202,6 +210,18 @@ def open_or_create_store(
                 # not gated), and the Decision issuer's ledger reader keeps
                 # reading, so row 4 is not issued again.  The sweep is IP-18.
                 LOGGER.warning(R18_RECORDS_PRESENT_BUT_DISABLED)
+            if not r19_enabled and store.has_r19_operations():
+                # IP-14b-2 (D1 r2 §6-1, mirroring IP-16b): start, refuse every
+                # new R19 / cycle PREPARE (the store; the IP-20 / IP-21
+                # handlers HOLD R19_DISABLED), settle pending ones through
+                # R07 reconcile, and keep the head and adopted-record readers
+                # running (cycle Decisions stay chain nodes). Never a refusal
+                # to start: disabling stays an emergency stop.
+                LOGGER.warning(R19_RECORDS_PRESENT_BUT_DISABLED)
+            if not plan_hold_receipts and store.has_plan_hold_operations():
+                # The same rule for HD-3 (a) plan-hold receipts (r2 final
+                # review P3-2); the PLAN_PREVIEW HOLD path writes none.
+                LOGGER.warning(PLAN_HOLD_RECORDS_PRESENT_BUT_DISABLED)
         except BaseException:
             store.close()
             raise
@@ -321,7 +341,9 @@ def current_incarnation(journal: EventJournal, store: SubjectHistoryStore) -> st
 
 
 __all__ = [
+    "PLAN_HOLD_RECORDS_PRESENT_BUT_DISABLED",
     "R18_RECORDS_PRESENT_BUT_DISABLED",
+    "R19_RECORDS_PRESENT_BUT_DISABLED",
     "SUBJECT_HISTORY_BASELINE",
     "HistoryAdoptionError",
     "activate_adopted_store",

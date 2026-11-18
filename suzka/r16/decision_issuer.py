@@ -101,10 +101,10 @@ from suzka.r16.history_reader import (
     SubjectHistoryReader,
 )
 from suzka.r16.history_store import (
-    HistoryOperationKind,
     HistoryPhase,
     HistoryStoreError,
     SubjectHistoryStore,
+    decision_slot_occupied,
 )
 from suzka.r16.commitment_owner import REVIEW_COMMITMENT_SCOPE
 from suzka.r16.outcomes import R16OwnerReason
@@ -853,18 +853,15 @@ class _DecisionIssuer:
             self._store.check_headroom(len(committed.canonical_bytes()))
         except HistoryStoreError:
             raise _IssuerHold(R16OwnerReason.HISTORY_CAPACITY) from None
-        rows = self._store.operations(incarnation)
-        for row in rows:
-            if (
-                row.operation_kind is not HistoryOperationKind.R16_DECISION_ISSUE
-                or row.phase is HistoryPhase.ABORTED
-            ):
-                continue
-            if row.review_intent_key == committed.review_intent_key or (
-                row.lineage_scope == committed.lineage_scope
-                and row.predecessor_key == committed.predecessor_key
-            ):
-                raise _IssuerHold(R16OwnerReason.DECISION_SLOT_OCCUPIED)
+        # IP-14b-2 (D1 r2 §4-3): a PREPARED / FINALIZED Wake-origin
+        # R16_CYCLE_DECISION holds the same slots as a PLAN_PREVIEW Decision.
+        if decision_slot_occupied(
+            self._store.operations(incarnation),
+            lineage_scope=committed.lineage_scope,
+            review_intent_key=committed.review_intent_key,
+            predecessor_key=committed.predecessor_key,
+        ):
+            raise _IssuerHold(R16OwnerReason.DECISION_SLOT_OCCUPIED)
 
     def _check_deadline(self, q: _QualifiedPreview) -> None:
         if q.commitment_id is None:
