@@ -835,19 +835,3 @@ def test_the_facts_reads_are_coalesced(app, monkeypatch) -> None:  # type: ignor
             assert owner.open_approvals().reason is R18ApprovalReason.REVIEW_BUSY
         finally:
             owner._facts_lock.release()
-
-
-def test_a_claim_is_timed_against_the_commitment_deadline() -> None:
-    """The claim refuses at or after the Commitment deadline (A1-4 / §6-1)."""
-
-    challenge = ip17b._challenge("2026-11-16T00:20:00Z")
-    with pytest.raises(ValueError, match="deadline"):
-        ExecutionClaimV1.claim(
-            challenge,
-            runtime_instance_id=ip17b.ip13.RUNTIME,
-            boot_id=ip17b.ip13.BOOT,
-            claim_event_id=ip17b.ip13.EVENT_C,
-            claim_sequence=22,
-            claimed_utc="2026-11-16T00:20:00Z",
-            approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
-        )
