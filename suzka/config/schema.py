@@ -251,6 +251,9 @@ class R18Settings(StrictBaseModel):
     # IP-17a (#411 D1 r7 §3a, HD-16 (a)): each forward Intent's approval
     # window; an unclaimed Intent closes at its end with no event.
     approval_window_seconds: StrictInt = Field(default=3600, ge=600, le=86_400)
+    # IP-17b (#411 D1 r7 §3 / §4): a challenge's TTL, capped by the Intent's
+    # window end and by MAX_APPROVAL_TTL (15 min).
+    approval_ttl_seconds: StrictInt = Field(default=300, ge=60, le=900)
 
 
 class R19Settings(StrictBaseModel):

@@ -86,6 +86,7 @@ from suzka.r16.decision_issuer import _DecisionIssuer
 from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
 from suzka.r17.expectation_issuer import ExpectationIssuerV1
 from suzka.r18.admission import ALWAYS_OPEN_UNTIL_IP18
+from suzka.r18.approval_owner import ApprovalChallengeOwnerV1
 from suzka.r18.policy_owner import ReviewArtifactPolicyV1
 from suzka.r16.history_attestation import SubjectHistoryAttestationProvider
 from suzka.runtime.r15_interpretation_reader import R15InterpretationReader
@@ -541,6 +542,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise StateRecoveryError("R18 Policy owner unavailable")
             return owner
 
+        def _r18_approval_owner_for_commit(
+            event: AgentEvent,
+        ) -> ApprovalChallengeOwnerV1 | None:
+            owner = getattr(app.state, "approval_owner", None)
+            if owner is None and event.event_type in {
+                AgentEventType.R18_CHALLENGE_ISSUE,
+                AgentEventType.R18_APPROVAL_EXPIRE,
+            }:
+                raise StateRecoveryError("R18 Approval owner unavailable")
+            return owner
+
         def _clear_r16_source(event: AgentEvent) -> None:
             owner = getattr(app.state, "_motivation_source_owner", None)
             if owner is not None:
@@ -563,6 +575,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             policy_owner = getattr(app.state, "policy_owner", None)
             if policy_owner is not None:
                 policy_owner._clear()
+            approval_owner = getattr(app.state, "approval_owner", None)
+            if approval_owner is not None:
+                approval_owner._clear()
 
         def _internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
             nonlocal committed_snapshot, committed_snapshot_hash
@@ -595,6 +610,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 policy_owner = _r18_policy_owner_for_commit(event)
                 if policy_owner is not None:
                     policy_owner._validate_commit(event)
+                approval_owner = _r18_approval_owner_for_commit(event)
+                if approval_owner is not None:
+                    approval_owner._validate_commit(event)
                 validate_belief_commit = getattr(
                     app.state.main_loop, "_validate_belief_event_commit", None
                 )
@@ -882,6 +900,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.intent_issuer = None
             app.state.expectation_issuer = None
             app.state.policy_owner = None
+            app.state.approval_owner = None
             history_store = getattr(app.state, "subject_history_store", None)
             if history_store is not None and preview_owner is not None:
                 interpretation_reader = R15InterpretationReader(
@@ -928,6 +947,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.agent_runtime,
                     enabled=app_settings.r18.enabled,
                     target_path=app_settings.r18.target_path,
+                    admission_gate=ALWAYS_OPEN_UNTIL_IP18,
+                )
+                # IP-17b (#411 D1 r7 §1/§3): the Approval owner (challenge
+                # issue and expiry).  Its boot id is a fresh UUID per API
+                # process (HD-10 (b)): this lifespan.
+                app.state.approval_owner = ApprovalChallengeOwnerV1(
+                    app.state.policy_owner,
+                    app.state.agent_runtime,
+                    enabled=app_settings.r18.enabled,
+                    ttl_seconds=app_settings.r18.approval_ttl_seconds,
                     admission_gate=ALWAYS_OPEN_UNTIL_IP18,
                 )
             # IP-6b (#370 R20-DRV): the R16 driver exists only with every
@@ -1006,7 +1035,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.emotion_timer.start()
                 if app.state.r16_driver is not None:
                     app.state.r16_driver.start(r16_rescan)
+                # IP-17b (§8): the BOOT_CHANGED expiry scan (r18.enabled only).
+                if app.state.approval_owner is not None:
+                    app.state.approval_owner.start()
             except BaseException:
+                if getattr(app.state, "approval_owner", None) is not None:
+                    app.state.approval_owner.stop()
                 if getattr(app.state, "r16_driver", None) is not None:
                     app.state.r16_driver.stop()
                 app.state.emotion_timer.stop()
@@ -1016,6 +1050,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            if getattr(app.state, "approval_owner", None) is not None:
+                app.state.approval_owner.stop()
             # The driver stops and joins before the runtime (#370 D2 P2-3).
             if getattr(app.state, "r16_driver", None) is not None:
                 app.state.r16_driver.stop()

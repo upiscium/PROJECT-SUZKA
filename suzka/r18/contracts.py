@@ -83,6 +83,18 @@ class Direction(str, Enum):
     INVERSE = "INVERSE"
 
 
+class ApprovalChannel(str, Enum):
+    """How the Human's approval reached the Claim (IP-17b, #411 D1 r7 §12-1).
+
+    A closed enum that names what the approval proves (§9): V1 is a deliberate
+    request accepted from localhost or a trusted network, after the
+    code-generated preview, with the typed confirmation code.  It does not
+    prove that the Human made it.  A stronger channel is a new member.
+    """
+
+    LOCAL_LOOPBACK_TYPED_CODE_V1 = "LOCAL_LOOPBACK_TYPED_CODE_V1"
+
+
 class GoalOrigin(str, Enum):
     """The origin of the Goal behind a Decision (#379; mirrors GoalOrigin)."""
 
@@ -889,6 +901,7 @@ def _require_allow(
 
 _CHALLENGE_BODY: Final = (
     "boot_id",
+    "commitment_deadline_utc",
     "direction",
     "expectation_digest",
     "expires_utc",
@@ -909,9 +922,20 @@ class ApprovalChallengeV1:
     """A single-use server challenge (#380 §2-3, D1 P2-2, D2 addendum 4).
 
     It binds intent, R17 expectation (forward only), target revision,
-    operation key, payload digest, expiry and boot. Consuming the nonce is
-    once-only in SubjectHistory and happens in the same event as the Claim
-    (IP-17). A restart (new boot) voids every earlier challenge.
+    operation key, payload digest, expiry, the Commitment deadline and boot.
+    Consuming the nonce is once-only in SubjectHistory and happens in the
+    same event as the Claim (IP-17c).
+
+    ``boot_id`` (IP-17b, Human decision HD-10 (b), #411 D1 r7 §3): a fresh
+    UUID4 per API process, separate from ``runtime_instance_id``.  #380 D2
+    P2-1 called it the kernel boot unit; it is the process, so *any* Runtime
+    restart voids every open challenge (BOOT_CHANGED), whether or not the host
+    rebooted.
+
+    ``commitment_deadline_utc`` (IP-17b, §12-1) is the qualified Commitment's
+    deadline (``None``: it has none; always ``None`` for an inverse).  It is
+    part of ``challenge_digest`` and so of the confirmation code the operator
+    types, and the Claim carries it (A1-4).  A challenge never outlives it.
 
     Build new challenges with ``for_forward`` / ``for_inverse``, which
     require this intent's ALLOW; the plain constructor is for decoding.
@@ -929,6 +953,7 @@ class ApprovalChallengeV1:
     issued_utc: str
     expires_utc: str
     boot_id: str
+    commitment_deadline_utc: str | None
 
     def __post_init__(self) -> None:
         digest(self.nonce, "nonce")
@@ -949,6 +974,12 @@ class ApprovalChallengeV1:
         if not issued < expires <= issued + MAX_APPROVAL_TTL:
             raise ValueError("a challenge expires after issue, within the maximum TTL")
         canonical_uuid(self.boot_id, "boot_id")
+        if self.commitment_deadline_utc is not None:
+            deadline = _utc(self.commitment_deadline_utc, "commitment_deadline_utc")
+            if self.direction is Direction.INVERSE:
+                raise ValueError("an inverse challenge carries no Commitment deadline")
+            if expires > deadline:
+                raise ValueError("a challenge never outlives the Commitment deadline")
 
     @classmethod
     def for_forward(
@@ -961,10 +992,13 @@ class ApprovalChallengeV1:
         issued_utc: str,
         expires_utc: str,
         boot_id: str,
+        commitment_deadline_utc: str | None,
     ) -> Self:
         if type(intent) is not ActionIntentV1:
             raise TypeError("intent must be an ActionIntentV1")
         _require_allow(policy, Direction.FORWARD, intent.intent_id, intent.intent_digest, intent.forward_key)
+        if _utc(expires_utc, "expires_utc") > intent.approval_window_end:
+            raise ValueError("a challenge never outlives its Intent's approval window")
         return cls(
             nonce,
             Direction.FORWARD,
@@ -978,6 +1012,7 @@ class ApprovalChallengeV1:
             issued_utc,
             expires_utc,
             boot_id,
+            commitment_deadline_utc,
         )
 
     @classmethod
@@ -1007,11 +1042,13 @@ class ApprovalChallengeV1:
             issued_utc,
             expires_utc,
             boot_id,
+            None,
         )
 
     def canonical_value(self) -> dict[str, object]:
         return {
             "boot_id": self.boot_id,
+            "commitment_deadline_utc": self.commitment_deadline_utc,
             "direction": self.direction.value,
             "expectation_digest": self.expectation_digest,
             "expires_utc": self.expires_utc,
@@ -1053,6 +1090,7 @@ class ApprovalChallengeV1:
     def from_json(cls, payload: bytes) -> Self:
         row = _parse(payload, MAX_RECORD_BYTES, _CHALLENGE_BODY, "approval challenge")
         expectation = row["expectation_digest"]
+        deadline = row["commitment_deadline_utc"]
         value = cls(
             nonce=_str(row["nonce"]),
             direction=parse_enum(row["direction"], Direction, "direction"),
@@ -1066,6 +1104,7 @@ class ApprovalChallengeV1:
             issued_utc=_str(row["issued_utc"]),
             expires_utc=_str(row["expires_utc"]),
             boot_id=_str(row["boot_id"]),
+            commitment_deadline_utc=None if deadline is None else _str(deadline),
         )
         if value.canonical_bytes() != payload:
             raise ValueError("challenge bytes are not canonical")
@@ -1075,11 +1114,13 @@ class ApprovalChallengeV1:
 # -------------------------------------------------------------------- claim
 
 _CLAIM_BODY: Final = (
+    "approval_channel",
     "boot_id",
     "challenge_digest",
     "claim_event_id",
     "claim_sequence",
     "claimed_utc",
+    "commitment_deadline_utc",
     "direction",
     "intent_digest",
     "intent_id",
@@ -1097,6 +1138,11 @@ class ExecutionClaimV1:
     The executor checks the same ``runtime_instance_id`` in the target CAS
     transaction (#380 D2 P2-1 / addendum 1).
 
+    IP-17b (#411 D1 r7 §12-1) amends the shape only (the CLAIM handler is
+    IP-17c): ``commitment_deadline_utc`` is the challenge's Commitment
+    deadline (copied, A1-4) and ``approval_channel`` names what the approval
+    proves.
+
     Build new claims with ``claim``, which refuses a stale challenge; the
     plain constructor is for decoding.
     """
@@ -1112,6 +1158,8 @@ class ExecutionClaimV1:
     claim_event_id: str
     claim_sequence: int
     claimed_utc: str
+    commitment_deadline_utc: str | None
+    approval_channel: ApprovalChannel
 
     def __post_init__(self) -> None:
         if type(self.direction) is not Direction:
@@ -1124,7 +1172,14 @@ class ExecutionClaimV1:
         canonical_uuid(self.runtime_instance_id, "runtime_instance_id")
         canonical_uuid(self.boot_id, "boot_id")
         _event(self.claim_event_id, self.claim_sequence, "claim")
-        _utc(self.claimed_utc, "claimed_utc")
+        claimed = _utc(self.claimed_utc, "claimed_utc")
+        if type(self.approval_channel) is not ApprovalChannel:
+            raise TypeError("approval_channel must be an ApprovalChannel")
+        if self.commitment_deadline_utc is not None:
+            if self.direction is Direction.INVERSE:
+                raise ValueError("an inverse claim carries no Commitment deadline")
+            if claimed >= _utc(self.commitment_deadline_utc, "commitment_deadline_utc"):
+                raise ValueError("a claim is made before the Commitment deadline")
 
     @classmethod
     def claim(
@@ -1136,8 +1191,10 @@ class ExecutionClaimV1:
         claim_event_id: str,
         claim_sequence: int,
         claimed_utc: str,
+        approval_channel: ApprovalChannel,
     ) -> Self:
-        """Refuses an expired challenge or one from another boot."""
+        """Refuses an expired challenge or one from another boot, or a claim at
+        or after the challenge's Commitment deadline."""
         if not challenge.is_live(claimed_utc, boot_id):
             raise ValueError("the challenge expired or belongs to an earlier boot")
         return cls(
@@ -1152,15 +1209,19 @@ class ExecutionClaimV1:
             claim_event_id,
             claim_sequence,
             claimed_utc,
+            challenge.commitment_deadline_utc,
+            approval_channel,
         )
 
     def _body(self) -> dict[str, object]:
         return {
+            "approval_channel": self.approval_channel.value,
             "boot_id": self.boot_id,
             "challenge_digest": self.challenge_digest,
             "claim_event_id": self.claim_event_id,
             "claim_sequence": self.claim_sequence,
             "claimed_utc": self.claimed_utc,
+            "commitment_deadline_utc": self.commitment_deadline_utc,
             "direction": self.direction.value,
             "intent_digest": self.intent_digest,
             "intent_id": self.intent_id,
@@ -1189,6 +1250,7 @@ class ExecutionClaimV1:
         row = _parse(
             payload, MAX_RECORD_BYTES, (*_CLAIM_BODY, "claim_digest", "claim_id"), "execution claim"
         )
+        deadline = row["commitment_deadline_utc"]
         value = cls(
             direction=parse_enum(row["direction"], Direction, "direction"),
             intent_id=_str(row["intent_id"]),
@@ -1201,6 +1263,8 @@ class ExecutionClaimV1:
             claim_event_id=_str(row["claim_event_id"]),
             claim_sequence=_int(row["claim_sequence"]),
             claimed_utc=_str(row["claimed_utc"]),
+            commitment_deadline_utc=None if deadline is None else _str(deadline),
+            approval_channel=parse_enum(row["approval_channel"], ApprovalChannel, "approval_channel"),
         )
         if value.canonical_bytes() != payload:
             raise ValueError("claim bytes are not canonical")

@@ -46,6 +46,10 @@ class AgentEventType(str, Enum):
     # IP-17a (#411 D1 r7 §1-§2): the R18 Policy verdict for one adopted
     # forward Intent (or a scan after a cursor). Refused in the soft band.
     R18_POLICY_COMMIT = "r18_policy_commit"
+    # IP-17b (#411 D1 r7 §1 / §3): the challenge written at an operator confirm
+    # (refused in the soft band) and its expiry (admitted there, HD-6 (a)).
+    R18_CHALLENGE_ISSUE = "r18_challenge_issue"
+    R18_APPROVAL_EXPIRE = "r18_approval_expire"
 
 
 class AgentEventSource(str, Enum):
@@ -83,6 +87,8 @@ class AgentEventSource(str, Enum):
     RUNTIME_R18_ACTION_INTENT_ISSUE = "runtime.r18.action_intent_issue"
     RUNTIME_R17_EXPECTATION_COMMIT = "runtime.r17.expectation_commit"
     RUNTIME_R18_POLICY_COMMIT = "runtime.r18.policy_commit"
+    API_R18_APPROVAL = "api.r18.approval"
+    RUNTIME_R18_APPROVAL_EXPIRE = "runtime.r18.approval_expire"
 
 
 class AgentRuntimeStatus(str, Enum):
