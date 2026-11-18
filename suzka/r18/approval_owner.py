@@ -37,13 +37,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import hmac
 import logging
 import secrets
 import threading
+import time
 from typing import TYPE_CHECKING, Final, Protocol
 from uuid import uuid4
 
@@ -75,6 +76,7 @@ from suzka.r18.contracts import (
     PolicyVerdict,
     SourceRole,
 )
+from suzka.r18.requalify import RequalifyFailed
 from suzka.r18.policy_owner import (
     ReviewArtifactPolicyV1,
     _adopted_intent,
@@ -111,6 +113,12 @@ EXPIRE_DELAY: Final = timedelta(seconds=1)
 MAX_PENDING_CHALLENGES: Final = 64
 MAX_EXPIRE_SCANS_PER_STARTUP: Final = 64
 MAX_TIMER_RETRIES: Final = 3
+# Review coalescing (condition B): a review that has to read the ledger does so
+# at most once per interval per Intent, and one read at a time.
+MIN_REVIEW_INTERVAL: Final = 2.0
+MAX_REVIEW_CACHE: Final = 256
+# The startup scan retries a transient HOLD that names no challenge once.
+STARTUP_SCAN_RETRY_DELAY: Final = 1.0
 _MAX_ID: Final = 256
 _EVENT_TYPES: Final = frozenset(
     {AgentEventType.R18_CHALLENGE_ISSUE, AgentEventType.R18_APPROVAL_EXPIRE}
@@ -186,6 +194,11 @@ class R18ApprovalReason(str, Enum):
     CHALLENGE_UNKNOWN = "challenge_unknown"
     STILL_LIVE = "still_live"
     ALREADY_CONSUMED = "already_consumed"
+    # A review is being computed for another caller (coalesced, not an error).
+    REVIEW_BUSY = "review_busy"
+    # The event could not be admitted or did not finish in time (soft or hard
+    # journal band, a stopped Runtime, a timeout): nothing was written.
+    JOURNAL_UNAVAILABLE = "journal_unavailable"
 
 
 # Transient: the timer retries these (bounded); the rest wait for the lazy
@@ -366,6 +379,13 @@ class ApprovalChallengeOwnerV1:
         # intent_id -> the one pending in-memory challenge (never written).
         self._pending_challenges: dict[str, ApprovalChallengeV1] = {}
         self._timers: dict[str, _Timer] = {}
+        # Review coalescing: the live challenge shown per Intent, the last
+        # computed result per Intent, and one ledger read at a time.
+        self._shown: dict[str, ReviewResult] = {}
+        self._reviewed: dict[str, tuple[float, ReviewResult]] = {}
+        self._review_lock = threading.Lock()
+        self._monotonic: Callable[[], float] = time.monotonic
+        self._stop_event = threading.Event()
         self._stopped = False
         self._scan_thread: threading.Thread | None = None
 
@@ -591,10 +611,51 @@ class ApprovalChallengeOwnerV1:
         In order: a written live unconsumed challenge; else the pending
         in-memory challenge while it is live (never replaced); else a new one,
         built after §2 steps 2 and 4-7 minus the source requalification (see
-        the module note) and held in the bounded map."""
+        the module note) and held in the bounded map.
+
+        Coalesced (condition B): reading the ledger holds the journal lock, so
+        a caller looping on review must not stall the Runtime.  While a live
+        challenge is shown for the Intent it is returned with no read at all;
+        otherwise a computed result is reused for ``MIN_REVIEW_INTERVAL``, and
+        only one read runs at a time (another caller gets the cached result,
+        or HOLD ``REVIEW_BUSY``)."""
 
         if not self._enabled:
             return ReviewResult(ReviewStatus.HOLD, str(intent_id), R18ApprovalReason.R18_DISABLED)
+        if not _valid_id(intent_id):
+            return self._review_hold(intent_id, R18ApprovalReason.INTENT_UNKNOWN)
+        shown = self._live_shown(intent_id)
+        if shown is not None:
+            return shown
+        cached = self._cached_review(intent_id)
+        if cached is not None:
+            return cached
+        if not self._review_lock.acquire(blocking=False):
+            return self._cached_review(intent_id, ignore_age=True) or self._review_hold(
+                intent_id, R18ApprovalReason.REVIEW_BUSY
+            )
+        try:
+            # Another caller may have finished while this one waited.
+            shown = self._live_shown(intent_id)
+            if shown is not None:
+                return shown
+            cached = self._cached_review(intent_id)
+            if cached is not None:
+                return cached
+            result = self._review_computed(intent_id)
+        finally:
+            self._review_lock.release()
+        with self._lock:
+            if result.status in (ReviewStatus.WRITTEN, ReviewStatus.PENDING, ReviewStatus.BUILT):
+                self._shown[intent_id] = result
+                self._reviewed.pop(intent_id, None)
+            else:
+                if len(self._reviewed) >= MAX_REVIEW_CACHE:
+                    self._reviewed.clear()
+                self._reviewed[intent_id] = (self._monotonic(), result)
+        return result
+
+    def _review_computed(self, intent_id: str) -> ReviewResult:
         try:
             return self._review(intent_id)
         except (HistoryStoreError, AgentStateLoadError):
@@ -605,6 +666,41 @@ class ApprovalChallengeOwnerV1:
             return self._review_hold(intent_id, _map(hold.reason.name))
         except _Deny as denied:
             return self._review_hold(intent_id, _map(denied.reason.name))
+
+    def _live_shown(self, intent_id: str) -> ReviewResult | None:
+        """The challenge shown for this Intent while it is still live (no read)."""
+
+        with self._lock:
+            shown = self._shown.get(intent_id)
+            if shown is None or shown.challenge is None:
+                return None
+            if not shown.challenge.is_live(_fmt(self._clock()), self._boot_id):
+                del self._shown[intent_id]
+                return None
+            if shown.status is ReviewStatus.BUILT:
+                # A repeat of a built challenge is the pending one.
+                shown = replace(shown, status=ReviewStatus.PENDING)
+                self._shown[intent_id] = shown
+            return shown
+
+    def _cached_review(self, intent_id: str, *, ignore_age: bool = False) -> ReviewResult | None:
+        with self._lock:
+            entry = self._reviewed.get(intent_id)
+            if entry is None:
+                return None
+            at, result = entry
+            if ignore_age or self._monotonic() - at < MIN_REVIEW_INTERVAL:
+                return result
+            del self._reviewed[intent_id]
+            return None
+
+    def invalidate(self, intent_id: str) -> None:
+        """Forget what a review showed for an Intent (a CLAIM, IP-17c, calls
+        this when it consumes the challenge)."""
+
+        with self._lock:
+            self._shown.pop(intent_id, None)
+            self._reviewed.pop(intent_id, None)
 
     @staticmethod
     def _review_hold(intent_id: str, reason: R18ApprovalReason) -> ReviewResult:
@@ -707,6 +803,70 @@ class ApprovalChallengeOwnerV1:
             return self._hold(R18ApprovalReason.UNKNOWN_CHALLENGE, None)
         if intent_id.startswith(INVERSE_INTENT_ID_PREFIX):
             return self._hold(R18ApprovalReason.INVERSE_DEFERRED, intent_id)
+        # A wrong code never reaches the Runtime: it is compared here, in the
+        # caller's thread, against the challenge shown (the pending one, or
+        # the written one), with no read and no event (the handler checks it
+        # again as defence in depth).
+        pending = self.pending_challenge(intent_id)
+        with self._lock:
+            shown = self._shown.get(intent_id)
+        for known in (pending, None if shown is None else shown.challenge):
+            if (
+                known is not None
+                and known.nonce == nonce
+                and not hmac.compare_digest(code, known.confirmation_code)
+            ):
+                return self._hold(R18ApprovalReason.CODE_MISMATCH, intent_id)
+        existing = self._existing(intent_id, nonce, code)
+        if existing is not None:
+            return existing
+        if pending is None or pending.nonce != nonce:
+            return self._hold(R18ApprovalReason.UNKNOWN_CHALLENGE, intent_id)
+        try:
+            result = self._issue_event(pending, code)
+            if (
+                result.status is ApprovalStatus.HOLD
+                and result.reason is R18ApprovalReason.PREVIOUS_CHALLENGE_OPEN
+                and result.challenge_digest is not None
+            ):
+                # The earlier challenge is dead: end it first (§3 step 5), once.
+                ended = self._expire_event(result.challenge_digest)
+                if ended.status not in (ApprovalStatus.EXPIRED, ApprovalStatus.EXPIRE_EXISTING):
+                    return ended
+                result = self._issue_event(pending, code)
+        except Exception:  # a refused band, a stopped Runtime, a timeout
+            LOGGER.warning("R18 approval confirm could not run its event")
+            return self._hold(R18ApprovalReason.JOURNAL_UNAVAILABLE, intent_id)
+        if result.status is ApprovalStatus.HOLD and result.reason is R18ApprovalReason.NONCE_USED:
+            # A lost race: another confirm wrote this very challenge first.
+            existing = self._existing(intent_id, nonce, code)
+            if existing is not None:
+                result = existing
+        if result.status is ApprovalStatus.HOLD:
+            # What a review showed may be stale (drift, supersession): the next
+            # review reads the ledger again (still rate limited), and the
+            # pending challenge itself is untouched.
+            with self._lock:
+                self._shown.pop(intent_id, None)
+        if result.status is ApprovalStatus.ISSUED and result.challenge is not None:
+            with self._lock:
+                window_end = None if shown is None else shown.window_end_utc
+                self._shown[intent_id] = ReviewResult(
+                    ReviewStatus.WRITTEN,
+                    intent_id,
+                    None,
+                    result.challenge,
+                    result.attempt,
+                    window_end,
+                )
+                self._reviewed.pop(intent_id, None)
+            self._arm(result.challenge, 0)
+        return result
+
+    def _existing(self, intent_id: str, nonce: str, code: str) -> ApprovalResult | None:
+        """A written challenge with this nonce: EXISTING when live, unconsumed
+        and the code is right; a HOLD when not; None when none is written."""
+
         try:
             classified = self._policy._classify()
             now = self._clock()
@@ -716,40 +876,24 @@ class ApprovalChallengeOwnerV1:
         except _PolicyHold as hold:
             return self._hold(_map(hold.reason.name), intent_id)
         written = [c for c in facts.challenges if c.nonce == nonce]
-        if written:
-            challenge = written[0]
-            if (
-                challenge.challenge_digest in facts.expired
-                or challenge.challenge_digest in facts.consumed
-                or not challenge.is_live(_fmt(now), self._boot_id)
-            ):
-                return self._hold(R18ApprovalReason.CHALLENGE_NOT_LIVE, intent_id)
-            if not hmac.compare_digest(code, challenge.confirmation_code):
-                return self._hold(R18ApprovalReason.CODE_MISMATCH, intent_id)
-            return ApprovalResult(
-                ApprovalStatus.EXISTING,
-                intent_id,
-                None,
-                facts.challenges.index(challenge) + 1,
-                challenge,
-            )
-        pending = self.pending_challenge(intent_id)
-        if pending is None or pending.nonce != nonce:
-            return self._hold(R18ApprovalReason.UNKNOWN_CHALLENGE, intent_id)
-        result = self._issue_event(pending, code)
+        if not written:
+            return None
+        challenge = written[0]
         if (
-            result.status is ApprovalStatus.HOLD
-            and result.reason is R18ApprovalReason.PREVIOUS_CHALLENGE_OPEN
-            and result.challenge_digest is not None
+            challenge.challenge_digest in facts.expired
+            or challenge.challenge_digest in facts.consumed
+            or not challenge.is_live(_fmt(now), self._boot_id)
         ):
-            # The earlier challenge is dead: end it first (§3 step 5), once.
-            ended = self._expire_event(result.challenge_digest)
-            if ended.status not in (ApprovalStatus.EXPIRED, ApprovalStatus.EXPIRE_EXISTING):
-                return ended
-            result = self._issue_event(pending, code)
-        if result.status is ApprovalStatus.ISSUED and result.challenge is not None:
-            self._arm(result.challenge, 0)
-        return result
+            return self._hold(R18ApprovalReason.CHALLENGE_NOT_LIVE, intent_id)
+        if not hmac.compare_digest(code, challenge.confirmation_code):
+            return self._hold(R18ApprovalReason.CODE_MISMATCH, intent_id)
+        return ApprovalResult(
+            ApprovalStatus.EXISTING,
+            intent_id,
+            None,
+            facts.challenges.index(challenge) + 1,
+            challenge,
+        )
 
     def _issue_event(self, challenge: ApprovalChallengeV1, code: str) -> ApprovalResult:
         return self._run(self._submit_issue(challenge, code))
@@ -870,7 +1014,10 @@ class ApprovalChallengeOwnerV1:
 
         from suzka.r18.requalify import commitment_deadline
 
-        at = commitment_deadline(self._preview, requalified.q)
+        try:
+            at = commitment_deadline(self._preview, requalified.q)
+        except RequalifyFailed:
+            raise _ApprovalHold(R18ApprovalReason.SOURCE_NOT_CURRENT, intent.intent_id) from None
         expected = None if at is None else _fmt(at.replace(microsecond=0))
         if expected != challenge.commitment_deadline_utc:
             raise _ApprovalHold(R18ApprovalReason.CHALLENGE_STALE, intent.intent_id)
@@ -1135,7 +1282,13 @@ class ApprovalChallengeOwnerV1:
         if not self._enabled or self._scan_thread is not None:
             return
         self._stopped = False
-        if not self._store.has_record_operations():
+        self._stop_event.clear()
+        try:
+            has_records = self._store.has_record_operations()
+        except Exception:  # closed code only; the lazy path / window cover it
+            LOGGER.warning("R18 approval startup scan skipped: history_unavailable")
+            return
+        if not has_records:
             return
         thread = threading.Thread(
             target=self._startup_scan, name="suzka-r18-approval-scan", daemon=True
@@ -1144,7 +1297,14 @@ class ApprovalChallengeOwnerV1:
         thread.start()
 
     def _startup_scan(self) -> None:
+        """Chain the scan over every dead challenge.  A transient HOLD that
+        names no challenge (the journal or store was briefly unavailable) is
+        retried ONCE after ``STARTUP_SCAN_RETRY_DELAY``; a second one ends the
+        scan, and whatever it left unended is ended by the lazy path (the next
+        confirm) or is closed by the window end (§8a)."""
+
         after: str | None = None
+        retried = False
         for _ in range(MAX_EXPIRE_SCANS_PER_STARTUP):
             if self._stopped:
                 return
@@ -1156,13 +1316,21 @@ class ApprovalChallengeOwnerV1:
             if result.status is ApprovalStatus.NONE_LEFT:
                 return
             if result.status is ApprovalStatus.HOLD and result.challenge_digest is None:
-                return
+                if (
+                    retried
+                    or result.reason not in TRANSIENT_APPROVAL_REASONS
+                    or self._stop_event.wait(STARTUP_SCAN_RETRY_DELAY)
+                ):
+                    return
+                retried = True
+                continue
             after = result.challenge_digest
 
     def stop(self) -> None:
         """Cancel the timers and join the startup scan (before the runtime stops)."""
 
         self._stopped = True
+        self._stop_event.set()
         with self._lock:
             timers = list(self._timers.values())
             self._timers.clear()

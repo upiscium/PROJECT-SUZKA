@@ -702,7 +702,9 @@ def test_every_insert_condition_holds_before_prepare(app, monkeypatch) -> None: 
         with monkeypatch.context() as patch:
             patch.setattr(owner, "_gate", SimpleNamespace(is_open=lambda: False))
             hold(R18ApprovalReason.ADMISSION_GATE_CLOSED)
+            owner.invalidate(intent.intent_id)
             assert owner.review(intent.intent_id).reason is R18ApprovalReason.ADMISSION_GATE_CLOSED
+        owner.invalidate(intent.intent_id)
         # The target cannot be opened / sources drift: HOLD, never a DENY.
         path = state.settings.r18.target_path
         moved = path.with_name("moved.sqlite3")
@@ -860,16 +862,35 @@ def test_the_soft_band_refuses_the_challenge_and_admits_the_expiry() -> None:
 
 
 def test_only_the_approval_owner_submits_the_approval_events() -> None:
+    """No other module names the approval event types / source, or calls the
+    owner's private submit methods; server.py has only its exact wiring."""
+
+    import re
+
     root = Path(__file__).resolve().parents[1] / "suzka"
-    allowed = {"approval_owner.py", "agent_runtime.py", "event_journal.py"}
+    types = re.compile(r"AgentEventType\.R18_(CHALLENGE_ISSUE|APPROVAL_EXPIRE)")
+    source = re.compile(r"AgentEventSource\.(API_R18_APPROVAL|RUNTIME_R18_APPROVAL_EXPIRE)")
+    submits = re.compile(r"\b_submit_(issue|expire|expire_scan)\b")
+    # file -> the exact count of allowed type mentions (an event list or table).
+    allowed_types = {"approval_owner.py": None, "event_journal.py": 1, "server.py": 2}
     for path in root.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
-        for name in ("R18_CHALLENGE_ISSUE", "R18_APPROVAL_EXPIRE"):
-            for needle in (f"AgentEventType.{name}", "AgentEventSource.API_R18_APPROVAL"):
-                if needle in text and path.name not in allowed and path.name != "server.py":
-                    raise AssertionError(f"{path} uses {needle}")
+        if path.name != "approval_owner.py":
+            assert not source.search(text), path
+            assert not submits.search(text), f"{path} calls a private approval submit"
+        found = types.findall(text)
+        if path.name in allowed_types:
+            if allowed_types[path.name] is not None:
+                assert len(found) == allowed_types[path.name], path
+        else:
+            assert not found, f"{path} uses an approval event type"
     server = (root / "api" / "server.py").read_text(encoding="utf-8")
-    assert ".submit(" not in server.split("_r18_approval_owner_for_commit")[1].split("_clear_r16_source")[0]
+    wiring = [line.strip() for line in server.splitlines() if types.search(line)]
+    assert wiring == [
+        "AgentEventType.R18_CHALLENGE_ISSUE,",
+        "AgentEventType.R18_APPROVAL_EXPIRE,",
+    ]
+    assert "approval_owner.review" not in server and ".issue(" not in server
 
 
 # ============================================== §8a: no stop hinders the subject
@@ -1002,3 +1023,380 @@ def test_the_boot_id_is_a_fresh_uuid_per_owner(app) -> None:  # type: ignore[no-
                     enabled=False,
                     ttl_seconds=bad,  # type: ignore[arg-type]
                 )
+
+
+# ============================================ review fixes (independent review)
+
+
+def _count_inspects(state, monkeypatch) -> list[int]:  # type: ignore[no-untyped-def]
+    calls = [0]
+    real = state.event_journal.inspect
+
+    def counting(*args, **kwargs):  # type: ignore[no-untyped-def]
+        calls[0] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(state.event_journal, "inspect", counting)
+    return calls
+
+
+def test_rapid_reviews_are_coalesced_and_cannot_stall_the_journal(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Condition B: a caller looping on review does not loop the journal read
+    (``inspect`` holds the journal lock)."""
+
+    import threading
+
+    with TestClient(app) as client:
+        state = client.app.state
+        owner = state.approval_owner
+        _fake_timers(state)
+        _Clock(state)
+        now = [1000.0]
+        owner._monotonic = lambda: now[0]
+        _gid, intent, _forecast = _allowed(state)
+        calls = _count_inspects(state, monkeypatch)
+        # A live (built, then pending) challenge: one read in total.
+        for _ in range(100):
+            assert owner.review(intent.intent_id).challenge is not None
+        assert calls[0] <= 2
+        # A HOLD (unknown Intent): one read per interval, however many callers.
+        calls[0] = 0
+        unknown = "intent-" + "0" * 64
+        for _ in range(100):
+            assert owner.review(unknown).reason is R18ApprovalReason.INTENT_UNKNOWN
+        assert calls[0] <= 2
+        now[0] += 2.5
+        owner.review(unknown)
+        assert calls[0] <= 4
+        # Concurrent callers: one read at a time, the rest get the cached
+        # result or REVIEW_BUSY.
+        calls[0] = 0
+        now[0] += 10
+        results: list[Any] = []
+
+        def loop() -> None:
+            for _ in range(25):
+                results.append(owner.review("intent-" + "1" * 64))
+
+        threads = [threading.Thread(target=loop) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert len(results) == 200 and calls[0] <= 3
+        assert {r.reason for r in results} <= {
+            R18ApprovalReason.INTENT_UNKNOWN,
+            R18ApprovalReason.REVIEW_BUSY,
+        }
+        assert _approval_rows(state) == [] and _approval_events(state) == 0
+
+
+def test_a_live_written_challenge_is_shown_without_a_read(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    with TestClient(app) as client:
+        state = client.app.state
+        owner = state.approval_owner
+        _fake_timers(state)
+        _Clock(state)
+        _gid, intent, _forecast = _allowed(state)
+        reviewed, issued = _confirm(state, intent.intent_id)
+        calls = _count_inspects(state, monkeypatch)
+        for _ in range(20):
+            again = owner.review(intent.intent_id)
+            assert (again.status, again.challenge, again.attempt) == (
+                ReviewStatus.WRITTEN,
+                reviewed.challenge,
+                1,
+            )
+        assert calls[0] == 0 and issued.status is ApprovalStatus.ISSUED
+
+
+def test_a_wrong_code_submits_no_event(app) -> None:  # type: ignore[no-untyped-def]
+    with TestClient(app) as client:
+        state = client.app.state
+        owner = state.approval_owner
+        _fake_timers(state)
+        _Clock(state)
+        _gid, intent, _forecast = _allowed(state)
+        review = owner.review(intent.intent_id)
+        assert review.challenge is not None
+        events = _approval_events(state)
+        for _ in range(5):
+            held = owner.issue(intent.intent_id, review.challenge.nonce, "WRONG000")
+            assert (held.status, held.reason) == (ApprovalStatus.HOLD, R18ApprovalReason.CODE_MISMATCH)
+        assert _approval_events(state) == events and _approval_rows(state) == []
+        _reviewed, issued = _confirm(state, intent.intent_id)
+        assert issued.status is ApprovalStatus.ISSUED
+        events = _approval_events(state)
+        held = owner.issue(intent.intent_id, review.challenge.nonce, "WRONG000")
+        assert held.reason is R18ApprovalReason.CODE_MISMATCH
+        assert _approval_events(state) == events
+
+
+def test_issue_never_raises_on_a_refused_band_or_a_timeout(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from concurrent.futures import Future, TimeoutError as FutureTimeout
+
+    from suzka.runtime.agent_runtime import AgentRuntimeStopped
+    from suzka.runtime.event_journal import EventJournalError
+
+    with TestClient(app) as client:
+        state = client.app.state
+        owner = state.approval_owner
+        _fake_timers(state)
+        _Clock(state)
+        _gid, intent, _forecast = _allowed(state)
+        review = owner.review(intent.intent_id)
+        assert review.challenge is not None
+        args = (intent.intent_id, review.challenge.nonce, review.challenge.confirmation_code)
+
+        def refused(challenge, code):  # type: ignore[no-untyped-def]
+            future: Future[Any] = Future()
+            future.set_exception(EventJournalError("journal_soft_limit"))
+            return future
+
+        def stopped(challenge, code):  # type: ignore[no-untyped-def]
+            raise AgentRuntimeStopped(None)  # type: ignore[arg-type]
+
+        def timeout(challenge, code):  # type: ignore[no-untyped-def]
+            return Future()  # never completes
+
+        for submit in (refused, stopped):
+            monkeypatch.setattr(owner, "_submit_issue", submit)
+            held = owner.issue(*args)
+            assert (held.status, held.reason) == (ApprovalStatus.HOLD, R18ApprovalReason.JOURNAL_UNAVAILABLE)
+        monkeypatch.setattr(owner, "_submit_issue", timeout)
+
+        def instant_timeout(future):  # type: ignore[no-untyped-def]
+            raise FutureTimeout()
+
+        monkeypatch.setattr(owner, "_run", instant_timeout)
+        held = owner.issue(*args)
+        assert held.reason is R18ApprovalReason.JOURNAL_UNAVAILABLE
+        assert _approval_rows(state) == []
+        # The pending challenge survives; the real path still works.
+        monkeypatch.undo()
+        _fake_timers(state)
+        assert owner.issue(*args).status is ApprovalStatus.ISSUED
+
+
+def test_start_survives_an_unreadable_store_and_the_scan_retries_once(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from concurrent.futures import Future
+
+    from suzka.r18 import approval_owner as module
+    from suzka.runtime.agent_runtime import AgentEventOutcome
+
+    with TestClient(app) as client:
+        state = client.app.state
+        owner = state.approval_owner
+        owner.stop()
+        owner._scan_thread = None
+
+        def broken() -> bool:
+            raise RuntimeError("store closed")
+
+        monkeypatch.setattr(state.subject_history_store, "has_record_operations", broken)
+        owner.start()
+        assert owner._scan_thread is None
+        monkeypatch.undo()
+        # The scan: one retry of a transient HOLD that names no challenge.
+        monkeypatch.setattr(module, "STARTUP_SCAN_RETRY_DELAY", 0.01)
+        script = [
+            owner._hold(R18ApprovalReason.HISTORY_UNAVAILABLE, None),
+            ApprovalResultFactory.none_left(),
+        ]
+        seen: list[Any] = []
+
+        def fake_scan(after):  # type: ignore[no-untyped-def]
+            seen.append(after)
+            future: Future[Any] = Future()
+            future.set_result(AgentEventOutcome(ip16a2._event(), script.pop(0)))
+            return future
+
+        monkeypatch.setattr(owner, "_submit_expire_scan", fake_scan)
+        owner._stopped = False
+        owner._startup_scan()
+        assert seen == [None, None] and script == []
+        # A second transient HOLD ends the scan (documented gap: the lazy path
+        # and the window cover it).
+        script[:] = [
+            owner._hold(R18ApprovalReason.HISTORY_UNAVAILABLE, None),
+            owner._hold(R18ApprovalReason.HISTORY_UNAVAILABLE, None),
+            ApprovalResultFactory.none_left(),
+        ]
+        seen.clear()
+        owner._startup_scan()
+        assert seen == [None, None] and len(script) == 1
+        # A non-transient HOLD without a digest is not retried.
+        script[:] = [owner._hold(R18ApprovalReason.R18_DISABLED, None)]
+        seen.clear()
+        owner._startup_scan()
+        assert seen == [None]
+
+
+class ApprovalResultFactory:
+    @staticmethod
+    def none_left():  # type: ignore[no-untyped-def]
+        from suzka.r18.approval_owner import ApprovalResult
+
+        return ApprovalResult(ApprovalStatus.NONE_LEFT, None)
+
+
+def test_a_lost_nonce_race_returns_the_written_challenge(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    with TestClient(app) as client:
+        state = client.app.state
+        owner = state.approval_owner
+        _fake_timers(state)
+        _Clock(state)
+        _gid, intent, _forecast = _allowed(state)
+        reviewed, issued = _confirm(state, intent.intent_id)
+        challenge = reviewed.challenge
+        assert challenge is not None and issued.status is ApprovalStatus.ISSUED
+        # The racing confirm still believes the nonce is only pending.
+        real = owner._existing
+        first = [True]
+
+        def lagging(intent_id, nonce, code):  # type: ignore[no-untyped-def]
+            if first[0]:
+                first[0] = False
+                return None
+            return real(intent_id, nonce, code)
+
+        monkeypatch.setattr(owner, "_existing", lagging)
+        owner._shown.clear()
+        events = _approval_events(state)
+        result = owner.issue(intent.intent_id, challenge.nonce, challenge.confirmation_code)
+        assert (result.status, result.challenge, result.attempt) == (
+            ApprovalStatus.EXISTING,
+            challenge,
+            1,
+        )
+        assert _approval_events(state) == events + 1 and len(_approval_rows(state)) == 1
+
+
+def test_a_confirm_holds_on_a_target_mismatch_and_on_exhausted_attempts(app) -> None:  # type: ignore[no-untyped-def]
+
+    with TestClient(app) as client:
+        state = client.app.state
+        owner = state.approval_owner
+        _fake_timers(state)
+        clock = _Clock(state)
+        _gid, intent, _forecast = _allowed(state)
+        # Three written challenges, two ended, the third dead and unended: a
+        # fourth attempt is refused (the Intent is still open: 2 expiries).
+        for attempt in (1, 2):
+            reviewed, issued = _confirm(state, intent.intent_id)
+            assert issued.attempt == attempt and reviewed.challenge is not None
+            clock.advance(301)
+            assert _expire(state, reviewed.challenge).status is ApprovalStatus.EXPIRED
+        reviewed, issued = _confirm(state, intent.intent_id)
+        assert issued.attempt == 3
+        clock.advance(301)
+        exhausted = owner.review(intent.intent_id)
+        assert (exhausted.status, exhausted.reason) == (
+            ReviewStatus.HOLD,
+            R18ApprovalReason.ATTEMPTS_EXHAUSTED,
+        )
+        assert len(_approval_rows(state, HistoryOperationKind.R18_CHALLENGE_ISSUE)) == 3
+
+    # The same for a target that changed after the review.
+    # (A fresh app: another store.)
+
+
+def test_a_confirm_holds_on_a_target_mismatch(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from suzka.r18.target import TargetStore
+
+    with TestClient(_app(_settings(tmp_path / "mismatch"))) as client:
+        state = client.app.state
+        owner = state.approval_owner
+        _fake_timers(state)
+        _Clock(state)
+        _gid, intent, _forecast = _allowed(state)
+        review = owner.review(intent.intent_id)
+        assert review.challenge is not None
+        target = TargetStore.open(state.settings.r18.target_path)
+        try:
+            target.fence(intent.obligation_group_key, Direction.FORWARD)
+        finally:
+            target.close()
+        owner.invalidate(intent.intent_id)
+        held = owner.issue(intent.intent_id, review.challenge.nonce, review.challenge.confirmation_code)
+        assert (held.status, held.reason) == (ApprovalStatus.HOLD, R18ApprovalReason.TARGET_MISMATCH)
+        assert _approval_rows(state) == []
+        # A review no longer shows it (cache dropped by the HOLD; interval ok).
+        owner._monotonic = lambda: 10**9
+        assert owner.review(intent.intent_id).reason is R18ApprovalReason.TARGET_MISMATCH
+
+
+def test_an_unadopted_prepared_row_is_in_flight(app) -> None:  # type: ignore[no-untyped-def]
+    """The real path: a PREPARED operation row of this Intent that is not
+    adopted holds its keys and its attempt count."""
+
+    from uuid import uuid4
+
+    from suzka.r16.history_records import (
+        ApprovalExpirationV1 as Expiration,
+        HistoryRecordOperationV1,
+    )
+    from suzka.r16.history_store import HistoryStoreError
+    from suzka.runtime.event_journal import TransactionKind
+
+    with TestClient(app) as client:
+        state = client.app.state
+        owner = state.approval_owner
+        _fake_timers(state)
+        clock = _Clock(state)
+        store = state.subject_history_store
+        _gid, intent, _forecast = _allowed(state)
+        reviewed, _issued = _confirm(state, intent.intent_id)
+        challenge = reviewed.challenge
+        assert challenge is not None
+        clock.advance(301)
+        operation = HistoryRecordOperationV1(
+            HistoryOperationKind.R18_APPROVAL_EXPIRE,
+            ip10._incarnation(state),
+            str(uuid4()),
+            10**6,
+            TransactionKind.EVENT_MUTATION.value,
+            RecordKind.APPROVAL_EXPIRATION,
+            Expiration.for_challenge(challenge, ExpirationReason.EXPIRED),
+        )
+        store.insert_prepared_record(
+            transaction_id=str(uuid4()),
+            operation_digest=operation.operation_digest,
+            operation=operation,
+        )
+        assert [r.phase for r in _approval_rows(state, HistoryOperationKind.R18_APPROVAL_EXPIRE)] == [
+            HistoryPhase.PREPARED
+        ]
+        kinds = frozenset({HistoryOperationKind.R18_APPROVAL_EXPIRE})
+        try:
+            classified = owner._policy._classify()
+        except Exception as blocked:  # a stray PREPARED row blocks the reader
+            from suzka.r18.policy_owner import _PolicyHold
+
+            assert isinstance(blocked, _PolicyHold)
+            # The reader refuses to classify at all (a global block), so the
+            # handler HOLDs earlier than ``_in_flight`` can: not reachable.
+            held = _expire(state, challenge)
+            assert (held.status, held.reason) in (
+                (ApprovalStatus.HOLD, R18ApprovalReason.HISTORY_UNAVAILABLE),
+                (ApprovalStatus.HOLD, R18ApprovalReason.HISTORY_CONFLICT),
+            )
+        else:
+            assert owner._in_flight(classified, intent.intent_id, kinds) is True
+            held = _expire(state, challenge)
+            assert held.status is ApprovalStatus.HOLD
+        assert HistoryStoreError  # imported for the store contract
+        # Why the real path is not reachable through the server: the reader
+        # blocks the whole incarnation on a PREPARED row that has no journal
+        # transaction, so the handler HOLDs at the classification, before
+        # ``_in_flight``.  ``_in_flight`` (a FINALIZED-but-not-adopted row, a
+        # race) is therefore tested on the row the store really holds.
+        row = _approval_rows(state, HistoryOperationKind.R18_APPROVAL_EXPIRE)[0]
+        fake = SimpleNamespace(records=(), rows=(row,))
+        assert owner._in_flight(fake, intent.intent_id, kinds) is True  # type: ignore[arg-type]
+        assert owner._in_flight(fake, "intent-" + "9" * 64, kinds) is False  # type: ignore[arg-type]
+        adopted = SimpleNamespace(
+            records=(SimpleNamespace(record=Expiration.for_challenge(challenge, ExpirationReason.EXPIRED)),),
+            rows=(row,),
+        )
+        assert owner._in_flight(adopted, intent.intent_id, kinds) is False  # type: ignore[arg-type]
