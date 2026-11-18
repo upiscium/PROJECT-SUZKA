@@ -433,10 +433,12 @@ def test_crash_between_intent_and_forecast_is_completed_by_the_restart_scan(tmp_
         time.sleep(0.5)
         assert _forecast_events(state) == 2
         adopted = _adopted(state)
-        assert [r.record_kind for r in adopted] == [
+        # IP-17a: the driver's Policy stage may follow with a verdict.
+        assert [r.record_kind for r in adopted][:2] == [
             RecordKind.ACTION_INTENT,
             RecordKind.ACTION_FORECAST,
         ]
+        assert {r.record_kind for r in adopted[2:]} <= {RecordKind.POLICY_VERDICT}
         assert adopted[1].record.action_intent_id == intent.intent_id
         _no_failed_events(state)
 

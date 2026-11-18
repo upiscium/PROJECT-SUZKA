@@ -248,6 +248,9 @@ class R18Settings(StrictBaseModel):
     # obligation secret (``obligation.key`` in the same private directory).
     # Only ``python -m suzka.r18.target_init`` creates them; startup never does.
     target_path: Path = Path(".suzka/private/r18/target.sqlite3")
+    # IP-17a (#411 D1 r7 §3a, HD-16 (a)): each forward Intent's approval
+    # window; an unclaimed Intent closes at its end with no event.
+    approval_window_seconds: StrictInt = Field(default=3600, ge=600, le=86_400)
 
 
 class R19Settings(StrictBaseModel):

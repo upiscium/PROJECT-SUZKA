@@ -85,6 +85,8 @@ from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinato
 from suzka.r16.decision_issuer import _DecisionIssuer
 from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
 from suzka.r17.expectation_issuer import ExpectationIssuerV1
+from suzka.r18.admission import ALWAYS_OPEN_UNTIL_IP18
+from suzka.r18.policy_owner import ReviewArtifactPolicyV1
 from suzka.r16.history_attestation import SubjectHistoryAttestationProvider
 from suzka.runtime.r15_interpretation_reader import R15InterpretationReader
 from suzka.runtime.journal_compaction import (
@@ -531,6 +533,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise StateRecoveryError("R17 expectation issuer unavailable")
             return issuer
 
+        def _r18_policy_owner_for_commit(
+            event: AgentEvent,
+        ) -> ReviewArtifactPolicyV1 | None:
+            owner = getattr(app.state, "policy_owner", None)
+            if owner is None and event.event_type is AgentEventType.R18_POLICY_COMMIT:
+                raise StateRecoveryError("R18 Policy owner unavailable")
+            return owner
+
         def _clear_r16_source(event: AgentEvent) -> None:
             owner = getattr(app.state, "_motivation_source_owner", None)
             if owner is not None:
@@ -550,6 +560,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             expectation_issuer = getattr(app.state, "expectation_issuer", None)
             if expectation_issuer is not None:
                 expectation_issuer._clear()
+            policy_owner = getattr(app.state, "policy_owner", None)
+            if policy_owner is not None:
+                policy_owner._clear()
 
         def _internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
             nonlocal committed_snapshot, committed_snapshot_hash
@@ -579,6 +592,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 expectation_issuer = _r17_expectation_issuer_for_commit(event)
                 if expectation_issuer is not None:
                     expectation_issuer._validate_commit(event)
+                policy_owner = _r18_policy_owner_for_commit(event)
+                if policy_owner is not None:
+                    policy_owner._validate_commit(event)
                 validate_belief_commit = getattr(
                     app.state.main_loop, "_validate_belief_event_commit", None
                 )
@@ -865,6 +881,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.decision_issuer = None
             app.state.intent_issuer = None
             app.state.expectation_issuer = None
+            app.state.policy_owner = None
             history_store = getattr(app.state, "subject_history_store", None)
             if history_store is not None and preview_owner is not None:
                 interpretation_reader = R15InterpretationReader(
@@ -892,6 +909,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.agent_runtime,
                     enabled=app_settings.r18.enabled,
                     target_path=app_settings.r18.target_path,
+                    # IP-17a (D1 r7 §3a): the Intent's approval window.
+                    approval_window_seconds=app_settings.r18.approval_window_seconds,
+                    # IP-17a (§2-7): the real gate is IP-18's sweep.
+                    admission_gate=ALWAYS_OPEN_UNTIL_IP18,
                 )
                 # IP-16a-3 (#411 D1 §1/§4): the R17 forecast issuer, installed
                 # and gated exactly like the Intent issuer.
@@ -900,6 +921,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.agent_runtime,
                     enabled=app_settings.r18.enabled,
                 )
+                # IP-17a (#411 D1 r7 §1/§2): the R18 Policy owner, installed
+                # and gated exactly like the Intent issuer.
+                app.state.policy_owner = ReviewArtifactPolicyV1(
+                    app.state.decision_issuer,
+                    app.state.agent_runtime,
+                    enabled=app_settings.r18.enabled,
+                    target_path=app_settings.r18.target_path,
+                    admission_gate=ALWAYS_OPEN_UNTIL_IP18,
+                )
             # IP-6b (#370 R20-DRV): the R16 driver exists only with every
             # owner bound; it runs only after the unique activation event.
             if preview_owner is None:
@@ -907,6 +937,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else:
                 intent_issuer = app.state.intent_issuer
                 expectation_issuer = app.state.expectation_issuer
+                policy_owner = app.state.policy_owner
                 app.state.r16_driver = R16Driver(
                     app.state.agent_runtime,
                     app.state._motivation_source_owner,
@@ -929,6 +960,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         expectation_issuer
                         if expectation_issuer is not None
                         and expectation_issuer.enabled
+                        else None
+                    ),
+                    policy_owner=(
+                        policy_owner
+                        if policy_owner is not None and policy_owner.enabled
                         else None
                     ),
                 )

@@ -438,6 +438,7 @@ def payload_digest(payload: bytes) -> str:
 _INTENT_BODY: Final = (
     "admitting_event_id",
     "admitting_sequence",
+    "approval_window_end_utc",
     "artifact",
     "decision_committed_digest",
     "decision_id",
@@ -466,6 +467,11 @@ class ActionIntentV1:
     Only from a terminal row-4 CommittedDecision of a user-request Goal: a
     self-origin (MOTIVATION) Goal is refused (#368 2026-11-14, defence in depth
     with R16's Plan B ban). The artifact P is carried by value (#371 D6-A7).
+
+    IP-17a (#411 D1 r7 §3a / §12-1): ``approval_window_end_utc`` is the end of
+    the approval window, fixed by the issuer and bound into ``intent_digest``.
+    At or after it an unclaimed forward Intent is closed
+    (APPROVAL_EXPIRED_UNCLAIMED, derived by the ledger reader with no event).
     """
 
     lineage_scope: str
@@ -482,6 +488,7 @@ class ActionIntentV1:
     target_instance_id: str
     target_expected_revision: int
     artifact: ReviewArtifactV1
+    approval_window_end_utc: str
 
     def __post_init__(self) -> None:
         identifier(self.lineage_scope, "lineage_scope")
@@ -514,6 +521,7 @@ class ActionIntentV1:
             self.decision_committed_digest,
         ):
             raise ValueError("the artifact's DECISION source is not this Decision")
+        _utc(self.approval_window_end_utc, "approval_window_end_utc")
         _bounded(self.canonical_bytes(), MAX_RECORD_BYTES, "action intent")
 
     @property
@@ -532,10 +540,22 @@ class ActionIntentV1:
     def payload_digest(self) -> str:
         return self.artifact.payload_digest
 
+    @property
+    def approval_window_end(self) -> datetime:
+        """The window end as an aware UTC moment."""
+        return _utc(self.approval_window_end_utc, "approval_window_end_utc")
+
+    def window_open(self, now: datetime) -> bool:
+        """§3a: ``now < approval_window_end_utc`` (an aware clock read)."""
+        if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("the window clock must be timezone-aware")
+        return now < self.approval_window_end
+
     def _body(self) -> dict[str, object]:
         return {
             "admitting_event_id": self.admitting_event_id,
             "admitting_sequence": self.admitting_sequence,
+            "approval_window_end_utc": self.approval_window_end_utc,
             "artifact": self.artifact.canonical_value(),
             "decision_committed_digest": self.decision_committed_digest,
             "decision_id": self.decision_id,
@@ -592,6 +612,7 @@ class ActionIntentV1:
             target_instance_id=_str(row["target_instance_id"]),
             target_expected_revision=_int(row["target_expected_revision"]),
             artifact=ReviewArtifactV1.from_value(row["artifact"]),
+            approval_window_end_utc=_str(row["approval_window_end_utc"]),
         )
         if value.canonical_bytes() != payload:
             raise ValueError("action intent bytes are not canonical")

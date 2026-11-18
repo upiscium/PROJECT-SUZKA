@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 from dataclasses import replace
+from datetime import timedelta, timezone
 import os
 from pathlib import Path
 import time
@@ -277,8 +278,21 @@ def test_commitment_deadline_margin_holds(app, monkeypatch) -> None:  # type: ig
         monkeypatch.setattr(issuer, "_clock", lambda: at + decision_module.DEADLINE_MARGIN)
         assert _intent(state, decision.lineage_scope).reason is R18IntentReason.DEADLINE_ELAPSED
         assert _intent_rows(state) == []
-        monkeypatch.setattr(issuer, "_clock", lambda: at - decision_module.DEADLINE_MARGIN * 2)
-        assert _intent(state, decision.lineage_scope).status is IntentIssueStatus.ISSUED
+        # IP-17a §3a: a window shorter than MIN_APPROVAL_WINDOW (it ends at
+        # ``deadline - DEADLINE_MARGIN``) is DEADLINE_ELAPSED too.
+        from suzka.r18.intent_issuer import MIN_APPROVAL_WINDOW
+
+        short = at - decision_module.DEADLINE_MARGIN - MIN_APPROVAL_WINDOW + timedelta(seconds=1)
+        monkeypatch.setattr(issuer, "_clock", lambda: short)
+        assert _intent(state, decision.lineage_scope).reason is R18IntentReason.DEADLINE_ELAPSED
+        assert _intent_rows(state) == []
+        enough = at - decision_module.DEADLINE_MARGIN - MIN_APPROVAL_WINDOW - timedelta(seconds=1)
+        monkeypatch.setattr(issuer, "_clock", lambda: enough)
+        issued = _intent(state, decision.lineage_scope)
+        assert issued.status is IntentIssueStatus.ISSUED
+        # The window ends at the deadline margin (floored to the second).
+        end = (at - decision_module.DEADLINE_MARGIN).astimezone(timezone.utc).replace(microsecond=0)
+        assert issued.intent.approval_window_end_utc == end.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def test_drifted_sources_hold(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -306,7 +320,8 @@ def test_deadline_is_checked_again_after_the_slow_reads(app, monkeypatch) -> Non
         at = state.main_loop._commitment_system.get(commitment_id).deadline.at
         if at is None:
             pytest.skip("fixture Commitment has no deadline")
-        now = [at - decision_module.DEADLINE_MARGIN * 2]
+        # IP-17a: early enough for a window of at least MIN_APPROVAL_WINDOW.
+        now = [at - decision_module.DEADLINE_MARGIN - timedelta(minutes=10)]
         issuer = state.intent_issuer
         monkeypatch.setattr(issuer, "_clock", lambda: now[0])
         real_open = intent_module.TargetReader.open

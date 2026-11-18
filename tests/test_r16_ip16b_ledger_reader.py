@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -39,6 +40,7 @@ from suzka.r16.history_records import (
 )
 from suzka.r16.history_store import HistoryPhase, HistoryStoreRecordsDisabled
 from suzka.r16.successor_policy import (
+    CLOSED_UNCLAIMED_LEDGER,
     MAX_LEDGER_REFS,
     CommitmentState,
     FeedbackState,
@@ -111,6 +113,8 @@ OTHER = "2" * 64
 BOOT = "00000000-0000-4000-8000-0000000000bb"
 RUNTIME = "00000000-0000-4000-8000-0000000000cc"
 H = "a" * 64
+# IP-17a: the pure derivation's clock, before the fixture window end.
+NOW = datetime(2026, 11, 16, 0, 30, tzinfo=timezone.utc)
 
 
 @pytest.fixture
@@ -537,13 +541,16 @@ def test_each_forward_and_inverse_state_maps_to_its_row(app, monkeypatch) -> Non
         _no_failed_events(state)
 
 
-def test_a_denied_intent_is_policy_denied_row_2(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_a_denied_intent_is_policy_denied_row_2c(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """IP-17a (§12-2): POLICY_DENIED closed the obligation; V3 row 2c."""
+
     with TestClient(app) as client:
         state = client.app.state
         seen = _Seen(monkeypatch)
         gid, _decision, intent, _forecast = _forward(state)
         verdict = _verdict(state, intent, PolicyVerdict.DENY)
-        assert _preview(state, gid, seen).row is SuccessorRow.ROW_2
+        issued = _preview(state, gid, seen)
+        assert (issued.status, issued.row) == (DecisionIssueStatus.ISSUED, SuccessorRow.ROW_2C)
         assert seen.last.ledger is LedgerState.POLICY_DENIED
         assert _refs(seen.last) == sorted(
             [(INTENT_REF_KIND, intent.intent_id), (VERDICT_REF_KIND, verdict.verdict_digest)]
@@ -754,7 +761,7 @@ def test_a_tampered_prior_claim_digest_is_corrupt(app, monkeypatch) -> None:  # 
 
 def test_end_to_end_chat_to_intent_and_forecast_then_row_2(tmp_path) -> None:  # type: ignore[no-untyped-def]
     """§7 end to end (HP-6, lab only): CHAT -> ... -> Decision row 4 ->
-    Intent -> forecast through the real driver; PLAN_PREVIEW afterwards is
+    Intent -> forecast (-> IP-17a ALLOW) through the real driver; PLAN_PREVIEW afterwards is
     row 2 and issues nothing."""
 
     import time
@@ -773,11 +780,12 @@ def test_end_to_end_chat_to_intent_and_forecast_then_row_2(tmp_path) -> None:  #
             commit = ip16a2._chat(client, f"COMMIT_REVIEW_EXPERIENCE:1:{x['experience_id']}")
             assert _settled(client, commit["command_ticket"]["ticket_id"])["status"] == "accepted"
             reader = SubjectHistoryReader(state.event_journal, state.subject_history_store)
-            ip16a2._until(lambda: len(reader.adopted_records().records) >= 2, timeout=30)
+            # IP-17a: the driver's Policy stage follows the forecast (ALLOW).
+            ip16a2._until(lambda: len(reader.adopted_records().records) >= 3, timeout=30)
             time.sleep(0.5)
             records = reader.adopted_records()
             kinds = [item.record_kind for item in records.records]
-            assert kinds == [R.ACTION_INTENT, R.ACTION_FORECAST]
+            assert kinds == [R.ACTION_INTENT, R.ACTION_FORECAST, R.POLICY_VERDICT]
             intent = records.records[0].record
             assert type(intent) is ActionIntentV1
             assert type(records.records[1].record) is ExpectedObservationV1
@@ -986,15 +994,16 @@ def test_derived_forward_states_and_their_policy_rows() -> None:
         (base, LedgerState.INTENT_ISSUED, SuccessorRow.ROW_2),
         ([*base, c[0]], LedgerState.INTENT_ISSUED, SuccessorRow.ROW_2),
         ([*base, c[0], expiries[0]], LedgerState.INTENT_ISSUED, SuccessorRow.ROW_2),
+        # IP-17a (§12-2): a closed unclaimed obligation is V3 row 2c.
         (
             [*base, c[0], expiries[0], c[1], expiries[1], c[2], expiries[2]],
             LedgerState.APPROVAL_EXPIRED_UNCLAIMED,
-            SuccessorRow.ROW_2,
+            SuccessorRow.ROW_2C,
         ),
         (
             [chain.intent, chain.forecast, replace(chain.verdict, verdict=PolicyVerdict.DENY, deny_reason=PolicyDenyReason.SOURCE_NOT_CURRENT)],
             LedgerState.POLICY_DENIED,
-            SuccessorRow.ROW_2,
+            SuccessorRow.ROW_2C,
         ),
         ([*base, c[0], chain.claim], LedgerState.CLAIMED, SuccessorRow.ROW_2),
     ]
@@ -1002,17 +1011,20 @@ def test_derived_forward_states_and_their_policy_rows() -> None:
         row = SuccessorRow.ROW_6 if state is VerifiedState.ACTIVE_VERIFIED_AUTHORIZED else SuccessorRow.ROW_2
         cases.append(([*base, c[0], chain.claim, _outcome_of(chain, state)], LedgerState(state.value), row))
     for records, ledger, row in cases:
-        read = derive_ledger(_at(*records), group)
+        read = derive_ledger(_at(*records), group, NOW)
         assert read.state is ledger, (ledger, read)
         assert _policy(read) is row, ledger
         assert list(read.refs) == sorted(read.refs, key=lambda ref: ref.sort_key)
         assert len(read.refs) <= MAX_LEDGER_REFS
         assert all(ref.kind != OUTCOME_REF_KIND for ref in read.refs)
-        if ledger is not LedgerState.NONE:
-            # A new lineage (no head) contradicts any non-NONE ledger.
+        if ledger in CLOSED_UNCLAIMED_LEDGER:
+            # IP-17a (§12-2): a new lineage on a closed group re-decides.
+            assert _policy(read, PredecessorState.ABSENT_INITIAL) is SuccessorRow.ROW_2C
+        elif ledger is not LedgerState.NONE:
+            # A new lineage (no head) contradicts any other non-NONE ledger.
             assert _policy(read, PredecessorState.ABSENT_INITIAL) is SuccessorRow.ROW_0
     # Records of another group are not this ledger.
-    assert derive_ledger(_at(chain.intent, chain.verdict), "f" * 64) == NO_LEDGER
+    assert derive_ledger(_at(chain.intent, chain.verdict), "f" * 64, NOW) == NO_LEDGER
 
 
 def test_derived_inverse_states_and_their_policy_rows() -> None:
@@ -1050,7 +1062,7 @@ def test_derived_inverse_states_and_their_policy_rows() -> None:
         ([inverse, verdict, challenge, claim, _outcome_of(chain, VerifiedState.REVERTED)], LedgerState.REVERTED),
     ]
     for extra, ledger in cases:
-        read = derive_ledger(_at(*forward, *extra), group)
+        read = derive_ledger(_at(*forward, *extra), group, NOW)
         assert read.state is ledger, (ledger, read)
         assert _policy(read) is SuccessorRow.ROW_2
         assert read.verified_outcome_ref is not None
@@ -1058,9 +1070,9 @@ def test_derived_inverse_states_and_their_policy_rows() -> None:
         assert len(read.refs) <= MAX_LEDGER_REFS
         assert (CLAIM_REF_KIND, chain.claim.claim_id) in [ref.sort_key for ref in read.refs]
         assert (INTENT_REF_KIND, chain.intent.intent_id) not in [ref.sort_key for ref in read.refs]
-    reverted = derive_ledger(_at(*forward, *cases[-1][0]), group)
+    reverted = derive_ledger(_at(*forward, *cases[-1][0]), group, NOW)
     assert reverted.inverse_authorization is InverseAuthorization.AUTHORIZED
-    full = derive_ledger(_at(*forward, inverse, verdict, challenge, claim), group)
+    full = derive_ledger(_at(*forward, inverse, verdict, challenge, claim), group, NOW)
     assert len(full.refs) == MAX_LEDGER_REFS
     assert [ref.kind for ref in full.refs] == sorted(ref.kind for ref in full.refs)
     # An inverse after UNAUTHORIZED_EFFECT is the same table.
@@ -1077,6 +1089,7 @@ def test_derived_inverse_states_and_their_policy_rows() -> None:
             ),
         ),
         group,
+        NOW,
     )
     assert after.state is LedgerState.INVERSE_INTENT_ISSUED
 
@@ -1113,13 +1126,13 @@ def test_inconsistent_record_sets_are_corrupt() -> None:
         ],  # an inverse of another Outcome
     ]
     for records in corrupt:
-        read = derive_ledger(_at(*records), group)
+        read = derive_ledger(_at(*records), group, NOW)
         assert read == LedgerRead(LedgerState.CORRUPT, (), None, None), records
         assert _policy(read) is SuccessorRow.ROW_0
     # A prior-incarnation Claim beside a forward record of this one.
     prior = PolicyRef(PRIOR_CLAIM_REF_KIND, chain.claim.claim_id, 1, chain.claim.claim_digest)
-    assert derive_ledger(_at(chain.intent), group, prior_claim=prior).state is LedgerState.CORRUPT
-    assert derive_ledger((), group, prior_claim=prior) == LedgerRead(LedgerState.CLAIMED, (prior,), None, None)
+    assert derive_ledger(_at(chain.intent), group, NOW, prior_claim=prior).state is LedgerState.CORRUPT
+    assert derive_ledger((), group, NOW, prior_claim=prior) == LedgerRead(LedgerState.CLAIMED, (prior,), None, None)
 
 
 def test_prior_claim_ref_checks_the_raw_row() -> None:
@@ -1153,7 +1166,7 @@ def test_latest_stage_ref_tie_break_is_expiry_then_challenge_then_verdict() -> N
 
     def stage_kinds(*records: object) -> list[str]:
         at = [RecordAt(chain.intent, 1), *(RecordAt(record, 5) for record in records)]
-        read = derive_ledger(at, group)
+        read = derive_ledger(at, group, NOW)
         return [ref.kind for ref in read.refs if ref.kind != INTENT_REF_KIND]
 
     for order in ((chain.verdict, chain.challenges[0], expiry), (expiry, chain.challenges[0], chain.verdict)):
@@ -1162,7 +1175,7 @@ def test_latest_stage_ref_tie_break_is_expiry_then_challenge_then_verdict() -> N
     assert stage_kinds(chain.verdict) == [VERDICT_REF_KIND]
     # A higher sequence still wins over the stage order.
     later = derive_ledger(
-        [RecordAt(chain.intent, 1), RecordAt(chain.challenges[0], 4), RecordAt(chain.verdict, 6)], group
+        [RecordAt(chain.intent, 1), RecordAt(chain.challenges[0], 4), RecordAt(chain.verdict, 6)], group, NOW
     )
     assert [ref.kind for ref in later.refs if ref.kind != INTENT_REF_KIND] == [VERDICT_REF_KIND]
 
