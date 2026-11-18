@@ -35,6 +35,7 @@ async function proxyAdminRequest(request: NextRequest, context: RouteContext): P
       "X-SUZKA-Admin-Token": ADMIN_TOKEN,
     },
     body,
+    redirect: "manual",
   });
 
   return new NextResponse(response.body, {

@@ -128,3 +128,31 @@ describe("admin proxy path hardening matrix", () => {
     expect(safeBackendPath(["adapters", "r18", "evaluate"])).toBeNull();
   });
 });
+
+describe("admin proxy redirects and per-rule path checks", () => {
+  it("does not follow backend redirects", async () => {
+    const mod = await load();
+    await call(mod, "GET", "/state/emotion", ["state", "emotion"]);
+    expect(fetchMock.mock.calls[0][1].redirect).toBe("manual");
+  });
+
+  it.each([
+    ["empty segment", ["state", ""], "/state/"],
+    ["dot", ["state", "."], "/state/."],
+    ["dotdot", ["state", ".."], "/state/.."],
+    ["backslash", ["memory", "episodes", "a\\b"], "/memory/episodes/a\\b"],
+    ["hash", ["memory", "episodes", "a#b"], "/memory/episodes/a#b"],
+    ["percent", ["memory", "episodes", "a%b"], "/memory/episodes/a%b"],
+    ["question mark", ["memory", "episodes", "a?b"], "/memory/episodes/a?b"],
+    ["control char", ["memory", "episodes", "a\u0001b"], "/memory/episodes/a\u0001b"],
+    ["slash in segment", ["memory", "episodes", "a/b"], "/memory/episodes/a/b"],
+    ["r18 segment", ["adapters", "R18", "evaluate"], "/adapters/R18/evaluate"],
+  ])("rejects %s in isolation (raw path otherwise matches)", (_n, segs, raw) => {
+    expect(safeBackendPath(segs, `/admin-proxy${raw}`)).toBeNull();
+  });
+
+  it("rejects raw/decoded mismatch in isolation", () => {
+    expect(safeBackendPath(["state", "emotion"], "/admin-proxy/state%2Femotion")).toBeNull();
+    expect(safeBackendPath(["state", "emotion"], "/admin-proxy/state/emotion")).toBe("state/emotion");
+  });
+});
