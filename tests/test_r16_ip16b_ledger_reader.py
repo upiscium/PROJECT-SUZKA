@@ -10,6 +10,8 @@ real ones.
 
 from __future__ import annotations
 
+from suzka.r18.contracts import ApprovalChannel
+
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -213,7 +215,7 @@ def _challenge(state, intent, verdict, attempt, forecast=None) -> ApprovalChalle
     if forecast is not None:
         record = ApprovalChallengeV1.for_forward(
             intent, forecast.forecast_digest, verdict, nonce=nonce,
-            issued_utc="2026-11-16T00:00:00Z", expires_utc="2026-11-16T00:10:00Z", boot_id=BOOT,
+            issued_utc="2026-11-16T00:00:00Z", expires_utc="2026-11-16T00:10:00Z", boot_id=BOOT, commitment_deadline_utc=None,
         )
     else:
         record = ApprovalChallengeV1.for_inverse(
@@ -241,7 +243,7 @@ def _claim(state, challenge, claimed_utc="2026-11-16T00:05:00Z") -> ExecutionCla
         record = ExecutionClaimV1.claim(
             challenge, runtime_instance_id=RUNTIME, boot_id=BOOT,
             claim_event_id=event.event_id, claim_sequence=event.processing_sequence,
-            claimed_utc=claimed_utc,
+            claimed_utc=claimed_utc, approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
         )
         return _operation(state, event, K.R18_EXECUTION_CLAIM, R.EXECUTION_CLAIM, record)
 
@@ -1042,7 +1044,7 @@ def test_derived_inverse_states_and_their_policy_rows() -> None:
     )
     claim = ExecutionClaimV1.claim(
         challenge, runtime_instance_id=RUNTIME, boot_id=BOOT, claim_event_id=chain.event("ic"),
-        claim_sequence=chain.seq(13), claimed_utc="2026-11-16T01:05:00Z",
+        claim_sequence=chain.seq(13), claimed_utc="2026-11-16T01:05:00Z", approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
     )
     denied = replace(verdict, verdict=PolicyVerdict.DENY, deny_reason=PolicyDenyReason.SOURCE_NOT_CURRENT)
     challenges = [

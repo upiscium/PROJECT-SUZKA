@@ -6,6 +6,8 @@ is a FIXTURE ONLY; nothing comes from a real Decision, operator or target.
 
 from __future__ import annotations
 
+from suzka.r18.contracts import ApprovalChannel
+
 from dataclasses import replace
 import os
 from pathlib import Path
@@ -634,7 +636,7 @@ class Chain:
         self.challenges = [self._challenge(attempt) for attempt in range(1, MAX_CHALLENGES_PER_INTENT + 2)]
         self.claim = ExecutionClaimV1.claim(
             self.challenges[0], runtime_instance_id=RUNTIME, boot_id=BOOT,
-            claim_event_id=self.event("claim"), claim_sequence=self.seq(4), claimed_utc="2026-11-16T00:05:00Z",
+            claim_event_id=self.event("claim"), claim_sequence=self.seq(4), claimed_utc="2026-11-16T00:05:00Z", approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
         )
         self.outcome = replace(
             _outcome(),
@@ -661,7 +663,7 @@ class Chain:
         return ApprovalChallengeV1.for_forward(
             self.intent, self.forecast.forecast_digest, self.verdict,
             nonce=f"{attempt:x}".rjust(64, "d") if self.sequence == 100 else f"{attempt:x}".rjust(64, "e"),
-            issued_utc="2026-11-16T00:00:00Z", expires_utc="2026-11-16T00:10:00Z", boot_id=BOOT,
+            issued_utc="2026-11-16T00:00:00Z", expires_utc="2026-11-16T00:10:00Z", boot_id=BOOT, commitment_deadline_utc=None,
         )
 
     def operation(self, kind: HistoryOperationKind, record_kind: RecordKind, record: object, step: int, attempt: int | None = None) -> HistoryRecordOperationV1:
@@ -874,7 +876,7 @@ def test_a_later_challenge_can_be_claimed(tmp_path: Path) -> None:
     _apply(store, chain.operation(K.R18_CHALLENGE_ISSUE, R.APPROVAL_CHALLENGE, chain.challenges[1], 21, attempt=2))
     claim = ExecutionClaimV1.claim(
         chain.challenges[1], runtime_instance_id=RUNTIME, boot_id=BOOT,
-        claim_event_id=chain.event("claim-2"), claim_sequence=chain.seq(22), claimed_utc="2026-11-16T00:05:00Z",
+        claim_event_id=chain.event("claim-2"), claim_sequence=chain.seq(22), claimed_utc="2026-11-16T00:05:00Z", approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
     )
     _apply(store, chain.operation(K.R18_EXECUTION_CLAIM, R.EXECUTION_CLAIM, claim, 22))
     # The expired first challenge can no longer be claimed.
@@ -943,7 +945,7 @@ def test_an_inverse_needs_a_verified_forward_effect(tmp_path: Path) -> None:
     _apply(store, chain.operation(K.R18_CHALLENGE_ISSUE, R.APPROVAL_CHALLENGE, challenge, 12, attempt=1))
     claim = ExecutionClaimV1.claim(
         challenge, runtime_instance_id=RUNTIME, boot_id=BOOT,
-        claim_event_id=chain.event("inverse-claim"), claim_sequence=chain.seq(13), claimed_utc="2026-11-16T01:05:00Z",
+        claim_event_id=chain.event("inverse-claim"), claim_sequence=chain.seq(13), claimed_utc="2026-11-16T01:05:00Z", approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
     )
     _apply(store, chain.operation(K.R18_EXECUTION_CLAIM, R.EXECUTION_CLAIM, claim, 13))
     reverted = replace(

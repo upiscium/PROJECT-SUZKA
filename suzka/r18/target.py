@@ -854,6 +854,7 @@ def _bind(
         or claim.nonce != challenge.nonce
         or claim.operation_key != challenge.operation_key
         or claim.boot_id != challenge.boot_id
+        or claim.commitment_deadline_utc != challenge.commitment_deadline_utc
     ):
         raise TargetBindingError("the claim is not this challenge's claim for this intent")
 

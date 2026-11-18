@@ -6,6 +6,8 @@ real Decision, operator or Runtime.
 
 from __future__ import annotations
 
+from suzka.r18.contracts import ApprovalChannel
+
 from dataclasses import replace
 import os
 from pathlib import Path
@@ -77,11 +79,11 @@ def _forward(store: TargetStore, group: str = GROUP, nonce: str = NONCE) -> tupl
     )
     challenge = ApprovalChallengeV1.for_forward(
         intent, "e" * 64, _allow(intent),
-        nonce=nonce, issued_utc="2026-11-16T00:00:00Z", expires_utc="2026-11-16T00:10:00Z", boot_id=BOOT,
+        nonce=nonce, issued_utc="2026-11-16T00:00:00Z", expires_utc="2026-11-16T00:10:00Z", boot_id=BOOT, commitment_deadline_utc=None,
     )
     claim = ExecutionClaimV1.claim(
         challenge, runtime_instance_id=RUNTIME, boot_id=BOOT,
-        claim_event_id=CLAIM_EVENT, claim_sequence=22, claimed_utc="2026-11-16T00:05:00Z",
+        claim_event_id=CLAIM_EVENT, claim_sequence=22, claimed_utc="2026-11-16T00:05:00Z", approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
     )
     return intent, challenge, claim
 
@@ -102,7 +104,7 @@ def _inverse_for(store: TargetStore, intent: ActionIntentV1) -> tuple[InverseInt
     )
     claim = ExecutionClaimV1.claim(
         challenge, runtime_instance_id=RUNTIME, boot_id=BOOT,
-        claim_event_id=CLAIM_EVENT, claim_sequence=32, claimed_utc="2026-11-16T01:05:00Z",
+        claim_event_id=CLAIM_EVENT, claim_sequence=32, claimed_utc="2026-11-16T01:05:00Z", approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
     )
     return inverse, challenge, claim
 
@@ -240,11 +242,11 @@ def test_double_execution_is_suppressed_across_reopen(tmp_path: Path) -> None:
     renewed = replace(renewed, selected_candidate_digest="9" * 64)
     renewed_challenge = ApprovalChallengeV1.for_forward(
         renewed, "e" * 64, _allow(renewed),
-        nonce="8" * 64, issued_utc="2026-11-16T00:00:00Z", expires_utc="2026-11-16T00:10:00Z", boot_id=BOOT,
+        nonce="8" * 64, issued_utc="2026-11-16T00:00:00Z", expires_utc="2026-11-16T00:10:00Z", boot_id=BOOT, commitment_deadline_utc=None,
     )
     renewed_claim = ExecutionClaimV1.claim(
         renewed_challenge, runtime_instance_id=RUNTIME, boot_id=BOOT,
-        claim_event_id=CLAIM_EVENT, claim_sequence=40, claimed_utc="2026-11-16T00:05:00Z",
+        claim_event_id=CLAIM_EVENT, claim_sequence=40, claimed_utc="2026-11-16T00:05:00Z", approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
     )
     assert again.forward_write(renewed, renewed_challenge, renewed_claim).executor_result is ExecutorResult.CAS_REJECTED
     assert [row.kind for row in again.ledger()] == [LedgerKind.EFFECT]
@@ -256,7 +258,7 @@ def test_the_written_bytes_must_be_the_approved_bytes(tmp_path: Path) -> None:
     wrong = replace(challenge, payload_digest="0" * 64)
     wrong_claim = ExecutionClaimV1.claim(
         wrong, runtime_instance_id=RUNTIME, boot_id=BOOT,
-        claim_event_id=CLAIM_EVENT, claim_sequence=22, claimed_utc="2026-11-16T00:05:00Z",
+        claim_event_id=CLAIM_EVENT, claim_sequence=22, claimed_utc="2026-11-16T00:05:00Z", approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
     )
     with pytest.raises(TargetBindingError, match="approve"):
         store.forward_write(intent, wrong, wrong_claim)
@@ -265,11 +267,11 @@ def test_the_written_bytes_must_be_the_approved_bytes(tmp_path: Path) -> None:
     other_target = replace(intent, target_instance_id="00000000-0000-4000-8000-0000000000ff")
     other_challenge = ApprovalChallengeV1.for_forward(
         other_target, "e" * 64, _allow(other_target),
-        nonce=NONCE, issued_utc="2026-11-16T00:00:00Z", expires_utc="2026-11-16T00:10:00Z", boot_id=BOOT,
+        nonce=NONCE, issued_utc="2026-11-16T00:00:00Z", expires_utc="2026-11-16T00:10:00Z", boot_id=BOOT, commitment_deadline_utc=None,
     )
     other_claim = ExecutionClaimV1.claim(
         other_challenge, runtime_instance_id=RUNTIME, boot_id=BOOT,
-        claim_event_id=CLAIM_EVENT, claim_sequence=22, claimed_utc="2026-11-16T00:05:00Z",
+        claim_event_id=CLAIM_EVENT, claim_sequence=22, claimed_utc="2026-11-16T00:05:00Z", approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
     )
     with pytest.raises(TargetBindingError, match="another target"):
         store.forward_write(other_target, other_challenge, other_claim)

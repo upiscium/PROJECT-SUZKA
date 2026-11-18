@@ -6,6 +6,8 @@ executed or verified, and no target is touched.
 
 from __future__ import annotations
 
+from suzka.r18.contracts import ApprovalChannel
+
 import ast
 from dataclasses import replace
 from hashlib import sha256
@@ -127,7 +129,7 @@ def _allow(intent: ActionIntentV1 | InverseIntentV1, **changes: Any) -> PolicyVe
 def _challenge(intent: ActionIntentV1 | None = None, **changes: Any) -> ApprovalChallengeV1:
     intent = intent or _intent()
     base = ApprovalChallengeV1.for_forward(
-        intent, EXPECTATION, _allow(intent), nonce=NONCE, issued_utc=ISSUED, expires_utc=EXPIRES, boot_id=BOOT
+        intent, EXPECTATION, _allow(intent), nonce=NONCE, issued_utc=ISSUED, expires_utc=EXPIRES, boot_id=BOOT, commitment_deadline_utc=None
     )
     return replace(base, **changes)
 
@@ -139,7 +141,7 @@ def _claim(challenge: ApprovalChallengeV1 | None = None) -> ExecutionClaimV1:
         boot_id=BOOT,
         claim_event_id=EVENT_C,
         claim_sequence=22,
-        claimed_utc="2026-11-16T00:05:00Z",
+        claimed_utc="2026-11-16T00:05:00Z", approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
     )
 
 
@@ -436,7 +438,7 @@ def test_challenge_cannot_be_built_with_a_missing_binding() -> None:
     intent = _intent()
     with pytest.raises(ValueError):
         ApprovalChallengeV1.for_forward(
-            intent, None, _allow(intent), nonce=NONCE, issued_utc=ISSUED, expires_utc=EXPIRES, boot_id=BOOT  # type: ignore[arg-type]
+            intent, None, _allow(intent), nonce=NONCE, issued_utc=ISSUED, expires_utc=EXPIRES, boot_id=BOOT, commitment_deadline_utc=None  # type: ignore[arg-type]
         )
     for field, value in (
         ("intent_digest", ""),
@@ -451,7 +453,7 @@ def test_challenge_cannot_be_built_with_a_missing_binding() -> None:
             _challenge(intent, **{field: value})
     with pytest.raises(ValueError, match="R17 expectation"):
         ApprovalChallengeV1(
-            NONCE, Direction.INVERSE, _inverse().intent_id, H, EXPECTATION, TARGET, 1, H, H, ISSUED, EXPIRES, BOOT
+            NONCE, Direction.INVERSE, _inverse().intent_id, H, EXPECTATION, TARGET, 1, H, H, ISSUED, EXPIRES, BOOT, None
         )
     with pytest.raises(ValueError):
         _challenge(intent, intent_id=_inverse().intent_id)
@@ -464,7 +466,7 @@ def test_challenge_needs_this_intents_policy_allow() -> None:
 
     def build(policy: Any) -> ApprovalChallengeV1:
         return ApprovalChallengeV1.for_forward(
-            intent, EXPECTATION, policy, nonce=NONCE, issued_utc=ISSUED, expires_utc=EXPIRES, boot_id=BOOT
+            intent, EXPECTATION, policy, nonce=NONCE, issued_utc=ISSUED, expires_utc=EXPIRES, boot_id=BOOT, commitment_deadline_utc=None
         )
 
     with pytest.raises(ValueError, match="denied"):
@@ -539,7 +541,7 @@ def test_claim_copies_the_challenge_and_refuses_stale_ones() -> None:
                 boot_id=boot,
                 claim_event_id=EVENT_C,
                 claim_sequence=22,
-                claimed_utc=now,
+                claimed_utc=now, approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
             )
     with pytest.raises(ValueError):
         ExecutionClaimV1.from_json(_tamper(claim.canonical_bytes(), claim_id="claim-" + "0" * 64))

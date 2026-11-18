@@ -3,6 +3,7 @@
 from suzka.r18.contracts import (
     ActionIntentV1,
     ApprovalChallengeV1,
+    ApprovalChannel,
     Direction,
     ExecutionClaimV1,
     ExecutionReceiptV1,
@@ -31,6 +32,7 @@ from suzka.r18.contracts import (
 __all__ = [
     "ActionIntentV1",
     "ApprovalChallengeV1",
+    "ApprovalChannel",
     "Direction",
     "ExecutionClaimV1",
     "ExecutionReceiptV1",
