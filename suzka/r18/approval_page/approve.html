@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SUZKA approval</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 1.5rem auto; max-width: 46rem; padding: 0 1rem; color: #1b1b1b; background: #fafafa; }
+  h1 { font-size: 1.25rem; }
+  table { border-collapse: collapse; width: 100%; margin: .75rem 0; }
+  th, td { text-align: left; padding: .25rem .5rem; border-bottom: 1px solid #ddd; vertical-align: top; }
+  th { width: 11rem; font-weight: 600; }
+  td { font-family: ui-monospace, monospace; word-break: break-all; }
+  button { font: inherit; padding: .35rem .8rem; }
+  .code { font-size: 1.6rem; letter-spacing: .15em; font-family: ui-monospace, monospace; }
+  .abort { color: #a00000; font-weight: 600; }
+  .ok { color: #1a6b1a; }
+  .note { color: #555; }
+  #card { border: 1px solid #ccc; padding: .5rem 1rem; margin: 1rem 0; background: #fff; }
+</style>
+</head>
+<body>
+<h1>SUZKA: approve one governed Action</h1>
+<p class="note">This page shows exactly what will be approved, computed in your browser from the server's records. Nothing is sent unless every check below passes and you type the code.</p>
+<div id="status" class="note" role="status"></div>
+<div id="list"></div>
+<div id="card" hidden></div>
+<script src="/api/r18/approve.js"></script>
+</body>
+</html>

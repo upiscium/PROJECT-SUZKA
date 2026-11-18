@@ -31,6 +31,7 @@ from suzka.api.context_read_model import (
 )
 from suzka.chat_log import ChatLogUnavailable
 from suzka.config import Settings, get_settings
+from suzka.config.schema import require_approval_binding
 from suzka.identity import ValueConflictDefinition
 from suzka.learning import AdapterRegistry, SleepCycleManager
 from suzka.memory import DualMemorySystem, ExperienceStore
@@ -86,6 +87,7 @@ from suzka.r16.decision_issuer import _DecisionIssuer
 from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
 from suzka.r17.expectation_issuer import ExpectationIssuerV1
 from suzka.r18.admission import ALWAYS_OPEN_UNTIL_IP18
+from suzka.r18.approval_api import mount_approval_api
 from suzka.r18.approval_owner import ApprovalChallengeOwnerV1
 from suzka.r18.policy_owner import ReviewArtifactPolicyV1
 from suzka.r16.history_attestation import SubjectHistoryAttestationProvider
@@ -549,6 +551,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if owner is None and event.event_type in {
                 AgentEventType.R18_CHALLENGE_ISSUE,
                 AgentEventType.R18_APPROVAL_EXPIRE,
+                AgentEventType.R18_EXECUTION_CLAIM,
             }:
                 raise StateRecoveryError("R18 Approval owner unavailable")
             return owner
@@ -1160,6 +1163,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(adapters.router)
     app.include_router(values.router)
     app.include_router(r16.router)
+    # IP-17c (#411 D1 r7 §4): the approval API and its request guards exist
+    # only with r18.enabled, and the guard goes AFTER the CORS middleware
+    # (outside it) so an OPTIONS preflight is refused before CORS answers.
+    # With r18.enabled false nothing is mounted: every /api/r18 path is a 404.
+    if app_settings.r18.enabled:
+        require_approval_binding(app_settings.api.host, app_settings.r18)
+        mount_approval_api(app, app_settings.r18)
 
     return app
 
