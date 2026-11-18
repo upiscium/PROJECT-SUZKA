@@ -42,7 +42,7 @@ from suzka.r16.history_records import (
 )
 from suzka.r16.history_store import HistoryPhase, HistoryStoreRecordsDisabled
 from suzka.r16.successor_policy import (
-    CLOSED_UNCLAIMED_LEDGER,
+    CLOSED_FORWARD_LEDGER,
     MAX_LEDGER_REFS,
     CommitmentState,
     FeedbackState,
@@ -1010,7 +1010,7 @@ def test_derived_forward_states_and_their_policy_rows() -> None:
         ([*base, c[0], chain.claim], LedgerState.CLAIMED, SuccessorRow.ROW_2),
     ]
     for state in (VerifiedState.ACTIVE_VERIFIED_AUTHORIZED, VerifiedState.VERIFIED_ABSENT, VerifiedState.UNAUTHORIZED_EFFECT):
-        row = SuccessorRow.ROW_6 if state is VerifiedState.ACTIVE_VERIFIED_AUTHORIZED else SuccessorRow.ROW_2
+        row = SuccessorRow.ROW_6 if state is VerifiedState.ACTIVE_VERIFIED_AUTHORIZED else SuccessorRow.ROW_2C  # IP-18b: closed forward states re-decide
         cases.append(([*base, c[0], chain.claim, _outcome_of(chain, state)], LedgerState(state.value), row))
     for records, ledger, row in cases:
         read = derive_ledger(_at(*records), group, NOW)
@@ -1019,7 +1019,7 @@ def test_derived_forward_states_and_their_policy_rows() -> None:
         assert list(read.refs) == sorted(read.refs, key=lambda ref: ref.sort_key)
         assert len(read.refs) <= MAX_LEDGER_REFS
         assert all(ref.kind != OUTCOME_REF_KIND for ref in read.refs)
-        if ledger in CLOSED_UNCLAIMED_LEDGER:
+        if ledger in CLOSED_FORWARD_LEDGER:
             # IP-17a (§12-2): a new lineage on a closed group re-decides.
             assert _policy(read, PredecessorState.ABSENT_INITIAL) is SuccessorRow.ROW_2C
         elif ledger is not LedgerState.NONE:

@@ -135,6 +135,7 @@
  "tests/test_r18_ip16a2_intent_issuer.py": 87.1,
  "tests/test_r18_ip16a_obligation.py": 1.0,
  "tests/test_r18_ip17a_policy.py": 110.0,
+ "tests/test_r18_ip18b_policy.py": 40.0,
  "tests/test_r18_ip17b_approval.py": 150.0,
  "tests/test_r18_ip17c_api.py": 60.0,
  "tests/test_r18_ip17c_claim.py": 190.0,
