@@ -420,14 +420,18 @@ class SubjectHistoryParticipant:
 
 
 class SubjectHistoryRecordParticipant:
-    """IP-14a-2: the same R07 authority for one R17 / R18 record operation.
+    """IP-14a-2: the same R07 authority for one record operation.
 
     Ordering, abort, tombstone and reconcile follow ``SubjectHistoryParticipant``
     exactly; only the pending bytes are a ``HistoryRecordOperationV1`` envelope,
     whose incarnation, event, sequence and transaction kind must equal the R07
-    binding. PREPARE reserves the record's keys (D1 §2a) and needs
-    ``r18.enabled``; FINALIZE and reconcile do not, so a store switched off
-    with a pending record still settles it at startup (IP-16b, #411 D1 r3 §6).
+    binding. PREPARE reserves the record's keys (D1 §2a) and needs the kind's
+    family switch (R17 / R18: ``r18.enabled``; IP-14b-2, D1 r2 §4-3: the
+    R19 / cycle kinds ``r19.enabled``, ``R16_PLAN_HOLD``
+    ``subject_history.plan_hold_receipts``); FINALIZE and reconcile do not, so
+    a store switched off with a pending record still settles it at startup
+    (IP-16b, #411 D1 r3 §6). An ``R16_CYCLE_DECISION`` also writes its
+    Decision and source rows, which ``record_rows_match`` verifies.
     """
 
     participant_id = SUBJECT_HISTORY_PARTICIPANT_ID
