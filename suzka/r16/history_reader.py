@@ -561,7 +561,10 @@ class SubjectHistoryReader:
         self, incarnation: str, row: HistoryOperationRow
     ) -> tuple[ChainNode, PostcommitReceiptV1]:
         finalized = self.store.finalized_decision(incarnation, row.transaction_id)
-        if finalized is None:
+        if finalized is None or (
+            row.operation_kind is HistoryOperationKind.R16_DECISION_ISSUE
+            and row.pending_bytes != finalized.committed_bytes
+        ):
             raise _Blocked(HeadBlockReason.DIVERGED)
         decision = CommittedDecisionV1.from_json(finalized.committed_bytes)
         _require_decision_operation(row, decision, incarnation)
@@ -636,7 +639,8 @@ def _require_decision_operation(
 ) -> None:
     """The operation-digest check per Decision kind (IP-14b D1 r2 §4-3).
 
-    ``R16_DECISION_ISSUE``: the pending bytes are the Decision and the digest
+    ``R16_DECISION_ISSUE``: the pending bytes are the stored committed bytes
+    (checked by the caller before decoding, as before IP-14b-2) and the digest
     is ``history_operation_digest``. ``R16_CYCLE_DECISION``: the pending bytes
     are a ``HistoryRecordOperationV1`` envelope of this incarnation, event
     and transaction kind, whose digest is ``record_operation_digest`` and
@@ -644,15 +648,12 @@ def _require_decision_operation(
     row itself is checked by the adopted-record path (``record_rows_match``).
     """
 
-    if row.pending_bytes is None:
-        raise _Blocked(HeadBlockReason.DIVERGED)
     if row.operation_kind is HistoryOperationKind.R16_DECISION_ISSUE:
-        if (
-            row.pending_bytes != decision.canonical_bytes()
-            or history_operation_digest(decision) != row.operation_digest
-        ):
+        if history_operation_digest(decision) != row.operation_digest:
             raise _Blocked(HeadBlockReason.DIVERGED)
         return
+    if row.pending_bytes is None:
+        raise _Blocked(HeadBlockReason.DIVERGED)
     if row.operation_kind is not HistoryOperationKind.R16_CYCLE_DECISION:
         raise _Blocked(HeadBlockReason.DIVERGED)
     try:
