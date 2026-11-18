@@ -1,35 +1,45 @@
-"""IP-14a-1 / IP-16a-1: the one-way SubjectHistory v1 or v2 -> v3 migration (D1 r3 §5).
+"""IP-14a-1 / IP-16a-1 / IP-14b-1: the one-way SubjectHistory v1, v2 or v3 -> v4 migration.
 
 Human decision §11-1 (2026-11-16): the store never migrates by itself. An
 operator backs up ``.suzka/`` and runs::
 
-    python -m suzka.r16.history_migration /abs/path/subject_history.sqlite3
+    python -m suzka.r16.history_migration [--max-page-count N] /abs/path/subject_history.sqlite3
 
-The command detects the source version. v1 (``rebuild/develop`` before
-IP-14a-1) goes straight to v3 by rebuilding ``history_meta`` /
-``history_operations`` / ``history_decisions``. v2 (IP-14a-1 .. 6ed2361,
-deployed on eve) rebuilds ``history_meta`` and the two tables whose UNIQUE
-scope IP-16 §9 changed (``action_intents``, ``action_forecasts``). A v2 store
-that holds any R17 / R18 record operation or key reservation is refused: its
-PREPARE reservations use the v2 (global) key format, and no such store exists
-outside tests (R18 was never enabled on v2, and startup refuses records while
-it is off). Recreate a lab store instead.
+The command detects the source version and migrates it directly to v4 (one
+transaction, one backup):
+
+- v1 (``rebuild/develop`` before IP-14a-1) rebuilds ``history_meta`` /
+  ``history_operations`` / ``history_decisions``.
+- v2 (IP-14a-1 .. 6ed2361) also rebuilds those three (their v4 CHECKs) and the
+  two tables whose UNIQUE scope IP-16 §9 changed (``action_intents``,
+  ``action_forecasts``). A v2 store that holds any R17 / R18 record
+  operation or key reservation is refused: its PREPARE reservations use the
+  v2 (global) key format, and no such store exists outside tests.
+- v3 (IP-16a-1 .. 52c61ab, eve) rebuilds ``history_meta`` /
+  ``history_operations`` / ``history_decisions`` (IP-14b D1 r2 §3-3: the
+  NULL-safe CHECKs, the R16 kinds of the slot indexes and row 2c). R17 / R18
+  records migrate: v4 changes neither their tables nor their key formats.
 
 The steps follow the recipe verified on SQLite 3.50 with DEFENSIVE mode
 (D1 review): under the write lock, verify the exact source schema, copy the
 file to a 0600 backup and check the copy, then in the same rollback-journal
 transaction drop every trigger and user index, rebuild each changed table as
-``X -> X_old, CREATE X (exact v3 text), copy, DROP X_old`` with
+``X -> X_old, CREATE X (exact v4 text), copy, DROP X_old`` with
 ``legacy_alter_table = ON`` (child foreign keys keep naming ``X``), create the
-missing v3 objects, and verify the exact v3 schema, ``quick_check``,
-``foreign_key_check`` and every source row before COMMIT. A crash anywhere
-before COMMIT leaves the source file (a crashed attempt's journal is rolled
-back by SQLite and the command can simply be run again); after COMMIT it is
-v3, and only the VACUUM is best effort. There is no way back except
-restoring a backup.
+missing v4 objects, and verify the exact v4 schema, ``quick_check``,
+``foreign_key_check`` and every source row before COMMIT. The copy re-checks
+every row against the stricter v4 CHECKs: a violating row rolls the whole
+migration back. A crash anywhere before COMMIT leaves the source file (a
+crashed attempt's journal is rolled back by SQLite and the command can simply
+be run again); after COMMIT it is v4, and only the VACUUM is best effort.
+There is no way back except restoring a backup.
 
-The rebuild is parameterised (``_rebuild``) so IP-14b's next version can
-reuse it.
+The page cap is always enforced (D1 r2 §3-3): ``--max-page-count`` or, without
+it, ``subject_history.max_page_count`` of the SUZKA config. A store is refused
+when ``2 x page_count + 64`` exceeds the cap (the rebuild briefly holds a
+second copy of each rebuilt table), and the migration connection sets
+``PRAGMA max_page_count`` so an overflow during the rebuild fails as
+SQLITE_FULL and rolls back.
 """
 
 from __future__ import annotations
@@ -43,9 +53,11 @@ import sqlite3
 import sys
 from typing import Final
 
-from suzka.r16.history_records import RECORD_OPERATION_KINDS
+from suzka.config.schema import SubjectHistorySettings
+from suzka.r16.history_records import R18_GATED_KINDS
 from suzka.r16.history_schema_v1 import SCHEMA_HASH_V1, SCHEMA_STATEMENTS_V1
 from suzka.r16.history_schema_v2 import SCHEMA_HASH_V2, SCHEMA_STATEMENTS_V2
+from suzka.r16.history_schema_v3 import SCHEMA_HASH_V3, SCHEMA_STATEMENTS_V3
 from suzka.r16.history_store import (
     _SCHEMA_QUERY,
     HISTORY_SCHEMA_VERSION,
@@ -68,9 +80,12 @@ _META_COLUMNS: Final = (
     "phase, adopted_baseline_id, adopted_baseline_hash, genesis_incarnation_id"
 )
 
-# v1 -> v3 adds about 40 pages to an empty v1 store (the v2 objects; 66 vs 21),
-# and v2 -> v3 only rebuilds tables that are empty; keep a margin.
+# IP-14b D1 r2 §3-3: refuse when 2 x page_count + _MIGRATION_PAGES exceeds
+# the cap. v3 -> v4 adds about 32 pages (67 vs 99 for an empty store) and the
+# rebuild briefly holds a second copy of each rebuilt table; conservative.
 _MIGRATION_PAGES: Final = 64
+# The configured default (#376 D1-9): used when no cap is given.
+DEFAULT_MAX_PAGE_COUNT: Final = SubjectHistorySettings().max_page_count
 
 # Tests inject a failure at a named stage to prove crash safety.
 _STAGE_HOOK: Callable[[str], None] | None = None
@@ -89,7 +104,7 @@ class _Source:
     version: int
     statements: tuple[str, ...]
     schema_hash: str
-    # Tables whose CREATE text changes in v3 and must be rebuilt, in an
+    # Tables whose CREATE text changes in v4 and must be rebuilt, in an
     # order where a rebuilt parent comes before its rebuilt child.
     rebuilt: tuple[str, ...]
 
@@ -98,9 +113,11 @@ class _Source:
         return _tables(self.statements)
 
 
+_V1_TABLES: Final = ("history_meta", "history_operations", "history_decisions")
 _SOURCES: Final = (
-    _Source(1, SCHEMA_STATEMENTS_V1, SCHEMA_HASH_V1, ("history_meta", "history_operations", "history_decisions")),
-    _Source(2, SCHEMA_STATEMENTS_V2, SCHEMA_HASH_V2, ("history_meta", "action_intents", "action_forecasts")),
+    _Source(1, SCHEMA_STATEMENTS_V1, SCHEMA_HASH_V1, _V1_TABLES),
+    _Source(2, SCHEMA_STATEMENTS_V2, SCHEMA_HASH_V2, (*_V1_TABLES, "action_intents", "action_forecasts")),
+    _Source(3, SCHEMA_STATEMENTS_V3, SCHEMA_HASH_V3, _V1_TABLES),
 )
 
 
@@ -127,7 +144,7 @@ def _object_name(statement: str) -> str:
     return words[3] if words[1] == "UNIQUE" else words[2]
 
 
-def _connect(path: Path) -> sqlite3.Connection:
+def _connect(path: Path, max_page_count: int) -> sqlite3.Connection:
     connection = sqlite3.connect(f"{path.as_uri()}?mode=rw", uri=True, isolation_level=None, timeout=5.0)
     try:
         if sys.version_info >= (3, 12):
@@ -137,6 +154,12 @@ def _connect(path: Path) -> sqlite3.Connection:
             connection.execute(f"PRAGMA {pragma}").fetchall()
         if connection.execute("PRAGMA journal_mode").fetchone()[0] != "delete":
             raise HistoryMigrationError("SubjectHistory journal mode could not be enforced")
+        # A page overflow during the rebuild fails as SQLITE_FULL and rolls
+        # back. SQLite never lowers the cap below the current size: a store
+        # already larger than the cap is refused here.
+        connection.execute(f"PRAGMA max_page_count = {max_page_count}").fetchall()
+        if connection.execute("PRAGMA max_page_count").fetchone()[0] != max_page_count:
+            raise HistoryMigrationError("SubjectHistory is larger than max_page_count")
         return connection
     except BaseException:
         connection.close()
@@ -157,11 +180,11 @@ def _detect(connection: sqlite3.Connection) -> _Source:
             return source
     if actual == _expected_schema(SCHEMA_STATEMENTS):
         raise HistoryMigrationError(f"SubjectHistory is already schema v{HISTORY_SCHEMA_VERSION}")
-    raise HistoryMigrationError("SubjectHistory is not exactly schema v1 or v2")
+    raise HistoryMigrationError("SubjectHistory is not exactly schema v1, v2 or v3")
 
 
 def _holds_records(connection: sqlite3.Connection) -> bool:
-    kinds = tuple(kind.value for kind in RECORD_OPERATION_KINDS)
+    kinds = tuple(sorted(kind.value for kind in R18_GATED_KINDS))
     marks = ", ".join("?" for _ in kinds)
     return bool(
         connection.execute("SELECT 1 FROM history_operation_keys LIMIT 1").fetchall()
@@ -284,11 +307,13 @@ class MigrationResult:
     compaction_error: str | None
 
 
-def migrate(path: Path, *, now: datetime | None = None, max_page_count: int | None = None) -> MigrationResult:
-    """Migrate one v1 or v2 store in place to the current version.
+def migrate(
+    path: Path, *, now: datetime | None = None, max_page_count: int = DEFAULT_MAX_PAGE_COUNT
+) -> MigrationResult:
+    """Migrate one v1, v2 or v3 store in place to the current version.
 
-    Refuses anything that is not exactly a v1 or v2 store (a current store,
-    a corrupt file). A journal left by a crashed earlier attempt is handled
+    Refuses anything that is not exactly a v1, v2 or v3 store (a current
+    store, a corrupt file). A journal left by a crashed earlier attempt is handled
     by SQLite on the first read (a hot journal rolls back; a cold one is
     ignored), so a crashed migration can simply be run again. The exact
     source checks, the backup and the row snapshot all run under the write
@@ -296,10 +321,13 @@ def migrate(path: Path, *, now: datetime | None = None, max_page_count: int | No
     leaves the source file; after COMMIT the store is current and only the
     VACUUM is best effort.
 
-    ``max_page_count``, when given, refuses a store too close to its cap to
-    take the new objects before anything changes.
+    ``max_page_count`` is always enforced: a store with ``2 x page_count +
+    64`` above it is refused before anything changes, and the migration
+    connection runs under that cap.
     """
 
+    if type(max_page_count) is not int or not 16 <= max_page_count <= 2**31 - 2:
+        raise HistoryMigrationError("max_page_count is invalid")
     path = _trusted_path(path)
     _check_private_directory(path.parent)
     _check_private_file(path, required=True)
@@ -309,7 +337,7 @@ def migrate(path: Path, *, now: datetime | None = None, max_page_count: int | No
             raise HistoryStoreCorrupt("SubjectHistory has an unexpected WAL sidecar")
     stamp = (now or datetime.now(UTC)).strftime("%Y%m%dT%H%M%SZ")
     try:
-        connection = _connect(path)
+        connection = _connect(path, max_page_count)
     except sqlite3.Error as error:
         raise HistoryStoreUnavailable("SubjectHistory cannot be opened for migration") from error
     committed = False
@@ -332,12 +360,11 @@ def migrate(path: Path, *, now: datetime | None = None, max_page_count: int | No
                 raise HistoryMigrationError(
                     "SubjectHistory v2 holds R17 / R18 records; only a store without them migrates"
                 )
-            if max_page_count is not None:
-                pages = int(connection.execute("PRAGMA page_count").fetchone()[0])
-                if pages + _MIGRATION_PAGES > max_page_count:
-                    raise HistoryMigrationError(
-                        "SubjectHistory is too close to max_page_count to take the new objects"
-                    )
+            pages = int(connection.execute("PRAGMA page_count").fetchone()[0])
+            if 2 * pages + _MIGRATION_PAGES > max_page_count:
+                raise HistoryMigrationError(
+                    "SubjectHistory is too close to max_page_count to take the new objects"
+                )
             backup = _backup(path, stamp, source)
             _stage("backed-up")
             before = _snapshot(connection, source.tables)
@@ -373,10 +400,28 @@ def migrate(path: Path, *, now: datetime | None = None, max_page_count: int | No
         connection.close()
 
 
+def _configured_max_page_count() -> tuple[int, str]:
+    """``subject_history.max_page_count`` of the SUZKA config and where it
+    came from. ``SUZKA_CONFIG_PATH``, when set, must name a readable config
+    (a missing file refuses); unset, the repository ``config.yaml`` is read,
+    and only its absence falls back to the setting's default."""
+
+    from suzka.config.settings import CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH, load_settings
+
+    configured = os.environ.get(CONFIG_PATH_ENV)
+    if configured is not None:
+        return load_settings(configured).subject_history.max_page_count, f"{CONFIG_PATH_ENV}={configured}"
+    try:
+        return load_settings(DEFAULT_CONFIG_PATH).subject_history.max_page_count, str(DEFAULT_CONFIG_PATH)
+    except FileNotFoundError:
+        return DEFAULT_MAX_PAGE_COUNT, "the default (no config file)"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     max_page_count: int | None = None
-    if len(args) == 3 and args[0] == "--max-page-count" and args[1].isdigit():
+    source = "--max-page-count"
+    if len(args) == 3 and args[0] == "--max-page-count" and args[1].isascii() and args[1].isdigit():
         max_page_count = int(args[1])
         args = args[2:]
     if len(args) != 1:
@@ -386,13 +431,26 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if max_page_count is None:
+        try:
+            max_page_count, source = _configured_max_page_count()
+        except Exception as error:  # noqa: BLE001 - any unreadable config refuses
+            print(
+                f"migration refused, the file is unchanged: the SUZKA config is unreadable ({error}); "
+                "pass --max-page-count",
+                file=sys.stderr,
+            )
+            return 1
     try:
         result = migrate(Path(args[0]), max_page_count=max_page_count)
     except HistoryStoreError as error:
         print(f"migration refused, the file is unchanged: {error}", file=sys.stderr)
         return 1
     current = f"v{HISTORY_SCHEMA_VERSION}"
-    print(f"migrated SubjectHistory v{result.from_version} to {current}; backup: {result.backup}")
+    print(
+        f"migrated SubjectHistory v{result.from_version} to {current}; backup: {result.backup}; "
+        f"max_page_count {max_page_count} from {source}"
+    )
     if not result.compacted:
         print(f"note: the store is {current}, but compaction (VACUUM) failed: {result.compaction_error}")
     return 0
@@ -402,4 +460,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["HistoryMigrationError", "MigrationResult", "main", "migrate"]
+__all__ = ["DEFAULT_MAX_PAGE_COUNT", "HistoryMigrationError", "MigrationResult", "main", "migrate"]

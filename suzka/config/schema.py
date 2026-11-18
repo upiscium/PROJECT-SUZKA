@@ -268,8 +268,12 @@ class SubjectHistorySettings(StrictBaseModel):
     path: Path = Path(".suzka/private/subject_history/subject_history.sqlite3")
     # SQLite page cap.  #376 D1-9 (Human-approved 2026-11-14): 65536 pages,
     # 256 MiB when the SQLite page size is the usual 4096 bytes.
-    # IP-14a: an empty v2 store already takes 66 pages.
+    # IP-14a: an empty v2 store already takes 66 pages; IP-14b-1: v4, 99.
     max_page_count: StrictInt = Field(default=65_536, ge=128, le=2_147_483_646)
+    # IP-14b D1 r2 HD-3 (a): PLAN_PREVIEW policy-HOLD receipts for the R20
+    # report. Only lab_prepare turns it on for R20 subjects (IP-14b-3); eve
+    # leaves it off and writes none. Independent of r18 / r19.
+    plan_hold_receipts: StrictBool = False
 
 
 class ChatLogSettings(StrictBaseModel):

@@ -11,8 +11,15 @@ any store access:
 - the keys PREPARE reserves (§2a), so uniqueness is decided before R07
   commits, not at FINALIZE.
 
+IP-14b-1 (D1 r2 §4-2) adds the R19 / cycle record kinds of schema v4 (Wake,
+claim, attempt outcome, cycle closure, terminal, Outbox message, Inbox ACK)
+and the HD-3 (a) plan-hold receipt, each one record in the same envelope
+(``ENVELOPE_SCHEMA_VERSION`` stays 1). ``R16_CYCLE_DECISION`` is the one
+record kind that also writes R16 Decision rows; the store fills its lineage
+columns from the embedded Decision.
+
 Pure: no store, Journal or clock. Validation rejects inconsistent values;
-whether a writer was allowed to issue them is the writer's (IP-16..IP-19).
+whether a writer was allowed to issue them is the writer's (IP-16..IP-21).
 """
 
 from __future__ import annotations
@@ -33,7 +40,13 @@ from suzka.r16.contracts import (
     parse_enum,
     parse_json,
 )
-from suzka.r16.history_codec import MAX_PENDING_BYTES, canonical_uuid, event_sequence
+from suzka.r16.cycle_contracts import CycleClosureV1, PlanHoldReceiptV1, ResultKind
+from suzka.r16.history_codec import (
+    MAX_PENDING_BYTES,
+    CommittedDecisionV1,
+    canonical_uuid,
+    event_sequence,
+)
 from suzka.r17.contracts import DecisionFeedbackV1, ExpectedObservationV1, OutcomeAssessmentV1
 from suzka.r18.contracts import (
     ActionIntentV1,
@@ -43,6 +56,15 @@ from suzka.r18.contracts import (
     InverseIntentV1,
     PolicyVerdictV1,
     VerifiedOutcomeV1,
+)
+from suzka.r19.contracts import (
+    STORED_ATTEMPT_OUTCOMES,
+    InboxAckV1,
+    OutboxMessageV1,
+    WakeAttemptOutcomeV1,
+    WakeClaimV1,
+    WakeTerminalV1,
+    WakeV1,
 )
 
 ENVELOPE_SCHEMA_VERSION: Final = 1
@@ -65,14 +87,55 @@ class HistoryOperationKind(str, Enum):
     R18_OUTCOME_COMMIT = "R18_OUTCOME_COMMIT"
     R17_ASSESSMENT_COMMIT = "R17_ASSESSMENT_COMMIT"
     R17_FEEDBACK_COMMIT = "R17_FEEDBACK_COMMIT"
+    # IP-14b-1 (schema v4, D1 r2 §4-1).
+    R19_WAKE_MATERIALIZE = "R19_WAKE_MATERIALIZE"
+    R19_WAKE_CLAIM = "R19_WAKE_CLAIM"
+    R19_WAKE_ATTEMPT_OUTCOME = "R19_WAKE_ATTEMPT_OUTCOME"
+    R16_PLAN_HOLD = "R16_PLAN_HOLD"
+    R16_CYCLE_DECISION = "R16_CYCLE_DECISION"
+    R16_CYCLE_RECEIPT = "R16_CYCLE_RECEIPT"
+    R19_WAKE_TERMINAL = "R19_WAKE_TERMINAL"
+    R19_OUTBOX_EMIT = "R19_OUTBOX_EMIT"
+    R19_INBOX_ACK = "R19_INBOX_ACK"
 
 
-R16_OPERATION_KINDS: Final = frozenset(
-    {HistoryOperationKind.R16_DECISION_ISSUE, HistoryOperationKind.R07_BINDING_ONLY_ABORT}
-)
+_K = HistoryOperationKind
+# The two kinds that are not a record envelope.
+R16_OPERATION_KINDS: Final = frozenset({_K.R16_DECISION_ISSUE, _K.R07_BINDING_ONLY_ABORT})
+# Every kind whose pending bytes are a HistoryRecordOperationV1 envelope.
 RECORD_OPERATION_KINDS: Final = frozenset(set(HistoryOperationKind) - set(R16_OPERATION_KINDS))
 # r18.enabled gates every R17 / R18 kind (R17 follows R18 Outcomes, §7).
-R18_GATED_KINDS: Final = RECORD_OPERATION_KINDS
+R18_GATED_KINDS: Final = frozenset(
+    {
+        _K.R18_INTENT_ISSUE,
+        _K.R17_EXPECTATION_COMMIT,
+        _K.R18_POLICY_COMMIT,
+        _K.R18_CHALLENGE_ISSUE,
+        _K.R18_APPROVAL_EXPIRE,
+        _K.R18_EXECUTION_CLAIM,
+        _K.R18_OUTCOME_COMMIT,
+        _K.R17_ASSESSMENT_COMMIT,
+        _K.R17_FEEDBACK_COMMIT,
+    }
+)
+# IP-14b D1 r2 §6-1: r19.enabled gates the eight R19 / cycle kinds.
+R19_GATED_KINDS: Final = frozenset(
+    {
+        _K.R19_WAKE_MATERIALIZE,
+        _K.R19_WAKE_CLAIM,
+        _K.R19_WAKE_ATTEMPT_OUTCOME,
+        _K.R16_CYCLE_DECISION,
+        _K.R16_CYCLE_RECEIPT,
+        _K.R19_WAKE_TERMINAL,
+        _K.R19_OUTBOX_EMIT,
+        _K.R19_INBOX_ACK,
+    }
+)
+# HD-3 (a): subject_history.plan_hold_receipts gates only this kind.
+PLAN_HOLD_GATED_KINDS: Final = frozenset({_K.R16_PLAN_HOLD})
+assert R18_GATED_KINDS | R19_GATED_KINDS | PLAN_HOLD_GATED_KINDS == RECORD_OPERATION_KINDS
+# The record kinds that also write R16 lineage columns and Decision rows.
+LINEAGE_RECORD_KINDS: Final = frozenset({_K.R16_CYCLE_DECISION})
 
 
 class RecordKind(str, Enum):
@@ -86,6 +149,14 @@ class RecordKind(str, Enum):
     VERIFIED_OUTCOME = "VERIFIED_OUTCOME"
     OUTCOME_ASSESSMENT = "OUTCOME_ASSESSMENT"
     DECISION_FEEDBACK = "DECISION_FEEDBACK"
+    WAKE = "WAKE"
+    WAKE_CLAIM = "WAKE_CLAIM"
+    WAKE_ATTEMPT_OUTCOME = "WAKE_ATTEMPT_OUTCOME"
+    PLAN_HOLD = "PLAN_HOLD"
+    CYCLE_CLOSURE = "CYCLE_CLOSURE"
+    WAKE_TERMINAL = "WAKE_TERMINAL"
+    OUTBOX_MESSAGE = "OUTBOX_MESSAGE"
+    INBOX_ACK = "INBOX_ACK"
 
 
 OPERATION_RECORD_KINDS: Final[Mapping[HistoryOperationKind, frozenset[RecordKind]]] = {
@@ -98,9 +169,20 @@ OPERATION_RECORD_KINDS: Final[Mapping[HistoryOperationKind, frozenset[RecordKind
     HistoryOperationKind.R18_OUTCOME_COMMIT: frozenset({RecordKind.VERIFIED_OUTCOME}),
     HistoryOperationKind.R17_ASSESSMENT_COMMIT: frozenset({RecordKind.OUTCOME_ASSESSMENT}),
     HistoryOperationKind.R17_FEEDBACK_COMMIT: frozenset({RecordKind.DECISION_FEEDBACK}),
+    _K.R19_WAKE_MATERIALIZE: frozenset({RecordKind.WAKE}),
+    _K.R19_WAKE_CLAIM: frozenset({RecordKind.WAKE_CLAIM}),
+    _K.R19_WAKE_ATTEMPT_OUTCOME: frozenset({RecordKind.WAKE_ATTEMPT_OUTCOME}),
+    _K.R16_PLAN_HOLD: frozenset({RecordKind.PLAN_HOLD}),
+    _K.R16_CYCLE_DECISION: frozenset({RecordKind.CYCLE_CLOSURE}),
+    _K.R16_CYCLE_RECEIPT: frozenset({RecordKind.CYCLE_CLOSURE}),
+    _K.R19_WAKE_TERMINAL: frozenset({RecordKind.WAKE_TERMINAL}),
+    _K.R19_OUTBOX_EMIT: frozenset({RecordKind.OUTBOX_MESSAGE}),
+    _K.R19_INBOX_ACK: frozenset({RecordKind.INBOX_ACK}),
 }
 # The tables each operation kind writes at FINALIZE (§3); used by the
-# finalize_complete trigger and the startup check.
+# finalize_complete trigger and the startup check. ``R16_CYCLE_DECISION``
+# also names the v1 ``history_decisions`` (its source rows are optional in
+# SQL, as for ``R16_DECISION_ISSUE``).
 OPERATION_TABLES: Final[Mapping[HistoryOperationKind, tuple[str, ...]]] = {
     HistoryOperationKind.R18_INTENT_ISSUE: ("action_intents",),
     HistoryOperationKind.R17_EXPECTATION_COMMIT: ("action_forecasts",),
@@ -111,10 +193,34 @@ OPERATION_TABLES: Final[Mapping[HistoryOperationKind, tuple[str, ...]]] = {
     HistoryOperationKind.R18_OUTCOME_COMMIT: ("verified_outcomes",),
     HistoryOperationKind.R17_ASSESSMENT_COMMIT: ("outcome_assessments",),
     HistoryOperationKind.R17_FEEDBACK_COMMIT: ("decision_feedback",),
+    # IP-14b-1 (v4), in the CREATE order of D1 r2 §3-1.
+    _K.R19_WAKE_MATERIALIZE: ("wakeups",),
+    _K.R19_WAKE_CLAIM: ("wake_claims",),
+    _K.R19_WAKE_ATTEMPT_OUTCOME: ("wake_attempt_outcomes",),
+    _K.R16_CYCLE_DECISION: ("history_decisions", "logical_cycle_resolutions"),
+    _K.R16_CYCLE_RECEIPT: ("logical_cycle_resolutions",),
+    _K.R19_WAKE_TERMINAL: ("wake_terminals",),
+    _K.R19_OUTBOX_EMIT: ("outbox_messages",),
+    _K.R19_INBOX_ACK: ("outbox_acks",),
+    _K.R16_PLAN_HOLD: ("plan_hold_receipts",),
 }
+# The v1 tables have their own triggers and are never record tables.
+_V1_TABLES: Final = frozenset({"history_decisions", "history_source_refs"})
 RECORD_TABLES: Final = tuple(
-    dict.fromkeys(table for tables in OPERATION_TABLES.values() for table in tables)
+    dict.fromkeys(
+        table
+        for tables in OPERATION_TABLES.values()
+        for table in tables
+        if table not in _V1_TABLES
+    )
 )
+# The v2 / v3 record tables (R17 / R18) and the v4 ones (R19 / cycle / hold).
+V2_RECORD_TABLES: Final = tuple(
+    table
+    for table in RECORD_TABLES
+    if any(table in OPERATION_TABLES[kind] for kind in R18_GATED_KINDS)
+)
+V4_RECORD_TABLES: Final = tuple(table for table in RECORD_TABLES if table not in V2_RECORD_TABLES)
 
 
 class ExpirationReason(str, Enum):
@@ -444,6 +550,172 @@ def _feedback(value: DecisionFeedbackV1) -> DecodedRecord:
     )
 
 
+# ------------------------------------------------- v4 records (IP-14b-1)
+# Keys (D1 r2 §2-4). Wakes, cycles, messages and ACKs are cognition records
+# of one incarnation (IP-16 §9); their ids already hash the incarnation.
+
+
+def _same_incarnation(value: str, incarnation_id: str) -> None:
+    if value != incarnation_id:
+        raise ValueError("the record belongs to another incarnation than its operation")
+
+
+def _wake(value: WakeV1, incarnation_id: str) -> DecodedRecord:
+    _same_incarnation(value.incarnation_id, incarnation_id)
+    outcome = value.verified_outcome_key
+    row = RecordRow(
+        "wakeups",
+        (
+            *_common(value.wakeup_id, value.canonical_bytes(), value.wake_digest),
+            ("logical_cycle_id", value.logical_cycle_id),
+            ("cause_event_id", value.cause_event_id),
+            ("verified_outcome_id", None if outcome is None else outcome[0]),
+            ("outcome_revision", None if outcome is None else outcome[1]),
+        ),
+    )
+    keys = [f"wake:{value.wakeup_id}", f"wake-cause:{incarnation_id}:{value.cause_event_id}"]
+    if outcome is not None:
+        keys.append(f"wake-outcome:{incarnation_id}:{outcome[0]}:{outcome[1]}")
+    return DecodedRecord(RecordKind.WAKE, value, (row,), tuple(keys), None)
+
+
+def _wake_claim(value: WakeClaimV1, incarnation_id: str) -> DecodedRecord:
+    _same_incarnation(value.incarnation_id, incarnation_id)
+    row = RecordRow(
+        "wake_claims",
+        (
+            *_common(value.claim_id, value.canonical_bytes(), value.claim_digest),
+            ("wakeup_id", value.wakeup_id),
+            ("logical_cycle_id", value.logical_cycle_id),
+            ("attempt_index", value.attempt_index),
+        ),
+    )
+    return DecodedRecord(
+        RecordKind.WAKE_CLAIM,
+        value,
+        (row,),
+        (f"wake-attempt:{value.wakeup_id}:{value.attempt_index}",),
+        (value.claim_event_id, value.claim_sequence),
+    )
+
+
+def _attempt_outcome(value: WakeAttemptOutcomeV1) -> DecodedRecord:
+    if value.outcome not in STORED_ATTEMPT_OUTCOMES:
+        # LEASE_EXPIRED is derived from the claim and the clock (D1 r2 §1-1).
+        raise ValueError("only a REFUSED or DEFERRED_BUDGET attempt outcome is recorded")
+    row = RecordRow(
+        "wake_attempt_outcomes",
+        _common(value.claim_id, value.canonical_bytes(), value.attempt_digest),
+    )
+    return DecodedRecord(
+        RecordKind.WAKE_ATTEMPT_OUTCOME, value, (row,), (f"attempt-end:{value.claim_id}",), None
+    )
+
+
+def _plan_hold(value: PlanHoldReceiptV1, incarnation_id: str) -> DecodedRecord:
+    _same_incarnation(value.incarnation_id, incarnation_id)
+    row = RecordRow(
+        "plan_hold_receipts",
+        (
+            *_common(value.hold_id, value.canonical_bytes(), value.hold_digest),
+            ("lineage_scope", value.lineage_scope),
+            ("review_intent_key", value.review_intent_key),
+        ),
+    )
+    return DecodedRecord(
+        RecordKind.PLAN_HOLD,
+        value,
+        (row,),
+        (f"plan-hold:{incarnation_id}:{value.review_intent_key}",),
+        (value.event_id, value.event_sequence),
+    )
+
+
+def _cycle_closure(value: CycleClosureV1, incarnation_id: str) -> DecodedRecord:
+    resolution = value.resolution
+    _same_incarnation(resolution.incarnation_id, incarnation_id)
+    decision = value.decision
+    row = RecordRow(
+        "logical_cycle_resolutions",
+        (
+            *_common(resolution.resolution_id, resolution.canonical_bytes(), resolution.resolution_digest),
+            ("logical_cycle_id", resolution.logical_cycle_id),
+            ("review_intent_key", resolution.review_intent_key),
+            ("claim_id", resolution.claim_id),
+            ("result_kind", resolution.result_kind.value),
+            ("result_id", resolution.result_id),
+            ("result_digest", resolution.result_digest),
+            ("decision_id", None if decision is None else decision.decision_id),
+            ("receipt_bytes", value.receipt_bytes),
+        ),
+    )
+    # The Decision and source rows of R16_CYCLE_DECISION are written by the
+    # store's Decision insert (history_source_refs has no operation columns).
+    return DecodedRecord(
+        RecordKind.CYCLE_CLOSURE,
+        value,
+        (row,),
+        (
+            f"cycle:{incarnation_id}:{resolution.logical_cycle_id}",
+            f"attempt-end:{resolution.claim_id}",
+        ),
+        value.event,
+    )
+
+
+def _wake_terminal(value: WakeTerminalV1, incarnation_id: str) -> DecodedRecord:
+    row = RecordRow(
+        "wake_terminals",
+        (
+            *_common(value.terminal_id, value.canonical_bytes(), value.terminal_digest),
+            ("wakeup_id", value.wakeup_id),
+            ("terminal", value.terminal.value),
+            ("reason", value.reason.value),
+            ("superseding_wakeup_id", value.superseding_wakeup_id),
+        ),
+    )
+    return DecodedRecord(
+        RecordKind.WAKE_TERMINAL,
+        value,
+        (row,),
+        (f"cycle:{incarnation_id}:{value.logical_cycle_id}",),
+        (value.event_id, value.event_sequence),
+    )
+
+
+def _outbox_message(value: OutboxMessageV1, incarnation_id: str) -> DecodedRecord:
+    _same_incarnation(value.incarnation_id, incarnation_id)
+    row = RecordRow(
+        "outbox_messages",
+        (
+            *_common(value.message_id, value.canonical_bytes(), value.message_digest),
+            ("source_id", value.source_id),
+            ("result_digest", value.result_digest),
+            ("template", value.template.value),
+            ("context_id", value.context_id),
+        ),
+    )
+    return DecodedRecord(RecordKind.OUTBOX_MESSAGE, value, (row,), (f"outbox:{value.message_id}",), None)
+
+
+def _inbox_ack(value: InboxAckV1) -> DecodedRecord:
+    row = RecordRow(
+        "outbox_acks",
+        (
+            *_common(value.ack_id, value.canonical_bytes(), value.ack_digest),
+            ("message_id", value.message_id),
+            ("context_id", value.context_id),
+        ),
+    )
+    return DecodedRecord(
+        RecordKind.INBOX_ACK,
+        value,
+        (row,),
+        (f"ack:{value.message_id}",),
+        (value.event_id, value.event_sequence),
+    )
+
+
 _DECODERS: Final[Mapping[RecordKind, Callable[[bytes], object]]] = {
     RecordKind.ACTION_INTENT: ActionIntentV1.from_json,
     RecordKind.INVERSE_INTENT: InverseIntentV1.from_json,
@@ -455,6 +727,14 @@ _DECODERS: Final[Mapping[RecordKind, Callable[[bytes], object]]] = {
     RecordKind.VERIFIED_OUTCOME: VerifiedOutcomeV1.from_json,
     RecordKind.OUTCOME_ASSESSMENT: OutcomeAssessmentV1.from_json,
     RecordKind.DECISION_FEEDBACK: DecisionFeedbackV1.from_json,
+    RecordKind.WAKE: WakeV1.from_json,
+    RecordKind.WAKE_CLAIM: WakeClaimV1.from_json,
+    RecordKind.WAKE_ATTEMPT_OUTCOME: WakeAttemptOutcomeV1.from_json,
+    RecordKind.PLAN_HOLD: PlanHoldReceiptV1.from_json,
+    RecordKind.CYCLE_CLOSURE: CycleClosureV1.from_json,
+    RecordKind.WAKE_TERMINAL: WakeTerminalV1.from_json,
+    RecordKind.OUTBOX_MESSAGE: OutboxMessageV1.from_json,
+    RecordKind.INBOX_ACK: InboxAckV1.from_json,
 }
 _TYPES: Final[Mapping[RecordKind, type]] = {
     RecordKind.ACTION_INTENT: ActionIntentV1,
@@ -467,10 +747,18 @@ _TYPES: Final[Mapping[RecordKind, type]] = {
     RecordKind.VERIFIED_OUTCOME: VerifiedOutcomeV1,
     RecordKind.OUTCOME_ASSESSMENT: OutcomeAssessmentV1,
     RecordKind.DECISION_FEEDBACK: DecisionFeedbackV1,
+    RecordKind.WAKE: WakeV1,
+    RecordKind.WAKE_CLAIM: WakeClaimV1,
+    RecordKind.WAKE_ATTEMPT_OUTCOME: WakeAttemptOutcomeV1,
+    RecordKind.PLAN_HOLD: PlanHoldReceiptV1,
+    RecordKind.CYCLE_CLOSURE: CycleClosureV1,
+    RecordKind.WAKE_TERMINAL: WakeTerminalV1,
+    RecordKind.OUTBOX_MESSAGE: OutboxMessageV1,
+    RecordKind.INBOX_ACK: InboxAckV1,
 }
 
 
-def _decode(kind: RecordKind, record: object, attempt: int | None) -> DecodedRecord:
+def _decode(kind: RecordKind, record: object, attempt: int | None, incarnation_id: str) -> DecodedRecord:
     if kind is RecordKind.APPROVAL_CHALLENGE:
         if attempt is None:
             raise ValueError("a challenge record carries its attempt")
@@ -498,6 +786,22 @@ def _decode(kind: RecordKind, record: object, attempt: int | None) -> DecodedRec
         return _assessment(record)
     if isinstance(record, DecisionFeedbackV1):
         return _feedback(record)
+    if isinstance(record, WakeV1):
+        return _wake(record, incarnation_id)
+    if isinstance(record, WakeClaimV1):
+        return _wake_claim(record, incarnation_id)
+    if isinstance(record, WakeAttemptOutcomeV1):
+        return _attempt_outcome(record)
+    if isinstance(record, PlanHoldReceiptV1):
+        return _plan_hold(record, incarnation_id)
+    if isinstance(record, CycleClosureV1):
+        return _cycle_closure(record, incarnation_id)
+    if isinstance(record, WakeTerminalV1):
+        return _wake_terminal(record, incarnation_id)
+    if isinstance(record, OutboxMessageV1):
+        return _outbox_message(record, incarnation_id)
+    if isinstance(record, InboxAckV1):
+        return _inbox_ack(record)
     raise TypeError("unknown record type")
 
 
@@ -545,14 +849,21 @@ class HistoryRecordOperationV1:
             raise ValueError("the record kind does not belong to the operation kind")
         if type(self.record) is not _TYPES[self.record_kind]:
             raise TypeError("the record is not of its record kind")
+        if type(self.record) is CycleClosureV1:
+            # The kind matches the result: a Decision <=> R16_CYCLE_DECISION.
+            is_decision = self.record.resolution.result_kind is ResultKind.DECISION_ISSUED
+            if is_decision != (self.operation_kind is HistoryOperationKind.R16_CYCLE_DECISION):
+                raise ValueError("a cycle Decision is exactly an R16_CYCLE_DECISION operation")
         decoded = self.decoded()
         if decoded.event is not None and decoded.event != (self.event_id, self.processing_sequence):
             raise ValueError("the record names another event than its operation")
+        if type(self.record) is WakeV1 and not self.record.horizon_sequence < self.processing_sequence:
+            raise ValueError("a Wake is materialized after its creation horizon")
         if len(self.canonical_bytes()) > MAX_PENDING_BYTES:
             raise ValueError("the record operation exceeds the pending bound")
 
     def decoded(self) -> DecodedRecord:
-        return _decode(self.record_kind, self.record, self.attempt)
+        return _decode(self.record_kind, self.record, self.attempt, self.incarnation_id)
 
     @property
     def reserved_keys(self) -> tuple[str, ...]:
@@ -561,6 +872,13 @@ class HistoryRecordOperationV1:
     @property
     def rows(self) -> tuple[RecordRow, ...]:
         return self.decoded().rows
+
+    @property
+    def cycle_decision(self) -> CommittedDecisionV1 | None:
+        """The embedded Decision of an ``R16_CYCLE_DECISION`` operation."""
+        if type(self.record) is CycleClosureV1:
+            return self.record.decision
+        return None
 
     def canonical_value(self) -> dict[str, object]:
         return {
@@ -623,13 +941,18 @@ def record_operation_digest(pending_bytes: bytes) -> str:
 
 __all__ = [
     "ENVELOPE_SCHEMA_VERSION",
+    "LINEAGE_RECORD_KINDS",
     "MAX_CHALLENGES_PER_INTENT",
     "OPERATION_RECORD_KINDS",
     "OPERATION_TABLES",
+    "PLAN_HOLD_GATED_KINDS",
     "R16_OPERATION_KINDS",
     "R18_GATED_KINDS",
+    "R19_GATED_KINDS",
     "RECORD_OPERATION_KINDS",
     "RECORD_TABLES",
+    "V2_RECORD_TABLES",
+    "V4_RECORD_TABLES",
     "ApprovalExpirationV1",
     "DecodedRecord",
     "ExpirationReason",
