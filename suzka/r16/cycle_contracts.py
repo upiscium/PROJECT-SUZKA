@@ -7,6 +7,10 @@ confirmed) or a HoldReceipt. ``LogicalCycleResolutionV1`` points at that one
 result. Nothing here issues, persists or reads anything; the R16 issuer and
 the SubjectHistory DDL (IP-14b) own that.
 
+IP-14b-1 adds ``CycleClosureV1`` (the record of one ``R16_CYCLE_DECISION`` /
+``R16_CYCLE_RECEIPT`` operation) and ``PlanHoldReceiptV1`` (HD-3 (a): a
+PLAN_PREVIEW policy-HOLD row, sealed for the R20 report).
+
 R16 must not import ``suzka.r19``: the R19 claim arrives as its id and digest.
 """
 
@@ -18,23 +22,29 @@ from enum import Enum
 from typing import Final, Self
 
 from suzka.r16.contracts import (
+    ReasonCode,
     canonical_json,
     checksum,
     closed,
     digest,
+    identifier,
     parse_enum,
     parse_json,
 )
 from suzka.r16.history_codec import (
     DECISION_ID_PREFIX,
+    GENESIS,
+    MAX_PENDING_BYTES,
+    MAX_POLICY_INPUT_BYTES,
     CommittedDecisionV1,
     PolicyKind,
     PolicyRow,
     canonical_uuid,
     decision_id,
     event_sequence,
+    policy_input_digest,
 )
-from suzka.r16.successor_policy import SuccessorRow
+from suzka.r16.successor_policy import SuccessorPolicyInputV2, SuccessorRow, evaluate
 
 SCHEMA_VERSION: Final = 1
 MAX_RECORD_BYTES: Final = 4096
@@ -42,6 +52,10 @@ WAKE_CLAIM_ID_PREFIX: Final = "wake-claim-"
 HOLD_RECEIPT_ID_PREFIX: Final = "cycle-hold-"
 EXISTING_RECEIPT_ID_PREFIX: Final = "cycle-existing-"
 RESOLUTION_ID_PREFIX: Final = "cycle-resolution-"
+PLAN_HOLD_ID_PREFIX: Final = "plan-hold-"
+# HD-3 (a): the receipt's fields (< 4 KiB) plus the sealed policy input
+# (<= MAX_POLICY_INPUT_BYTES), nested as canonical JSON.
+MAX_PLAN_HOLD_BYTES: Final = 16_384
 _UTC_FORMAT: Final = "%Y-%m-%dT%H:%M:%SZ"
 
 _REVIEW_INTENT_DOMAIN: Final = b"PROJECT-SUZKA:R16:WAKE-REVIEW-INTENT:V1\0"
@@ -51,6 +65,8 @@ _EXISTING_ID_DOMAIN: Final = b"PROJECT-SUZKA:R16:CYCLE-EXISTING-ID:V1\0"
 _EXISTING_DOMAIN: Final = b"PROJECT-SUZKA:R16:CYCLE-EXISTING:V1\0"
 _RESOLUTION_ID_DOMAIN: Final = b"PROJECT-SUZKA:R16:CYCLE-RESOLUTION-ID:V1\0"
 _RESOLUTION_DOMAIN: Final = b"PROJECT-SUZKA:R16:CYCLE-RESOLUTION:V1\0"
+_PLAN_HOLD_ID_DOMAIN: Final = b"PROJECT-SUZKA:R16:PLAN-HOLD-ID:V1\0"
+_PLAN_HOLD_DOMAIN: Final = b"PROJECT-SUZKA:R16:PLAN-HOLD:V1\0"
 
 # D-R19 §4: policy rows that close a cycle with a terminal HOLD. Row 1 from
 # an EXPIRED / INELIGIBLE Commitment is terminal; row 1 from an UNAVAILABLE
@@ -256,7 +272,13 @@ class HoldReceiptV1:
 
     ``policy_row`` is present exactly for a policy HOLD row. Refuses
     (UNAVAILABLE sources, capacity, a pending slot, the clock) never become a
-    HoldReceipt; they are R19 WakeAttemptOutcomes and count as attempts.
+    HoldReceipt; they are R19 WakeAttemptOutcomes and count as attempts. They
+    are decided before PREPARE and recorded by ``R19_WAKE_ATTEMPT_OUTCOME``
+    (IP-14b D1 r2 D-1).
+
+    ``prepare_checked_at_utc`` is the frozen admission time T that the
+    handler checks against (#373 A4-1 / A4-4), not a clock read inside
+    ``participant.prepare``.
     """
 
     logical_cycle_id: str
@@ -374,6 +396,9 @@ class ExistingDecisionReceiptV1:
 
     It confirms the existing Decision without issuing a new one. Human
     decision §8-2 (2026-11-15): S1 counts it as "continue".
+    ``prepare_checked_at_utc`` is the frozen admission time T that the
+    handler checks against (#373 A4-1 / A4-4), not a clock read inside
+    ``participant.prepare``.
     """
 
     logical_cycle_id: str
@@ -607,16 +632,286 @@ class LogicalCycleResolutionV1:
         return value
 
 
+# ------------------------------------------------------------ cycle closure
+
+_CLOSURE_FIELDS: Final = ("resolution", "result", "schema_version")
+CycleResult = CommittedDecisionV1 | HoldReceiptV1 | ExistingDecisionReceiptV1
+_RESULT_TYPES: Final = {
+    ResultKind.DECISION_ISSUED: CommittedDecisionV1,
+    ResultKind.EXISTING_DECISION: ExistingDecisionReceiptV1,
+    ResultKind.HOLD: HoldReceiptV1,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class CycleClosureV1:
+    """IP-14b-1 (D1 r2 §4-2): the one record that closes a logical cycle.
+
+    The resolution and its one result travel together in one
+    ``R16_CYCLE_DECISION`` (a CommittedDecision) or ``R16_CYCLE_RECEIPT``
+    (a HOLD / EXISTING receipt) operation. The resolution must be exactly the
+    one its result derives (``of_decision`` / ``of_hold`` / ``of_existing``);
+    the claim digest of a Decision result is the resolution's own, because a
+    CommittedDecision does not carry the claim (D-5).
+    """
+
+    resolution: LogicalCycleResolutionV1
+    result: CycleResult
+
+    def __post_init__(self) -> None:
+        if type(self.resolution) is not LogicalCycleResolutionV1:
+            raise TypeError("resolution must be a LogicalCycleResolutionV1")
+        self.resolution.__post_init__()
+        expected_type = _RESULT_TYPES[self.resolution.result_kind]
+        if type(self.result) is not expected_type:
+            raise TypeError("the result is not of the resolution's result kind")
+        self.result.__post_init__()
+        if isinstance(self.result, CommittedDecisionV1):
+            expected = LogicalCycleResolutionV1.of_decision(
+                self.resolution.logical_cycle_id,
+                self.resolution.claim_id,
+                self.resolution.claim_digest,
+                self.result,
+            )
+        elif isinstance(self.result, HoldReceiptV1):
+            expected = LogicalCycleResolutionV1.of_hold(self.resolution.incarnation_id, self.result)
+        else:
+            expected = LogicalCycleResolutionV1.of_existing(self.resolution.incarnation_id, self.result)
+        if expected != self.resolution:
+            raise ValueError("the resolution does not match its result")
+        if len(self.canonical_bytes()) > MAX_PENDING_BYTES:
+            raise ValueError("cycle closure exceeds the pending byte bound")
+
+    @property
+    def decision(self) -> CommittedDecisionV1 | None:
+        return self.result if isinstance(self.result, CommittedDecisionV1) else None
+
+    @property
+    def receipt_bytes(self) -> bytes | None:
+        """The canonical HOLD / EXISTING receipt; None for a Decision."""
+        return None if isinstance(self.result, CommittedDecisionV1) else self.result.canonical_bytes()
+
+    @property
+    def event(self) -> tuple[str, int]:
+        """The event that issued the result (the operation's own event)."""
+        if isinstance(self.result, CommittedDecisionV1):
+            return self.result.issuer_event_id, self.result.issuer_sequence
+        if isinstance(self.result, HoldReceiptV1):
+            return self.result.hold_event_id, self.result.hold_sequence
+        return self.result.event_id, self.result.event_sequence
+
+    def canonical_value(self) -> dict[str, object]:
+        return {
+            "resolution": self.resolution.canonical_value(),
+            "result": self.result.canonical_value(),
+            "schema_version": SCHEMA_VERSION,
+        }
+
+    def canonical_bytes(self) -> bytes:
+        return canonical_json(self.canonical_value())
+
+    @classmethod
+    def from_json(cls, payload: bytes) -> Self:
+        if type(payload) is not bytes:
+            raise TypeError("cycle closure payload must be bytes")
+        if len(payload) > MAX_PENDING_BYTES:
+            raise ValueError("cycle closure exceeds the pending byte bound")
+        row = closed(parse_json(payload, MAX_PENDING_BYTES), _CLOSURE_FIELDS, "cycle closure")
+        if row["schema_version"] != SCHEMA_VERSION or type(row["schema_version"]) is not int:
+            raise ValueError("cycle closure schema_version is not V1")
+        resolution = LogicalCycleResolutionV1.from_json(canonical_json(row["resolution"]))
+        result_bytes = canonical_json(row["result"])
+        result: CycleResult
+        if resolution.result_kind is ResultKind.DECISION_ISSUED:
+            result = CommittedDecisionV1.from_json(result_bytes)
+        elif resolution.result_kind is ResultKind.HOLD:
+            result = HoldReceiptV1.from_json(result_bytes)
+        else:
+            result = ExistingDecisionReceiptV1.from_json(result_bytes)
+        value = cls(resolution, result)
+        if value.canonical_bytes() != payload:
+            raise ValueError("cycle closure bytes are not canonical")
+        return value
+
+
+# --------------------------------------------------------- plan hold receipt
+
+_PLAN_HOLD_BODY: Final = (
+    "event_id",
+    "event_sequence",
+    "hold_reason",
+    "incarnation_id",
+    "lineage_scope",
+    "policy_input",
+    "policy_input_digest",
+    "policy_kind",
+    "policy_row",
+    "predecessor_digest",
+    "predecessor_key",
+    "prepare_checked_at_utc",
+    "review_intent_key",
+    "schema_version",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanHoldReceiptV1:
+    """HD-3 (a): one SuccessorPolicy HOLD row of a PLAN_PREVIEW_REVIEW.
+
+    Only for the R20 report (F1's CONTRADICTORY -> 2b branch, S0's
+    non-SETTLED runs), written only where ``subject_history.plan_hold_receipts``
+    is on (IP-14b-3; never on eve). One receipt per ``(incarnation,
+    review_intent_key)``: the same sealed evidence gives the same key, so the
+    first receipt stands. It reserves no Decision slot and no decision path
+    reads it.
+
+    The sealed ``policy_input_bytes`` replay to ``policy_row`` and
+    ``hold_reason`` (the same check as a Decision's sealed replay), and the
+    input names this event and the frozen admission time T
+    (``prepare_checked_at_utc``).
+    """
+
+    incarnation_id: str
+    lineage_scope: str
+    review_intent_key: str
+    predecessor_key: str
+    predecessor_digest: str | None
+    event_id: str
+    event_sequence: int
+    policy_kind: PolicyKind
+    policy_row: SuccessorRow
+    hold_reason: ReasonCode
+    policy_input_bytes: bytes
+    prepare_checked_at_utc: str
+
+    def __post_init__(self) -> None:
+        digest(self.incarnation_id, "incarnation_id")
+        identifier(self.lineage_scope, "lineage_scope")
+        digest(self.review_intent_key, "review_intent_key")
+        if self.predecessor_key == GENESIS:
+            if self.predecessor_digest is not None:
+                raise ValueError("a GENESIS predecessor has no digest")
+        else:
+            decision_id(self.predecessor_key, "predecessor_key")
+            digest(self.predecessor_digest, "predecessor_digest")
+        canonical_uuid(self.event_id, "event_id")
+        event_sequence(self.event_sequence, "event_sequence")
+        if type(self.policy_kind) is not PolicyKind or self.policy_kind not in _POLICY_KINDS:
+            raise ValueError("policy_kind must be SuccessorPolicy V2 or V3")
+        if type(self.policy_row) is not SuccessorRow:
+            raise TypeError("policy_row must be a SuccessorRow")
+        if self.policy_row not in _HOLD_ROWS:
+            raise ValueError("a plan hold names a HOLD row (0, 1, 2, 2b or 7)")
+        if type(self.hold_reason) is not ReasonCode:
+            raise TypeError("hold_reason must be a ReasonCode")
+        utc(self.prepare_checked_at_utc, "prepare_checked_at_utc")
+        if type(self.policy_input_bytes) is not bytes:
+            raise TypeError("policy_input_bytes must be bytes")
+        if len(self.policy_input_bytes) > MAX_POLICY_INPUT_BYTES:
+            raise ValueError("the sealed policy input exceeds its bound")
+        sealed = SuccessorPolicyInputV2.from_bytes(self.policy_input_bytes)
+        if sealed.canonical_bytes() != self.policy_input_bytes:
+            raise ValueError("the sealed policy input is not canonical")
+        replay = evaluate(sealed)
+        if (
+            sealed.version is not self.policy_kind
+            or replay.row is not self.policy_row
+            or replay.hold_reason is not self.hold_reason
+        ):
+            raise ValueError("the sealed policy input does not replay to this HOLD row")
+        if (sealed.event_id, sealed.event_sequence, sealed.now_utc) != (
+            self.event_id,
+            self.event_sequence,
+            self.prepare_checked_at_utc,
+        ):
+            raise ValueError("the sealed policy input names another event or time")
+        if len(self.canonical_bytes()) > MAX_PLAN_HOLD_BYTES:
+            raise ValueError(f"plan hold receipt exceeds its {MAX_PLAN_HOLD_BYTES}-byte bound")
+
+    @property
+    def policy_input_digest(self) -> str:
+        return policy_input_digest(self.policy_input_bytes)
+
+    def _body(self) -> dict[str, object]:
+        return {
+            "event_id": self.event_id,
+            "event_sequence": self.event_sequence,
+            "hold_reason": self.hold_reason.value,
+            "incarnation_id": self.incarnation_id,
+            "lineage_scope": self.lineage_scope,
+            "policy_input": parse_json(self.policy_input_bytes, MAX_POLICY_INPUT_BYTES),
+            "policy_input_digest": self.policy_input_digest,
+            "policy_kind": self.policy_kind.value,
+            "policy_row": self.policy_row.value,
+            "predecessor_digest": self.predecessor_digest,
+            "predecessor_key": self.predecessor_key,
+            "prepare_checked_at_utc": self.prepare_checked_at_utc,
+            "review_intent_key": self.review_intent_key,
+            "schema_version": SCHEMA_VERSION,
+        }
+
+    @property
+    def hold_id(self) -> str:
+        return PLAN_HOLD_ID_PREFIX + checksum(_PLAN_HOLD_ID_DOMAIN, self._body())
+
+    @property
+    def hold_digest(self) -> str:
+        return checksum(_PLAN_HOLD_DOMAIN, self._body())
+
+    def canonical_value(self) -> dict[str, object]:
+        return {**self._body(), "hold_digest": self.hold_digest, "hold_id": self.hold_id}
+
+    def canonical_bytes(self) -> bytes:
+        return canonical_json(self.canonical_value())
+
+    @classmethod
+    def from_json(cls, payload: bytes) -> Self:
+        if type(payload) is not bytes:
+            raise TypeError("plan hold receipt payload must be bytes")
+        if len(payload) > MAX_PLAN_HOLD_BYTES:
+            raise ValueError(f"plan hold receipt exceeds its {MAX_PLAN_HOLD_BYTES}-byte bound")
+        row = closed(
+            parse_json(payload, MAX_PLAN_HOLD_BYTES),
+            (*_PLAN_HOLD_BODY, "hold_digest", "hold_id"),
+            "plan hold receipt",
+        )
+        if row["schema_version"] != SCHEMA_VERSION or type(row["schema_version"]) is not int:
+            raise ValueError("plan hold receipt schema_version is not V1")
+        predecessor = row["predecessor_digest"]
+        value = cls(
+            incarnation_id=_str(row["incarnation_id"]),
+            lineage_scope=_str(row["lineage_scope"]),
+            review_intent_key=_str(row["review_intent_key"]),
+            predecessor_key=_str(row["predecessor_key"]),
+            predecessor_digest=None if predecessor is None else _str(predecessor),
+            event_id=_str(row["event_id"]),
+            event_sequence=_int(row["event_sequence"]),
+            policy_kind=parse_enum(row["policy_kind"], PolicyKind, "policy_kind"),
+            policy_row=parse_enum(row["policy_row"], SuccessorRow, "policy_row"),
+            hold_reason=parse_enum(row["hold_reason"], ReasonCode, "hold_reason"),
+            policy_input_bytes=canonical_json(row["policy_input"]),
+            prepare_checked_at_utc=_str(row["prepare_checked_at_utc"]),
+        )
+        if value.canonical_bytes() != payload:
+            raise ValueError("plan hold receipt bytes are not canonical")
+        return value
+
+
 __all__ = [
     "EXISTING_RECEIPT_ID_PREFIX",
     "HOLD_RECEIPT_ID_PREFIX",
+    "MAX_PLAN_HOLD_BYTES",
+    "PLAN_HOLD_ID_PREFIX",
     "RESOLUTION_ID_PREFIX",
     "WAKE_CLAIM_ID_PREFIX",
+    "CycleClosureV1",
+    "CycleResult",
     "ExistingDecisionReceiptV1",
     "FrozenPredecessor",
     "HoldReason",
     "HoldReceiptV1",
     "LogicalCycleResolutionV1",
+    "PlanHoldReceiptV1",
     "ResultKind",
     "wake_review_intent_key",
 ]

@@ -1,4 +1,4 @@
-"""R16 U4-1 / IP-14a-1 / IP-16a-1: the SubjectHistoryDB SQLite file, schema v3, trusted opener.
+"""R16 U4-1 / IP-14a-1 / IP-16a-1 / IP-14b-1: the SubjectHistoryDB SQLite file, schema v4, trusted opener.
 
 v1 (#376 §A/§B, #376 6738757841 / 6752207008): five tables (``history_meta``,
 ``history_operations``, ``history_decisions``, ``history_source_refs``,
@@ -13,9 +13,17 @@ and their PREPARE reservations are per incarnation; Claim, nonce and Outcome
 stay global. v2 was already deployed on eve (6ed2361), so this is a new
 version, not an edit of v2.
 
-A v1 or v2 file is never opened: it raises ``HistoryStoreMigrationRequired``
-and is migrated only by the explicit ``suzka.r16.history_migration`` command
-(Human decision §11-1). HOLD receipts and R19 cycle resolution are IP-14b.
+v4 (IP-14b D1 r2, #411; bundled with IP-17a's row 2c, Human decision
+2026-11-18): the R19 Wake / claim / attempt-outcome / terminal / Outbox / ACK
+tables, the R16 cycle closure (``logical_cycle_resolutions`` with the HOLD /
+EXISTING receipts, the ``cycle:`` key as #376's 3rd uniqueness), the HD-3 (a)
+``plan_hold_receipts``, ``policy_row`` '2c' for V3, and NULL-safe multi-branch
+CHECKs in ``history_meta`` / ``history_operations``. Writers are IP-14b-3 /
+IP-20 / IP-21; this module only stores.
+
+A v1, v2 or v3 file is never opened: it raises
+``HistoryStoreMigrationRequired`` and is migrated only by the explicit
+``suzka.r16.history_migration`` command (Human decision §11-1).
 
 Authority boundary: this module is storage only.  The single writer authority
 for the file is the ``subject.history`` R07 participant; SQL CHECKs and
@@ -51,21 +59,38 @@ from suzka.r16.history_codec import (
     history_operation_digest,
 )
 from suzka.r16.contracts import MAX_JSON_BYTES, digest, identifier
+from suzka.r16.cycle_contracts import MAX_PLAN_HOLD_BYTES
+from suzka.r16.cycle_contracts import MAX_RECORD_BYTES as _CYCLE_RECORD_BYTES
 from suzka.r16.history_records import (
+    LINEAGE_RECORD_KINDS,
     MAX_CHALLENGES_PER_INTENT,
     OPERATION_TABLES,
+    PLAN_HOLD_GATED_KINDS,
+    R18_GATED_KINDS,
+    R19_GATED_KINDS,
     RECORD_OPERATION_KINDS,
     RECORD_TABLES,
+    V2_RECORD_TABLES,
+    V4_RECORD_TABLES,
     HistoryOperationKind,
     HistoryRecordOperationV1,
 )
 from suzka.r16.history_schema_v1 import SCHEMA_HASH_V1, SCHEMA_STATEMENTS_V1
 from suzka.r16.history_schema_v2 import SCHEMA_HASH_V2, SCHEMA_STATEMENTS_V2
+from suzka.r16.history_schema_v3 import SCHEMA_HASH_V3, SCHEMA_STATEMENTS_V3
 from suzka.r17.contracts import MAX_RECORD_BYTES as _R17_RECORD_BYTES
 from suzka.r18.contracts import MAX_RECORD_BYTES as _R18_RECORD_BYTES
+from suzka.r19.contracts import MAX_ATTEMPTS
+from suzka.r19.contracts import MAX_RECORD_BYTES as _R19_RECORD_BYTES
 
 
-HISTORY_SCHEMA_VERSION: Final = 3
+HISTORY_SCHEMA_VERSION: Final = 4
+# The versions the explicit migration command turns into this one.
+_MIGRATABLE: Final = (
+    (1, SCHEMA_STATEMENTS_V1, SCHEMA_HASH_V1),
+    (2, SCHEMA_STATEMENTS_V2, SCHEMA_HASH_V2),
+    (3, SCHEMA_STATEMENTS_V3, SCHEMA_HASH_V3),
+)
 _SQLITE_BUSY_TIMEOUT_SECONDS: Final = 5.0
 # Conservative bytes a FINALIZE may add for one pending operation: the
 # committed envelope, inner U1 bytes, policy input, source rows, receipt and
@@ -89,11 +114,24 @@ def _decision(column: str) -> str:
     )
 
 
-_RECORD_BYTES: Final = max(_R17_RECORD_BYTES, _R18_RECORD_BYTES)
+# IP-14b D1 r2 §2-2 (P3): the bound over every record family, so a later
+# increase in any family changes the schema text visibly. 16384 today.
+_RECORD_BYTES: Final = max(
+    _R17_RECORD_BYTES, _R18_RECORD_BYTES, _R19_RECORD_BYTES, _CYCLE_RECORD_BYTES, MAX_PLAN_HOLD_BYTES
+)
 _ALL_KINDS: Final = ",".join(f"'{kind.value}'" for kind in HistoryOperationKind)
+# Every envelope kind (PREPARE inserts and key reservations).
 _RECORD_KINDS: Final = ",".join(
     f"'{kind.value}'" for kind in HistoryOperationKind if kind in RECORD_OPERATION_KINDS
 )
+# Envelope kinds without R16 lineage columns (the history_operations CHECK).
+_PLAIN_RECORD_KINDS: Final = ",".join(
+    f"'{kind.value}'"
+    for kind in HistoryOperationKind
+    if kind in RECORD_OPERATION_KINDS and kind not in LINEAGE_RECORD_KINDS
+)
+# The kinds that carry the R16 lineage columns and hold the Decision slots.
+_DECISION_KINDS: Final = "'R16_DECISION_ISSUE', 'R16_CYCLE_DECISION'"
 
 
 def _kind_exists(kind: HistoryOperationKind) -> str:
@@ -108,23 +146,29 @@ def _kind_exists(kind: HistoryOperationKind) -> str:
 def _gate(kind: HistoryOperationKind, bound: str = "NEW.record_bytes") -> str:
     """The row's operation is PREPARED, of this kind, and its pending envelope
     contains the row's canonical bytes (the record is embedded verbatim)."""
+    return _gate_sql(f"'{kind.value}'", bound)
+
+
+def _gate_sql(kind_sql: str, bound: str = "NEW.record_bytes") -> str:
+    """``_gate`` with the kind as an SQL expression (a v4 resolution's kind
+    depends on whether it names a Decision)."""
     return (
         "NOT EXISTS (SELECT 1 FROM history_operations o"
         " WHERE o.incarnation_id = NEW.incarnation_id AND o.transaction_id = NEW.transaction_id"
-        f" AND o.phase = 'PREPARED' AND o.operation_kind = '{kind.value}'"
+        f" AND o.phase = 'PREPARED' AND o.operation_kind = {kind_sql}"
         f" AND instr(o.pending_bytes, {bound}) > 0)"
     )
 
 
 def _record_table(name: str, columns: str, constraints: str = "") -> str:
+    body = f"{columns}\n" if columns else ""
     return f"""CREATE TABLE {name} (
     record_id TEXT PRIMARY KEY NOT NULL CHECK (length(record_id) BETWEEN 1 AND 192),
     incarnation_id TEXT NOT NULL,
     transaction_id TEXT NOT NULL,
     record_bytes BLOB NOT NULL CHECK (length(record_bytes) BETWEEN 2 AND {_RECORD_BYTES}),
     record_digest TEXT NOT NULL CHECK {_hex("record_digest")},
-{columns}
-    FOREIGN KEY (incarnation_id, transaction_id)
+{body}    FOREIGN KEY (incarnation_id, transaction_id)
         REFERENCES history_operations (incarnation_id, transaction_id){constraints}
 ) STRICT"""
 
@@ -371,7 +415,166 @@ BEGIN SELECT RAISE(ABORT, 'outcome assessment is not admissible here'); END""",
 WHEN {_gate(_K.R17_FEEDBACK_COMMIT)}
     OR NOT EXISTS (SELECT 1 FROM outcome_assessments a WHERE a.record_id = NEW.assessment_id)
 BEGIN SELECT RAISE(ABORT, 'decision feedback is not admissible here'); END""",
-    *(statement for table in RECORD_TABLES for statement in _immutable(table)),
+    *(statement for table in V2_RECORD_TABLES for statement in _immutable(table)),
+)
+
+# ------------------------------------------------------------ v4 additions
+# IP-14b D1 r2 §2-2 / §2-3: tables, then their insert triggers, then their
+# immutability triggers. No trigger reads a clock (§2-7); every condition is
+# structural and is pre-checked by the writers (§2-6), so these refusals are
+# defence in depth.
+_CYCLE_KEY: Final = "'cycle:' || {inc} || ':' || {cycle}"
+V4_STATEMENTS: Final[tuple[str, ...]] = (
+    _record_table(
+        "wakeups",
+        f"""    logical_cycle_id TEXT NOT NULL UNIQUE CHECK {_hex("logical_cycle_id")},
+    cause_event_id TEXT NOT NULL CHECK {_uuid("cause_event_id")},
+    verified_outcome_id TEXT CHECK (verified_outcome_id IS NULL
+        OR length(verified_outcome_id) BETWEEN 1 AND 192),
+    outcome_revision INTEGER CHECK (outcome_revision IS NULL OR outcome_revision > 0),
+    UNIQUE (incarnation_id, cause_event_id),
+    UNIQUE (incarnation_id, verified_outcome_id, outcome_revision),
+    CHECK ((verified_outcome_id IS NULL) = (outcome_revision IS NULL)),""",
+        ",\n    FOREIGN KEY (verified_outcome_id, outcome_revision)\n"
+        "        REFERENCES verified_outcomes (verified_outcome_id, outcome_revision)",
+    ),
+    _record_table(
+        "wake_claims",
+        f"""    wakeup_id TEXT NOT NULL REFERENCES wakeups (record_id),
+    logical_cycle_id TEXT NOT NULL CHECK {_hex("logical_cycle_id")},
+    attempt_index INTEGER NOT NULL CHECK (attempt_index BETWEEN 1 AND {MAX_ATTEMPTS}),
+    UNIQUE (wakeup_id, attempt_index),""",
+    ),
+    # One outcome per attempt; record_id is the claim (as approval_expirations).
+    _record_table(
+        "wake_attempt_outcomes",
+        "",
+        ",\n    FOREIGN KEY (record_id) REFERENCES wake_claims (record_id)",
+    ),
+    _record_table(
+        "logical_cycle_resolutions",
+        f"""    logical_cycle_id TEXT NOT NULL CHECK {_hex("logical_cycle_id")},
+    review_intent_key TEXT NOT NULL CHECK {_hex("review_intent_key")},
+    claim_id TEXT NOT NULL REFERENCES wake_claims (record_id),
+    result_kind TEXT NOT NULL CHECK (result_kind IN ('DECISION_ISSUED', 'EXISTING_DECISION', 'HOLD')),
+    result_id TEXT NOT NULL CHECK (length(result_id) BETWEEN 1 AND 192),
+    result_digest TEXT NOT NULL CHECK {_hex("result_digest")},
+    decision_id TEXT REFERENCES history_decisions (decision_id),
+    receipt_bytes BLOB CHECK (receipt_bytes IS NULL
+        OR length(receipt_bytes) BETWEEN 2 AND {_CYCLE_RECORD_BYTES}),
+    UNIQUE (incarnation_id, logical_cycle_id),
+    CHECK ((result_kind = 'DECISION_ISSUED') = (decision_id IS NOT NULL)),
+    CHECK ((decision_id IS NULL) = (receipt_bytes IS NOT NULL)),
+    CHECK (decision_id IS NULL OR decision_id = result_id),""",
+    ),
+    _record_table(
+        "wake_terminals",
+        """    wakeup_id TEXT NOT NULL UNIQUE REFERENCES wakeups (record_id),
+    terminal TEXT NOT NULL CHECK (terminal IN ('FAILED_TERMINAL', 'CANCELLED')),
+    reason TEXT NOT NULL CHECK (reason IN ('EXPIRED_WAKE', 'ATTEMPTS_EXHAUSTED', 'SUPERSEDED')),
+    superseding_wakeup_id TEXT REFERENCES wakeups (record_id),
+    CHECK ((terminal = 'CANCELLED') = (reason = 'SUPERSEDED')),
+    CHECK ((reason = 'SUPERSEDED') = (superseding_wakeup_id IS NOT NULL)),""",
+    ),
+    # No text column: the body is generated from the template (F13).
+    _record_table(
+        "outbox_messages",
+        f"""    source_id TEXT NOT NULL CHECK (length(source_id) BETWEEN 64 AND 128),
+    result_digest TEXT NOT NULL CHECK {_hex("result_digest")},
+    template TEXT NOT NULL CHECK (template IN (
+        'DECISION_ISSUED', 'DECISION_CONFIRMED', 'DECISION_HELD', 'CYCLE_FAILED')),
+    context_id TEXT NOT NULL CHECK (length(context_id) BETWEEN 1 AND 128),""",
+    ),
+    _record_table(
+        "outbox_acks",
+        """    message_id TEXT NOT NULL UNIQUE REFERENCES outbox_messages (record_id),
+    context_id TEXT NOT NULL CHECK (length(context_id) BETWEEN 1 AND 128),""",
+    ),
+    _record_table(
+        "plan_hold_receipts",
+        f"""    lineage_scope TEXT NOT NULL CHECK (length(lineage_scope) BETWEEN 1 AND 128),
+    review_intent_key TEXT NOT NULL CHECK {_hex("review_intent_key")},
+    UNIQUE (incarnation_id, review_intent_key),""",
+    ),
+    f"""CREATE TRIGGER wakeups_insert BEFORE INSERT ON wakeups
+WHEN {_gate(_K.R19_WAKE_MATERIALIZE)}
+BEGIN SELECT RAISE(ABORT, 'wake is not admissible here'); END""",
+    # Claims in order, of the Wake's own cycle, and never once the cycle is
+    # closed or a closure is PREPARED (#373 A4-3).
+    f"""CREATE TRIGGER wake_claims_insert BEFORE INSERT ON wake_claims
+WHEN {_gate(_K.R19_WAKE_CLAIM)}
+    OR NOT EXISTS (SELECT 1 FROM wakeups w WHERE w.record_id = NEW.wakeup_id
+        AND w.logical_cycle_id = NEW.logical_cycle_id AND w.incarnation_id = NEW.incarnation_id)
+    OR (SELECT count(*) FROM wake_claims c WHERE c.wakeup_id = NEW.wakeup_id)
+        IS NOT NEW.attempt_index - 1
+    OR EXISTS (SELECT 1 FROM history_operation_keys k WHERE k.live = 1
+        AND k.reserved_key = {_CYCLE_KEY.format(inc="NEW.incarnation_id", cycle="NEW.logical_cycle_id")})
+BEGIN SELECT RAISE(ABORT, 'wake claim is not admissible here'); END""",
+    # Only for the latest claim of a cycle that is not closed.
+    f"""CREATE TRIGGER wake_attempt_outcomes_insert BEFORE INSERT ON wake_attempt_outcomes
+WHEN {_gate(_K.R19_WAKE_ATTEMPT_OUTCOME)}
+    OR NOT EXISTS (SELECT 1 FROM wake_claims c WHERE c.record_id = NEW.record_id
+        AND c.incarnation_id = NEW.incarnation_id
+        AND NOT EXISTS (SELECT 1 FROM wake_claims l
+            WHERE l.wakeup_id = c.wakeup_id AND l.attempt_index > c.attempt_index)
+        AND NOT EXISTS (SELECT 1 FROM history_operation_keys k WHERE k.live = 1
+            AND k.reserved_key = {_CYCLE_KEY.format(inc="c.incarnation_id", cycle="c.logical_cycle_id")}))
+BEGIN SELECT RAISE(ABORT, 'wake attempt outcome is not admissible here'); END""",
+    # The latest claim (#373 A3-2 (ii)) with no attempt outcome; a Decision
+    # of this same operation with the cycle's review_intent_key; a receipt
+    # embedded in this operation.
+    f"""CREATE TRIGGER logical_cycle_resolutions_insert BEFORE INSERT ON logical_cycle_resolutions
+WHEN {_gate_sql("CASE WHEN NEW.decision_id IS NULL THEN 'R16_CYCLE_RECEIPT' ELSE 'R16_CYCLE_DECISION' END")}
+    OR (NEW.receipt_bytes IS NOT NULL AND {_gate(_K.R16_CYCLE_RECEIPT, "NEW.receipt_bytes")})
+    OR NOT EXISTS (SELECT 1 FROM wake_claims c WHERE c.record_id = NEW.claim_id
+        AND c.logical_cycle_id = NEW.logical_cycle_id AND c.incarnation_id = NEW.incarnation_id
+        AND NOT EXISTS (SELECT 1 FROM wake_claims l
+            WHERE l.wakeup_id = c.wakeup_id AND l.attempt_index > c.attempt_index))
+    OR (NEW.decision_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM history_decisions d
+        WHERE d.decision_id = NEW.decision_id AND d.incarnation_id = NEW.incarnation_id
+            AND d.transaction_id = NEW.transaction_id
+            AND d.review_intent_key = NEW.review_intent_key))
+    OR EXISTS (SELECT 1 FROM wake_attempt_outcomes a WHERE a.record_id = NEW.claim_id)
+BEGIN SELECT RAISE(ABORT, 'cycle resolution is not admissible here'); END""",
+    # The terminal's operation holds the cycle key of this Wake's own cycle
+    # (IP-14b-1: binds the reserved key to the Wake in SQL); ATTEMPTS_EXHAUSTED
+    # needs every attempt; SUPERSEDED only an unclaimed Wake by another Wake.
+    f"""CREATE TRIGGER wake_terminals_insert BEFORE INSERT ON wake_terminals
+WHEN {_gate(_K.R19_WAKE_TERMINAL)}
+    OR NOT EXISTS (SELECT 1 FROM wakeups w JOIN history_operation_keys k
+        ON k.reserved_key = {_CYCLE_KEY.format(inc="w.incarnation_id", cycle="w.logical_cycle_id")}
+        WHERE w.record_id = NEW.wakeup_id AND w.incarnation_id = NEW.incarnation_id
+            AND k.incarnation_id = NEW.incarnation_id AND k.transaction_id = NEW.transaction_id
+            AND k.live = 1)
+    OR (NEW.reason = 'ATTEMPTS_EXHAUSTED'
+        AND (SELECT count(*) FROM wake_claims c WHERE c.wakeup_id = NEW.wakeup_id) IS NOT {MAX_ATTEMPTS})
+    OR (NEW.reason = 'SUPERSEDED' AND (
+        NEW.superseding_wakeup_id = NEW.wakeup_id
+        OR EXISTS (SELECT 1 FROM wake_claims c WHERE c.wakeup_id = NEW.wakeup_id)
+        OR NOT EXISTS (SELECT 1 FROM wakeups s WHERE s.record_id = NEW.superseding_wakeup_id
+            AND s.incarnation_id = NEW.incarnation_id)))
+BEGIN SELECT RAISE(ABORT, 'wake terminal is not admissible here'); END""",
+    f"""CREATE TRIGGER outbox_messages_insert BEFORE INSERT ON outbox_messages
+WHEN {_gate(_K.R19_OUTBOX_EMIT)}
+    OR (NEW.template = 'CYCLE_FAILED' AND NOT EXISTS (SELECT 1 FROM wake_terminals t
+        WHERE t.record_id = NEW.source_id AND t.record_digest = NEW.result_digest
+            AND t.terminal = 'FAILED_TERMINAL' AND t.incarnation_id = NEW.incarnation_id))
+    OR (NEW.template IS NOT 'CYCLE_FAILED' AND NOT EXISTS (SELECT 1 FROM logical_cycle_resolutions r
+        WHERE r.logical_cycle_id = NEW.source_id AND r.incarnation_id = NEW.incarnation_id
+            AND r.result_digest = NEW.result_digest
+            AND r.result_kind = CASE NEW.template WHEN 'DECISION_ISSUED' THEN 'DECISION_ISSUED'
+                WHEN 'DECISION_CONFIRMED' THEN 'EXISTING_DECISION' ELSE 'HOLD' END))
+BEGIN SELECT RAISE(ABORT, 'outbox message is not admissible here'); END""",
+    # F11: an ACK of the exact message in the same Context.
+    f"""CREATE TRIGGER outbox_acks_insert BEFORE INSERT ON outbox_acks
+WHEN {_gate(_K.R19_INBOX_ACK)}
+    OR NOT EXISTS (SELECT 1 FROM outbox_messages m WHERE m.record_id = NEW.message_id
+        AND m.context_id = NEW.context_id AND m.incarnation_id = NEW.incarnation_id)
+BEGIN SELECT RAISE(ABORT, 'inbox ack is not admissible here'); END""",
+    f"""CREATE TRIGGER plan_hold_receipts_insert BEFORE INSERT ON plan_hold_receipts
+WHEN {_gate(_K.R16_PLAN_HOLD)}
+BEGIN SELECT RAISE(ABORT, 'plan hold receipt is not admissible here'); END""",
+    *(statement for table in V4_RECORD_TABLES for statement in _immutable(table)),
 )
 
 # Order matters: it is also the schema hash input.  Every statement is
@@ -389,14 +592,14 @@ SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
     adopted_baseline_id TEXT,
     adopted_baseline_hash TEXT,
     genesis_incarnation_id TEXT,
-    CHECK (
+    CHECK (coalesce((
         (phase = 'PROVISIONAL' AND adopted_baseline_id IS NULL
             AND adopted_baseline_hash IS NULL AND genesis_incarnation_id IS NULL)
         OR (phase = 'ACTIVE'
             AND length(adopted_baseline_id) BETWEEN 1 AND 128
             AND {_hex("adopted_baseline_hash")}
             AND {_hex("genesis_incarnation_id")})
-    )
+    ), 0))
 ) STRICT""",
     f"""CREATE TABLE history_operations (
     incarnation_id TEXT NOT NULL CHECK {_hex("incarnation_id")},
@@ -416,8 +619,8 @@ SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
     predecessor_key TEXT,
     PRIMARY KEY (incarnation_id, transaction_id),
     UNIQUE (incarnation_id, event_id, processing_sequence),
-    CHECK (
-        (operation_kind = 'R16_DECISION_ISSUE'
+    CHECK (coalesce((
+        (operation_kind IN ({_DECISION_KINDS})
             AND typeof(pending_bytes) = 'blob'
             AND length(pending_bytes) BETWEEN 1 AND {MAX_PENDING_BYTES}
             AND {_hex("pending_digest")}
@@ -428,20 +631,22 @@ SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
             AND pending_bytes IS NULL AND pending_digest IS NULL
             AND lineage_scope IS NULL AND review_intent_key IS NULL
             AND predecessor_key IS NULL)
-        OR (operation_kind IN ({_RECORD_KINDS})
+        OR (operation_kind IN ({_PLAIN_RECORD_KINDS})
             AND typeof(pending_bytes) = 'blob'
             AND length(pending_bytes) BETWEEN 1 AND {MAX_PENDING_BYTES}
             AND {_hex("pending_digest")}
             AND lineage_scope IS NULL AND review_intent_key IS NULL
             AND predecessor_key IS NULL)
-    )
+    ), 0))
 ) STRICT""",
-    """CREATE UNIQUE INDEX history_operations_review_intent
+    # A Wake-origin Decision competes with PLAN_PREVIEW Decisions for the
+    # same slots, at PREPARE (IP-14b D1 r2 §2-1 (c)).
+    f"""CREATE UNIQUE INDEX history_operations_review_intent
     ON history_operations (incarnation_id, review_intent_key)
-    WHERE operation_kind = 'R16_DECISION_ISSUE' AND phase IN ('PREPARED', 'FINALIZED')""",
-    """CREATE UNIQUE INDEX history_operations_predecessor
+    WHERE operation_kind IN ({_DECISION_KINDS}) AND phase IN ('PREPARED', 'FINALIZED')""",
+    f"""CREATE UNIQUE INDEX history_operations_predecessor
     ON history_operations (incarnation_id, lineage_scope, predecessor_key)
-    WHERE operation_kind = 'R16_DECISION_ISSUE' AND phase IN ('PREPARED', 'FINALIZED')""",
+    WHERE operation_kind IN ({_DECISION_KINDS}) AND phase IN ('PREPARED', 'FINALIZED')""",
     f"""CREATE TABLE history_decisions (
     decision_id TEXT PRIMARY KEY NOT NULL CHECK {_decision("decision_id")},
     incarnation_id TEXT NOT NULL,
@@ -465,6 +670,7 @@ SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
         policy_row IN ('3', '4', '5', '6')
         OR (policy_kind IN ('SUCCESSOR_POLICY_V2', 'SUCCESSOR_POLICY_V3')
             AND policy_row IN ('4b', '5b'))
+        OR (policy_kind = 'SUCCESSOR_POLICY_V3' AND policy_row = '2c')
     ),
     policy_input_bytes BLOB NOT NULL
         CHECK (length(policy_input_bytes) BETWEEN 2 AND {MAX_POLICY_INPUT_BYTES}),
@@ -595,20 +801,23 @@ BEGIN SELECT RAISE(ABORT, 'an operation with finalize rows cannot abort'); END""
     """CREATE TRIGGER history_operations_no_delete BEFORE DELETE ON history_operations
 BEGIN SELECT RAISE(ABORT, 'history operations are immutable'); END""",
     # Decision, source and receipt rows are written only inside the FINALIZE
-    # of their exact PREPARED operation, then never changed.
+    # of their exact PREPARED operation, then never changed. A cycle Decision
+    # is embedded verbatim in its CycleClosureV1 envelope (the record-table
+    # pattern of _gate).
     """CREATE TRIGGER history_decisions_insert BEFORE INSERT ON history_decisions
 WHEN NOT EXISTS (
     SELECT 1 FROM history_operations o
     WHERE o.incarnation_id = NEW.incarnation_id
         AND o.transaction_id = NEW.transaction_id
         AND o.phase = 'PREPARED'
-        AND o.operation_kind = 'R16_DECISION_ISSUE'
         AND o.event_id = NEW.issuer_event_id
         AND o.processing_sequence = NEW.issuer_sequence
         AND o.lineage_scope = NEW.lineage_scope
         AND o.review_intent_key = NEW.review_intent_key
         AND o.predecessor_key = NEW.predecessor_key
-        AND o.pending_bytes = NEW.committed_bytes
+        AND ((o.operation_kind = 'R16_DECISION_ISSUE' AND o.pending_bytes = NEW.committed_bytes)
+            OR (o.operation_kind = 'R16_CYCLE_DECISION'
+                AND instr(o.pending_bytes, NEW.committed_bytes) > 0))
 )
 BEGIN SELECT RAISE(ABORT, 'history decision has no matching PREPARED operation'); END""",
     """CREATE TRIGGER history_decisions_no_update BEFORE UPDATE ON history_decisions
@@ -642,6 +851,7 @@ BEGIN SELECT RAISE(ABORT, 'history receipts are immutable'); END""",
     """CREATE TRIGGER history_receipts_no_delete BEFORE DELETE ON history_postcommit_receipts
 BEGIN SELECT RAISE(ABORT, 'history receipts are immutable'); END""",
     *V2_STATEMENTS,
+    *V4_STATEMENTS,
 )
 
 SCHEMA_HASH: Final = sha256(
@@ -670,13 +880,15 @@ class HistoryStoreConflict(HistoryStoreError):
 
 
 class HistoryStoreMigrationRequired(HistoryStoreError):
-    """The file is a valid v1 or v2 store: run the explicit migration to v3.
+    """The file is a valid v1, v2 or v3 store: run the explicit migration to v4.
 
     Not corruption and not retryable by waiting; startup stops (§11-1)."""
 
 
 class HistoryStoreRecordsDisabled(HistoryStoreError):
-    """An R17 / R18 record write while ``r18.enabled`` is false (§7)."""
+    """A record PREPARE while its family's switch is off: R17 / R18 kinds and
+    ``r18.enabled`` (§7), R19 / cycle kinds and ``r19.enabled``, the plan-hold
+    kind and ``subject_history.plan_hold_receipts`` (IP-14b D1 r2 §6-1)."""
 
 
 class HistoryPhase(str, Enum):
@@ -892,6 +1104,58 @@ def _expected_schema(statements: tuple[str, ...]) -> list[tuple[object, ...]]:
         reference.close()
 
 
+def _insert_decision(
+    connection: sqlite3.Connection, transaction_id: str, decision: CommittedDecisionV1
+) -> None:
+    """The Decision and source rows of one FINALIZE (``R16_DECISION_ISSUE``,
+    and ``R16_CYCLE_DECISION`` before its resolution row)."""
+
+    committed = decision.canonical_bytes()
+    decision_bytes = decision.decision_bytes
+    connection.execute(
+        "INSERT INTO history_decisions (decision_id, incarnation_id, "
+        "transaction_id, lineage_scope, review_intent_key, predecessor_key, "
+        "predecessor_digest, issuer_event_id, issuer_sequence, decision_bytes, "
+        "decision_digest, committed_bytes, committed_digest, policy_kind, "
+        "policy_row, policy_input_bytes, policy_input_digest) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            decision.decision_id,
+            decision.incarnation_id,
+            transaction_id,
+            decision.lineage_scope,
+            decision.review_intent_key,
+            decision.predecessor_key,
+            decision.predecessor_digest,
+            decision.issuer_event_id,
+            decision.issuer_sequence,
+            decision_bytes,
+            sha256(decision_bytes).hexdigest(),
+            committed,
+            decision.content_digest,
+            decision.policy_kind.value,
+            decision.policy_row.value,
+            decision.policy_input_bytes,
+            decision.policy_input_digest,
+        ),
+    )
+    connection.executemany(
+        "INSERT INTO history_source_refs (decision_id, source_role, "
+        "source_kind, ref_id, revision, digest) VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            (
+                decision.decision_id,
+                item.role.value,
+                item.kind,
+                item.ref_id,
+                item.revision,
+                item.digest,
+            )
+            for item in decision.source_refs
+        ],
+    )
+
+
 def _finish(
     connection: sqlite3.Connection,
     incarnation_id: str,
@@ -947,12 +1211,16 @@ class SubjectHistoryStore:
         max_page_count: int,
         *,
         r18_enabled: bool = False,
+        r19_enabled: bool = False,
+        plan_hold_receipts: bool = False,
     ) -> None:
         self.path = path
         self._connection = connection
         self._max_page_count = max_page_count
         self._lock = Lock()
         self._r18_enabled = r18_enabled
+        self._r19_enabled = r19_enabled
+        self._plan_hold_receipts = plan_hold_receipts
 
     # ------------------------------------------------------------------ open
 
@@ -965,6 +1233,8 @@ class SubjectHistoryStore:
         journal_lineage_id: str,
         max_page_count: int,
         r18_enabled: bool = False,
+        r19_enabled: bool = False,
+        plan_hold_receipts: bool = False,
     ) -> SubjectHistoryStore:
         """Create a PROVISIONAL store; refuses an existing path."""
 
@@ -1014,11 +1284,23 @@ class SubjectHistoryStore:
             except FileNotFoundError:
                 pass
         _fsync_directory(path.parent)
-        return cls.open(path, max_page_count=max_page_count, r18_enabled=r18_enabled)
+        return cls.open(
+            path,
+            max_page_count=max_page_count,
+            r18_enabled=r18_enabled,
+            r19_enabled=r19_enabled,
+            plan_hold_receipts=plan_hold_receipts,
+        )
 
     @classmethod
     def open(
-        cls, path: Path, *, max_page_count: int, r18_enabled: bool = False
+        cls,
+        path: Path,
+        *,
+        max_page_count: int,
+        r18_enabled: bool = False,
+        r19_enabled: bool = False,
+        plan_hold_receipts: bool = False,
     ) -> SubjectHistoryStore:
         """Open an existing store read-write; never creates or migrates."""
 
@@ -1041,7 +1323,14 @@ class SubjectHistoryStore:
             if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
                 raise HistoryStoreCorrupt("SubjectHistory file was replaced")
             cls._verify_schema(connection)
-            store = cls(path, connection, max_page_count, r18_enabled=r18_enabled)
+            store = cls(
+                path,
+                connection,
+                max_page_count,
+                r18_enabled=r18_enabled,
+                r19_enabled=r19_enabled,
+                plan_hold_receipts=plan_hold_receipts,
+            )
             store.meta()
             return store
         except sqlite3.Error as error:
@@ -1099,12 +1388,12 @@ class SubjectHistoryStore:
     def _verify_schema(connection: sqlite3.Connection) -> None:
         actual = connection.execute(_SCHEMA_QUERY).fetchall()
         if actual != _expected_schema(SCHEMA_STATEMENTS):
-            for version, statements in ((1, SCHEMA_STATEMENTS_V1), (2, SCHEMA_STATEMENTS_V2)):
+            for version, statements, _ in _MIGRATABLE:
                 if actual == _expected_schema(statements):
                     raise HistoryStoreMigrationRequired(
                         f"SubjectHistory is schema v{version}: run suzka.r16.history_migration"
                     )
-            raise HistoryStoreCorrupt("SubjectHistory schema is not schema v3")
+            raise HistoryStoreCorrupt(f"SubjectHistory schema is not schema v{HISTORY_SCHEMA_VERSION}")
         check = connection.execute("PRAGMA quick_check").fetchall()
         if check != [("ok",)]:
             raise HistoryStoreCorrupt("SubjectHistory integrity check failed")
@@ -1171,12 +1460,12 @@ class SubjectHistoryStore:
             )
         except (TypeError, ValueError) as error:
             raise HistoryStoreCorrupt("SubjectHistory meta is invalid") from error
-        if (meta.schema_version, meta.schema_hash) in ((1, SCHEMA_HASH_V1), (2, SCHEMA_HASH_V2)):
+        if (meta.schema_version, meta.schema_hash) in {(v, h) for v, _, h in _MIGRATABLE}:
             raise HistoryStoreMigrationRequired(
                 f"SubjectHistory meta is schema v{meta.schema_version}"
             )
         if meta.schema_version != HISTORY_SCHEMA_VERSION or meta.schema_hash != SCHEMA_HASH:
-            raise HistoryStoreCorrupt("SubjectHistory meta schema is not v3")
+            raise HistoryStoreCorrupt(f"SubjectHistory meta schema is not v{HISTORY_SCHEMA_VERSION}")
         return meta
 
     def activate(
@@ -1344,63 +1633,35 @@ class SubjectHistoryStore:
     ) -> None:
         """One ``BEGIN IMMEDIATE`` FINALIZE: Decision, sources, receipt, phase."""
 
-        committed = decision.canonical_bytes()
-        decision_bytes = decision.decision_bytes
         with self._write("finalize") as connection:
-            connection.execute(
-                "INSERT INTO history_decisions (decision_id, incarnation_id, "
-                "transaction_id, lineage_scope, review_intent_key, predecessor_key, "
-                "predecessor_digest, issuer_event_id, issuer_sequence, decision_bytes, "
-                "decision_digest, committed_bytes, committed_digest, policy_kind, "
-                "policy_row, policy_input_bytes, policy_input_digest) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    decision.decision_id,
-                    decision.incarnation_id,
-                    transaction_id,
-                    decision.lineage_scope,
-                    decision.review_intent_key,
-                    decision.predecessor_key,
-                    decision.predecessor_digest,
-                    decision.issuer_event_id,
-                    decision.issuer_sequence,
-                    decision_bytes,
-                    sha256(decision_bytes).hexdigest(),
-                    committed,
-                    decision.content_digest,
-                    decision.policy_kind.value,
-                    decision.policy_row.value,
-                    decision.policy_input_bytes,
-                    decision.policy_input_digest,
-                ),
-            )
-            connection.executemany(
-                "INSERT INTO history_source_refs (decision_id, source_role, "
-                "source_kind, ref_id, revision, digest) VALUES (?, ?, ?, ?, ?, ?)",
-                [
-                    (
-                        decision.decision_id,
-                        item.role.value,
-                        item.kind,
-                        item.ref_id,
-                        item.revision,
-                        item.digest,
-                    )
-                    for item in decision.source_refs
-                ],
-            )
+            _insert_decision(connection, transaction_id, decision)
             _finish(connection, decision.incarnation_id, transaction_id, receipt)
 
     # -------------------------------------------------- v2 record operations
 
-    def has_record_operations(self) -> bool:
-        """Whether any R17 / R18 operation row exists (§7 startup check)."""
-
-        kinds = tuple(kind.value for kind in RECORD_OPERATION_KINDS)
-        marks = ", ".join("?" for _ in kinds)
+    def _has_kinds(self, kinds: frozenset[HistoryOperationKind]) -> bool:
+        values = tuple(sorted(kind.value for kind in kinds))
+        marks = ", ".join("?" for _ in values)
         return bool(
-            self._read(f"SELECT 1 FROM history_operations WHERE operation_kind IN ({marks}) LIMIT 1", kinds)
+            self._read(f"SELECT 1 FROM history_operations WHERE operation_kind IN ({marks}) LIMIT 1", values)
         )
+
+    def has_record_operations(self) -> bool:
+        """Whether any R17 / R18 operation row exists (§7 startup check, and
+        the Decision issuer's NO_LEDGER shortcut). R19 / cycle and plan-hold
+        rows are not R18 data (IP-14b D1 r2 §4-3, P3-1)."""
+
+        return self._has_kinds(R18_GATED_KINDS)
+
+    def has_r19_operations(self) -> bool:
+        """Whether any R19 / cycle operation row exists (IP-14b D1 r2 §6-1)."""
+
+        return self._has_kinds(R19_GATED_KINDS)
+
+    def has_plan_hold_operations(self) -> bool:
+        """Whether any ``R16_PLAN_HOLD`` operation row exists (HD-3 (a))."""
+
+        return self._has_kinds(PLAN_HOLD_GATED_KINDS)
 
     def live_keys(self, keys: tuple[str, ...]) -> frozenset[str]:
         """The given keys that are currently reserved (writers' pre-check, §2a)."""
@@ -1440,9 +1701,23 @@ class SubjectHistoryStore:
             return None
         return str(rows[0][0]), str(rows[0][1])
 
-    def _require_records_enabled(self) -> None:
-        if not self._r18_enabled:
-            raise HistoryStoreRecordsDisabled("R17 / R18 records are disabled (r18.enabled is false)")
+    def _require_records_enabled(self, kind: HistoryOperationKind) -> None:
+        """PREPARE needs the kind's family switch; FINALIZE, abort, tombstone
+        and reconcile are never gated (IP-16 §6, IP-14b D1 r2 §4-3)."""
+
+        if kind in R18_GATED_KINDS:
+            if not self._r18_enabled:
+                raise HistoryStoreRecordsDisabled("R17 / R18 records are disabled (r18.enabled is false)")
+        elif kind in R19_GATED_KINDS:
+            if not self._r19_enabled:
+                raise HistoryStoreRecordsDisabled("R19 / cycle records are disabled (r19.enabled is false)")
+        elif kind in PLAN_HOLD_GATED_KINDS:
+            if not self._plan_hold_receipts:
+                raise HistoryStoreRecordsDisabled(
+                    "plan hold receipts are disabled (subject_history.plan_hold_receipts is false)"
+                )
+        else:
+            raise HistoryStoreConflict("not a record operation kind")
 
     def insert_prepared_record(
         self,
@@ -1454,13 +1729,22 @@ class SubjectHistoryStore:
         """PREPARE one record operation and reserve its keys (§2a), atomically.
 
         The envelope carries the incarnation, event, sequence and transaction
-        kind; the caller (IP-14a-2 participant) checks them against R07.
+        kind; the caller (IP-14a-2 participant) checks them against R07. An
+        ``R16_CYCLE_DECISION`` also fills the three R16 lineage columns from
+        its embedded Decision, so it holds the same review-intent and
+        predecessor slots as a PLAN_PREVIEW Decision (IP-14b D1 r2 §2-1 (c)).
         """
 
-        self._require_records_enabled()
         if type(operation) is not HistoryRecordOperationV1:
             raise TypeError("operation must be a HistoryRecordOperationV1")
+        self._require_records_enabled(operation.operation_kind)
         pending = operation.canonical_bytes()
+        lineage: tuple[str | None, str | None, str | None] = (None, None, None)
+        if operation.operation_kind in LINEAGE_RECORD_KINDS:
+            decision = operation.cycle_decision
+            if decision is None:
+                raise HistoryStoreConflict("a cycle Decision operation carries its Decision")
+            lineage = (decision.lineage_scope, decision.review_intent_key, decision.predecessor_key)
         if operation.operation_digest != operation_digest:
             raise HistoryStoreConflict("SubjectHistory operation digest conflicts")
         self._require_active()
@@ -1468,7 +1752,7 @@ class SubjectHistoryStore:
         with self._write("prepare") as connection:
             connection.execute(
                 f"INSERT INTO history_operations ({_OPERATION_COLUMNS}, participant_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, NULL, NULL, NULL, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?, ?, ?, ?, ?, ?)",
                 (
                     operation.incarnation_id,
                     canonical_uuid(transaction_id, "transaction_id"),
@@ -1479,6 +1763,7 @@ class SubjectHistoryStore:
                     operation_digest,
                     pending,
                     sha256(pending).hexdigest(),
+                    *lineage,
                     SUBJECT_HISTORY_PARTICIPANT_ID,
                 ),
             )
@@ -1495,7 +1780,10 @@ class SubjectHistoryStore:
         operation: HistoryRecordOperationV1,
         receipt: PostcommitReceiptV1,
     ) -> None:
-        """One ``BEGIN IMMEDIATE`` FINALIZE: the record rows, receipt and phase."""
+        """One ``BEGIN IMMEDIATE`` FINALIZE: the record rows, receipt and phase.
+
+        ``R16_CYCLE_DECISION`` writes its Decision and source rows first (the
+        resolution row references the Decision)."""
 
         if type(operation) is not HistoryRecordOperationV1:
             raise TypeError("operation must be a HistoryRecordOperationV1")
@@ -1510,6 +1798,9 @@ class SubjectHistoryStore:
                 operation.operation_kind.value,
             ):
                 raise HistoryStoreConflict("SubjectHistory operation is not this PREPARED record")
+            decision = operation.cycle_decision
+            if operation.operation_kind in LINEAGE_RECORD_KINDS and decision is not None:
+                _insert_decision(connection, transaction_id, decision)
             for row in operation.rows:
                 names = (*(name for name, _ in row.columns), "incarnation_id", "transaction_id")
                 values = (*(value for _, value in row.columns), operation.incarnation_id, transaction_id)
@@ -1667,5 +1958,6 @@ __all__ = [
     "HistoryStoreRecordsDisabled",
     "HistoryStoreUnavailable",
     "V2_STATEMENTS",
+    "V4_STATEMENTS",
     "SubjectHistoryStore",
 ]

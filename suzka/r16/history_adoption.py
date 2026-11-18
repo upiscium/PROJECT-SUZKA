@@ -152,10 +152,12 @@ def open_or_create_store(
     subject_id: str,
     max_page_count: int,
     r18_enabled: bool = False,
+    r19_enabled: bool = False,
+    plan_hold_receipts: bool = False,
 ) -> SubjectHistoryStore:
     """Open the store, creating it PROVISIONAL only before adoption.
 
-    IP-14a: a v1 or v2 store stops startup until the explicit migration ran
+    IP-14a: a v1, v2 or v3 store stops startup until the explicit migration ran
     (§11-1).  IP-16b (#411 D1 r3 §6) replaced IP-14a-1's refusal of a store
     holding R17 / R18 records while ``r18.enabled`` is false: it starts, logs
     ``R18_RECORDS_PRESENT_BUT_DISABLED`` once, and stays switched off."""
@@ -169,7 +171,11 @@ def open_or_create_store(
     adopted = adopted_history_baseline(inspection)
     try:
         store = SubjectHistoryStore.open(
-            path, max_page_count=max_page_count, r18_enabled=r18_enabled
+            path,
+            max_page_count=max_page_count,
+            r18_enabled=r18_enabled,
+            r19_enabled=r19_enabled,
+            plan_hold_receipts=plan_hold_receipts,
         )
     except HistoryStoreMigrationRequired as error:
         raise HistoryAdoptionError(
@@ -207,6 +213,8 @@ def open_or_create_store(
             journal_lineage_id=lineage,
             max_page_count=max_page_count,
             r18_enabled=r18_enabled,
+            r19_enabled=r19_enabled,
+            plan_hold_receipts=plan_hold_receipts,
         )
     except (HistoryStoreConflict, HistoryStoreCorrupt, HistoryStoreUnavailable) as error:
         raise HistoryAdoptionError("SubjectHistory store creation failed") from error

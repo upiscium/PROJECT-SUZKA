@@ -1160,6 +1160,8 @@ def _open_subject_history(
             subject_id=app_settings.project.name,
             max_page_count=settings.max_page_count,
             r18_enabled=app_settings.r18.enabled,
+            r19_enabled=app_settings.r19.enabled,
+            plan_hold_receipts=settings.plan_hold_receipts,
         )
     except (HistoryAdoptionError, OSError) as error:
         raise StateRecoveryError(f"SubjectHistory is unavailable: {error}") from error

@@ -50,7 +50,6 @@ from suzka.r19.contracts import (
     WakeAttemptOutcomeV1,
     WakeCause,
     WakeClaimV1,
-    WakeCompletionV1,
     WakeKind,
     WakeTerminalKind,
     WakeTerminalV1,
@@ -59,6 +58,7 @@ from suzka.r19.contracts import (
     logical_cycle_id,
     may_supersede,
     next_attempt_index,
+    notification_required,
     outbox_reason_for,
     wake_fingerprint,
     wake_window,
@@ -373,10 +373,10 @@ def test_terminal_kinds_and_reasons_are_paired() -> None:
     wake = _wake()
     newer = _wake(evidence_fingerprint="e" * 64)
     for reason in (TerminalReason.EXPIRED_WAKE, TerminalReason.ATTEMPTS_EXHAUSTED):
-        value = WakeTerminalV1(wake.wakeup_id, WakeTerminalKind.FAILED_TERMINAL, reason, None, EVENT_T, 30)
+        value = WakeTerminalV1(wake.wakeup_id, wake.logical_cycle_id, WakeTerminalKind.FAILED_TERMINAL, reason, None, EVENT_T, 30)
         assert WakeTerminalV1.from_json(value.canonical_bytes()) == value
     cancelled = WakeTerminalV1(
-        wake.wakeup_id, WakeTerminalKind.CANCELLED, TerminalReason.SUPERSEDED, newer.wakeup_id, EVENT_T, 30
+        wake.wakeup_id, wake.logical_cycle_id, WakeTerminalKind.CANCELLED, TerminalReason.SUPERSEDED, newer.wakeup_id, EVENT_T, 30
     )
     assert WakeTerminalV1.from_json(cancelled.canonical_bytes()) == cancelled
     assert cancelled.terminal_id == replace(cancelled, event_sequence=31).terminal_id  # one per Wake
@@ -388,7 +388,7 @@ def test_terminal_kinds_and_reasons_are_paired() -> None:
         (WakeTerminalKind.FAILED_TERMINAL, TerminalReason.EXPIRED_WAKE, newer.wakeup_id),
     ):
         with pytest.raises(ValueError):
-            WakeTerminalV1(wake.wakeup_id, *bad, EVENT_T, 30)
+            WakeTerminalV1(wake.wakeup_id, wake.logical_cycle_id, *bad, EVENT_T, 30)
 
 
 # ------------------------------------------------------------ supersession
@@ -420,27 +420,44 @@ def test_supersession_needs_all_four_conditions() -> None:
 # --------------------------------------------------------------- completion
 
 
-def test_completion_refers_to_this_cycles_resolution() -> None:
+def test_every_resolution_requires_one_notification() -> None:
+    """IP-14b D1 r2 D-2: WakeCompletionV1 is gone; whether a resolved cycle
+    is notified is a pure function of its resolution (each result kind has
+    its own template)."""
+
     wake = _wake()
     claim = _claim(wake)
-    resolution = LogicalCycleResolutionV1.of_hold(INC, _hold(claim))
-    completion = WakeCompletionV1.for_resolution(wake, claim, resolution, notification_required=True)
-    assert (completion.resolution_id, completion.resolution_digest) == (
-        resolution.resolution_id,
-        resolution.resolution_digest,
-    )
-    assert WakeCompletionV1.from_json(completion.canonical_bytes()) == completion
-    assert completion.completion_id == replace(completion, notification_required=False).completion_id
-    with pytest.raises(ValueError, match="not this Wake"):
-        WakeCompletionV1.for_resolution(
-            wake, claim, replace(resolution, claim_id="wake-claim-" + "0" * 64), notification_required=True
-        )
-    with pytest.raises(ValueError, match="not this Wake"):
-        WakeCompletionV1.for_resolution(
-            wake, claim, replace(resolution, incarnation_id=H), notification_required=True
-        )
+    held = LogicalCycleResolutionV1.of_hold(INC, _hold(claim))
+    for kind, result_id in (
+        (ResultKind.HOLD, held.result_id),
+        (ResultKind.EXISTING_DECISION, "cycle-existing-" + "e" * 64),
+        (ResultKind.DECISION_ISSUED, "decision-" + "d" * 64),
+    ):
+        assert notification_required(replace(held, result_kind=kind, result_id=result_id))
     with pytest.raises(TypeError):
-        WakeCompletionV1.from_json(_tamper(completion.canonical_bytes(), notification_required=1))
+        notification_required(_hold(claim))  # type: ignore[arg-type]
+    assert not hasattr(contracts, "WakeCompletionV1") and not hasattr(contracts, "COMPLETION_ID_PREFIX")
+
+
+def test_a_terminal_names_its_wakes_cycle() -> None:
+    wake = _wake()
+    failed = WakeTerminalV1(wake.wakeup_id, wake.logical_cycle_id, WakeTerminalKind.FAILED_TERMINAL, TerminalReason.EXPIRED_WAKE, None, EVENT_T, 30)
+    assert json.loads(failed.canonical_bytes())["logical_cycle_id"] == wake.logical_cycle_id
+    with pytest.raises(ValueError):
+        replace(failed, logical_cycle_id="x")
+    other_cycle = replace(failed, logical_cycle_id="c" * 64)
+    with pytest.raises(ValueError, match="cycle"):
+        OutboxMessageV1.for_failed_cycle(wake, other_cycle, created_utc=CREATED, expires_utc=EXPIRES)
+
+
+def test_the_inbox_assurance_is_the_api_client_claim() -> None:
+    """IP-14b D1 r2 §4-2 (P2-2): the SO_PEERCRED socket was dropped, so an
+    ACK claims only that a client the SUZKA API admits acknowledged."""
+
+    assert INBOX_ASSURANCE == "SUZKA_API_CLIENT_V1"
+    source = inspect.getsource(contracts)
+    assert "neither proof that a\n# person read it nor an approval" in source
+    assert "LOCAL_OPERATOR_PEER_UID_V1" not in source
 
 
 # ------------------------------------------------------------------- outbox
@@ -483,7 +500,7 @@ def test_outbox_message_belongs_to_the_wakes_cycle() -> None:
     other = _wake(evidence_fingerprint="e" * 64)
     with pytest.raises(ValueError, match="this Wake's cycle"):
         OutboxMessageV1.for_completion(other, _held(), None, created_utc=CREATED, expires_utc=EXPIRES)
-    failed = WakeTerminalV1(_wake().wakeup_id, WakeTerminalKind.FAILED_TERMINAL, TerminalReason.EXPIRED_WAKE, None, EVENT_T, 30)
+    failed = WakeTerminalV1(_wake().wakeup_id, _wake().logical_cycle_id, WakeTerminalKind.FAILED_TERMINAL, TerminalReason.EXPIRED_WAKE, None, EVENT_T, 30)
     with pytest.raises(ValueError, match="this Wake's"):
         OutboxMessageV1.for_failed_cycle(other, failed, created_utc=CREATED, expires_utc=EXPIRES)
 
@@ -522,7 +539,7 @@ def test_outbox_message_validates_template_and_ttl() -> None:
         with pytest.raises(ValueError, match="7 days"):
             replace(message, expires_utc=expires)
     wake = _wake()
-    failed = WakeTerminalV1(wake.wakeup_id, WakeTerminalKind.FAILED_TERMINAL, TerminalReason.ATTEMPTS_EXHAUSTED, None, EVENT_T, 30)
+    failed = WakeTerminalV1(wake.wakeup_id, wake.logical_cycle_id, WakeTerminalKind.FAILED_TERMINAL, TerminalReason.ATTEMPTS_EXHAUSTED, None, EVENT_T, 30)
     cycle_failed = OutboxMessageV1.for_failed_cycle(wake, failed, created_utc=CREATED, expires_utc=EXPIRES)
     assert (cycle_failed.source_id, cycle_failed.reason_code) == (failed.terminal_id, OutboxReason.FAILED)
     assert OutboxMessageV1.from_json(cycle_failed.canonical_bytes()) == cycle_failed
@@ -574,8 +591,7 @@ def test_every_id_and_digest_is_distinct() -> None:
     claim = _claim(wake)
     hold = _hold(claim)
     resolution = LogicalCycleResolutionV1.of_hold(INC, hold)
-    completion = WakeCompletionV1.for_resolution(wake, claim, resolution, notification_required=True)
-    terminal = WakeTerminalV1(wake.wakeup_id, WakeTerminalKind.FAILED_TERMINAL, TerminalReason.EXPIRED_WAKE, None, EVENT_T, 30)
+    terminal = WakeTerminalV1(wake.wakeup_id, wake.logical_cycle_id, WakeTerminalKind.FAILED_TERMINAL, TerminalReason.EXPIRED_WAKE, None, EVENT_T, 30)
     attempt = WakeAttemptOutcomeV1(claim.claim_id, AttemptOutcome.REFUSED, RefuseReason.CLOCK_UNVERIFIABLE)
     message = _message(wake)
     ack = InboxAckV1(message.message_id, "context-1", "session-1", AckStatus.ACKNOWLEDGED, EVENT_T, 40, CREATED)
@@ -585,7 +601,6 @@ def test_every_id_and_digest_is_distinct() -> None:
         claim.claim_id, claim.claim_digest, attempt.attempt_digest,
         hold.hold_id, hold.hold_digest, hold.review_intent_key,
         resolution.resolution_id, resolution.resolution_digest,
-        completion.completion_id, completion.completion_digest,
         terminal.terminal_id, terminal.terminal_digest,
         message.message_id, message.message_digest, message.dedupe_key,
         ack.ack_id, ack.ack_digest, reply.reply_id, reply.reply_digest,
@@ -598,7 +613,7 @@ def test_every_id_and_digest_is_distinct() -> None:
     "decode",
     [
         WakeV1.from_json, WakeClaimV1.from_json, WakeAttemptOutcomeV1.from_json, WakeTerminalV1.from_json,
-        WakeCompletionV1.from_json, OutboxMessageV1.from_json, InboxAckV1.from_json, InboxReplyV1.from_json,
+        OutboxMessageV1.from_json, InboxAckV1.from_json, InboxReplyV1.from_json,
     ],
 )
 def test_every_decoder_refuses_oversize_and_non_bytes(decode: Any) -> None:

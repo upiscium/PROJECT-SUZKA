@@ -31,7 +31,6 @@ from suzka.r16.contracts import (
     sequence,
 )
 from suzka.r16.cycle_contracts import (
-    RESOLUTION_ID_PREFIX,
     WAKE_CLAIM_ID_PREFIX,
     FrozenPredecessor,
     LogicalCycleResolutionV1,
@@ -56,7 +55,6 @@ MAX_RECORD_BYTES: Final = 4096
 MAX_ORIGIN_REFS: Final = 4
 WAKEUP_ID_PREFIX: Final = "wakeup-"
 TERMINAL_ID_PREFIX: Final = "wake-terminal-"
-COMPLETION_ID_PREFIX: Final = "wake-completion-"
 MESSAGE_ID_PREFIX: Final = "outbox-"
 ACK_ID_PREFIX: Final = "inbox-ack-"
 REPLY_ID_PREFIX: Final = "inbox-reply-"
@@ -65,8 +63,13 @@ COMMITMENT_ADMISSION_REF_KIND: Final = "commitment-admission"
 ASSESSMENT_REF_KIND: Final = "r17-assessment"
 COMMITMENT_REF_KIND: Final = "commitment"
 OBSERVATION_REF_KIND: Final = "observation"
-# #373 A1-3: the only Inbox trust claim the MVI makes.
-INBOX_ASSURANCE: Final = "LOCAL_OPERATOR_PEER_UID_V1"
+# IP-14b D1 r2 §4-2 (P2-2): the only Inbox trust claim the MVI makes. A
+# client that the SUZKA HTTP API admits, through the existing chat / API route
+# (direct loopback, or via Caddy from the networks the firewall already
+# admits to :8080), acknowledged this message. It is neither proof that a
+# person read it nor an approval. (#373 A1-3's SO_PEERCRED operator socket was
+# dropped by the 2026-11-18 scope decision, so its value would be false.)
+INBOX_ASSURANCE: Final = "SUZKA_API_CLIENT_V1"
 
 # HP-5 (#411, 2026-11-15).
 MAX_ATTEMPTS: Final = 3
@@ -86,8 +89,6 @@ _CLAIM_DOMAIN: Final = b"PROJECT-SUZKA:R19:WAKE-CLAIM:V1\0"
 _ATTEMPT_DOMAIN: Final = b"PROJECT-SUZKA:R19:WAKE-ATTEMPT:V1\0"
 _TERMINAL_ID_DOMAIN: Final = b"PROJECT-SUZKA:R19:WAKE-TERMINAL-ID:V1\0"
 _TERMINAL_DOMAIN: Final = b"PROJECT-SUZKA:R19:WAKE-TERMINAL:V1\0"
-_COMPLETION_ID_DOMAIN: Final = b"PROJECT-SUZKA:R19:WAKE-COMPLETION-ID:V1\0"
-_COMPLETION_DOMAIN: Final = b"PROJECT-SUZKA:R19:WAKE-COMPLETION:V1\0"
 _DEDUPE_DOMAIN: Final = b"PROJECT-SUZKA:R19:OUTBOX-DEDUPE:V1\0"
 _MESSAGE_ID_DOMAIN: Final = b"PROJECT-SUZKA:R19:OUTBOX-MESSAGE-ID:V1\0"
 _MESSAGE_DOMAIN: Final = b"PROJECT-SUZKA:R19:OUTBOX-MESSAGE:V1\0"
@@ -113,8 +114,14 @@ class WakeCause(str, Enum):
 
 class AttemptOutcome(str, Enum):
     DEFERRED_BUDGET = "DEFERRED_BUDGET"
+    # Derived only (IP-14b D1 r2 §1-1): "now >= the claim's lease" is a value
+    # of IP-20's attempt view and is never stored.
     LEASE_EXPIRED = "LEASE_EXPIRED"
     REFUSED = "REFUSED"
+
+
+# The outcomes SubjectHistory stores (``wake_attempt_outcomes``).
+STORED_ATTEMPT_OUTCOMES: Final = frozenset({AttemptOutcome.DEFERRED_BUDGET, AttemptOutcome.REFUSED})
 
 
 class RefuseReason(str, Enum):
@@ -770,8 +777,12 @@ _ATTEMPT_BODY: Final = ("claim_id", "outcome", "reason", "schema_version")
 class WakeAttemptOutcomeV1:
     """An attempt that produced no result; it counts toward the 3 attempts.
 
-    A REFUSED record is the PREPARED operation of the refused event
-    (``R19_WAKE_ATTEMPT_REFUSED``), never an exception (D-R19 §4)."""
+    IP-14b D1 r2 (D-1): a REFUSED or DEFERRED_BUDGET outcome is decided by the
+    handler before PREPARE and recorded by its own ``R19_WAKE_ATTEMPT_OUTCOME``
+    operation; nothing is substituted inside ``prepare``. The row records the
+    reason only: it never shortens the gap before the next claim, which is at
+    least the previous claim's lease (P2-A). LEASE_EXPIRED is derived from the
+    claim and the clock and is never stored."""
 
     claim_id: str
     outcome: AttemptOutcome
@@ -820,6 +831,7 @@ class WakeAttemptOutcomeV1:
 _TERMINAL_BODY: Final = (
     "event_id",
     "event_sequence",
+    "logical_cycle_id",
     "reason",
     "schema_version",
     "superseding_wakeup_id",
@@ -832,9 +844,13 @@ _TERMINAL_BODY: Final = (
 class WakeTerminalV1:
     """FAILED_TERMINAL (expired / 3 attempts) or CANCELLED (SUPERSEDED).
 
-    Neither is retried, and an unchanged fingerprint is never rescheduled."""
+    Neither is retried, and an unchanged fingerprint is never rescheduled.
+    ``logical_cycle_id`` is the Wake's (IP-14b-1): the terminal reserves the
+    cycle's ``cycle:`` key, so a cycle closes once, by a result or a terminal.
+    """
 
     wakeup_id: str
+    logical_cycle_id: str
     terminal: WakeTerminalKind
     reason: TerminalReason
     superseding_wakeup_id: str | None
@@ -843,6 +859,7 @@ class WakeTerminalV1:
 
     def __post_init__(self) -> None:
         prefixed(self.wakeup_id, WAKEUP_ID_PREFIX, "wakeup_id")
+        digest(self.logical_cycle_id, "logical_cycle_id")
         if type(self.terminal) is not WakeTerminalKind:
             raise TypeError("terminal must be a WakeTerminalKind")
         if type(self.reason) is not TerminalReason:
@@ -862,6 +879,7 @@ class WakeTerminalV1:
         return {
             "event_id": self.event_id,
             "event_sequence": self.event_sequence,
+            "logical_cycle_id": self.logical_cycle_id,
             "reason": self.reason.value,
             "schema_version": SCHEMA_VERSION,
             "superseding_wakeup_id": self.superseding_wakeup_id,
@@ -889,6 +907,7 @@ class WakeTerminalV1:
         row = _parse(payload, (*_TERMINAL_BODY, "terminal_digest", "terminal_id"), "wake terminal")
         value = cls(
             wakeup_id=_str(row["wakeup_id"]),
+            logical_cycle_id=_str(row["logical_cycle_id"]),
             terminal=parse_enum(row["terminal"], WakeTerminalKind, "terminal"),
             reason=parse_enum(row["reason"], TerminalReason, "reason"),
             superseding_wakeup_id=_opt_str(row["superseding_wakeup_id"]),
@@ -902,108 +921,18 @@ class WakeTerminalV1:
 
 # --------------------------------------------------------------- completion
 
-_COMPLETION_BODY: Final = (
-    "claim_id",
-    "notification_required",
-    "resolution_digest",
-    "resolution_id",
-    "schema_version",
-    "wakeup_id",
-)
 
+def notification_required(resolution: LogicalCycleResolutionV1) -> bool:
+    """IP-14b D1 r2 D-2: whether a resolved cycle gets one Outbox message.
 
-@dataclass(frozen=True, slots=True)
-class WakeCompletionV1:
-    """R19's completion of a cycle that has an R16 resolution (D-R19 §2).
+    A pure function of the resolution (it replaces the removed
+    ``WakeCompletionV1``). Every result kind has its own template
+    (DECISION_ISSUED / DECISION_CONFIRMED / DECISION_HELD), so every
+    resolution is notified; ``R19_WAKE_COMPLETE`` writes only that message."""
 
-    R19 only refers to the one resolution; it never authors or swaps it."""
-
-    wakeup_id: str
-    claim_id: str
-    resolution_id: str
-    resolution_digest: str
-    notification_required: bool
-
-    def __post_init__(self) -> None:
-        prefixed(self.wakeup_id, WAKEUP_ID_PREFIX, "wakeup_id")
-        prefixed(self.claim_id, WAKE_CLAIM_ID_PREFIX, "claim_id")
-        prefixed(self.resolution_id, RESOLUTION_ID_PREFIX, "resolution_id")
-        digest(self.resolution_digest, "resolution_digest")
-        if type(self.notification_required) is not bool:
-            raise TypeError("notification_required must be a bool")
-
-    @classmethod
-    def for_resolution(
-        cls,
-        wake: WakeV1,
-        claim: WakeClaimV1,
-        resolution: LogicalCycleResolutionV1,
-        *,
-        notification_required: bool,
-    ) -> Self:
-        if type(wake) is not WakeV1 or type(claim) is not WakeClaimV1:
-            raise TypeError("expected a WakeV1 and a WakeClaimV1")
-        if type(resolution) is not LogicalCycleResolutionV1:
-            raise TypeError("resolution must be a LogicalCycleResolutionV1")
-        if claim.wakeup_id != wake.wakeup_id or (
-            resolution.incarnation_id,
-            resolution.logical_cycle_id,
-            resolution.claim_id,
-            resolution.claim_digest,
-        ) != (wake.incarnation_id, wake.logical_cycle_id, claim.claim_id, claim.claim_digest):
-            raise ValueError("the resolution is not this Wake's cycle and claim")
-        return cls(
-            wake.wakeup_id,
-            claim.claim_id,
-            resolution.resolution_id,
-            resolution.resolution_digest,
-            notification_required,
-        )
-
-    def _body(self) -> dict[str, object]:
-        return {
-            "claim_id": self.claim_id,
-            "notification_required": self.notification_required,
-            "resolution_digest": self.resolution_digest,
-            "resolution_id": self.resolution_id,
-            "schema_version": SCHEMA_VERSION,
-            "wakeup_id": self.wakeup_id,
-        }
-
-    @property
-    def completion_id(self) -> str:
-        """One completion per Wake."""
-        return COMPLETION_ID_PREFIX + checksum(_COMPLETION_ID_DOMAIN, {"wakeup_id": self.wakeup_id})
-
-    @property
-    def completion_digest(self) -> str:
-        return checksum(_COMPLETION_DOMAIN, self._body())
-
-    def canonical_value(self) -> dict[str, object]:
-        return {
-            **self._body(),
-            "completion_digest": self.completion_digest,
-            "completion_id": self.completion_id,
-        }
-
-    def canonical_bytes(self) -> bytes:
-        return canonical_json(self.canonical_value())
-
-    @classmethod
-    def from_json(cls, payload: bytes) -> Self:
-        row = _parse(
-            payload, (*_COMPLETION_BODY, "completion_digest", "completion_id"), "wake completion"
-        )
-        value = cls(
-            wakeup_id=_str(row["wakeup_id"]),
-            claim_id=_str(row["claim_id"]),
-            resolution_id=_str(row["resolution_id"]),
-            resolution_digest=_str(row["resolution_digest"]),
-            notification_required=_bool(row["notification_required"]),
-        )
-        if value.canonical_bytes() != payload:
-            raise ValueError("wake completion bytes are not canonical")
-        return value
+    if type(resolution) is not LogicalCycleResolutionV1:
+        raise TypeError("resolution must be a LogicalCycleResolutionV1")
+    return resolution.result_kind in _RESULT_TEMPLATE
 
 
 # ------------------------------------------------------------------- outbox
@@ -1124,6 +1053,8 @@ class OutboxMessageV1:
             raise ValueError("the terminal is not this Wake's")
         if terminal.terminal is not WakeTerminalKind.FAILED_TERMINAL:
             raise ValueError("only a FAILED_TERMINAL cycle is reported as failed")
+        if terminal.logical_cycle_id != wake.logical_cycle_id:
+            raise ValueError("the terminal is not this Wake's cycle")
         return cls(
             terminal.terminal_id,
             terminal.terminal_digest,
@@ -1222,8 +1153,8 @@ def _inbox_common(message_id: object, context_id: object, session_selector: obje
 class InboxAckV1:
     """ACK / REJECT of one message (#369 D1, #373 A1-3).
 
-    ACK means a qualified local client acknowledged; it does not mean a
-    person read it, and it approves nothing. One status per message: the
+    ACK means a client the SUZKA API admits acknowledged (``INBOX_ASSURANCE``);
+    it does not mean a person read it, and it approves nothing. One status per message: the
     same status again is idempotent, the other one is a conflict."""
 
     message_id: str

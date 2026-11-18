@@ -1,4 +1,4 @@
-"""IP-14a-1 / IP-16a-1: SubjectHistory v3 schema, v1 / v2 -> v3 migration, record operations.
+"""IP-14a-1 / IP-16a-1: SubjectHistory schema, v1 / v2 migration, record operations (now to v4, IP-14b-1).
 
 Design: #411 comment 6910958369 (IP-14a D1 r3). Every R17 / R18 value here
 is a FIXTURE ONLY; nothing comes from a real Decision, operator or target.
@@ -201,7 +201,7 @@ def test_a_fresh_store_is_exactly_v3(tmp_path: Path) -> None:
         "approval_challenges", "approval_expirations", "approval_nonce_consumptions",
         "execution_claims", "verified_outcomes", "outcome_assessments", "decision_feedback",
     } <= names
-    assert store.meta().schema_version == HISTORY_SCHEMA_VERSION == 3
+    assert store.meta().schema_version == HISTORY_SCHEMA_VERSION == 4
 
 
 def test_a_v1_file_requires_migration_and_a_tampered_file_is_corrupt(tmp_path: Path) -> None:
@@ -241,7 +241,7 @@ def test_migration_keeps_every_v1_row_and_the_decisions_replay(tmp_path: Path) -
     backup = result.backup
     assert result.compacted and os.stat(backup).st_mode & 0o777 == 0o600
     store = SubjectHistoryStore.open(path, max_page_count=PAGES)
-    assert store.meta().schema_version == HISTORY_SCHEMA_VERSION == 3
+    assert store.meta().schema_version == HISTORY_SCHEMA_VERSION == 4
     after = sqlite3.connect(path)
     assert after.execute(_SCHEMA_QUERY).fetchall() == _expected_schema(SCHEMA_STATEMENTS)
     for table, expected in rows.items():
@@ -277,7 +277,7 @@ def test_a_killed_process_leaves_v1_and_a_rerun_migrates(tmp_path: Path, stage: 
     with pytest.raises(HistoryStoreMigrationRequired):
         SubjectHistoryStore.open(path, max_page_count=PAGES)
     assert history_migration.main([str(path)]) == 0  # no manual cleanup needed
-    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == HISTORY_SCHEMA_VERSION == 3
+    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == HISTORY_SCHEMA_VERSION == 4
 
 
 def test_a_failed_compaction_after_commit_is_not_a_refusal(
@@ -298,9 +298,9 @@ def test_a_failed_compaction_after_commit_is_not_a_refusal(
     monkeypatch.setattr(history_migration, "_STAGE_HOOK", hold_a_read_lock)
     assert history_migration.main([str(path)]) == 0
     out = capsys.readouterr().out
-    assert "migrated SubjectHistory v1 to v3" in out and "compaction (VACUUM) failed" in out
+    assert "migrated SubjectHistory v1 to v4" in out and "compaction (VACUUM) failed" in out
     readers[0].close()
-    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == HISTORY_SCHEMA_VERSION == 3
+    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == HISTORY_SCHEMA_VERSION == 4
 
 
 def test_migration_refuses_a_store_too_close_to_its_cap(tmp_path: Path) -> None:
@@ -371,7 +371,7 @@ def test_a_crash_before_commit_leaves_the_v1_file(tmp_path: Path, monkeypatch: p
     from datetime import UTC, datetime
 
     migrate(path, now=datetime(2030, 1, 1, tzinfo=UTC))
-    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == HISTORY_SCHEMA_VERSION == 3
+    assert SubjectHistoryStore.open(path, max_page_count=PAGES).meta().schema_version == HISTORY_SCHEMA_VERSION == 4
 
 
 def test_a_record_row_must_be_in_its_operations_envelope(tmp_path: Path) -> None:
@@ -396,7 +396,7 @@ def test_a_record_row_must_be_in_its_operations_envelope(tmp_path: Path) -> None
 def test_migration_refuses_what_is_not_exactly_v1_or_v2(tmp_path: Path) -> None:
     store = _v2_store(tmp_path)
     store.close()
-    with pytest.raises(HistoryMigrationError, match="already schema v3"):
+    with pytest.raises(HistoryMigrationError, match="already schema v4"):
         migrate(store.path)
     path, _ = _v1_store_with_decisions(tmp_path / "other")
     connection = sqlite3.connect(path)
@@ -410,7 +410,7 @@ def test_migration_refuses_what_is_not_exactly_v1_or_v2(tmp_path: Path) -> None:
 def test_the_migration_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     path, _ = _v1_store_with_decisions(tmp_path)
     assert history_migration.main([str(path)]) == 0
-    assert "migrated SubjectHistory v1 to v3; backup:" in capsys.readouterr().out
+    assert "migrated SubjectHistory v1 to v4; backup:" in capsys.readouterr().out
     assert history_migration.main([str(path)]) == 1  # already v3: refused
     assert history_migration.main([]) == 2
 
@@ -469,14 +469,17 @@ def test_a_v2_store_migrates_to_v3_and_keeps_every_row(tmp_path: Path) -> None:
     result = migrate(path)
     assert result.from_version == 2 and result.compacted
     assert ".v2-" in result.backup.name and os.stat(result.backup).st_mode & 0o777 == 0o600
-    assert _all_rows(path) == before
+    after_rows = _all_rows(path)
+    # v4's new tables are added empty; every v2 row is unchanged.
+    assert {t: r for t, r in after_rows.items() if t in before} == before
+    assert all(rows == [] for t, rows in after_rows.items() if t not in before)
     after = sqlite3.connect(path)
     assert after.execute(_SCHEMA_QUERY).fetchall() == _expected_schema(SCHEMA_STATEMENTS)
     meta_after = after.execute("SELECT * FROM history_meta").fetchall()
     assert [(r[0], *r[3:]) for r in meta_after] == [(r[0], *r[3:]) for r in meta_before]
     after.close()
     store = SubjectHistoryStore.open(path, max_page_count=PAGES, r18_enabled=True)
-    assert store.meta().schema_version == HISTORY_SCHEMA_VERSION == 3
+    assert store.meta().schema_version == HISTORY_SCHEMA_VERSION == 4
     for decision in decisions:
         operations = {row.event_id: row for row in store.operations(INCARNATION)}
         finalized = store.finalized_decision(INCARNATION, operations[decision.issuer_event_id].transaction_id)
@@ -552,9 +555,9 @@ def test_a_killed_v2_migration_leaves_v2_and_a_rerun_migrates(tmp_path: Path, st
 def test_the_migration_command_on_v2(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     path, _ = _v2_store_with_decisions(tmp_path)
     assert history_migration.main(["--max-page-count", str(PAGES), str(path)]) == 0
-    assert "migrated SubjectHistory v2 to v3; backup:" in capsys.readouterr().out
+    assert "migrated SubjectHistory v2 to v4; backup:" in capsys.readouterr().out
     assert history_migration.main([str(path)]) == 1
-    assert "already schema v3" in capsys.readouterr().err
+    assert "already schema v4" in capsys.readouterr().err
 
 
 # --------------------------------------------------------- record fixtures
@@ -997,7 +1000,7 @@ def test_records_are_immutable_and_finalize_is_complete(tmp_path: Path) -> None:
 def test_record_capacity_refuses_before_prepare(tmp_path: Path) -> None:
     from suzka.r16.history_store import HistoryStoreCapacityError
 
-    store = _v2_store(tmp_path, pages=80)  # an empty v2 store takes 66 pages
+    store = _v2_store(tmp_path, pages=112)  # an empty v4 store takes 99 pages
     chain = Chain(_committed(_event("capacity", 3)))
     with pytest.raises(HistoryStoreCapacityError):
         _prepare(store, _steps(chain)[0])
