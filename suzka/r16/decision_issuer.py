@@ -38,6 +38,11 @@ source.  A lineage with no Commitment yet keys on the review Commitment
 scope (the only one a review Commitment can have), so a second identical
 request is held on its first preview (row 0).
 
+IP-17a (#411 D1 r7 §3a / §12-2 / §12-3): the ledger reader also gets the
+issuer's clock, so an unclaimed forward Intent whose approval window has
+ended reads APPROVAL_EXPIRED_UNCLAIMED with no event; under SuccessorPolicy V3
+that state and POLICY_DENIED are row 2c (Plan A, no WRITE).
+
 Known limits: Feedback stays ABSENT (IP-19); HOLD is not persisted (R19,
 #376 v2 §2); the R15 interpretation is sealed as its closed enum only; the
 Context ref is the frame's last-modified revision, not a digest of the
@@ -608,6 +613,11 @@ class _DecisionIssuer:
                 for item in classified.records
             ),
             group_key,
+            # IP-17a (§3a / §12-3): the issuer's clock closes an unclaimed
+            # forward Intent whose approval window has ended.  IP-20 note: a
+            # Wake-origin evaluation at a frozen time T must pass T here, not
+            # the live clock, or its closure would not match its sealed T.
+            self._clock(),
             prior_claim=prior,
         )
 

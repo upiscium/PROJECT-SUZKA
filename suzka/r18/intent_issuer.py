@@ -31,7 +31,8 @@ R1-3), so a stored artifact always carries six PASS gates (r2 P3-11):
 7. the keys: this incarnation's Intent keys reserved but not adopted ->
    ``IN_FLIGHT`` (transient); adopted by another Decision, or the group's
    Claim key reserved at all -> ``PRIOR_OBLIGATION``;
-8. headroom, a last requalification and deadline check, then a
+8. headroom, a last requalification and deadline check, the
+   ``AdmissionGate`` (IP-17a, closed -> ``ADMISSION_GATE_CLOSED``), then a
    ``CoordinatedResult`` with one
    ``SubjectHistoryRecordParticipant`` carrying
    ``HistoryRecordOperationV1(R18_INTENT_ISSUE, ACTION_INTENT, ActionIntentV1)``.
@@ -44,6 +45,12 @@ row, as the Decision issuer does; like it, it does not re-check the deadline
 handler -> ``_validate_commit`` window).  Its failure is a runtime fail-stop,
 recovered at startup (PREPARED -> tombstone, internally committed -> roll
 forward).
+
+IP-17a (#411 D1 r7 §2-5, §3a, §12-1): the source requalification lives in
+``suzka.r18.requalify`` (shared with the Policy owner), and the Intent carries
+``approval_window_end_utc = min(now + r18.approval_window_seconds, Commitment
+deadline - DEADLINE_MARGIN)`` (floored to the second).  A window shorter than
+``MIN_APPROVAL_WINDOW`` is the existing ``DEADLINE_ELAPSED`` HOLD.
 
 The forecast is IP-16a-3's; the Decision issuer's ledger reader (IP-16b)
 holds a re-issued PLAN_PREVIEW at row 2 once this Intent exists, and the
@@ -59,7 +66,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import logging
 import os
@@ -67,23 +74,18 @@ from pathlib import Path
 import re
 from typing import TYPE_CHECKING, Final
 
-from suzka.motivation.commitment import CommitmentLifecycle
 from suzka.r16.decision_issuer import (
     DEADLINE_MARGIN,
     _CONFLICT_HEADS,
     _context_digest,
     _DecisionIssuer,
-    _history_refs,
     _sequence,
-    lineage_scope_for,
 )
-from suzka.r16.goal_owner import GoalOrigin as R16GoalOrigin
 from suzka.r16.history_attestation_digest import operations_digest
 from suzka.r16.history_codec import (
     CommittedDecisionV1,
     PolicyKind,
     PolicyRow,
-    SourceRole as HistorySourceRole,
 )
 from suzka.r16.history_participant import (
     JournalCommitProofSource,
@@ -112,12 +114,20 @@ from suzka.r18.contracts import (
     ReviewSourceRef,
     SourceRole,
 )
+from suzka.r18.admission import ALWAYS_OPEN_UNTIL_IP18, AdmissionGate, gate_open
 from suzka.r18.obligation import (
     TARGET_NAMESPACE,
     ObligationIdentity,
     ObligationSecretError,
     ObligationSourceUnavailable,
     identity_for_source,
+)
+from suzka.r18.requalify import (
+    RequalifyFailed,
+    active_commitment,
+    commitment_deadline,
+    qualify_twice,
+    check_sources,
 )
 from suzka.r18.target import TargetError, TargetReader
 from suzka.runtime.agent_runtime import (
@@ -144,6 +154,10 @@ _INTENT_POLICY_KINDS: Final = frozenset(
     {PolicyKind.SUCCESSOR_POLICY_V2, PolicyKind.SUCCESSOR_POLICY_V3}
 )
 _TARGET_EXPECTED_REVISION: Final = 0
+# IP-17a §3a: the default and bounds of r18.approval_window_seconds (HD-16
+# (a)), and the shortest window an Intent may carry.
+DEFAULT_APPROVAL_WINDOW_SECONDS: Final = 3600
+MIN_APPROVAL_WINDOW: Final = timedelta(seconds=120)
 
 
 class IntentIssueStatus(str, Enum):
@@ -174,6 +188,8 @@ class R18IntentReason(str, Enum):
     PRIOR_OBLIGATION = "prior_obligation"
     IN_FLIGHT = "in_flight"
     HISTORY_CAPACITY = "history_capacity"
+    # IP-17a §2-7: the AdmissionGate is closed (IP-18's sweep).
+    ADMISSION_GATE_CLOSED = "admission_gate_closed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +259,8 @@ class ReviewArtifactIntentIssuerV1:
         *,
         enabled: bool,
         target_path: Path,
+        approval_window_seconds: int = DEFAULT_APPROVAL_WINDOW_SECONDS,
+        admission_gate: AdmissionGate = ALWAYS_OPEN_UNTIL_IP18,
     ) -> None:
         if (
             type(decision_issuer) is not _DecisionIssuer
@@ -251,8 +269,12 @@ class ReviewArtifactIntentIssuerV1:
             or decision_issuer._preview._issuer is not decision_issuer
             or type(enabled) is not bool
             or not isinstance(target_path, Path)
+            or type(approval_window_seconds) is not int
+            or not isinstance(admission_gate, AdmissionGate)
         ):
             raise TypeError("unqualified Intent issuer binding")
+        if not 600 <= approval_window_seconds <= 86_400:
+            raise ValueError("approval window must be 600..86400 seconds")
         self._decision = decision_issuer
         self._preview = decision_issuer._preview
         self._runtime = runtime
@@ -262,6 +284,8 @@ class ReviewArtifactIntentIssuerV1:
         self._enabled = enabled
         self._target_path = _resolve_target_path(target_path)
         self._clock: Callable[[], datetime] = decision_issuer._clock
+        self._window = timedelta(seconds=approval_window_seconds)
+        self._gate = admission_gate
         self._inflight: tuple[object, str] | None = None
         self._pending: _PendingIntent | None = None
 
@@ -334,13 +358,13 @@ class ReviewArtifactIntentIssuerV1:
             raise _IntentHold(R18IntentReason.R18_DISABLED)
         # 1. head and lineage records from one classification.
         classified, decision, depth = self._head(scope)
-        # 2. sources.
+        # 2. sources (IP-17a: the shared requalification).
         initial = self._preview._state_snapshot()
         q = self._qualified(event, decision, initial)
-        if q.self_origin or q.goal_origin is not R16GoalOrigin.USER_REQUEST:
-            raise _IntentHold(R18IntentReason.SELF_ORIGIN_GOAL)
-        if lineage_scope_for(q.experience_id) != scope or _history_refs(q) != decision.source_refs:
-            raise _IntentHold(R18IntentReason.SOURCE_DRIFT)
+        try:
+            check_sources(q, decision)
+        except RequalifyFailed as failed:
+            raise _IntentHold(R18IntentReason[failed.reason.name]) from None
         obligation_scope = self._active_commitment(q)
         # 3. gates: every check above passed, so each gate is PASS.
         gates = tuple(GateResult(gate, GateStatus.PASS) for gate in sorted(ReviewGate))
@@ -353,9 +377,23 @@ class ReviewArtifactIntentIssuerV1:
             return _IntentIssueResult(
                 IntentIssueStatus.EXISTING, existing.intent_id, None, existing
             )
+        # IP-17a §3a: the approval window, from the clock before the slow
+        # target read (the deadline is checked again last, below).
+        window_end = self._window_end(q)
         # 6. target.
         target_instance_id = self._target(identity.group_key)
-        intent = self._intent(event, scope, classified.incarnation, decision, depth, q, identity, gates, target_instance_id)
+        intent = self._intent(
+            event,
+            scope,
+            classified.incarnation,
+            decision,
+            depth,
+            q,
+            identity,
+            gates,
+            target_instance_id,
+            window_end,
+        )
         operation = HistoryRecordOperationV1(
             HistoryOperationKind.R18_INTENT_ISSUE,
             classified.incarnation,
@@ -378,6 +416,9 @@ class ReviewArtifactIntentIssuerV1:
         # target's busy timeout): the deadline rule is applied again here,
         # last before PREPARE, as the Decision issuer does (D2 P2-2).
         self._active_commitment(q)
+        # IP-17a §2-7: the AdmissionGate, last before PREPARE.
+        if not gate_open(self._gate):
+            raise _IntentHold(R18IntentReason.ADMISSION_GATE_CLOSED)
         snapshot_hash, _as_of = self._decision._snapshot()
         transaction_id = TransactionCoordinator.derive_transaction_id(
             event, TransactionKind.EVENT_MUTATION
@@ -435,39 +476,36 @@ class ReviewArtifactIntentIssuerV1:
     def _qualified(
         self, event: AgentEvent, decision: CommittedDecisionV1, initial: object
     ) -> _QualifiedPreview:
-        from suzka.r16.plan_preview import _PlanSourceConflict, _PlanSourceUnavailable
-
-        goals = [ref for ref in decision.source_refs if ref.role is HistorySourceRole.GOAL]
-        if len(goals) != 1:
-            raise _IntentHold(R18IntentReason.HEAD_CONFLICT)
         try:
-            before = self._preview._qualify(goals[0].ref_id, event)
-            after = self._preview._qualify(goals[0].ref_id, event)
-        except _PlanSourceConflict:
-            raise _IntentHold(R18IntentReason.SOURCE_CONFLICT) from None
-        except _PlanSourceUnavailable:
-            raise _IntentHold(R18IntentReason.SOURCE_UNAVAILABLE) from None
-        if after != before or self._preview._state_snapshot() != initial:
-            raise _IntentHold(R18IntentReason.SOURCE_UNAVAILABLE)
-        return before
+            return qualify_twice(self._preview, decision, event, initial)
+        except RequalifyFailed as failed:
+            raise _IntentHold(R18IntentReason[failed.reason.name]) from None
 
     def _active_commitment(self, q: _QualifiedPreview) -> tuple[str, ...]:
         """§3-2: ACTIVE and before ``deadline - DEADLINE_MARGIN``; its scope."""
 
-        if q.commitment_id is None:
-            raise _IntentHold(R18IntentReason.COMMITMENT_NOT_ACTIVE)
-        record = self._preview._loop._commitment_system.get(q.commitment_id)
-        if (
-            record is None
-            or record.lifecycle is not CommitmentLifecycle.ACTIVE
-            or record.revision != q.commitment_revision
-            or record.record_digest != q.commitment_digest
-        ):
-            raise _IntentHold(R18IntentReason.COMMITMENT_NOT_ACTIVE)
-        at = record.deadline.at
-        if at is not None and at - self._clock() < DEADLINE_MARGIN:
+        try:
+            return active_commitment(self._preview, q, self._clock)
+        except RequalifyFailed as failed:
+            raise _IntentHold(R18IntentReason[failed.reason.name]) from None
+
+    def _window_end(self, q: _QualifiedPreview) -> str:
+        """IP-17a §3a: ``min(now + window, deadline - DEADLINE_MARGIN)``,
+        floored to the second; shorter than ``MIN_APPROVAL_WINDOW`` is
+        ``DEADLINE_ELAPSED``."""
+
+        try:
+            deadline = commitment_deadline(self._preview, q)
+        except RequalifyFailed as failed:
+            raise _IntentHold(R18IntentReason[failed.reason.name]) from None
+        now = self._clock()
+        end = now + self._window
+        if deadline is not None:
+            end = min(end, deadline - DEADLINE_MARGIN)
+        end = end.astimezone(timezone.utc).replace(microsecond=0)
+        if end - now < MIN_APPROVAL_WINDOW:
             raise _IntentHold(R18IntentReason.DEADLINE_ELAPSED)
-        return tuple(record.scope)
+        return end.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _identity(
         self, q: _QualifiedPreview, obligation_scope: tuple[str, ...]
@@ -518,6 +556,7 @@ class ReviewArtifactIntentIssuerV1:
         identity: ObligationIdentity,
         gates: tuple[GateResult, ...],
         target_instance_id: str,
+        window_end: str,
     ) -> ActionIntentV1:
         assert q.commitment_id is not None
         assert q.commitment_revision is not None and q.commitment_digest is not None
@@ -552,6 +591,7 @@ class ReviewArtifactIntentIssuerV1:
                 target_instance_id=target_instance_id,
                 target_expected_revision=_TARGET_EXPECTED_REVISION,
                 artifact=artifact,
+                approval_window_end_utc=window_end,
             )
         except (TypeError, ValueError):
             raise _IntentHold(R18IntentReason.SOURCE_UNAVAILABLE) from None
@@ -643,6 +683,8 @@ def _intent_for(
 
 
 __all__ = [
+    "DEFAULT_APPROVAL_WINDOW_SECONDS",
+    "MIN_APPROVAL_WINDOW",
     "IntentIssueStatus",
     "R18IntentReason",
     "ReviewArtifactIntentIssuerV1",

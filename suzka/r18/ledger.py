@@ -1,11 +1,12 @@
 """IP-16b: the Decision issuer's operation ledger (#411 D1 r3 §5, §10).
 
 Pure: from the adopted R17 / R18 records of the current incarnation (one
-``SubjectHistoryReader.classify()``, the same one the lineage head came from)
-and one obligation group key, derive the SuccessorPolicy ledger witness:
-``LedgerState``, ``ledger_refs`` (at most ``MAX_LEDGER_REFS``, sorted and
-unique by (kind, id), §10-3), ``inverse_authorization`` and
-``verified_outcome_ref``.  No store, Journal or clock.
+``SubjectHistoryReader.classify()``, the same one the lineage head came from),
+one obligation group key and one clock read, derive the SuccessorPolicy
+ledger witness: ``LedgerState``, ``ledger_refs`` (at most
+``MAX_LEDGER_REFS``, sorted and unique by (kind, id), §10-3),
+``inverse_authorization`` and ``verified_outcome_ref``.  No store or Journal;
+the clock is the caller's (IP-17a, #411 D1 r7 §3a / §12-3).
 
 Records of *every* lineage count: the group is the obligation, not the
 lineage (r2 P1-3).  A Claim of another incarnation (its ``claim:`` key is
@@ -21,6 +22,9 @@ Forward table (latest state):
 - + DENY                                          -> POLICY_DENIED
 - + expiries < MAX_CHALLENGES_PER_INTENT          -> INTENT_ISSUED
 - + expiries = MAX_CHALLENGES_PER_INTENT          -> APPROVAL_EXPIRED_UNCLAIMED
+- no Claim and ``now >= approval_window_end_utc`` -> APPROVAL_EXPIRED_UNCLAIMED
+  (IP-17a, HD-13 (a): closure derived from the records and the clock, with
+  no event; a DENY stays POLICY_DENIED)
 - + Claim, no Outcome                             -> CLAIMED
 - + forward Outcome                               -> its state (latest revision)
 - an inconsistent set                             -> CORRUPT
@@ -40,6 +44,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Final, TypeVar
 
 from suzka.r16.history_records import (
@@ -145,13 +150,19 @@ def prior_claim_ref(row: Mapping[str, object] | None, forward_key: str) -> Polic
 def derive_ledger(
     records: Iterable[RecordAt],
     group_key: str,
+    now: datetime,
     *,
     prior_claim: PolicyRef | None = None,
 ) -> LedgerRead:
-    """The §5 table for one obligation group (pure, total, fail-closed)."""
+    """The §5 table for one obligation group (pure, total, fail-closed).
 
+    ``now`` (timezone-aware) closes an unclaimed forward Intent whose
+    approval window has ended (IP-17a §3a)."""
+
+    if type(now) is not datetime or now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("the ledger clock must be timezone-aware")
     try:
-        return _derive(tuple(records), group_key, prior_claim)
+        return _derive(tuple(records), group_key, prior_claim, now)
     except _Corrupt:
         return CORRUPT_LEDGER
 
@@ -166,12 +177,15 @@ class _Side:
 
 
 def _derive(
-    records: tuple[RecordAt, ...], group_key: str, prior_claim: PolicyRef | None
+    records: tuple[RecordAt, ...],
+    group_key: str,
+    prior_claim: PolicyRef | None,
+    now: datetime,
 ) -> LedgerRead:
     forward_key = operation_key(group_key, Direction.FORWARD)
     inverse_key = operation_key(group_key, Direction.INVERSE)
-    forward = _side(records, Direction.FORWARD, group_key, forward_key)
-    inverse = _side(records, Direction.INVERSE, group_key, inverse_key)
+    forward = _side(records, Direction.FORWARD, group_key, forward_key, now)
+    inverse = _side(records, Direction.INVERSE, group_key, inverse_key, now)
     if prior_claim is not None:
         # Another incarnation claimed this group's forward effect.  This
         # incarnation's writers refuse a second forward obligation for it, so
@@ -249,7 +263,11 @@ def _of(
 
 
 def _side(
-    records: tuple[RecordAt, ...], direction: Direction, group_key: str, key: str
+    records: tuple[RecordAt, ...],
+    direction: Direction,
+    group_key: str,
+    key: str,
+    now: datetime,
 ) -> _Side | None:
     """One direction of the group, or None when it has no record at all."""
 
@@ -339,6 +357,9 @@ def _side(
     elif verdict is not None and not allowed:
         state = LedgerState.POLICY_DENIED
     elif len(expiries) >= MAX_CHALLENGES_PER_INTENT:
+        state = LedgerState.APPROVAL_EXPIRED_UNCLAIMED
+    elif isinstance(intent, ActionIntentV1) and not intent.window_open(now):
+        # IP-17a §3a (HD-13 (a)): the approval window ended unclaimed.
         state = LedgerState.APPROVAL_EXPIRED_UNCLAIMED
     else:
         state = LedgerState.INTENT_ISSUED

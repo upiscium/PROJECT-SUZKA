@@ -63,6 +63,8 @@ EVENT_V = "00000000-0000-4000-8000-000000000004"
 NONCE = "d" * 64
 ISSUED = "2026-11-16T00:00:00Z"
 EXPIRES = "2026-11-16T00:10:00Z"
+# IP-17a: the forward Intent's approval window end.
+WINDOW_END = "2026-11-16T01:00:00Z"
 DECISION = "decision-" + "f" * 64
 GROUP = obligation_group_key("subject-1", "1" * 64, "review", "review-artifact")
 
@@ -101,6 +103,7 @@ def _intent(**changes: Any) -> ActionIntentV1:
         target_instance_id=TARGET,
         target_expected_revision=0,
         artifact=_artifact(),
+        approval_window_end_utc=WINDOW_END,
     )
     return replace(base, **changes)
 

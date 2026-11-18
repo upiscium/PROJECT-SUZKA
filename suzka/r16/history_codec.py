@@ -62,6 +62,9 @@ class PolicyKind(str, Enum):
 class PolicyRow(str, Enum):
     """Policy rows that issue a Decision; HOLD rows (0/1/2/2b/7) never do."""
 
+    # IP-17a (#411 D1 r7 §12-2): SuccessorPolicy V3 only, Plan A after a
+    # forward obligation closed unclaimed (SubjectHistory v4 CHECK).
+    ROW_2C = "2c"
     ROW_3 = "3"
     ROW_4 = "4"
     ROW_4B = "4b"
@@ -73,6 +76,7 @@ class PolicyRow(str, Enum):
 # #374 F1 D3 §3-2: the "b" rows exist only in SuccessorPolicyV2, and row 5 is
 # the only Decision row whose output is NO_OP.
 _V2_ONLY_ROWS: Final = frozenset({PolicyRow.ROW_4B, PolicyRow.ROW_5B})
+_V3_ONLY_ROWS: Final = frozenset({PolicyRow.ROW_2C})
 
 
 class SourceRole(str, Enum):
@@ -252,6 +256,11 @@ class CommittedDecisionV1:
             and self.policy_row in _V2_ONLY_ROWS
         ):
             raise ValueError("SuccessorPolicyV1 has no b rows")
+        if (
+            self.policy_kind is not PolicyKind.SUCCESSOR_POLICY_V3
+            and self.policy_row in _V3_ONLY_ROWS
+        ):
+            raise ValueError("only SuccessorPolicyV3 has row 2c")
         expected_reason = (
             ReasonCode.NO_OP_PREFERRED
             if self.policy_row is PolicyRow.ROW_5

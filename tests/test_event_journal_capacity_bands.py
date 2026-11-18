@@ -111,9 +111,11 @@ def test_soft_band_allow_list_matches_the_design_table() -> None:
         AgentEventType.R18_ACTION_INTENT_ISSUE,
         # IP-16a-3 (D1 §1): the R17 forecast commit is refused too.
         AgentEventType.R17_EXPECTATION_COMMIT,
+        # IP-17a (HP-8): the R18 Policy verdict is refused too.
+        AgentEventType.R18_POLICY_COMMIT,
     }
     assert AgentEventType.GOAL_SELF_PROPOSAL_REVIEW in SOFT_BAND_ADMITTED_EVENT_TYPES
-    assert len(AgentEventType) == 21
+    assert len(AgentEventType) == 22
     assert SOFT_BAND_ADMITTED_EVENT_TYPES <= set(AgentEventType)
 
 

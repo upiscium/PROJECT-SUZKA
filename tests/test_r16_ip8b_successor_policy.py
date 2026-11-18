@@ -271,7 +271,11 @@ def test_policy_is_total_and_never_writes_over_every_state_tuple(version: Policy
         if interpretation is Interpretation.UNCERTAIN:
             # UNCERTAIN never reaches Plan B or NO_OP.
             assert result.output not in (PolicyOutputKind.PLAN_B, PolicyOutputKind.NO_OP)
-    assert seen == set(SuccessorRow)
+    # IP-17a: row 2c exists in V3 only.
+    expected = set(SuccessorRow)
+    if version is PolicyKind.SUCCESSOR_POLICY_V2:
+        expected.discard(SuccessorRow.ROW_2C)
+    assert seen == expected
 
 
 def test_uncertain_only_downgrades_rows_4_and_5_to_plan_a() -> None:
