@@ -1,20 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
+import { isAllowed, safeBackendPath } from "@/lib/admin-proxy-path";
 
 const BACKEND_URL = process.env.SUZKA_BACKEND_URL ?? "http://127.0.0.1:8000";
 const ADMIN_TOKEN = process.env.SUZKA_ADMIN_TOKEN;
 
 type RouteContext = { params: Promise<{ path: string[] }> };
-
-const ALLOWED_ROUTES = [
-  { method: "GET", pattern: /^state\/emotion$/ },
-  { method: "GET", pattern: /^memory\/search$/ },
-  { method: "GET", pattern: /^memory\/episodes\/[^/]+$/ },
-  { method: "GET", pattern: /^memory\/semantic\/[^/]+$/ },
-  { method: "POST", pattern: /^chat\/debug$/ },
-  { method: "POST", pattern: /^sleep\/run$/ },
-  { method: "GET", pattern: /^adapters$/ },
-  { method: "POST", pattern: /^adapters\/[^/]+\/(evaluate|trial|approve|activate|reject)$/ },
-];
 
 export async function GET(request: NextRequest, context: RouteContext) {
   return proxyAdminRequest(request, context);
@@ -30,8 +20,8 @@ async function proxyAdminRequest(request: NextRequest, context: RouteContext): P
   }
 
   const { path } = await context.params;
-  const backendPath = path.join("/");
-  if (!isAllowed(request.method, backendPath)) {
+  const backendPath = safeBackendPath(path, request.nextUrl.pathname);
+  if (backendPath === null || !isAllowed(request.method, backendPath)) {
     return NextResponse.json({ detail: "Admin proxy route is not allowed" }, { status: 404 });
   }
 
@@ -54,6 +44,3 @@ async function proxyAdminRequest(request: NextRequest, context: RouteContext): P
   });
 }
 
-function isAllowed(method: string, path: string): boolean {
-  return ALLOWED_ROUTES.some((route) => route.method === method && route.pattern.test(path));
-}
