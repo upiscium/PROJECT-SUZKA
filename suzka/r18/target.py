@@ -39,9 +39,10 @@ A lost target is never replaced by a new empty one: ``open`` never creates.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 import os
 from pathlib import Path
@@ -142,6 +143,13 @@ class TargetUnavailable(TargetError):
 
 class TargetCorrupt(TargetError):
     """Custody, schema or integrity is wrong: BLOCKED, never recreated."""
+
+
+class TargetNotStarted(TargetUnavailable):
+    """``BEGIN IMMEDIATE`` failed: provably nothing ran (IP-18a, F07 refined).
+
+    Raised only from the ``BEGIN`` branch of a write, so a caller may retry
+    the same write; every other failure is an unknown result."""
 
 
 class TargetCapacityError(TargetUnavailable):
@@ -604,7 +612,10 @@ class TargetStore(_Connection):
             try:
                 connection.execute("BEGIN IMMEDIATE")
             except sqlite3.Error as error:
-                raise _error(error, action) from error
+                failure = _error(error, action)
+                if type(failure) is TargetUnavailable:
+                    raise TargetNotStarted(str(failure)) from error
+                raise failure from error
             try:
                 yield connection
                 connection.execute("COMMIT")
@@ -691,8 +702,14 @@ class TargetStore(_Connection):
         intent: ActionIntentV1,
         challenge: ApprovalChallengeV1,
         claim: ExecutionClaimV1,
+        *,
+        now: Callable[[], datetime],
     ) -> ExecutionReceiptV1:
-        """``FORWARD_WRITE_REVIEW_ARTIFACT_V1`` (ABSENT → ACTIVE)."""
+        """``FORWARD_WRITE_REVIEW_ARTIFACT_V1`` (ABSENT → ACTIVE).
+
+        HP-7 (a): inside the ``BEGIN IMMEDIATE`` transaction, ``now()`` must be
+        before the claim's Commitment deadline (none: no check), else the
+        receipt is ``DEADLINE_ELAPSED`` and nothing is written."""
 
         if type(intent) is not ActionIntentV1:
             raise TypeError("intent must be an ActionIntentV1")
@@ -714,6 +731,7 @@ class TargetStore(_Connection):
             expected_revision=intent.target_expected_revision,
             payload=payload,
             approved_digest=challenge.payload_digest,
+            now=now,
         )
 
     def inverse_write(
@@ -756,6 +774,7 @@ class TargetStore(_Connection):
         expected_revision: int,
         payload: bytes | None,
         approved_digest: str,
+        now: Callable[[], datetime] | None = None,
     ) -> ExecutionReceiptV1:
         def receipt(result: ExecutorResult, revision: int | None = None) -> ExecutionReceiptV1:
             return ExecutionReceiptV1.for_claim(
@@ -792,6 +811,17 @@ class TargetStore(_Connection):
             ).fetchone()
             if existing:
                 return receipt(ExecutorResult.CAS_REJECTED)  # already applied: never twice
+            if direction is Direction.FORWARD and claim.commitment_deadline_utc is not None:
+                assert now is not None
+                # Read after BEGIN IMMEDIATE returned: check and commit adjoin.
+                moment = now()
+                if moment.tzinfo is None:
+                    raise TargetBindingError("the target clock must be aware")
+                deadline = datetime.strptime(
+                    claim.commitment_deadline_utc, "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=timezone.utc)
+                if moment >= deadline:
+                    return receipt(ExecutorResult.DEADLINE_ELAPSED)
             if direction is Direction.FORWARD:
                 if artifact is not None or expected_revision != 0:
                     return receipt(ExecutorResult.CAS_REJECTED)
@@ -880,6 +910,7 @@ __all__ = [
     "TargetCapacityError",
     "TargetCorrupt",
     "TargetError",
+    "TargetNotStarted",
     "TargetMeta",
     "TargetReader",
     "TargetStore",
