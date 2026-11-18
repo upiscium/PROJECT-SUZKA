@@ -1285,7 +1285,9 @@ class EventJournalAdmissionBand(str, Enum):
 # 2026-11-14, and R16_SELF_GOAL_ACTIVATION, refused like the driver's; IP-16a-2
 # added R18_ACTION_INTENT_ISSUE, refused by HP-8: the forward side only;
 # IP-16a-3 added R17_EXPECTATION_COMMIT, refused: it only moves the forward
-# pipeline, and admitting it would be a separate Human decision, D1 §1).
+# pipeline, and admitting it would be a separate Human decision, D1 §1;
+# IP-17a added R18_POLICY_COMMIT, refused by HP-8 like the Intent: an
+# unattended Intent still closes at its window end with no event, §3a).
 # Cognition continues; DEBUG_CHAT, ADAPTER_EVALUATE and ADAPTER_UPDATE (Human
 # decision 2026-11-10) are refused, and so is every type not listed here,
 # including any type added later (R18/R19 external effects).

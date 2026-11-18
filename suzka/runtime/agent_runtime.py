@@ -43,6 +43,9 @@ class AgentEventType(str, Enum):
     # IP-16a-3 (#411 D1 §1): the R17 forecast for one terminal forward Intent
     # (or a scan for one without). Refused in the soft band like the Intent.
     R17_EXPECTATION_COMMIT = "r17_expectation_commit"
+    # IP-17a (#411 D1 r7 §1-§2): the R18 Policy verdict for one adopted
+    # forward Intent (or a scan after a cursor). Refused in the soft band.
+    R18_POLICY_COMMIT = "r18_policy_commit"
 
 
 class AgentEventSource(str, Enum):
@@ -79,6 +82,7 @@ class AgentEventSource(str, Enum):
     API_R16_SELF_GOAL_ACTIVATE = "api.r16.self_goal.activate"
     RUNTIME_R18_ACTION_INTENT_ISSUE = "runtime.r18.action_intent_issue"
     RUNTIME_R17_EXPECTATION_COMMIT = "runtime.r17.expectation_commit"
+    RUNTIME_R18_POLICY_COMMIT = "runtime.r18.policy_commit"
 
 
 class AgentRuntimeStatus(str, Enum):

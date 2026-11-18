@@ -44,7 +44,19 @@ Stages (#370 D0 §2, D1, D2):
   stops at NONE_LEFT, a HOLD, or after ``MAX_SCANS_PER_STARTUP`` scans.  The
   driver never counts pending Intents itself.  Only with the expectation
   issuer installed and ``r18.enabled`` true (the server passes none
-  otherwise).
+  otherwise);
+- IP-17a (#411 D1 r7 §2): after any forecast result COMMITTED or EXISTING,
+  one ``R18_POLICY_COMMIT(intent_id)`` per Intent this incarnation; a
+  transient HOLD (``not_yet_terminal`` / ``forecast_missing`` / ``in_flight``)
+  is retried with the same bounded delays (at most 3 times).  Once per
+  driver incarnation, when the driver is (or becomes) active,
+  ``R18_POLICY_COMMIT(scan(after))``, chained on each result's intent id (a
+  HOLD on one Intent is skipped); the chain stops at NONE_LEFT, a result with
+  no intent id (``r18_disabled``, a history block), a submission that is not
+  admitted (the soft band), or after ``MAX_POLICY_SCANS_PER_STARTUP`` scans.
+  Every HOLD is bounded anyway: an unattended Intent closes at its approval
+  window's end with no event (§3a).  Only with the Policy owner installed and
+  ``r18.enabled`` true.
 
 Tickets (#370 D1 2-1, 2-2, D2 P1-3/P1-5, addendum P1-A): a 128-bit random
 capability per command, held in a bounded in-memory ring. Nothing about
@@ -89,6 +101,13 @@ from suzka.r18.intent_issuer import (
     R18IntentReason,
     _IntentIssueResult,
 )
+from suzka.r18.policy_owner import (
+    MAX_POLICY_SCANS_PER_STARTUP,
+    TRANSIENT_POLICY_REASONS,
+    PolicyCommitStatus,
+    R18PolicyReason,
+    _PolicyResult,
+)
 from suzka.runtime.agent_runtime import (
     AgentEventOutcome,
     AgentEventSource,
@@ -106,6 +125,7 @@ if TYPE_CHECKING:
     from suzka.r16.source_owner import _MotivationSourceOwner
     from suzka.r17.expectation_issuer import ExpectationIssuerV1
     from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
+    from suzka.r18.policy_owner import ReviewArtifactPolicyV1
     from suzka.runtime.main_loop import ChatResult
 
 LOGGER = logging.getLogger(__name__)
@@ -207,6 +227,8 @@ class _Stage(str, Enum):
     ACTION_INTENT = "action_intent"
     # IP-16a-3 (#411 D1 §2): the R17 forecast for one Intent, or a scan.
     EXPECTATION = "expectation"
+    # IP-17a (#411 D1 r7 §2): the R18 Policy verdict for one Intent, or a scan.
+    POLICY = "policy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +249,20 @@ class _ForecastTarget:
 @dataclass(frozen=True, slots=True)
 class _ForecastScan:
     """Queue item: start the once-per-incarnation forecast scan."""
+
+
+@dataclass(frozen=True, slots=True)
+class _PolicyTarget:
+    """One Intent's id (public-safe), or a scan after a cursor (``scan``)."""
+
+    intent_id: str | None
+    scan: bool = False
+    after: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PolicyScan:
+    """Queue item: start the once-per-incarnation Policy scan."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,6 +332,7 @@ class R16Driver:
         clock: Callable[[], float] = time.monotonic,
         intent_issuer: ReviewArtifactIntentIssuerV1 | None = None,
         expectation_issuer: ExpectationIssuerV1 | None = None,
+        policy_owner: ReviewArtifactPolicyV1 | None = None,
     ) -> None:
         self._runtime = runtime
         self._source = source_owner
@@ -316,6 +353,14 @@ class R16Driver:
         self._forecast_retries: dict[str, int] = {}
         self._scan_posted = False
         self._scans = 0
+        # IP-17a: present only when installed with r18.enabled (server).
+        self._policy = policy_owner
+        # Intents whose verdict was submitted, transient retries made, and
+        # this incarnation's Policy scan state (D1 r7 §2).
+        self._policed: dict[str, None] = {}
+        self._policy_retries: dict[str, int] = {}
+        self._policy_scan_posted = False
+        self._policy_scans = 0
         self.incarnation = secrets.token_hex(8)
         self._active = active
         # IP-11: the self path also needs its own unique activation marker.
@@ -369,6 +414,7 @@ class R16Driver:
             started = self._thread is not None
         if started:
             self._post_forecast_scan()
+            self._post_policy_scan()
 
     def activate_self_goal(self) -> None:
         """IP-11: called after the unique self-Goal activation has completed."""
@@ -386,6 +432,16 @@ class R16Driver:
             self._post(rescan)
         if self._active:
             self._post_forecast_scan()
+            self._post_policy_scan()
+
+    def _post_policy_scan(self) -> None:
+        """IP-17a (D1 r7 §2): one Policy scan when the driver is active,
+        queued after the forecast scan."""
+
+        if self._policy is None or not self._policy.enabled or self._policy_scan_posted:
+            return
+        self._policy_scan_posted = True
+        self._post(_PolicyScan())
 
     def _post_forecast_scan(self) -> None:
         """IP-16a-3 (D1 §2): one forecast scan when the driver is active."""
@@ -548,6 +604,8 @@ class R16Driver:
                     self._on_rescan(item)
                 elif isinstance(item, _ForecastScan):
                     self._maybe_scan()
+                elif isinstance(item, _PolicyScan):
+                    self._maybe_policy_scan(None)
                 with self._tickets_lock:
                     finished, self._done = self._done, []
                 for result in finished:
@@ -761,6 +819,12 @@ class R16Driver:
         if stage is _Stage.EXPECTATION:
             assert isinstance(context, _ForecastTarget) and self._expectation is not None
             return _untyped(self._expectation._submit_expectation(context.intent_id))
+        if stage is _Stage.POLICY:
+            assert isinstance(context, _PolicyTarget) and self._policy is not None
+            if context.scan:
+                return _untyped(self._policy._submit_scan(context.after))
+            assert context.intent_id is not None
+            return _untyped(self._policy._submit_policy(context.intent_id))
         assert isinstance(context, str)
         return _untyped(self._preview._submit_preview(context))
 
@@ -827,6 +891,10 @@ class R16Driver:
         if item.stage is _Stage.EXPECTATION:
             assert isinstance(item.context, _ForecastTarget)
             self._forecast_done(item.context, outcome.value)
+            return
+        if item.stage is _Stage.POLICY:
+            assert isinstance(item.context, _PolicyTarget)
+            self._policy_done(item.context, outcome.value)
             return
         value = outcome.value
         command = _command_of(item.context)
@@ -991,6 +1059,13 @@ class R16Driver:
     def _forecast_done(self, target: _ForecastTarget, value: object) -> None:
         if not isinstance(value, _ExpectationResult):
             return
+        if (
+            value.status
+            in (ExpectationCommitStatus.COMMITTED, ExpectationCommitStatus.EXISTING)
+            and value.intent_id is not None
+        ):
+            # IP-17a (D1 r7 §2): the Policy follows any forecast result.
+            self._maybe_policy(value.intent_id)
         if target.intent_id is None:
             # The scan: only a COMMITTED continues it.
             if value.status is ExpectationCommitStatus.COMMITTED:
@@ -1011,6 +1086,60 @@ class R16Driver:
                 self._clock() + RETRY_DELAYS_SECONDS[attempt],
                 0,
                 _Stage.EXPECTATION,
+                target,
+            )
+        )
+
+    def _maybe_policy(self, intent_id: str) -> None:
+        """IP-17a (D1 r7 §2): one Policy request per Intent this incarnation."""
+
+        if self._policy is None or not self._policy.enabled or intent_id in self._policed:
+            return
+        self._policed[intent_id] = None
+        _bound(self._policed)
+        self._submit(_Stage.POLICY, _PolicyTarget(intent_id))
+
+    def _maybe_policy_scan(self, after: str | None) -> None:
+        """At most ``MAX_POLICY_SCANS_PER_STARTUP`` scans per driver incarnation."""
+
+        if (
+            self._policy is None
+            or not self._policy.enabled
+            or self._policy_scans >= MAX_POLICY_SCANS_PER_STARTUP
+        ):
+            return
+        self._policy_scans += 1
+        self._submit(_Stage.POLICY, _PolicyTarget(None, scan=True, after=after))
+
+    def _policy_done(self, target: _PolicyTarget, value: object) -> None:
+        if not isinstance(value, _PolicyResult):
+            return
+        if target.scan:
+            # Chained on the result's intent id; a HOLD on one Intent is
+            # skipped.  NONE_LEFT, R18_DISABLED or no id ends the chain.
+            if (
+                value.status is not PolicyCommitStatus.NONE_LEFT
+                and value.reason is not R18PolicyReason.R18_DISABLED
+                and value.intent_id is not None
+            ):
+                self._maybe_policy_scan(value.intent_id)
+            return
+        assert target.intent_id is not None
+        if value.reason not in TRANSIENT_POLICY_REASONS:
+            self._policy_retries.pop(target.intent_id, None)
+            return
+        attempt = self._policy_retries.get(target.intent_id, 0)
+        if attempt >= len(RETRY_DELAYS_SECONDS):
+            self._policy_retries.pop(target.intent_id, None)
+            return
+        self._policy_retries[target.intent_id] = attempt + 1
+        while len(self._policy_retries) > OBSERVED_CAPACITY:
+            del self._policy_retries[next(iter(self._policy_retries))]
+        self._retries.append(
+            _Retry(
+                self._clock() + RETRY_DELAYS_SECONDS[attempt],
+                0,
+                _Stage.POLICY,
                 target,
             )
         )
@@ -1052,6 +1181,11 @@ def _result_code(value: object) -> str:
         return value.status.value
     if isinstance(value, _ExpectationResult):
         # IP-16a-3: a closed status and reason only, never forecast contents.
+        if value.reason is not None:
+            return f"{value.status.value}:{value.reason.value}"
+        return value.status.value
+    if isinstance(value, _PolicyResult):
+        # IP-17a: a closed status and reason only, never verdict contents.
         if value.reason is not None:
             return f"{value.status.value}:{value.reason.value}"
         return value.status.value

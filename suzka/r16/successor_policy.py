@@ -12,6 +12,8 @@ Row   Condition                                        Output
       R15 interpretation is unavailable
 2     the operation ledger is pending or unsafe        HOLD(INSUFFICIENT_EVIDENCE)
 2b    interpretation = CONTRADICTORY                   HOLD(CONFLICTING_EVIDENCE)
+2c    V3 only: the forward obligation closed           Plan A (no WRITE)
+      unclaimed, qualified sources and lineage
 3     initial, no Commitment                           Plan A
 4     initial, ACTIVE Commitment, SETTLED/NOT_REVIEWED Plan B
 4b    row 4 with interpretation = UNCERTAIN            Plan A (no WRITE)
@@ -44,6 +46,16 @@ effect whose source-side Claim was lost (e.g. by a true rollback). It is a row
 2 HOLD, carries no verified Outcome, and only a V3 input can hold it. A V2
 input keeps its exact bytes, schema string and fingerprint domain, so every
 existing V2 head still replays unchanged.
+
+IP-17a (#411 D1 r7 §3a / §12-2, HD-13 (a)) adds row 2c to V3 only. A forward
+obligation that closed without a Claim (``POLICY_DENIED``, or
+``APPROVAL_EXPIRED_UNCLAIMED`` after three expiries or the approval window's
+end) is no longer pending: under V3 the two states leave row 2 and, after
+rows 2 and 2b, a qualified lineage re-decides to Plan A (no WRITE). Row 0's
+"ABSENT_INITIAL with a non-NONE ledger" rule exempts them, so a second
+identical request on a closed group is Plan A too. V2 is unchanged, and any
+input with another ledger state evaluates exactly as before: every Decision
+persisted before IP-17a has ledger NONE, so all of them replay unchanged.
 
 R16 must not import ``suzka.r15``: the R15 read arrives as the closed strings
 of ``suzka.runtime.r15_interpretation_reader`` and is mapped here.
@@ -189,6 +201,8 @@ class SuccessorRow(str, Enum):
     ROW_1 = "1"
     ROW_2 = "2"
     ROW_2B = "2b"
+    # IP-17a: V3 only, a closed unclaimed forward obligation -> Plan A.
+    ROW_2C = "2c"
     ROW_3 = "3"
     ROW_4 = "4"
     ROW_4B = "4b"
@@ -225,6 +239,12 @@ _PENDING_LEDGER: Final = frozenset(
     }
 )
 _V3_ONLY_LEDGER: Final = frozenset({LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT})
+# IP-17a (§12-2): a forward obligation closed without a Claim. Under V3 the
+# two states leave row 2 for row 2c; under V2 they stay row 2.
+CLOSED_UNCLAIMED_LEDGER: Final = frozenset(
+    {LedgerState.POLICY_DENIED, LedgerState.APPROVAL_EXPIRED_UNCLAIMED}
+)
+_PENDING_LEDGER_V3: Final = _PENDING_LEDGER - CLOSED_UNCLAIMED_LEDGER
 # D6-2: no verified Outcome may accompany a ledger with no claimed effect.
 # A prior-incarnation effect has lost its source-side Claim, so no Outcome.
 _OUTCOME_FORBIDDEN: Final = frozenset(
@@ -729,6 +749,7 @@ _ROW_OUTPUTS: Final[Mapping[SuccessorRow, tuple[PolicyOutputKind, ReasonCode | N
     SuccessorRow.ROW_1: _INSUFFICIENT,
     SuccessorRow.ROW_2: _INSUFFICIENT,
     SuccessorRow.ROW_2B: _CONFLICT,
+    SuccessorRow.ROW_2C: (PolicyOutputKind.PLAN_A, None),
     SuccessorRow.ROW_3: (PolicyOutputKind.PLAN_A, None),
     SuccessorRow.ROW_4: (PolicyOutputKind.PLAN_B, None),
     SuccessorRow.ROW_4B: (PolicyOutputKind.PLAN_A, None),
@@ -831,6 +852,8 @@ def evaluate(value: SuccessorPolicyInputV2) -> SuccessorPolicyResult:
 
     if type(value) is not SuccessorPolicyInputV2:
         raise TypeError("SuccessorPolicyV2 needs an exact SuccessorPolicyInputV2")
+    v3 = value.version is PolicyKind.SUCCESSOR_POLICY_V3
+    closed_unclaimed = v3 and value.ledger in CLOSED_UNCLAIMED_LEDGER
     # Row 0: contradiction.
     if (
         value.required_source is RequiredSourceState.CONFLICT
@@ -843,6 +866,8 @@ def evaluate(value: SuccessorPolicyInputV2) -> SuccessorPolicyResult:
         or (
             value.predecessor is PredecessorState.ABSENT_INITIAL
             and value.ledger is not LedgerState.NONE
+            # IP-17a (§12-2): a new lineage on a closed group re-decides.
+            and not closed_unclaimed
         )
         or cross_reference_conflicts(value)
     ):
@@ -857,7 +882,7 @@ def evaluate(value: SuccessorPolicyInputV2) -> SuccessorPolicyResult:
     ):
         return _result(SuccessorRow.ROW_1)
     # Row 2: pending or unsafe operation ledger.
-    if value.ledger in _PENDING_LEDGER:
+    if value.ledger in (_PENDING_LEDGER_V3 if v3 else _PENDING_LEDGER):
         return _result(SuccessorRow.ROW_2)
     # Row 2b: a contradictory interpretation.
     if value.interpretation is Interpretation.CONTRADICTORY:
@@ -866,6 +891,15 @@ def evaluate(value: SuccessorPolicyInputV2) -> SuccessorPolicyResult:
         value.required_source is RequiredSourceState.QUALIFIED
         and value.lineage is LineageState.CONSISTENT
     )
+    # Row 2c (V3 only, IP-17a): the forward obligation closed unclaimed, so
+    # the lineage re-decides to Plan A (no WRITE).
+    if (
+        closed_unclaimed
+        and qualified
+        and value.predecessor
+        in (PredecessorState.ABSENT_INITIAL, PredecessorState.QUALIFIED)
+    ):
+        return _result(SuccessorRow.ROW_2C)
     initial = (
         qualified
         and value.ledger is LedgerState.NONE
@@ -1024,6 +1058,7 @@ __all__ = [
     "INPUT_SCHEMA_V3",
     "MAX_LEDGER_REFS",
     "POLICY_KIND",
+    "CLOSED_UNCLAIMED_LEDGER",
     "CommitmentState",
     "FeedbackState",
     "Interpretation",

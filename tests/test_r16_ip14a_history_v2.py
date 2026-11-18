@@ -604,6 +604,8 @@ class Chain:
             target_instance_id=TARGET,
             target_expected_revision=0,
             artifact=artifact,
+            # IP-17a: the approval window (after every fixture timestamp).
+            approval_window_end_utc="2026-11-16T01:00:00Z",
         )
         self.forecast = ExpectedObservationV1(
             lineage_scope="x-1",
