@@ -8,7 +8,16 @@
 # keep experiments short.
 #
 # Usage (on the deploy host, as a user with sudo):
-#   scripts/lab-from-production.sh [--port N] [--timeout SECONDS] [--keep] -- CMD...
+#   scripts/lab-from-production.sh [--port N] [--timeout SECONDS] [--keep] [--r18] -- CMD...
+#
+# --r18 (#411 D1 r7 §9-1, IP-17c) switches R18 on in the LAB only, for an
+# approval-relevant run started with the Human's own privileges (attended, HD-15):
+# the lab config gets r18.enabled and the approval origin http://localhost:PORT,
+# and the fixed target and its obligation secret are created inside the lab by
+# `python -m suzka.r18.target_init`, as the service user, with the same sudo
+# pattern this script already uses. Approve through a tunnel:
+#   ssh -L PORT:127.0.0.1:PORT <host>   then   http://localhost:PORT/api/r18/approve
+# Without --r18 the lab is unchanged.
 #
 # CMD runs as the invoking user with SUZKA_LAB_URL (the lab API base URL) and
 # SUZKA_LAB_DIR set. It is killed after --timeout seconds (default 3600).
@@ -26,18 +35,20 @@ LAB_BASE="${SUZKA_LAB_BASE:-/var/lib/suzka/lab}"
 PORT=8101
 TIMEOUT=3600
 KEEP=0
+R18=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) PORT="$2"; shift 2 ;;
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
+    --r18) R18=1; shift ;;
     --) shift; break ;;
     *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
 if [[ $# -eq 0 ]]; then
-  printf 'usage: %s [--port N] [--timeout S] [--keep] -- CMD...\n' "$0" >&2
+  printf 'usage: %s [--port N] [--timeout S] [--keep] [--r18] -- CMD...\n' "$0" >&2
   exit 2
 fi
 if ! [[ "${PORT}" =~ ^[1-9][0-9]{0,4}$ ]] || (( PORT > 65535 )); then
@@ -101,8 +112,33 @@ PYTHON="${PROD_ROOT}/.venv/bin/python"
 
 # Writes LAB/config.yaml and checks the parsed settings: every Path stays in
 # LAB, and the lab port is not the production port.
-sudo -u "${SERVICE_USER}" env -i "${SERVICE_ENV[@]}" PYTHONPATH="${PROD_ROOT}" \
-  "${PYTHON}" "${LAB}/lab_prepare.py" "${LAB}/prod-config.yaml" "${LAB}" "${PORT}" >/dev/null
+PREPARE_ARGS=("${LAB}/prod-config.yaml" "${LAB}" "${PORT}")
+if [[ "${R18}" == 1 ]]; then
+  PREPARE_ARGS+=(--r18)
+fi
+PREPARED="$(sudo -u "${SERVICE_USER}" env -i "${SERVICE_ENV[@]}" PYTHONPATH="${PROD_ROOT}" \
+  "${PYTHON}" "${LAB}/lab_prepare.py" "${PREPARE_ARGS[@]}")"
+
+if [[ "${R18}" == 1 ]]; then
+  # lab_prepare printed r18_target=<path relative to the lab>; it has checked
+  # that it stays inside the lab, and refused the production port and a lab
+  # that does not listen on loopback.
+  R18_TARGET="$(printf '%s\n' "${PREPARED}" | sed -n 's/^r18_target=//p')"
+  if [[ -z "${R18_TARGET}" || "${R18_TARGET}" == /* || "${R18_TARGET}" == *..* || "${R18_TARGET}" != */* ]]; then
+    printf 'refusing an unexpected r18 target path\n' >&2
+    exit 1
+  fi
+  R18_DIR="$(dirname "${R18_TARGET}")"
+  # The target's directory must be a private (0700) directory of the service
+  # user (check_secret_directory); parents are created as that user.
+  # Done as the service user (never as root following a symlink).
+  sudo -u "${SERVICE_USER}" mkdir -p -m 700 "${LAB}/${R18_DIR}"
+  sudo -u "${SERVICE_USER}" chmod 700 "${LAB}/${R18_DIR}"
+  # From the lab directory: `python -m` puts the working directory first on
+  # the path, and the lab holds no suzka package, so the deployed code runs.
+  (cd "${LAB}" && sudo -u "${SERVICE_USER}" env -i "${SERVICE_ENV[@]}" PYTHONPATH="${PROD_ROOT}" \
+    "${PYTHON}" -m suzka.r18.target_init "${LAB}/${R18_TARGET}" >&2)
+fi
 
 nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader 2>/dev/null \
   | sed 's/^/GPU before lab: /' >&2 || true
@@ -143,6 +179,10 @@ if ! sudo cat "/proc/${MAIN_PID}/environ" | tr '\0' '\n' | grep -qxF "SUZKA_CONF
   exit 1
 fi
 printf 'lab API at http://127.0.0.1:%s (unit %s, state %s)\n' "${PORT}" "${UNIT}" "${LAB}" >&2
+if [[ "${R18}" == 1 ]]; then
+  printf 'lab approvals: ssh -L %s:127.0.0.1:%s <host>, then http://localhost:%s/api/r18/approve\n' \
+    "${PORT}" "${PORT}" "${PORT}" >&2
+fi
 
 status=0
 SUZKA_LAB_URL="http://127.0.0.1:${PORT}" SUZKA_LAB_DIR="${LAB}" \

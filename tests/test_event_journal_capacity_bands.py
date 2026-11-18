@@ -115,9 +115,11 @@ def test_soft_band_allow_list_matches_the_design_table() -> None:
         AgentEventType.R18_POLICY_COMMIT,
         # IP-17b: the challenge issue is refused; EXPIRE is admitted (HD-6 (a)).
         AgentEventType.R18_CHALLENGE_ISSUE,
+        # IP-17c: the CLAIM is refused too (HP-8).
+        AgentEventType.R18_EXECUTION_CLAIM,
     }
     assert AgentEventType.GOAL_SELF_PROPOSAL_REVIEW in SOFT_BAND_ADMITTED_EVENT_TYPES
-    assert len(AgentEventType) == 24
+    assert len(AgentEventType) == 25
     assert SOFT_BAND_ADMITTED_EVENT_TYPES <= set(AgentEventType)
 
 

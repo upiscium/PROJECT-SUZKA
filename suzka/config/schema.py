@@ -1,7 +1,9 @@
 """Typed configuration schema for PROJECT-SUZKA."""
 
+import ipaddress
 from pathlib import Path
 import math
+from urllib.parse import urlsplit
 
 from typing import Literal
 
@@ -20,6 +22,66 @@ from pydantic import (
 from suzka.identifiers import validate_identifier
 from suzka.limits import MAX_TRACE_ITEMS_PER_CONTEXT, MAX_TRACE_STABILITY_HOURS
 from suzka.identity.value_system import ValueSeedDeclaration, ValueScope
+
+
+def parse_approval_origin(origin: str) -> tuple[str, int]:
+    """``http(s)://host[:port]`` -> (lowercase host, port); nothing else.
+
+    No userinfo, path, query or fragment: an origin is a scheme, a host and an
+    optional port (the default port of the scheme otherwise).
+    """
+
+    if type(origin) is not str or not origin.isascii() or len(origin) > 128:
+        raise ValueError("an approval origin is a short ASCII http(s) origin")
+    parts = urlsplit(origin)
+    if (
+        parts.scheme not in {"http", "https"}
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or parts.path
+        or parts.query
+        or parts.fragment
+        or origin != f"{parts.scheme}://{parts.netloc}"
+        or origin != origin.lower()
+    ):
+        raise ValueError("an approval origin is http(s)://host[:port] only")
+    try:
+        port = parts.port
+    except ValueError as error:
+        raise ValueError("an approval origin has an invalid port") from error
+    host = parts.hostname
+    return host, (port if port is not None else (443 if parts.scheme == "https" else 80))
+
+
+def approval_host_header(origin: str) -> str:
+    """The ``Host`` header value a browser sends for this origin (the port is
+    omitted when it is the scheme's default)."""
+
+    host, port = parse_approval_origin(origin)
+    scheme = urlsplit(origin).scheme
+    shown = f"[{host}]" if ":" in host else host
+    default = 443 if scheme == "https" else 80
+    return shown if port == default else f"{shown}:{port}"
+
+
+def _is_loopback_ip(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def is_loopback_host(host: str) -> bool:
+    """Whether a bind address is loopback (``localhost`` or a loopback IP)."""
+
+    return host.strip().lower() == "localhost" or _is_loopback_ip(host.strip().strip("[]"))
+
+
+def is_localhost_origin(origin: str) -> bool:
+    """The direct-localhost transport's origins are exactly ``localhost``."""
+
+    return parse_approval_origin(origin)[0] == "localhost"
 
 
 class StrictBaseModel(BaseModel):
@@ -254,6 +316,45 @@ class R18Settings(StrictBaseModel):
     # IP-17b (#411 D1 r7 §3 / §4): a challenge's TTL, capped by the Intent's
     # window end and by MAX_APPROVAL_TTL (15 min).
     approval_ttl_seconds: StrictInt = Field(default=300, ge=60, le=900)
+    # IP-17c (#411 D1 r7 §4): the approval API's request guards.
+    # ``approval_origins`` lists every Host name the Human uses (fail-closed):
+    # ``http://localhost:<port>`` origins are the direct localhost transport;
+    # any other origin (for example ``http://10.12.0.2:8080``, served by Caddy)
+    # is a trusted-network origin and needs ``approval_trusted_networks``
+    # (CIDRs; the networks the firewall already admits to Caddy).  An origin on
+    # 127.0.0.1 / ::1 is refused (a relay's ``Host: 127.0.0.1:8000`` must never
+    # match).  The default is localhost only.
+    approval_origins: list[StrictStr] = Field(
+        default_factory=lambda: ["http://localhost:8000"], min_length=1, max_length=16
+    )
+    approval_trusted_networks: list[StrictStr] = Field(default_factory=list, max_length=16)
+    # IP-17c (§4): reviews per minute across the whole approval API.
+    approval_reviews_per_minute: StrictInt = Field(default=10, ge=1, le=60)
+
+    @field_validator("approval_origins")
+    @classmethod
+    def validate_approval_origins(cls, value: list[str]) -> list[str]:
+        seen: set[str] = set()
+        for origin in value:
+            host, _port = parse_approval_origin(origin)
+            if _is_loopback_ip(host):
+                raise ValueError("an approval origin must not be a loopback address")
+            if origin in seen:
+                raise ValueError("approval origins must be unique")
+            seen.add(origin)
+        return value
+
+    @field_validator("approval_trusted_networks")
+    @classmethod
+    def validate_approval_networks(cls, value: list[str]) -> list[str]:
+        for network in value:
+            try:
+                parsed = ipaddress.ip_network(network, strict=True)
+            except ValueError as error:
+                raise ValueError("approval_trusted_networks must be strict CIDRs") from error
+            if parsed.prefixlen == 0:
+                raise ValueError("a trusted network is never the whole address space")
+        return value
 
 
 class R19Settings(StrictBaseModel):
@@ -479,3 +580,20 @@ class Settings(StrictBaseModel):
     r18: R18Settings = Field(default_factory=R18Settings)
     r19: R19Settings = Field(default_factory=R19Settings)
     values: ValueSystemSettings = Field(default_factory=ValueSystemSettings)
+
+    @model_validator(mode="after")
+    def validate_approval_binding(self) -> "Settings":
+        require_approval_binding(self.api.host, self.r18)
+        return self
+
+
+def require_approval_binding(api_host: str, r18: R18Settings) -> None:
+    """IP-17c (#411 D1 r7 §4 rule 1): with R18 on, the API must listen on
+    loopback only, whatever the origins are, so every TCP peer is local
+    (Caddy's, or a tunnel).  On a wider listen address any LAN host could send
+    ``Host: localhost:<port>`` and pass the direct-localhost transport.  Called
+    by the Settings validator and again at startup, because ``model_copy``
+    skips validators."""
+
+    if r18.enabled and not is_loopback_host(api_host):
+        raise ValueError("r18.enabled needs api.host on loopback")

@@ -1,8 +1,9 @@
 """R18 IP-17b: the Approval owner (#411 D1 r7 §1, §3, §3b, §8a, §12-1).
 
-``ApprovalChallengeOwnerV1`` owns two events and is the only writer of
-``approval_challenges`` and ``approval_expirations`` (through the
-subject.history record participant):
+``ApprovalChallengeOwnerV1`` owns three events and is the only writer of
+``approval_challenges``, ``approval_expirations`` and (IP-17c) the nonce
+consumption + ``execution_claims`` (through the subject.history record
+participant):
 
 * ``R18_CHALLENGE_ISSUE(prebuilt challenge, attempt, code)`` (source
   ``api.r18.approval``): written only at an operator confirm that carries the
@@ -12,7 +13,12 @@ subject.history record participant):
   by the startup scan (BOOT_CHANGED) and by the lazy path.  ADMITTED in the
   soft band (HD-6 (a)): it only records that a challenge ended.
 
-Both are gated by ``r18.enabled`` (HOLD ``R18_DISABLED`` before any read) and
+* ``R18_EXECUTION_CLAIM(nonce, code)`` (IP-17c, source ``api.r18.approval``,
+  §6): nonce consumption and the claim in ONE R07 event.  Refused in the soft
+  band (HP-8).  It re-checks everything §6-1 lists and writes the CLAIM only;
+  it causes no effect (the executor is IP-18, §7).
+
+All are gated by ``r18.enabled`` (HOLD ``R18_DISABLED`` before any read) and
 are FORWARD only (an inverse is HOLD ``INVERSE_DEFERRED``).  A HOLD writes
 nothing.  No handler waits for an operator.
 
@@ -71,11 +77,14 @@ from suzka.r18.contracts import (
     MAX_APPROVAL_TTL,
     ActionIntentV1,
     ApprovalChallengeV1,
+    ApprovalChannel,
     Direction,
     ExecutionClaimV1,
     PolicyVerdict,
     SourceRole,
 )
+from suzka.r16.successor_policy import LedgerState
+from suzka.r18.ledger import RecordAt, derive_ledger
 from suzka.r18.requalify import RequalifyFailed
 from suzka.r18.policy_owner import (
     ReviewArtifactPolicyV1,
@@ -117,11 +126,17 @@ MAX_TIMER_RETRIES: Final = 3
 # at most once per interval per Intent, and one read at a time.
 MIN_REVIEW_INTERVAL: Final = 2.0
 MAX_REVIEW_CACHE: Final = 256
+# The list route shows at most this many open Intents (the newest).
+MAX_LISTED_APPROVALS: Final = 16
 # The startup scan retries a transient HOLD that names no challenge once.
 STARTUP_SCAN_RETRY_DELAY: Final = 1.0
 _MAX_ID: Final = 256
 _EVENT_TYPES: Final = frozenset(
-    {AgentEventType.R18_CHALLENGE_ISSUE, AgentEventType.R18_APPROVAL_EXPIRE}
+    {
+        AgentEventType.R18_CHALLENGE_ISSUE,
+        AgentEventType.R18_APPROVAL_EXPIRE,
+        AgentEventType.R18_EXECUTION_CLAIM,
+    }
 )
 
 
@@ -140,6 +155,8 @@ class ApprovalStatus(str, Enum):
     EXISTING = "challenge_existing"
     EXPIRED = "approval_expired"
     EXPIRE_EXISTING = "approval_expire_existing"
+    # IP-17c: the nonce is consumed and the claim written, in one event.
+    CLAIMED = "execution_claimed"
     NONE_LEFT = "approval_none_left"
     HOLD = "hold"
 
@@ -227,6 +244,7 @@ class ApprovalResult:
     expiration: ApprovalExpirationV1 | None = None
     # A HOLD PREVIOUS_CHALLENGE_OPEN names the dead challenge to expire first.
     challenge_digest: str | None = None
+    claim: ExecutionClaimV1 | None = None
 
     def __post_init__(self) -> None:
         if type(self.status) is not ApprovalStatus:
@@ -243,7 +261,39 @@ class ApprovalResult:
             ApprovalStatus.EXISTING,
             ApprovalStatus.EXPIRED,
             ApprovalStatus.EXPIRE_EXISTING,
+            ApprovalStatus.CLAIMED,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalFacts:
+    """One Intent's approval facts, from one classification (IP-17c, §4:
+    ledger facts only; no event, no challenge material, no code)."""
+
+    intent_id: str
+    ledger_state: str
+    decision_id: str
+    window_end_utc: str
+    attempts_used: int
+    live_challenge: bool
+    challenge_expires_utc: str | None
+    commitment_id: str
+    commitment_deadline_utc: str | None
+    target_instance_id: str
+    operation_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class FactsResult:
+    """A facts read: the facts of one Intent (``status``), of every open
+    Intent (``open_approvals``), or a closed HOLD reason."""
+
+    reason: R18ApprovalReason | None = None
+    items: tuple[ApprovalFacts, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.reason is not None and self.items:
+            raise ValueError("a HOLD carries no facts")
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +306,8 @@ class ReviewResult:
     challenge: ApprovalChallengeV1 | None = None
     attempt: int | None = None
     window_end_utc: str | None = None
+    # The Intent the challenge binds (the approval page recomputes its digest).
+    intent: ActionIntentV1 | None = None
 
     def __post_init__(self) -> None:
         if (self.status is ReviewStatus.HOLD) != (self.reason is not None):
@@ -306,6 +358,9 @@ class _Target:
     challenge_digest: str | None = None
     after: str | None = None
     scan: bool = False
+    # R18_EXECUTION_CLAIM: the confirmed nonce (written) and its Intent.
+    nonce: str | None = None
+    intent_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,6 +402,7 @@ class ApprovalChallengeOwnerV1:
         ttl_seconds: int,
         admission_gate: AdmissionGate = ALWAYS_OPEN_UNTIL_IP18,
         boot_id: str | None = None,
+        runtime_instance_id: str | None = None,
         timer_factory: TimerFactory = _thread_timer,
     ) -> None:
         if (
@@ -372,6 +428,11 @@ class ApprovalChallengeOwnerV1:
         self._gate = admission_gate
         # HD-10 (b): a fresh UUID per API process (this owner's lifetime).
         self._boot_id = boot_id if boot_id is not None else str(uuid4())
+        # IP-17c (§6-1 step 7): the claim's ``runtime_instance_id`` is a
+        # per-process UUID4 too (the executor, IP-18, checks the same value).
+        self._runtime_instance_id = (
+            runtime_instance_id if runtime_instance_id is not None else str(uuid4())
+        )
         self._timer_factory = timer_factory
         self._inflight: tuple[object, _Target] | None = None
         self._pending: _PendingOperation | None = None
@@ -384,6 +445,9 @@ class ApprovalChallengeOwnerV1:
         self._shown: dict[str, ReviewResult] = {}
         self._reviewed: dict[str, tuple[float, ReviewResult]] = {}
         self._review_lock = threading.Lock()
+        # Facts reads (list / status): one ledger read at a time, 2 s reuse.
+        self._facts_lock = threading.Lock()
+        self._facts_cache: dict[str, tuple[float, FactsResult]] = {}
         self._monotonic: Callable[[], float] = time.monotonic
         self._stop_event = threading.Event()
         self._stopped = False
@@ -396,6 +460,10 @@ class ApprovalChallengeOwnerV1:
     @property
     def boot_id(self) -> str:
         return self._boot_id
+
+    @property
+    def runtime_instance_id(self) -> str:
+        return self._runtime_instance_id
 
     # ----------------------------------------------------------- submission
 
@@ -430,6 +498,25 @@ class ApprovalChallengeOwnerV1:
         return self._submit(
             _Target(AgentEventType.R18_APPROVAL_EXPIRE, after=after, scan=True),
             AgentEventSource.RUNTIME_R18_APPROVAL_EXPIRE,
+        )
+
+    def _submit_claim(
+        self, intent_id: str, nonce: str, code: str
+    ) -> Future[AgentEventOutcome[object]]:
+        """``R18_EXECUTION_CLAIM(nonce, code)`` (IP-17c): nonce consumption and
+        the claim in one R07 event.  Only ``approval_api`` reaches this, through
+        ``confirm`` / ``claim`` (an architecture test pins it)."""
+
+        if not (_valid_id(intent_id) and _valid_id(nonce) and type(code) is str):
+            raise ValueError("a claim names one Intent, one nonce and its typed code")
+        return self._submit(
+            _Target(
+                AgentEventType.R18_EXECUTION_CLAIM,
+                code=code,
+                nonce=nonce,
+                intent_id=intent_id,
+            ),
+            AgentEventSource.API_R18_APPROVAL,
         )
 
     def _submit(
@@ -472,10 +559,16 @@ class ApprovalChallengeOwnerV1:
         event = self._current_event(nonce, source)
         assert self._inflight is not None
         target = self._inflight[1]
-        intent_id = None if target.challenge is None else target.challenge.intent_id
+        intent_id = (
+            target.intent_id
+            if target.challenge is None
+            else target.challenge.intent_id
+        )
         try:
             if target.kind is AgentEventType.R18_CHALLENGE_ISSUE:
                 return self._issue_checked(event, target)
+            if target.kind is AgentEventType.R18_EXECUTION_CLAIM:
+                return self._claim_checked(event, target)
             return self._expire_checked(event, target)
         except (HistoryStoreError, AgentStateLoadError):
             return self._hold(R18ApprovalReason.HISTORY_UNAVAILABLE, intent_id)
@@ -672,7 +765,7 @@ class ApprovalChallengeOwnerV1:
 
         with self._lock:
             shown = self._shown.get(intent_id)
-            if shown is None or shown.challenge is None:
+            if shown is None or shown.challenge is None or shown.intent is None:
                 return None
             if not shown.challenge.is_live(_fmt(self._clock()), self._boot_id):
                 del self._shown[intent_id]
@@ -701,6 +794,8 @@ class ApprovalChallengeOwnerV1:
         with self._lock:
             self._shown.pop(intent_id, None)
             self._reviewed.pop(intent_id, None)
+            # The list / status facts are reused for 2 s: a claim ends that.
+            self._facts_cache.clear()
 
     @staticmethod
     def _review_hold(intent_id: str, reason: R18ApprovalReason) -> ReviewResult:
@@ -724,14 +819,16 @@ class ApprovalChallengeOwnerV1:
         live = self._live_written(facts, now)
         if live:
             attempt, written = live[0]
-            return ReviewResult(ReviewStatus.WRITTEN, intent_id, None, written, attempt, window_end)
+            return ReviewResult(
+                ReviewStatus.WRITTEN, intent_id, None, written, attempt, window_end, intent
+            )
         attempt = len(facts.challenges) + 1
         with self._lock:
             self._prune(now)
             pending = self._pending_challenges.get(intent_id)
             if pending is not None:
                 return ReviewResult(
-                    ReviewStatus.PENDING, intent_id, None, pending, attempt, window_end
+                    ReviewStatus.PENDING, intent_id, None, pending, attempt, window_end, intent
                 )
             if len(facts.challenges) >= MAX_CHALLENGES_PER_INTENT:
                 raise _ApprovalHold(R18ApprovalReason.ATTEMPTS_EXHAUSTED, intent_id)
@@ -739,7 +836,9 @@ class ApprovalChallengeOwnerV1:
                 raise _ApprovalHold(R18ApprovalReason.PENDING_FULL, intent_id)
             challenge = self._build(intent, expectation, now, classified)
             self._pending_challenges[intent_id] = challenge
-        return ReviewResult(ReviewStatus.BUILT, intent_id, None, challenge, attempt, window_end)
+        return ReviewResult(
+            ReviewStatus.BUILT, intent_id, None, challenge, attempt, window_end, intent
+        )
 
     def _build(
         self,
@@ -858,10 +957,172 @@ class ApprovalChallengeOwnerV1:
                     result.challenge,
                     result.attempt,
                     window_end,
+                    None if shown is None else shown.intent,
                 )
                 self._reviewed.pop(intent_id, None)
             self._arm(result.challenge, 0)
         return result
+
+    def confirm(self, intent_id: str, nonce: str, code: str) -> ApprovalResult:
+        """A whole operator confirm (§3 / §4 / §6): ``issue`` and then the
+        CLAIM.  A nonce that is already written, live and unconsumed goes
+        straight to the CLAIM (``issue`` returns EXISTING and writes nothing),
+        so a retry after a CLAIM HOLD within the TTL writes no second challenge.
+        Anything but ISSUED / EXISTING is returned as it is (a HOLD, nothing
+        consumed)."""
+
+        issued = self.issue(intent_id, nonce, code)
+        if issued.status not in (ApprovalStatus.ISSUED, ApprovalStatus.EXISTING):
+            return issued
+        return self.claim(intent_id, nonce, code)
+
+    def claim(self, intent_id: str, nonce: str, code: str) -> ApprovalResult:
+        """The CLAIM half of a confirm: ``R18_EXECUTION_CLAIM`` for a nonce
+        that is already written.  On a claim, what a review showed is
+        forgotten (``invalidate``), the pending challenge is dropped and the
+        expiry timer is cancelled."""
+
+        if not self._enabled:
+            return self._hold(R18ApprovalReason.R18_DISABLED, None)
+        if not (_valid_id(intent_id) and _valid_id(nonce) and type(code) is str):
+            return self._hold(R18ApprovalReason.UNKNOWN_CHALLENGE, None)
+        if intent_id.startswith(INVERSE_INTENT_ID_PREFIX):
+            return self._hold(R18ApprovalReason.INVERSE_DEFERRED, intent_id)
+        try:
+            result = self._run(self._submit_claim(intent_id, nonce, code))
+        except Exception:  # a refused band, a stopped Runtime, a timeout
+            LOGGER.warning("R18 approval claim could not run its event")
+            return self._hold(R18ApprovalReason.JOURNAL_UNAVAILABLE, intent_id)
+        if result.status is ApprovalStatus.CLAIMED:
+            with self._lock:
+                self._pending_challenges.pop(intent_id, None)
+                timer = (
+                    None
+                    if result.challenge is None
+                    else self._timers.pop(result.challenge.challenge_digest, None)
+                )
+            if timer is not None:
+                timer.cancel()
+            self.invalidate(intent_id)
+        else:
+            # What a review showed may be stale (drift, supersession).
+            with self._lock:
+                self._shown.pop(intent_id, None)
+        return result
+
+    # ------------------------------------------------------- facts (no event)
+
+    def status(self, intent_id: str) -> FactsResult:
+        """§4 ``status``: one Intent's ledger facts.  Reads only; no event."""
+
+        if not self._enabled:
+            return FactsResult(R18ApprovalReason.R18_DISABLED)
+        if not _valid_id(intent_id) or intent_id.startswith(INVERSE_INTENT_ID_PREFIX):
+            return FactsResult(R18ApprovalReason.INTENT_UNKNOWN)
+        return self._facts_read(f"status:{intent_id}", lambda c, n: self._one_fact(c, intent_id, n))
+
+    def open_approvals(self) -> FactsResult:
+        """§4 ``list``: the open Intents (an ALLOW, ledger INTENT_ISSUED).
+        Reads only; no event."""
+
+        if not self._enabled:
+            return FactsResult(R18ApprovalReason.R18_DISABLED)
+        return self._facts_read("list", self._all_facts)
+
+    def _facts_read(
+        self,
+        key: str,
+        compute: Callable[[ReaderClassification, datetime], FactsResult],
+    ) -> FactsResult:
+        """Coalesced like a review (condition B): one ledger read at a time and
+        a result reused for ``MIN_REVIEW_INTERVAL``."""
+
+        def cached(ignore_age: bool) -> FactsResult | None:
+            with self._lock:
+                entry = self._facts_cache.get(key)
+                if entry is None:
+                    return None
+                at, value = entry
+                if ignore_age or self._monotonic() - at < MIN_REVIEW_INTERVAL:
+                    return value
+                del self._facts_cache[key]
+                return None
+
+        fresh = cached(False)
+        if fresh is not None:
+            return fresh
+        if not self._facts_lock.acquire(blocking=False):
+            return cached(True) or FactsResult(R18ApprovalReason.REVIEW_BUSY)
+        try:
+            try:
+                classified = self._policy._classify()
+                result = compute(classified, self._clock())
+            except (HistoryStoreError, AgentStateLoadError):
+                result = FactsResult(R18ApprovalReason.HISTORY_UNAVAILABLE)
+            except _PolicyHold as hold:
+                result = FactsResult(_map(hold.reason.name))
+            except _ApprovalHold as hold:
+                result = FactsResult(hold.reason)
+        finally:
+            self._facts_lock.release()
+        with self._lock:
+            if len(self._facts_cache) >= MAX_REVIEW_CACHE:
+                self._facts_cache.clear()
+            self._facts_cache[key] = (self._monotonic(), result)
+        return result
+
+    def _fact_of(
+        self, classified: ReaderClassification, intent: ActionIntentV1, now: datetime
+    ) -> ApprovalFacts:
+        facts = self._facts(classified, intent.intent_id)
+        ledger = derive_ledger(
+            (RecordAt(item.record, item.processing_sequence) for item in classified.records),
+            intent.obligation_group_key,
+            now,
+        )
+        live = self._live_written(facts, now)
+        challenge = live[0][1] if live else None
+        ref = intent.artifact.source(SourceRole.COMMITMENT)
+        try:
+            deadline = self._commitment_deadline(intent)
+        except _ApprovalHold:
+            deadline = None
+        return ApprovalFacts(
+            intent.intent_id,
+            ledger.state.value,
+            intent.decision_id,
+            intent.approval_window_end_utc,
+            len(facts.challenges),
+            challenge is not None,
+            None if challenge is None else challenge.expires_utc,
+            ref.ref_id,
+            None if deadline is None else _fmt(deadline),
+            intent.target_instance_id,
+            intent.forward_key,
+        )
+
+    def _one_fact(
+        self, classified: ReaderClassification, intent_id: str, now: datetime
+    ) -> FactsResult:
+        intent = self._policy._target_intent(classified, intent_id)
+        return FactsResult(items=(self._fact_of(classified, intent, now),))
+
+    def _all_facts(self, classified: ReaderClassification, now: datetime) -> FactsResult:
+        items: list[ApprovalFacts] = []
+        ordered = sorted(
+            classified.records, key=lambda item: (item.processing_sequence, item.transaction_id)
+        )
+        for adopted in ordered:
+            intent = adopted.record
+            if type(intent) is not ActionIntentV1 or intent.incarnation_id != classified.incarnation:
+                continue
+            verdict = _verdict_for(classified, intent.intent_id)
+            if verdict is None or verdict.verdict is not PolicyVerdict.ALLOW:
+                continue
+            fact = self._fact_of(classified, intent, now)
+            if fact.ledger_state == LedgerState.INTENT_ISSUED.value:
+                items.append(fact)
+        return FactsResult(items=tuple(items[-MAX_LISTED_APPROVALS:]))
 
     def _existing(self, intent_id: str, nonce: str, code: str) -> ApprovalResult | None:
         """A written challenge with this nonce: EXISTING when live, unconsumed
@@ -926,14 +1187,7 @@ class ApprovalChallengeOwnerV1:
         # §2 steps 2-3 for an approval.
         facts, expectation = self._forward_facts(classified, intent_id, now)
         intent = facts.intent
-        if (
-            challenge.intent_digest != intent.intent_digest
-            or challenge.operation_key != intent.forward_key
-            or challenge.payload_digest != intent.payload_digest
-            or challenge.target_instance_id != intent.target_instance_id
-            or challenge.target_expected_revision != intent.target_expected_revision
-            or challenge.expectation_digest != expectation
-        ):
+        if not self._chain_matches(challenge, intent, expectation):
             raise _ApprovalHold(R18ApprovalReason.CHALLENGE_STALE, intent_id)
         # The challenge is the pending in-memory one: never one a caller made.
         with self._lock:
@@ -1003,6 +1257,122 @@ class ApprovalChallengeOwnerV1:
             initial,
             operation,
             ApprovalResult(ApprovalStatus.ISSUED, intent_id, None, attempt, challenge),
+            intent=intent,
+            requalification=(decision, requalified),
+        )
+
+    @staticmethod
+    def _chain_matches(
+        challenge: ApprovalChallengeV1, intent: ActionIntentV1, expectation: str
+    ) -> bool:
+        """A1-4: the challenge binds exactly this Intent, forecast and target."""
+
+        return (
+            challenge.direction is Direction.FORWARD
+            and challenge.intent_id == intent.intent_id
+            and challenge.intent_digest == intent.intent_digest
+            and challenge.operation_key == intent.forward_key
+            and challenge.payload_digest == intent.payload_digest
+            and challenge.target_instance_id == intent.target_instance_id
+            and challenge.target_expected_revision == intent.target_expected_revision
+            and challenge.expectation_digest == expectation
+        )
+
+    # ------------------------------------------------- R18_EXECUTION_CLAIM
+
+    def _claim_checked(self, event: AgentEvent, target: _Target) -> object:
+        """§6-1.  Consumes the nonce and writes the claim in ONE event; it
+        causes no effect (IP-18 owns the executor, §7)."""
+
+        assert target.nonce is not None and target.code is not None
+        assert target.intent_id is not None
+        # 1. r18.enabled, then FORWARD only.
+        if not self._enabled:
+            raise _ApprovalHold(R18ApprovalReason.R18_DISABLED)
+        intent_id = target.intent_id
+        if intent_id.startswith(INVERSE_INTENT_ID_PREFIX):
+            raise _ApprovalHold(R18ApprovalReason.INVERSE_DEFERRED, intent_id)
+        initial = self._preview._state_snapshot()
+        classified = self._policy._classify()
+        now = self._clock()
+        # 2. the Intent, an ALLOW, the forecast and an open window ...
+        facts, expectation = self._forward_facts(classified, intent_id, now)
+        intent = facts.intent
+        # ... the challenge (written by this or an earlier confirm) ...
+        written = [item for item in facts.challenges if item.nonce == target.nonce]
+        if len(written) != 1:
+            raise _ApprovalHold(R18ApprovalReason.UNKNOWN_CHALLENGE, intent_id)
+        challenge = written[0]
+        digest = challenge.challenge_digest
+        attempt = facts.challenges.index(challenge) + 1
+        if digest in facts.consumed:
+            raise _ApprovalHold(R18ApprovalReason.NONCE_USED, intent_id)
+        stamp = _fmt(now)
+        if digest in facts.expired or not challenge.is_live(stamp, self._boot_id):
+            raise _ApprovalHold(R18ApprovalReason.CHALLENGE_NOT_LIVE, intent_id)
+        # ... and the typed code.
+        if not hmac.compare_digest(target.code, challenge.confirmation_code):
+            raise _ApprovalHold(R18ApprovalReason.CODE_MISMATCH, intent_id)
+        # 3. the A1-4 chain: Intent / forecast / ALLOW / challenge digests,
+        # payload, target.
+        if not self._chain_matches(challenge, intent, expectation):
+            raise _ApprovalHold(R18ApprovalReason.CHALLENGE_STALE, intent_id)
+        if (
+            _parse(challenge.expires_utc) > intent.approval_window_end
+            or _parse(challenge.expires_utc) - _parse(challenge.issued_utc) > self._ttl
+        ):
+            raise _ApprovalHold(R18ApprovalReason.CHALLENGE_STALE, intent_id)
+        # 4. not superseded (6-2), the Commitment ACTIVE outside the margin and
+        # the sources requalified (one code path with the Policy owner), then
+        # 5. the ledger is INTENT_ISSUED (inside ``_not_superseded``).
+        decision = self._policy._not_superseded(classified, intent, now)
+        requalified = self._policy._sources(event, decision, intent)
+        # 6. the target re-read; the AdmissionGate.
+        self._policy._target(intent)
+        self._check_deadline(intent, requalified, challenge)
+        if not gate_open(self._gate):
+            raise _ApprovalHold(R18ApprovalReason.ADMISSION_GATE_CLOSED, intent_id)
+        # 7. the claim.
+        try:
+            claim = ExecutionClaimV1.claim(
+                challenge,
+                runtime_instance_id=self._runtime_instance_id,
+                boot_id=self._boot_id,
+                claim_event_id=event.event_id,
+                claim_sequence=_sequence(event),
+                claimed_utc=stamp,
+                approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
+            )
+        except (TypeError, ValueError):
+            # Not live at the second, or at / after the Commitment deadline.
+            raise _ApprovalHold(R18ApprovalReason.DEADLINE_ELAPSED, intent_id) from None
+        # 8. ONE record operation: consumption + claim (§3b pre-checks: the
+        # challenge is adopted with this nonce, not expired, not consumed; the
+        # operation key and direction match; no claim for the key in any
+        # incarnation (``claim:`` key); ``challenge-end:`` free).
+        operation = HistoryRecordOperationV1(
+            HistoryOperationKind.R18_EXECUTION_CLAIM,
+            classified.incarnation,
+            event.event_id,
+            _sequence(event),
+            TransactionKind.EVENT_MUTATION.value,
+            RecordKind.EXECUTION_CLAIM,
+            claim,
+        )
+        if (
+            intent.incarnation_id != classified.incarnation
+            or _adopted_intent(classified, intent_id) is not intent
+        ):
+            raise _ApprovalHold(R18ApprovalReason.HISTORY_CONFLICT, intent_id)
+        self._precheck_rows(classified, intent_id, operation)
+        return self._prepare(
+            event,
+            classified,
+            initial,
+            operation,
+            ApprovalResult(
+                ApprovalStatus.CLAIMED, intent_id, None, attempt, challenge, claim=claim
+            ),
             intent=intent,
             requalification=(decision, requalified),
         )
@@ -1351,11 +1721,14 @@ def _map(name: str) -> R18ApprovalReason:
 
 __all__ = [
     "MAX_EXPIRE_SCANS_PER_STARTUP",
+    "MAX_LISTED_APPROVALS",
     "MAX_PENDING_CHALLENGES",
     "TRANSIENT_APPROVAL_REASONS",
     "ApprovalChallengeOwnerV1",
+    "ApprovalFacts",
     "ApprovalResult",
     "ApprovalStatus",
+    "FactsResult",
     "R18ApprovalReason",
     "ReviewResult",
     "ReviewStatus",

@@ -50,6 +50,9 @@ class AgentEventType(str, Enum):
     # (refused in the soft band) and its expiry (admitted there, HD-6 (a)).
     R18_CHALLENGE_ISSUE = "r18_challenge_issue"
     R18_APPROVAL_EXPIRE = "r18_approval_expire"
+    # IP-17c (#411 D1 r7 §1 / §6): nonce consumption + EXECUTION_CLAIM in ONE
+    # R07 event, from an operator confirm. Refused in the soft band (HP-8).
+    R18_EXECUTION_CLAIM = "r18_execution_claim"
 
 
 class AgentEventSource(str, Enum):
