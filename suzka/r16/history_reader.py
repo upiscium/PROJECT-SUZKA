@@ -23,6 +23,12 @@ The head is the tip of the single predecessor chain from GENESIS; a gap,
 duplicate child or digest mismatch blocks the scope.  This is historical
 existence only (#376 D2-3): R16/R18 owners separately requalify current
 Goal/Value/Context before any new action.
+
+IP-14b-2 (D1 r2 §4-3): the chain nodes are the Decisions of both
+``R16_DECISION_ISSUE`` (PLAN_PREVIEW) and ``R16_CYCLE_DECISION`` (a
+Wake-origin Decision, S0 step 8) operations, under the same adoption rules;
+only the operation-digest check differs per kind.  The adopted-only record
+path covers every v4 record kind (R17 / R18, R19 / cycle, plan hold).
 """
 
 from __future__ import annotations
@@ -49,10 +55,12 @@ from suzka.r16.history_codec import (
     history_operation_digest,
 )
 from suzka.r16.history_records import (
+    DECISION_OPERATION_KINDS,
     RECORD_OPERATION_KINDS,
     HistoryOperationKind as _RecordOperationKind,
     HistoryRecordOperationV1,
     RecordKind,
+    record_operation_digest,
 )
 from suzka.r16.history_store import (
     HistoryOperationKind,
@@ -228,7 +236,8 @@ class ReaderClassification:
 
 @dataclass(frozen=True, slots=True)
 class AdoptedRecord:
-    """One R17 / R18 record whose operation is adopted (D1 r3 §6).
+    """One record whose operation is adopted (D1 r3 §6): R17 / R18, and since
+    IP-14b-2 the R19 / cycle and plan-hold records of schema v4.
 
     Live rows: FINALIZED, their R07 transaction terminal with an adopted
     subject.history outcome, and the event terminal matching the receipt.
@@ -358,7 +367,7 @@ class SubjectHistoryReader:
             {
                 row.lineage_scope
                 for row in rows
-                if row.operation_kind is HistoryOperationKind.R16_DECISION_ISSUE
+                if row.operation_kind in DECISION_OPERATION_KINDS
                 and row.lineage_scope is not None
             }
             | set(requested)
@@ -370,7 +379,7 @@ class SubjectHistoryReader:
             scoped = tuple(
                 row
                 for row in rows
-                if row.operation_kind is HistoryOperationKind.R16_DECISION_ISSUE
+                if row.operation_kind in DECISION_OPERATION_KINDS
                 and row.lineage_scope == scope
             )
             if scope in poisoned:
@@ -424,7 +433,11 @@ class SubjectHistoryReader:
 
     def adopted_records(self) -> AdoptedRecords:
         """IP-14a-2: the only read path for R17 / R18 writers and the ledger
-        reader (IP-16..IP-19). Any whole-incarnation block returns no records."""
+        reader (IP-16..IP-19), and (IP-14b-2, D1 r2 §4-3) the only domain-truth
+        read path for the R19 / cycle / plan-hold writers (IP-20 / IP-21 /
+        IP-14b-3). FINALIZED but not yet terminal is invisible. Collision
+        pre-checks read raw state instead (``SubjectHistoryStore.
+        prepare_collisions``). Any whole-incarnation block returns no records."""
 
         try:
             result = self.classify()
@@ -548,15 +561,18 @@ class SubjectHistoryReader:
         self, incarnation: str, row: HistoryOperationRow
     ) -> tuple[ChainNode, PostcommitReceiptV1]:
         finalized = self.store.finalized_decision(incarnation, row.transaction_id)
-        if finalized is None or row.pending_bytes != finalized.committed_bytes:
+        if finalized is None or (
+            row.operation_kind is HistoryOperationKind.R16_DECISION_ISSUE
+            and row.pending_bytes != finalized.committed_bytes
+        ):
             raise _Blocked(HeadBlockReason.DIVERGED)
         decision = CommittedDecisionV1.from_json(finalized.committed_bytes)
+        _require_decision_operation(row, decision, incarnation)
         receipt = finalized.receipt
         if (
             decision.decision_id != finalized.decision_id
             or decision.content_digest != finalized.committed_digest
             or decision.incarnation_id != incarnation
-            or history_operation_digest(decision) != row.operation_digest
             or decision.lineage_scope != row.lineage_scope
             or decision.review_intent_key != row.review_intent_key
             or decision.predecessor_key != row.predecessor_key
@@ -616,6 +632,46 @@ class SubjectHistoryReader:
         if len(chain) != len(nodes):
             raise _Blocked(HeadBlockReason.LINEAGE_GAP)
         return tuple(chain)
+
+
+def _require_decision_operation(
+    row: HistoryOperationRow, decision: CommittedDecisionV1, incarnation: str
+) -> None:
+    """The operation-digest check per Decision kind (IP-14b D1 r2 §4-3).
+
+    ``R16_DECISION_ISSUE``: the pending bytes are the stored committed bytes
+    (checked by the caller before decoding, as before IP-14b-2) and the digest
+    is ``history_operation_digest``. ``R16_CYCLE_DECISION``: the pending bytes
+    are a ``HistoryRecordOperationV1`` envelope of this incarnation, event
+    and transaction kind, whose digest is ``record_operation_digest`` and
+    whose ``CycleClosureV1`` contains exactly this Decision. The resolution
+    row itself is checked by the adopted-record path (``record_rows_match``).
+    """
+
+    if row.operation_kind is HistoryOperationKind.R16_DECISION_ISSUE:
+        if history_operation_digest(decision) != row.operation_digest:
+            raise _Blocked(HeadBlockReason.DIVERGED)
+        return
+    if row.pending_bytes is None:
+        raise _Blocked(HeadBlockReason.DIVERGED)
+    if row.operation_kind is not HistoryOperationKind.R16_CYCLE_DECISION:
+        raise _Blocked(HeadBlockReason.DIVERGED)
+    try:
+        operation = HistoryRecordOperationV1.from_bytes(row.pending_bytes)
+    except (TypeError, ValueError):
+        raise _Blocked(HeadBlockReason.DIVERGED) from None
+    embedded = operation.cycle_decision
+    if (
+        embedded is None
+        or embedded.canonical_bytes() != decision.canonical_bytes()
+        or operation.operation_kind.value != row.operation_kind.value
+        or record_operation_digest(row.pending_bytes) != row.operation_digest
+        or operation.incarnation_id != incarnation
+        or operation.event_id != row.event_id
+        or operation.processing_sequence != row.processing_sequence
+        or operation.transaction_kind != row.transaction_kind
+    ):
+        raise _Blocked(HeadBlockReason.DIVERGED)
 
 
 def _current_attestation(
