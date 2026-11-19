@@ -500,24 +500,143 @@ def test_a_blocked_target_with_no_r18_data_computes_no_group_key(settings, monke
         assert seen.last.ledger is LedgerState.TARGET_UNAVAILABLE
 
 
-def test_a_lost_secret_does_not_hold_the_subject_while_the_target_is_blocked(settings, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def _lose_secret(state, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     from suzka.r16 import decision_issuer as module
 
+    def lost(q: Any) -> str:
+        raise module._LedgerSourceUnavailable
+
+    monkeypatch.setattr(state.decision_issuer, "_group_key", lost)
+
+
+def test_a_lost_secret_holds_when_not_blocked_and_gives_plan_a_when_blocked(settings, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     with TestClient(_app(settings)) as client:
         state = client.app.state
         seen = _seen(monkeypatch)
-        gid, row4, _forward = _row4_with_facts(state)
-
-        def lost(q: Any) -> str:
-            raise module._LedgerSourceUnavailable
-
+        gid, _row4, _forward = _row4_with_facts(state)
         state.r18_facts.publish(TargetFacts({"f" * 64: TargetFact.FENCED_NO_CLAIM}))  # data present
-        monkeypatch.setattr(state.decision_issuer, "_group_key", lost)
+        _lose_secret(state, monkeypatch)
         held = ip16b._preview(state, gid, seen)
-        assert held.status is not DecisionIssueStatus.ISSUED or held.row is not SuccessorRow.ROW_2C
+        assert held.status is DecisionIssueStatus.HOLD  # not blocked: the existing behaviour
+        assert held.row is not SuccessorRow.ROW_2C
         state.r18_gate.blocked()
         free = ip16b._preview(state, gid, seen)
         assert free.row is SuccessorRow.ROW_2C and seen.last.ledger is LedgerState.TARGET_UNAVAILABLE
+
+
+def test_a_lost_secret_while_blocked_still_holds_without_a_commitment(settings, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Negative case: no Commitment means row 4 is impossible anyway, so the
+    witness does not apply and an unreadable secret stays a hold."""
+
+    with TestClient(_app(settings)) as client:
+        state = client.app.state
+        _x, gid = ip16b._qualified_goal(state)  # a Goal with no Commitment
+        state.r18_facts.publish(TargetFacts({"f" * 64: TargetFact.FENCED_NO_CLAIM}))
+        _lose_secret(state, monkeypatch)
+        state.r18_gate.blocked()
+        result = ip16b._issue(state, gid)
+        assert result.status is DecisionIssueStatus.HOLD and result.row is not SuccessorRow.ROW_2C
+
+
+def test_a_capacity_failure_on_one_prior_key_fences_the_others_and_keeps_that_key_claimed(  # type: ignore[no-untyped-def]
+    world: _World, monkeypatch, caplog
+) -> None:
+    caplog.set_level(logging.WARNING, logger="suzka.r18.executor")
+    world.records.clear()
+    other_group = "c" * 64
+    other_key = operation_key(other_group, Direction.FORWARD)
+    _keys(world, prior=((FWD, GROUP), (other_key, other_group)))
+    real = TargetStore.fence
+
+    def fence(self: TargetStore, group: str, direction: Direction) -> Any:
+        if group == GROUP:
+            raise TargetCapacityError("no room")
+        return real(self, group, direction)
+
+    monkeypatch.setattr(TargetStore, "fence", fence)
+    _sweep(world)
+    facts = world.facts.get()
+    assert facts.get(other_key) is TargetFact.FENCED_NO_CLAIM  # the other key is fenced
+    assert facts.get(FWD) is None  # this one stays CLAIMED(prior)
+    assert "fence=capacity" in caplog.text
+
+
+def test_after_a_capacity_failure_the_next_decision_is_claimed_prior_row_2(settings, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    with TestClient(_app(settings)) as client:
+        state = client.app.state
+        gid, row4, _forward = _row4_with_facts(state)
+        ip16b._other_chain(state, row4.decision, upto=5)
+    def full(self: TargetStore, group: str, direction: Direction) -> Any:
+        raise TargetCapacityError("no room")
+
+    monkeypatch.setattr(TargetStore, "fence", full)
+    with TestClient(_app(settings, executor=True)) as client:
+        state = client.app.state
+        _until(lambda: state.r18_gate.is_open())
+        assert not state.r18_facts.get()
+        seen = _seen(monkeypatch)
+        held = ip16b._preview(state, gid, seen)
+        assert (held.row, seen.last.ledger) == (SuccessorRow.ROW_2, LedgerState.CLAIMED)
+        assert [ref.kind for ref in seen.last.ledger_refs] == [PRIOR_CLAIM_REF_KIND]
+
+
+def test_the_reconciler_tick_clears_the_block_and_calls_the_subscriber_once(world: _World) -> None:
+    mono = _Mono()
+    world.executor._gate._monotonic = mono  # type: ignore[attr-defined]
+    cleared: list[int] = []
+    world.executor._gate.subscribe_unblocked(lambda: cleared.append(1))
+    world.executor._gate.blocked()
+    world.executor._gate.open()
+    world.executor.tick()
+    assert cleared == []  # inside the dwell
+    mono.now += BLOCKED_MIN_DWELL_SECONDS
+    world.executor.tick()
+    world.executor.tick()
+    assert cleared == [1]
+
+
+def test_concurrent_blocked_target_and_poll_fire_the_clear_exactly_once() -> None:
+    import threading
+
+    mono = _Mono()
+    gate = _gate(mono)
+    cleared: list[int] = []
+    gate.subscribe_unblocked(lambda: cleared.append(1))
+    gate.blocked()
+    gate.open()
+    mono.now += BLOCKED_MIN_DWELL_SECONDS
+    barrier = threading.Barrier(8)
+
+    def hit(index: int) -> None:
+        barrier.wait()
+        for _ in range(200):
+            gate.blocked_target() if index % 2 else gate.poll()
+
+    threads = [threading.Thread(target=hit, args=(n,)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert cleared == [1] and gate.blocked_target() is False
+
+
+def test_a_plan_a_result_seen_while_latched_is_re_previewed_at_the_clear() -> None:
+    from types import SimpleNamespace
+
+    mono = _Mono()
+    gate = _gate(mono)
+    driver, _intent, preview, _policy, _clock = ip18a_driver._gated_driver(gate)
+    gate.open()
+    driver._maybe_preview("goal-late", "commitment_accepted")  # submitted before the block
+    gate.blocked()  # the block begins before the issuer reads it
+    driver._note_blocked_result("goal-late", SimpleNamespace(row=SuccessorRow.ROW_2C))
+    driver._note_blocked_result("goal-other", SimpleNamespace(row=SuccessorRow.ROW_4))  # not Plan A
+    before = len(preview.calls)
+    gate.open()
+    mono.now += BLOCKED_MIN_DWELL_SECONDS
+    gate.poll()
+    driver._on_blocked_clear()
+    assert [c[1] for c in preview.calls[before:]] == ["goal-late"]
 
 
 def test_with_r18_off_the_issuer_ignores_blocked_target_and_facts(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

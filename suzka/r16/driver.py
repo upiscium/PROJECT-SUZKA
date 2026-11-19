@@ -949,6 +949,7 @@ class R16Driver:
             return
         if item.stage is _Stage.PLAN_PREVIEW:
             LOGGER.info("R16 driver preview completed")
+            self._note_blocked_result(item.context, outcome.value)
             self._maybe_intent(outcome.value)
             return
         if item.stage is _Stage.ACTION_INTENT:
@@ -1054,6 +1055,23 @@ class R16Driver:
             self._blocked_previews[key] = None
             _bound(self._blocked_previews)
         self._submit(_Stage.PLAN_PREVIEW, goal_id)
+
+    def _note_blocked_result(self, goal_id: object, value: object) -> None:
+        """P3-2: the block can begin after the preview was submitted but before
+        the issuer read it. A Plan A (row 2c) result seen while the witness is
+        latched is remembered too, so the clear re-previews that goal."""
+
+        blocked = getattr(self._gate, "blocked_target", None)
+        if (
+            blocked is None
+            or not isinstance(goal_id, str)
+            or getattr(value, "row", None) is not SuccessorRow.ROW_2C
+            or not blocked()
+            or any(goal == goal_id for goal, _trigger in self._blocked_previews)
+        ):
+            return
+        self._blocked_previews[(goal_id, "blocked_result")] = None
+        _bound(self._blocked_previews)
 
     def _on_blocked_clear(self) -> None:
         """§3-6 item 5: BLOCKED_TARGET cleared (after the dwell): clear the

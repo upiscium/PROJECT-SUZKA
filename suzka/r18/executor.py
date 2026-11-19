@@ -520,7 +520,14 @@ class R18Executor:
                         # One key past the fence reserve is that key's problem
                         # (D1 §8): it keeps CLAIMED(prior), row 2, and must not
                         # keep the gate (and the subject's WRITE path) closed.
-                        self._sweep_log("S3", f"prior_key={forward_key[:8]} capacity")
+                        # Asymmetry on purpose: the S2-A fence of a CURRENT
+                        # incarnation claim above still fails the whole sweep,
+                        # because that claim needs its Outcome from this
+                        # process; a prior claim never gets one.
+                        LOGGER.warning(
+                            "R18_SWEEP step=S3 prior_key=%s fence=capacity (left CLAIMED, row 2)",
+                            forward_key[:8],
+                        )
                         continue
                     fenced_prior += 1
             self._sweep_log("S3", f"settled={len(settled)} prior={fenced_prior}")
