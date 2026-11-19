@@ -1202,12 +1202,117 @@ def test_stop_does_not_chain_a_review_and_the_next_start_resumes_it(sw) -> None:
     wake = fx.materialize(state, sw.gid, sw.time)
     scheduler = make(sw)
     assert scheduler.tick().action is TickAction.CLAIM
-    scheduler.stop()  # before or after the callback; at most the claim ran
+    scheduler.stop()  # the claim runs; nothing is chained after stop
     assert scheduler.wait_idle(30)
     settle(sw, scheduler)
-    started = len(journal_events(state, AgentEventType.R16_WAKE_REVIEW))
-    assert started in (0, 1)
+    chained = len(journal_events(state, AgentEventType.R16_WAKE_REVIEW))
+    assert chained in (0, 1)
     restarted = make(sw)
     step(sw, restarted)
-    assert entry_of(sw, wake).state in (WakeState.CLOSED, WakeState.CLAIMED_LIVE)
-    assert len(journal_events(state, AgentEventType.R16_WAKE_REVIEW)) <= 1
+    # Exactly one review in all, whether or not the first one was chained.
+    assert len(journal_events(state, AgentEventType.R16_WAKE_REVIEW)) == 1
+    assert entry_of(sw, wake).state is WakeState.CLOSED
+
+
+# ------------------------------------------------ review round 2 (feeder, server)
+
+
+@pytest.mark.parametrize("which", ["durability", "stopped"])
+def test_a_feeder_that_hits_a_dead_runtime_frees_the_slot_and_keeps_the_thread(sw, which) -> None:  # type: ignore[no-untyped-def]
+    from suzka.runtime.agent_runtime import (
+        AgentRuntimeDurabilityError,
+        AgentRuntimeStatus,
+        AgentRuntimeStopped,
+    )
+
+    state = sw.state
+    fx.materialize(state, sw.gid, sw.time)
+    scheduler = make(sw)
+    scheduler.start()
+    try:
+        error_type = AgentRuntimeDurabilityError if which == "durability" else AgentRuntimeStopped
+
+        def dead(claim_id):  # type: ignore[no-untyped-def]
+            if which == "durability":
+                raise AgentRuntimeDurabilityError(None, None, outcome_indeterminate=False)  # type: ignore[arg-type]
+            raise error_type(None)  # type: ignore[arg-type]
+
+        state.wake_review_owner._submit_review = dead  # type: ignore[method-assign]
+        scheduler._driver_active = lambda _i: True
+        scheduler.nudge()
+        deadline = real_time.monotonic() + 30
+        while not scheduler.submitted.get(TickAction.CLAIM):
+            assert real_time.monotonic() < deadline
+            real_time.sleep(0.05)
+        assert scheduler.wait_idle(30)
+        assert scheduler.running
+        scheduler._runtime = SimpleNamespace(  # type: ignore[assignment]
+            status=AgentRuntimeStatus.FAILED, is_idle=lambda: False
+        )
+        assert scheduler.tick().action is TickAction.NOT_ACCEPTING
+        assert scheduler.running
+    finally:
+        scheduler.stop()
+
+
+def test_a_settle_that_raises_still_releases_the_slot(sw) -> None:  # type: ignore[no-untyped-def]
+    state = sw.state
+    fx.materialize(state, sw.gid, sw.time)
+    scheduler = make(sw)
+
+    def broken(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("settle failed")
+
+    scheduler._settle = broken  # type: ignore[method-assign]
+    assert scheduler.tick().action is TickAction.CLAIM
+    assert scheduler.wait_idle(30)  # _done's finally released the slot
+    assert scheduler.tick().action is not TickAction.BUSY
+
+
+def test_an_expired_newer_wake_does_not_supersede(sw) -> None:  # type: ignore[no-untyped-def]
+    state, clock = sw.state, sw.time
+    sw.monkeypatch.setattr(scheduler_module, "may_supersede", lambda old, new: True)
+    old = fx.materialize(state, sw.gid, clock, not_before=-100)
+    expired = fx.materialize(
+        state, sw.gid, clock, cause_event_id=str(uuid4()), evidence_fingerprint="9" * 64,
+        expires=-5, not_before=-4000,
+    )
+    scheduler = make(sw)
+
+    def candidate(newer):  # type: ignore[no-untyped-def]
+        view = fx.view(state, clock.now())
+        read = SimpleNamespace(view=view)
+        found = scheduler._superseder(read, view.get(old.wakeup_id))  # type: ignore[arg-type]
+        return None if found is None else found.wakeup_id
+
+    assert fx.view(state, clock.now()).get(expired.wakeup_id).state is WakeState.EXPIRED
+    assert candidate(expired) is None
+    live = fx.materialize(
+        state, sw.gid, clock, cause_event_id=str(uuid4()), evidence_fingerprint="8" * 64
+    )
+    assert candidate(live) == live.wakeup_id
+
+
+def test_a_failing_scheduler_construction_or_start_never_blocks_the_app(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from suzka.api import server as server_module
+
+    class Broken:
+        def __init__(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("cannot build")
+
+    monkeypatch.setattr(server_module, "WakeScheduler", Broken)
+    with TestClient(_app(fx.settings(tmp_path / "bc"))) as client:
+        state = client.app.state
+        assert state.wake_scheduler is None
+        assert state.r16_driver._on_cause_terminal is None
+        assert client.get("/health").status_code == 200
+    monkeypatch.undo()
+
+    class NoStart(WakeScheduler):
+        def start(self) -> None:
+            raise RuntimeError("cannot start")
+
+    monkeypatch.setattr(server_module, "WakeScheduler", NoStart)
+    with TestClient(_app(fx.settings(tmp_path / "bs"))) as client:
+        assert client.app.state.wake_scheduler is None
+        assert client.get("/health").status_code == 200

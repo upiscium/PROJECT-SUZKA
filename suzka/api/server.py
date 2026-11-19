@@ -6,6 +6,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, cast
 
+import logging
+
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import (
@@ -1199,15 +1201,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     and app.state.wake_claim_owner is not None
                     and app.state.wake_review_owner is not None
                 ):
-                    app.state.wake_scheduler = WakeScheduler(
+                    # A Scheduler failure never blocks the subject (PHILOSOPHY):
+                    # without it R19 simply does not run.
+                    try:
+                        app.state.wake_scheduler = WakeScheduler(
                         app.state.agent_runtime,
                         app.state.event_journal,
                         app.state.wake_materializer,
                         app.state.wake_claim_owner,
                         app.state.wake_review_owner,
                         timing=app.state.wake_claim_owner.timing,
-                        rescan_s=app_settings.r19.rescan_s,
-                    )
+                            rescan_s=app_settings.r19.rescan_s,
+                        )
+                    except Exception:
+                        app.state.wake_scheduler = None
+                        logging.getLogger(__name__).warning(
+                            "R19 Wake Scheduler could not be built; R19 stays idle",
+                            exc_info=True,
+                        )
             # IP-6b (#370 R20-DRV): the R16 driver exists only with every
             # owner bound; it runs only after the unique activation event.
             if preview_owner is None:
@@ -1301,7 +1312,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # IP-20d: the Wake Scheduler starts after the runtime and the
                 # driver; its first tick submits the startup materialize scan.
                 if app.state.wake_scheduler is not None:
-                    app.state.wake_scheduler.start()
+                    try:
+                        app.state.wake_scheduler.start()
+                    except Exception:
+                        logging.getLogger(__name__).warning(
+                            "R19 Wake Scheduler could not start; R19 stays idle",
+                            exc_info=True,
+                        )
+                        app.state.wake_scheduler = None
                 # IP-17b (§8): the BOOT_CHANGED expiry scan (r18.enabled only).
                 if app.state.approval_owner is not None:
                     app.state.approval_owner.start()

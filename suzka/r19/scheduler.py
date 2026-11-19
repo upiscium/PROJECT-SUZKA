@@ -109,6 +109,17 @@ HOUR_S: Final = 3600.0
 MIN_TICK_GAP_S: Final = 1.0
 
 _MATERIALIZE_TARGET: Final = "materialize"
+# A newer Wake in one of these states must not take an older one's follow-up.
+_NO_SUPERSEDER: Final = frozenset(
+    {
+        WakeState.CORRUPT,
+        WakeState.FAILED,
+        WakeState.CANCELLED,
+        WakeState.EXPIRED,
+        WakeState.EXPIRED_PENDING_LEASE,
+        WakeState.EXHAUSTED,
+    }
+)
 _EVENT_FAILED: Final = "EVENT_FAILED"
 
 
@@ -447,7 +458,8 @@ class WakeScheduler:
             view = derive_wake_view(classified.records, utc_timestamp(now), clock_floor=None)
         except TypeError:
             self.derive_errors += 1
-            LOGGER.warning("R19 scheduler: the adopted Wake records could not be derived")
+            if self.derive_errors == 1 or self.derive_errors % 120 == 0:
+                LOGGER.warning("R19 scheduler: the adopted Wake records could not be derived")
             return TickOutcome(TickAction.DERIVE_ERROR)
         if view.orphans and not self._logged_orphans:
             self._logged_orphans = True
@@ -531,7 +543,7 @@ class WakeScheduler:
                 # A newer Wake that already failed or was cancelled must not
                 # take the older one's follow-up with it.
                 and other.state
-                not in (WakeState.CORRUPT, WakeState.FAILED, WakeState.CANCELLED)
+                not in _NO_SUPERSEDER
                 and may_supersede(entry.wake, other.wake)
             ):
                 return other
@@ -820,6 +832,12 @@ class WakeScheduler:
         if self._stop.is_set():
             return False
         review_ctx = _Ctx(TickAction.REVIEW, ctx.target, WakeState.CLAIMED_LIVE.value)
+        with self._lock:
+            if self._future is not claim_future:
+                # Cannot happen (the slot is ours until released); never let a
+                # second Future be in flight.
+                LOGGER.warning("R19 scheduler: the slot is not the claim's")
+                return False
         try:
             review = self._reviews._submit_review(claim_id)
         except (AgentRuntimeQueueFull, AgentRuntimeAdmissionBlocked):
@@ -830,9 +848,6 @@ class WakeScheduler:
             LOGGER.warning("R19 scheduler: a review was refused", exc_info=True)
             return False
         with self._lock:
-            if self._future is not claim_future:
-                # Cannot happen (the slot is ours until released); stay safe.
-                return False
             self._future = review
             self._ctx = review_ctx
             self.submitted[TickAction.REVIEW] = self.submitted.get(TickAction.REVIEW, 0) + 1
