@@ -91,6 +91,7 @@ from suzka.r19.claim_owner import WakeClaimOwnerV1
 from suzka.r19.contracts import WakeTiming
 from suzka.r19.materializer import WakeMaterializerV1
 from suzka.r19.review_owner import WakeReviewOwnerV1
+from suzka.r19.scheduler import WakeScheduler
 from suzka.r18.approval_api import mount_approval_api
 from suzka.r18.approval_owner import ApprovalChallengeOwnerV1
 from suzka.r18.executor import ClaimKeys, R18Executor
@@ -997,6 +998,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.approval_owner = None
             app.state.outcome_owner = None
             app.state.wake_materializer = None
+            app.state.wake_scheduler = None
             app.state.r18_executor = None
             # IP-18a: one runtime_instance_id per process; the SweepGate is
             # closed from construction (DISABLED, never opened, with
@@ -1186,6 +1188,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     ),
                     max_age_s=app_settings.r19.materialize_max_age_s,
                 )
+                # IP-20d (IP-20 D1 r3 §4-1, §8): the Wake Scheduler exists, and its
+                # thread starts, only with r19.enabled and every R19 owner
+                # installed.  Disabled: None, no thread, no R19 event.
+                # ``r19_scheduler_enabled`` is a test seam (default True), like
+                # ``r18_executor_enabled``.
+                if (
+                    app_settings.r19.enabled
+                    and getattr(app.state, "r19_scheduler_enabled", True)
+                    and app.state.wake_claim_owner is not None
+                    and app.state.wake_review_owner is not None
+                ):
+                    app.state.wake_scheduler = WakeScheduler(
+                        app.state.agent_runtime,
+                        app.state.event_journal,
+                        app.state.wake_materializer,
+                        app.state.wake_claim_owner,
+                        app.state.wake_review_owner,
+                        timing=app.state.wake_claim_owner.timing,
+                        rescan_s=app_settings.r19.rescan_s,
+                    )
             # IP-6b (#370 R20-DRV): the R16 driver exists only with every
             # owner bound; it runs only after the unique activation event.
             if preview_owner is None:
@@ -1230,6 +1252,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         if feedback_owner is not None and feedback_owner.enabled
                         else None
                     ),
+                    # IP-20b / IP-20d: a cause is terminal -> nudge the Scheduler
+                    # (non-blocking; None unless the Scheduler exists).
+                    on_cause_terminal=(
+                        None
+                        if app.state.wake_scheduler is None
+                        else app.state.wake_scheduler.nudge
+                    ),
                 )
         except BaseException:
             app.state.event_journal.close()
@@ -1269,6 +1298,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.emotion_timer.start()
                 if app.state.r16_driver is not None:
                     app.state.r16_driver.start(r16_rescan)
+                # IP-20d: the Wake Scheduler starts after the runtime and the
+                # driver; its first tick submits the startup materialize scan.
+                if app.state.wake_scheduler is not None:
+                    app.state.wake_scheduler.start()
                 # IP-17b (§8): the BOOT_CHANGED expiry scan (r18.enabled only).
                 if app.state.approval_owner is not None:
                     app.state.approval_owner.start()
@@ -1277,6 +1310,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if app.state.r18_executor is not None:
                     app.state.r18_executor.start()
             except BaseException:
+                if getattr(app.state, "wake_scheduler", None) is not None:
+                    app.state.wake_scheduler.stop()
                 if getattr(app.state, "approval_owner", None) is not None:
                     app.state.approval_owner.stop()
                 if getattr(app.state, "r18_executor", None) is not None:
@@ -1290,6 +1325,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            # IP-20d: the Scheduler submits Runtime events, so it stops first.
+            if getattr(app.state, "wake_scheduler", None) is not None:
+                app.state.wake_scheduler.stop()
             if getattr(app.state, "approval_owner", None) is not None:
                 app.state.approval_owner.stop()
             # IP-18a: the executor submits Runtime events, so it stops before
