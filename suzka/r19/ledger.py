@@ -36,23 +36,34 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Final, TypeVar
 
 from suzka.r16.cycle_contracts import CycleClosureV1, LogicalCycleResolutionV1, utc
-from suzka.r16.history_records import RecordKind
+from suzka.r16.history_records import (
+    HistoryOperationKind,
+    HistoryRecordOperationV1,
+    RecordKind,
+)
+from suzka.r16.history_store import HistoryOperationRow, HistoryPhase
+from suzka.runtime.agent_runtime import AgentEventType
+from suzka.runtime.event_journal import EventJournalRecord, EventLifecycle
 
 if TYPE_CHECKING:
     from suzka.r16.history_reader import AdoptedRecord
 
 from suzka.r19.contracts import (
+    ATTEMPT_MAX_SECONDS,
     MAX_ATTEMPTS,
+    RefuseReason,
     WakeAttemptOutcomeV1,
     WakeClaimV1,
     WakeTerminalKind,
     WakeTerminalV1,
+    TerminalReason,
     WakeV1,
+    may_supersede,
     next_attempt_index,
 )
 
@@ -430,10 +441,480 @@ def _state(entry: WakeEntry, now: datetime) -> WakeState:
     return WakeState.SCHEDULED
 
 
+
+
+# ===========================================================================
+# IP-20c: eligibility, closure admissibility and the Journal-based clock floor
+#
+# One pure function per decision, used by the claim / review / terminal owners
+# (inside their serialized events) and by the IP-20d Scheduler's pre-filter, so
+# the Scheduler submits only what a handler would pass (D1 §4-3). Nothing here
+# reads a store, the Journal or the clock: the caller passes rows, Journal
+# records and instants.
+# ===========================================================================
+
+# The live-clock wait a claim tolerates (HP-5's 10 s, §4-5); a review's wait is
+# bounded by its lease instead.
+QUEUE_WAIT_LIMIT: Final = timedelta(seconds=ATTEMPT_MAX_SECONDS)
+# The longest lease a claim can ever have been given (``r19.claim_lease_s`` is
+# capped at D-R19 §5's 120 s), so the claim-time lower bound below stays valid
+# if the setting was lowered after the claim.
+CLAIM_LEASE_CAP_S: Final = 120
+# §6 step (4): the issuer's 5 s margin plus the handler's own 10 s budget.
+REVIEW_DEADLINE_MARGIN: Final = timedelta(seconds=5 + ATTEMPT_MAX_SECONDS)
+
+
+class WakeHold(str, Enum):
+    """Why a Wake handler (or the Scheduler's pre-filter) writes nothing; a
+    closed, source-free vocabulary. A hold never ends a cycle or an attempt:
+    the attempt ends by its lease (D1 §6-1, last row)."""
+
+    R19_DISABLED = "R19_DISABLED"
+    HISTORY_UNAVAILABLE = "HISTORY_UNAVAILABLE"
+    WAKE_UNKNOWN = "WAKE_UNKNOWN"
+    WAKE_CORRUPT = "WAKE_CORRUPT"
+    WAKE_TERMINAL = "WAKE_TERMINAL"
+    WAKE_CLOSED = "WAKE_CLOSED"
+    # A raw claim / closure operation of this Wake is PREPARED or FINALIZED but
+    # not yet adopted, or a same-incarnation key is held by one (transient).
+    IN_FLIGHT = "IN_FLIGHT"
+    ATTEMPTS_USED = "ATTEMPTS_USED"
+    # The gap rule (#373 A2-5): the latest claim's lease has not ended.
+    LEASE_LIVE = "LEASE_LIVE"
+    OUTSIDE_WAKE_WINDOW = "OUTSIDE_WAKE_WINDOW"
+    CLOCK_UNVERIFIABLE = "CLOCK_UNVERIFIABLE"
+    QUEUE_DELAY = "QUEUE_DELAY"
+    CYCLE_RESERVED = "CYCLE_RESERVED"
+    CLAIM_UNKNOWN = "CLAIM_UNKNOWN"
+    CLAIM_NOT_LATEST = "CLAIM_NOT_LATEST"
+    INCARNATION_MISMATCH = "INCARNATION_MISMATCH"
+    ATTEMPT_ENDED = "ATTEMPT_ENDED"
+    # HD-20-2 (a): a ``STARTED`` review after this claim is in the Journal.
+    REVIEW_ALREADY_STARTED = "REVIEW_ALREADY_STARTED"
+    HISTORY_CAPACITY = "HISTORY_CAPACITY"
+    COLLISION = "COLLISION"
+    NOT_DUE = "NOT_DUE"
+    NOT_SUPERSEDABLE = "NOT_SUPERSEDABLE"
+    # A result the closure builders cannot represent (defensive, never expected).
+    UNREPRESENTABLE = "UNREPRESENTABLE"
+
+
+# Holds that are transient states of the runtime or the store, not of the Wake
+# (D1 §4-3 (ii), r3 P1-new): the Scheduler never counts them against its cap.
+UNCAPPED_HOLDS: Final = frozenset({WakeHold.QUEUE_DELAY, WakeHold.IN_FLIGHT})
+
+
+class ReviewStep(str, Enum):
+    PROCEED = "PROCEED"
+    # A resolution already exists: nothing is written (#373 A1-9).
+    EXISTING = "EXISTING"
+    HOLD = "HOLD"
+    # A recordable refusal: the attempt counts (only when every mirror passed).
+    REFUSE = "REFUSE"
+
+
+@dataclass(frozen=True, slots=True)
+class Eligibility:
+    """A handler's pre-checks: proceed, ``existing`` (a resolution exists), or a
+    hold."""
+
+    hold: WakeHold | None = None
+    existing: bool = False
+
+    @property
+    def proceed(self) -> bool:
+        return self.hold is None and not self.existing
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewCheck:
+    step: ReviewStep
+    hold: WakeHold | None = None
+    refuse: RefuseReason | None = None
+
+    def __post_init__(self) -> None:
+        if (self.step is ReviewStep.HOLD) != (self.hold is not None) or (
+            self.step is ReviewStep.REFUSE
+        ) != (self.refuse is not None):
+            raise ValueError("a hold or refusal step carries exactly its reason")
+
+
+def cycle_key(incarnation_id: str, logical_cycle_id: str) -> str:
+    """The key a closure or a terminal reserves (``history_records``)."""
+
+    return f"cycle:{incarnation_id}:{logical_cycle_id}"
+
+
+def attempt_end_key(claim_id: str) -> str:
+    """The key an attempt outcome or a resolution reserves, once per claim."""
+
+    return f"attempt-end:{claim_id}"
+
+
+def _second(moment: datetime) -> datetime:
+    """The instant as the canonical second-resolution stamps compare it."""
+
+    return moment.astimezone(timezone.utc).replace(microsecond=0)
+
+
+def _stamp(moment: datetime) -> str:
+    return _second(moment).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def raw_claims_of(
+    operations: Iterable[HistoryOperationRow], wakeup_id: str
+) -> tuple[WakeClaimV1, ...]:
+    """Every claim operation of one Wake in the **raw** store (PREPARED and
+    FINALIZED-not-yet-terminal included, never ABORTED), ordered by attempt
+    index. ``wake-attempt:`` keys carry no incarnation and the key index is
+    global, so the next index is derived from this, never from the adopted view
+    (D1 §4-4 step 3, forward note 4). Raises ``ValueError`` / ``TypeError`` on
+    an undecodable pending envelope: the caller treats it as an unavailable
+    history."""
+
+    found: list[WakeClaimV1] = []
+    for row in operations:
+        if (
+            row.operation_kind is not HistoryOperationKind.R19_WAKE_CLAIM
+            or row.phase is HistoryPhase.ABORTED
+            or row.pending_bytes is None
+        ):
+            continue
+        record = HistoryRecordOperationV1.from_bytes(row.pending_bytes).record
+        if type(record) is WakeClaimV1 and record.wakeup_id == wakeup_id:
+            found.append(record)
+    return tuple(sorted(found, key=lambda claim: claim.attempt_index))
+
+
+def _lease_ended(claim: WakeClaimV1 | None, now: datetime) -> bool:
+    return claim is None or _second(now) >= utc(
+        claim.claim_lease_expires_utc, "claim_lease_expires_utc"
+    )
+
+
+def _in_claim_window(wake: WakeV1, now: datetime) -> bool:
+    """``not_before <= T < min(Wake expiry, Commitment deadline)`` (half-open)."""
+
+    limits = [utc(wake.expires_at_utc, "expires_at_utc")]
+    if wake.commitment_deadline_utc is not None:
+        limits.append(utc(wake.commitment_deadline_utc, "commitment_deadline_utc"))
+    return utc(wake.not_before_utc, "not_before_utc") <= _second(now) < min(limits)
+
+
+def _clock_hold(
+    now: datetime, live: datetime | None, floor: datetime | None
+) -> WakeHold | None:
+    """``L < T`` or ``T < floor`` (never clamp; D1 §4-5)."""
+
+    if live is not None and live < now:
+        return WakeHold.CLOCK_UNVERIFIABLE
+    if floor is not None and now < floor:
+        return WakeHold.CLOCK_UNVERIFIABLE
+    return None
+
+
+def claim_eligibility(
+    entry: WakeEntry | None,
+    *,
+    now: datetime,
+    live: datetime | None,
+    floor: datetime | None,
+    raw_claims: tuple[WakeClaimV1, ...],
+    cycle_key_live: bool,
+) -> Eligibility:
+    """The checks of ``R19_WAKE_CLAIM`` that need only rows and a clock (D1 §4-4
+    steps 2-6; the PREPARE collision pre-check and headroom are the owner's).
+
+    ``now`` is T (the event's admission instant), ``live`` the clock read at the
+    handler's first line (the Scheduler passes ``None``: it has no queue wait),
+    ``floor`` the Journal high-water of ``clock_floor`` and ``raw_claims`` this
+    Wake's raw claim operations. Order: the Wake and its closure first, then
+    ``IN_FLIGHT``, the attempt budget, the gap rule, the window, and last the
+    clock (a claim that cannot be made is no attempt, so none of these records
+    anything)."""
+
+    if entry is None:
+        return Eligibility(WakeHold.WAKE_UNKNOWN)
+    if entry.state is WakeState.CORRUPT:
+        return Eligibility(WakeHold.WAKE_CORRUPT)
+    if entry.terminal is not None:
+        return Eligibility(WakeHold.WAKE_TERMINAL)
+    if entry.closure is not None:
+        return Eligibility(existing=True)
+    if len(raw_claims) != entry.attempts:
+        # Forward note 4: an operation of this Wake is in flight.
+        return Eligibility(WakeHold.IN_FLIGHT)
+    if cycle_key_live:
+        return Eligibility(WakeHold.CYCLE_RESERVED)
+    if next_attempt_index(len(raw_claims)) is None:
+        return Eligibility(WakeHold.ATTEMPTS_USED)
+    if not _lease_ended(entry.latest_claim, now):
+        # P2-A: an outcome row never shortens the gap, only the lease end does.
+        return Eligibility(WakeHold.LEASE_LIVE)
+    if not _in_claim_window(entry.wake, now):
+        return Eligibility(WakeHold.OUTSIDE_WAKE_WINDOW)
+    hold = _clock_hold(now, live, floor)
+    if hold is not None:
+        return Eligibility(hold)
+    if live is not None and live - now > QUEUE_WAIT_LIMIT:
+        return Eligibility(WakeHold.QUEUE_DELAY)
+    return Eligibility()
+
+
+def closure_admissible(
+    entry: WakeEntry,
+    claim: WakeClaimV1,
+    *,
+    incarnation_id: str,
+    raw_claims: tuple[WakeClaimV1, ...],
+    live_keys: frozenset[str],
+) -> WakeHold | None:
+    """The mirror of every trigger condition of ``wake_attempt_outcomes_insert``
+    and ``logical_cycle_resolutions_insert`` (D1 §6-4, r2 P1-1), over raw store
+    state. ``None`` means the trigger would accept; a hold means it would ABORT,
+    which in the participant is a runtime fail-stop, so the handler writes no
+    row. ``live_keys`` holds the live ones among ``cycle_key(...)`` and
+    ``attempt_end_key(claim_id)``.
+
+    The conditions: the claim is adopted, belongs to this Wake's cycle and this
+    incarnation; it is the Wake's latest claim in the raw store; the cycle key
+    is free (no closure, terminal or PREPARED closure); the claim has no attempt
+    outcome and no resolution (both reserve ``attempt-end:<claim_id>``); the
+    Wake is not terminal (the terminal reserves the cycle key)."""
+
+    wake = entry.wake
+    if entry.terminal is not None:
+        return WakeHold.WAKE_TERMINAL
+    if (
+        claim.incarnation_id != incarnation_id
+        or wake.incarnation_id != incarnation_id
+        or claim.logical_cycle_id != wake.logical_cycle_id
+        or claim.wakeup_id != wake.wakeup_id
+    ):
+        return WakeHold.INCARNATION_MISMATCH
+    adopted = {item.claim_id for item in entry.claims}
+    if claim.claim_id not in adopted or not raw_claims:
+        return WakeHold.CLAIM_UNKNOWN
+    if raw_claims[-1].claim_id != claim.claim_id or len(raw_claims) != entry.attempts:
+        return WakeHold.CLAIM_NOT_LATEST
+    if cycle_key(incarnation_id, wake.logical_cycle_id) in live_keys:
+        return WakeHold.CYCLE_RESERVED
+    if attempt_end_key(claim.claim_id) in live_keys or entry.outcome_of(claim.claim_id):
+        return WakeHold.ATTEMPT_ENDED
+    return None
+
+
+def review_eligibility(
+    entry: WakeEntry | None,
+    claim_id: str,
+    *,
+    now: datetime,
+    live: datetime,
+    floor: datetime | None,
+    journal_lineage_id: str | None,
+    incarnation_id: str,
+    raw_claims: tuple[WakeClaimV1, ...],
+    live_keys: frozenset[str],
+    review_started: bool,
+) -> ReviewCheck:
+    """D1 §6 pre-steps 0-2 for ``R16_WAKE_REVIEW`` of one claim.
+
+    No-row holds come first (the trigger would ABORT, or the attempt is
+    already over): an unknown or terminal Wake, a failed ``closure_admissible``
+    mirror, ``OUTSIDE_WAKE_WINDOW`` (the lease ended, so a row would add
+    nothing), a ``STARTED`` review after this claim. Only if every mirror
+    passed can a refusal be recorded: ``CLOCK_UNVERIFIABLE`` (``L < T`` or
+    ``T <`` the floor) and ``LINEAGE_MISMATCH``. A resolution that already
+    exists is ``EXISTING``, before any drift is evaluated (#373 A1-9)."""
+
+    if entry is None:
+        return ReviewCheck(ReviewStep.HOLD, WakeHold.WAKE_UNKNOWN)
+    if entry.state is WakeState.CORRUPT:
+        return ReviewCheck(ReviewStep.HOLD, WakeHold.WAKE_CORRUPT)
+    if entry.closure is not None:
+        return ReviewCheck(ReviewStep.EXISTING)
+    if entry.terminal is not None:
+        return ReviewCheck(ReviewStep.HOLD, WakeHold.WAKE_TERMINAL)
+    claim = next((item for item in entry.claims if item.claim_id == claim_id), None)
+    if claim is None:
+        return ReviewCheck(ReviewStep.HOLD, WakeHold.CLAIM_UNKNOWN)
+    hold = closure_admissible(
+        entry, claim, incarnation_id=incarnation_id, raw_claims=raw_claims, live_keys=live_keys
+    )
+    if hold is not None:
+        return ReviewCheck(ReviewStep.HOLD, hold)
+    lease_end = utc(claim.claim_lease_expires_utc, "claim_lease_expires_utc")
+    if live >= lease_end or not claim.in_window(entry.wake, _stamp(now)):
+        # The attempt is over: no row (and no 10 s cap on queue wait, §4-5).
+        return ReviewCheck(ReviewStep.HOLD, WakeHold.OUTSIDE_WAKE_WINDOW)
+    if review_started:
+        return ReviewCheck(ReviewStep.HOLD, WakeHold.REVIEW_ALREADY_STARTED)
+    if _clock_hold(now, live, floor) is not None:
+        return ReviewCheck(ReviewStep.REFUSE, refuse=RefuseReason.CLOCK_UNVERIFIABLE)
+    if journal_lineage_id is None or entry.wake.journal_lineage_id != journal_lineage_id:
+        return ReviewCheck(ReviewStep.REFUSE, refuse=RefuseReason.LINEAGE_MISMATCH)
+    return ReviewCheck(ReviewStep.PROCEED)
+
+
+def terminal_eligibility(
+    entry: WakeEntry | None,
+    reason: TerminalReason,
+    *,
+    now: datetime,
+    live: datetime | None,
+    floor: datetime | None,
+    raw_claims: tuple[WakeClaimV1, ...],
+    cycle_key_live: bool,
+    superseding: WakeEntry | None = None,
+) -> Eligibility:
+    """The checks of ``R19_WAKE_TERMINAL`` (D1 §4-4 last paragraph, A-4):
+    ``EXPIRED_WAKE`` needs ``T >= min(expiry, Commitment deadline)`` and no
+    live lease (``EXPIRED_PENDING_LEASE`` writes nothing, #373 A3-3);
+    ``ATTEMPTS_EXHAUSTED`` needs all 3 claims in the raw store and the last
+    lease over or its outcome row; ``SUPERSEDED`` needs ``may_supersede`` of an
+    adopted newer Wake and an old Wake that no claim (raw) has touched. Never
+    with a resolution (the cycle closes once), and never while the cycle key is
+    held. A terminal has no queue-wait bound (an old T only delays it)."""
+
+    if entry is None:
+        return Eligibility(WakeHold.WAKE_UNKNOWN)
+    if entry.state is WakeState.CORRUPT:
+        return Eligibility(WakeHold.WAKE_CORRUPT)
+    if entry.terminal is not None:
+        return Eligibility(WakeHold.WAKE_TERMINAL)
+    if entry.closure is not None:
+        return Eligibility(WakeHold.WAKE_CLOSED)
+    hold = _clock_hold(now, live, floor)
+    if hold is not None:
+        return Eligibility(hold)
+    if cycle_key_live:
+        return Eligibility(WakeHold.CYCLE_RESERVED)
+    if len(raw_claims) != entry.attempts:
+        return Eligibility(WakeHold.IN_FLIGHT)
+    claim = entry.latest_claim
+    if reason is TerminalReason.EXPIRED_WAKE:
+        if _second(now) < utc(entry.expiry_utc, "expiry") or not _lease_ended(claim, now):
+            return Eligibility(WakeHold.NOT_DUE)
+    elif reason is TerminalReason.ATTEMPTS_EXHAUSTED:
+        if len(raw_claims) != MAX_ATTEMPTS or not (
+            _lease_ended(claim, now) or entry.latest_outcome is not None
+        ):
+            return Eligibility(WakeHold.NOT_DUE)
+    else:
+        if (
+            raw_claims
+            or entry.claims
+            or superseding is None
+            or superseding.state is WakeState.CORRUPT
+            or not may_supersede(entry.wake, superseding.wake)
+        ):
+            return Eligibility(WakeHold.NOT_SUPERSEDABLE)
+    return Eligibility()
+
+
+# ------------------------------------------------------- the Journal-based floor
+
+
+def _stamp_of(record: EventJournalRecord) -> datetime:
+    stamp = record.timestamp
+    return stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp.astimezone(timezone.utc)
+
+
+def journal_clock_floor(
+    records: Iterable[EventJournalRecord], *, before_event_id: str | None = None
+) -> datetime | None:
+    """The high-water of D1 §4-5 (a): the **maximum** admission instant over the
+    retained Journal, not the latest record (a rolled-back clock across a
+    restart can make the latest older than an earlier one). The admission
+    instant of an event is its ``ACCEPTED`` record's timestamp (the runtime's
+    ``requested_at``, bound at the same serialized boundary); other lifecycle
+    records carry the later times of their own work and would make a queued
+    event look rolled back. ``before_event_id`` stops at that event's own
+    ``ACCEPTED`` record, so events admitted after it (they queue behind it and
+    are legitimately newer) never raise the floor. ``None``: no record."""
+
+    highest: datetime | None = None
+    for record in records:
+        if record.lifecycle is not EventLifecycle.ACCEPTED:
+            continue
+        if before_event_id is not None and record.event_id == before_event_id:
+            break
+        stamp = _stamp_of(record)
+        if highest is None or stamp > highest:
+            highest = stamp
+    return highest
+
+
+def wake_clock_floor(
+    records: Iterable[EventJournalRecord],
+    claim: WakeClaimV1 | None,
+    *,
+    claim_lease_s: int,
+    before_event_id: str | None = None,
+) -> datetime | None:
+    """``max`` of the Journal high-water and the previous claim's lower bound
+    ``claim_lease_expires - claim_lease_s`` (a lease ends at most ``claim_lease_s``
+    after its claim, so this bounds the claim time from below without the
+    Journal, D1 §4-5 (b)). The Wake's creation time (c) and the claim event's own
+    record are ``ACCEPTED`` records of the retained Journal, so the first term
+    already covers them while they are retained."""
+
+    floor = journal_clock_floor(records, before_event_id=before_event_id)
+    if claim is not None:
+        bound = utc(claim.claim_lease_expires_utc, "claim_lease_expires_utc") - timedelta(
+            seconds=max(claim_lease_s, CLAIM_LEASE_CAP_S)
+        )
+        floor = bound if floor is None else max(floor, bound)
+    return floor
+
+
+def review_started_after(
+    records: Iterable[EventJournalRecord],
+    claim_sequence: int,
+    *,
+    exclude_event_id: str | None = None,
+) -> bool:
+    """HD-20-2 (a): whether a ``STARTED`` ``R16_WAKE_REVIEW`` record with
+    ``processing_sequence > claim_sequence`` is in the retained Journal. An
+    ``ACCEPTED`` record has no ``processing_sequence``, so an event admitted but
+    lost before it started (no handler ran) may be repeated. The record does not
+    name its claim, so a later review of another Wake also answers True
+    (conservative: that attempt lapses at its lease)."""
+
+    for record in records:
+        if (
+            record.lifecycle is EventLifecycle.STARTED
+            and record.event_type is AgentEventType.R16_WAKE_REVIEW
+            and record.processing_sequence is not None
+            and record.processing_sequence > claim_sequence
+            and record.event_id != exclude_event_id
+        ):
+            return True
+    return False
+
+
 __all__ = [
+    "CLAIM_LEASE_CAP_S",
+    "QUEUE_WAIT_LIMIT",
+    "REVIEW_DEADLINE_MARGIN",
     "SETTLED_STATES",
+    "UNCAPPED_HOLDS",
+    "Eligibility",
+    "ReviewCheck",
+    "ReviewStep",
     "WakeEntry",
+    "WakeHold",
     "WakeState",
     "WakeView",
+    "attempt_end_key",
+    "claim_eligibility",
+    "closure_admissible",
+    "cycle_key",
     "derive_wake_view",
+    "journal_clock_floor",
+    "raw_claims_of",
+    "review_eligibility",
+    "review_started_after",
+    "terminal_eligibility",
+    "wake_clock_floor",
 ]
