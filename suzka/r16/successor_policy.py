@@ -42,10 +42,13 @@ must check that the original forward effect was authorized.
 
 IP-13 adds SuccessorPolicyV3: the same table and input, plus the ledger state
 ``PRIOR_INCARNATION_EFFECT_PRESENT`` (#373 A2-4, #378 II-4, R20-F12): a target
-effect whose source-side Claim was lost (e.g. by a true rollback). It is a row
-2 HOLD, carries no verified Outcome, and only a V3 input can hold it. A V2
-input keeps its exact bytes, schema string and fingerprint domain, so every
-existing V2 head still replays unchanged.
+effect whose source-side Claim was lost (e.g. by a true rollback). It carries
+no verified Outcome, and only a V3 input can hold it. IP-13 made it a row 2
+HOLD; IP-18b (#411 D1 §12-2, HD-18-5 (a)) amends that under V3 to row 2c
+(Plan A, still WRITE=false: Plan A has no tool step and produces no Feedback),
+because a permanent HOLD could never be released by anyone. A V2 input keeps
+its exact bytes, schema string and fingerprint domain, so every existing V2
+head still replays unchanged.
 
 IP-17a (#411 D1 r7 §3a / §12-2, HD-13 (a)) adds row 2c to V3 only. A forward
 obligation that closed without a Claim (``POLICY_DENIED``, or
@@ -56,6 +59,16 @@ rows 2 and 2b, a qualified lineage re-decides to Plan A (no WRITE). Row 0's
 identical request on a closed group is Plan A too. V2 is unchanged, and any
 input with another ledger state evaluates exactly as before: every Decision
 persisted before IP-17a has ledger NONE, so all of them replay unchanged.
+
+IP-18b (#411 D1 §9-1, §12-2, HD-18-5 (a)) extends row 2c, V3 only, to the
+ledger states ``UNAUTHORIZED_EFFECT``, ``PRIOR_INCARNATION_EFFECT_PRESENT`` and
+``VERIFIED_ABSENT`` (the effect is unproven or absent and the inverse is
+deferred, so a row 2 HOLD would never end; the write stays closed regardless).
+Plan A asserts nothing about an effect, so ``_MATCH_SELF_LEDGER`` still
+excludes UNAUTHORIZED_EFFECT, and a Feedback with it is intercepted by row 2c
+before rows 5/6.  It also adds the V3-only member ``TARGET_UNAVAILABLE``
+(§9-5).  The inverse states stay row 2.  V2 is unchanged, and no persisted
+Decision before IP-18 holds any of these states.
 
 R16 must not import ``suzka.r15``: the R15 read arrives as the closed strings
 of ``suzka.runtime.r15_interpretation_reader`` and is mapped here.
@@ -160,6 +173,12 @@ class LedgerState(str, Enum):
     CORRUPT = "CORRUPT"
     # V3 only: a target effect with no source-side Claim (prior incarnation).
     PRIOR_INCARNATION_EFFECT_PRESENT = "PRIOR_INCARNATION_EFFECT_PRESENT"
+    # V3 only (IP-18b, #411 D1 §9-5): the R18 target has been unavailable for
+    # more than the gate's bound and the group has no other ledger.  It claims
+    # nothing about any effect, carries no Outcome and closes the forward path
+    # for a new Decision (row 2c, Plan A).  Code only: no SQL column names it.
+    # A binary without this member cannot decode a sealed head that holds it.
+    TARGET_UNAVAILABLE = "TARGET_UNAVAILABLE"
 
 
 class InverseAuthorization(str, Enum):
@@ -238,13 +257,25 @@ _PENDING_LEDGER: Final = frozenset(
         LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT,
     }
 )
-_V3_ONLY_LEDGER: Final = frozenset({LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT})
-# IP-17a (§12-2): a forward obligation closed without a Claim. Under V3 the
-# two states leave row 2 for row 2c; under V2 they stay row 2.
-CLOSED_UNCLAIMED_LEDGER: Final = frozenset(
-    {LedgerState.POLICY_DENIED, LedgerState.APPROVAL_EXPIRED_UNCLAIMED}
+_V3_ONLY_LEDGER: Final = frozenset(
+    {LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT, LedgerState.TARGET_UNAVAILABLE}
 )
-_PENDING_LEDGER_V3: Final = _PENDING_LEDGER - CLOSED_UNCLAIMED_LEDGER
+# IP-17a (§12-2) / IP-18b (§9-1, §12-2): a forward obligation that is closed
+# for the write: unclaimed (POLICY_DENIED, APPROVAL_EXPIRED_UNCLAIMED), proven
+# absent or unauthorized, a prior-incarnation effect, or a lost target.  Under
+# V3 they leave row 2 for row 2c; under V2 they stay row 2 (the V3-only
+# members cannot occur in V2 at all).
+CLOSED_FORWARD_LEDGER: Final = frozenset(
+    {
+        LedgerState.POLICY_DENIED,
+        LedgerState.APPROVAL_EXPIRED_UNCLAIMED,
+        LedgerState.VERIFIED_ABSENT,
+        LedgerState.UNAUTHORIZED_EFFECT,
+        LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT,
+        LedgerState.TARGET_UNAVAILABLE,
+    }
+)
+_PENDING_LEDGER_V3: Final = _PENDING_LEDGER - CLOSED_FORWARD_LEDGER
 # D6-2: no verified Outcome may accompany a ledger with no claimed effect.
 # A prior-incarnation effect has lost its source-side Claim, so no Outcome.
 _OUTCOME_FORBIDDEN: Final = frozenset(
@@ -254,6 +285,7 @@ _OUTCOME_FORBIDDEN: Final = frozenset(
         LedgerState.POLICY_DENIED,
         LedgerState.APPROVAL_EXPIRED_UNCLAIMED,
         LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT,
+        LedgerState.TARGET_UNAVAILABLE,
     }
 )
 # Forward effect proven, then an inverse attempted or applied (A2-2/A2-3).
@@ -853,7 +885,7 @@ def evaluate(value: SuccessorPolicyInputV2) -> SuccessorPolicyResult:
     if type(value) is not SuccessorPolicyInputV2:
         raise TypeError("SuccessorPolicyV2 needs an exact SuccessorPolicyInputV2")
     v3 = value.version is PolicyKind.SUCCESSOR_POLICY_V3
-    closed_unclaimed = v3 and value.ledger in CLOSED_UNCLAIMED_LEDGER
+    closed_forward = v3 and value.ledger in CLOSED_FORWARD_LEDGER
     # Row 0: contradiction.
     if (
         value.required_source is RequiredSourceState.CONFLICT
@@ -867,7 +899,7 @@ def evaluate(value: SuccessorPolicyInputV2) -> SuccessorPolicyResult:
             value.predecessor is PredecessorState.ABSENT_INITIAL
             and value.ledger is not LedgerState.NONE
             # IP-17a (§12-2): a new lineage on a closed group re-decides.
-            and not closed_unclaimed
+            and not closed_forward
         )
         or cross_reference_conflicts(value)
     ):
@@ -894,7 +926,7 @@ def evaluate(value: SuccessorPolicyInputV2) -> SuccessorPolicyResult:
     # Row 2c (V3 only, IP-17a): the forward obligation closed unclaimed, so
     # the lineage re-decides to Plan A (no WRITE).
     if (
-        closed_unclaimed
+        closed_forward
         and qualified
         and value.predecessor
         in (PredecessorState.ABSENT_INITIAL, PredecessorState.QUALIFIED)
@@ -1058,7 +1090,7 @@ __all__ = [
     "INPUT_SCHEMA_V3",
     "MAX_LEDGER_REFS",
     "POLICY_KIND",
-    "CLOSED_UNCLAIMED_LEDGER",
+    "CLOSED_FORWARD_LEDGER",
     "CommitmentState",
     "FeedbackState",
     "Interpretation",

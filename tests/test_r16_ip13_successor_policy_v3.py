@@ -19,6 +19,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from suzka.r16.contracts import ReasonCode  # noqa: E402
 from suzka.r16.history_codec import MAX_POLICY_INPUT_BYTES, PolicyKind  # noqa: E402
 from suzka.r16.successor_policy import (  # noqa: E402
+    CLOSED_FORWARD_LEDGER,
+    PolicyOutputKind,
     INPUT_SCHEMA,
     INPUT_SCHEMA_V3,
     POLICY_KIND,
@@ -150,11 +152,12 @@ def test_version_must_be_v2_or_v3_exactly() -> None:
 
 
 def test_v3_evaluates_every_v2_state_exactly_like_v2() -> None:
-    """V3 adds one state; the ordered table is otherwise identical."""
+    """V3 adds states; the ordered table is otherwise identical, except that
+    the closed forward ledger states leave row 2 for row 2c (IP-17a, IP-18b)."""
 
     samples = [*_golden_inputs().values()]
     for ledger in LedgerState:
-        if ledger is PRIOR:
+        if ledger is PRIOR or ledger in CLOSED_FORWARD_LEDGER:
             continue
         extra: dict[str, object] = (
             {"inverse_authorization": InverseAuthorization.AUTHORIZED}
@@ -173,8 +176,10 @@ def test_v3_evaluates_every_v2_state_exactly_like_v2() -> None:
 # ------------------------------------------------------ the new V3 state
 
 
-def test_prior_incarnation_effect_is_a_row_2_hold() -> None:
-    """#373 A2-4 / #378 II-4 / #380 D1 P1-2: HOLD, WRITE=false."""
+def test_prior_incarnation_effect_is_a_row_2c_plan_a() -> None:
+    """#373 A2-4 / #378 II-4 / #380 D1 P1-2, amended by IP-18b (HD-18-5 (a),
+    #411 D1 §12-2): WRITE=false, and row 2c Plan A instead of a permanent
+    row 2 HOLD (V3 only)."""
 
     for commitment in (CommitmentState.ACTIVE, CommitmentState.ABSENT):
         extra: dict[str, object] = (
@@ -183,10 +188,11 @@ def test_prior_incarnation_effect_is_a_row_2_hold() -> None:
             else {}
         )
         result = evaluate(_prior(commitment=commitment, **extra))
-        assert (result.row, result.hold_reason, result.is_hold) == (
-            SuccessorRow.ROW_2,
-            ReasonCode.INSUFFICIENT_EVIDENCE,
-            True,
+        assert (result.row, result.output, result.is_hold, result.write_eligible) == (
+            SuccessorRow.ROW_2C,
+            PolicyOutputKind.PLAN_A,
+            False,
+            False,
         )
 
 
@@ -205,12 +211,12 @@ def test_prior_incarnation_effect_cannot_carry_a_verified_outcome_or_feedback() 
         ), changes
 
 
-def test_prior_incarnation_effect_without_predecessor_keeps_the_v2_row_0_rule() -> None:
-    """A non-NONE ledger under ABSENT_INITIAL is already a row 0 contradiction
-    in V2; V3 does not relax it. Both rows HOLD with WRITE=false."""
+def test_prior_incarnation_effect_without_predecessor_is_row_2c_like_the_closed_states() -> None:
+    """IP-18b: row 0's ABSENT_INITIAL rule exempts the closed forward states
+    (a new lineage on a closed group re-decides), this one included."""
 
     result = evaluate(_prior(predecessor=PredecessorState.ABSENT_INITIAL, predecessor_ref=_input().predecessor_ref))
-    assert (result.row, result.is_hold) == (SuccessorRow.ROW_0, True)
+    assert (result.row, result.is_hold) == (SuccessorRow.ROW_2C, False)
 
 
 def test_earlier_rows_still_win_over_the_new_state() -> None:

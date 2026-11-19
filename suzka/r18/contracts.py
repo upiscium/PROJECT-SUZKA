@@ -1653,6 +1653,9 @@ _TRANSITIONS: Final[dict[LedgerState, frozenset[LedgerState]]] = {
     LedgerState.INVERSE_VERIFIED_ABSENT: frozenset(),
     LedgerState.REVERTED: frozenset(),
     LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT: frozenset(),
+    # IP-18b (§9-5): a witness the Decision issuer substitutes, never a step
+    # of the operation's own state machine.
+    LedgerState.TARGET_UNAVAILABLE: frozenset(),
     LedgerState.CORRUPT: frozenset(),
 }
 
