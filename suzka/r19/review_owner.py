@@ -203,6 +203,7 @@ class _Review:
     entry: WakeEntry
     claim: WakeClaimV1
     started: float
+    snapshot_hash: str | None = None
 
     @property
     def wake(self) -> WakeV1:
@@ -252,8 +253,10 @@ class WakeReviewOwnerV1(_WakeOwnerBase):
         try:
             return self._review_checked(event, claim_id)
         except (HistoryStoreError, AgentStateLoadError):
+            self._pending = None
             return self._hold(claim_id, None, WakeHold.HISTORY_UNAVAILABLE)
         except _Hold as hold:
+            self._pending = None
             return self._hold(claim_id, None, hold.reason)
 
     @staticmethod
@@ -347,6 +350,8 @@ class WakeReviewOwnerV1(_WakeOwnerBase):
             # A store read error is a refusal (D1 §6 pre-step 3); recording it
             # re-reads the store, and a read that fails again is a no-row HOLD.
             return self._record(review, AttemptOutcome.REFUSED, RefuseReason.SOURCE_UNAVAILABLE)
+        if isinstance(evaluated, _Evaluation):
+            review.snapshot_hash = evaluated.snapshot_hash
         value = evaluated.value
         if _unavailable(evaluated):
             return self._record(review, AttemptOutcome.REFUSED, RefuseReason.SOURCE_UNAVAILABLE)
@@ -636,6 +641,7 @@ class WakeReviewOwnerV1(_WakeOwnerBase):
             operation,
             result,
             initial_state=initial_state,
+            snapshot_hash=review.snapshot_hash,
         )
 
 

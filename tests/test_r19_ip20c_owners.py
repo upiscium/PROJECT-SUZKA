@@ -826,3 +826,24 @@ def test_the_wake_path_has_no_model_and_never_asks_the_runtime_if_it_is_idle() -
         } | {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
         assert not [module for module in imported if module.startswith("suzka.models")], name
         assert "is_idle" not in source and "pending_count" not in source, name
+
+
+def test_a_hold_after_the_pending_state_was_set_leaves_none_behind(world) -> None:  # type: ignore[no-untyped-def]
+    """A caught HOLD must never leave ``_pending`` set: ``_validate_commit`` would
+    find no PREPARED row and fail-stop the runtime for what is a no-row HOLD."""
+
+    state, clock, monkeypatch = world.state, world.time, world.monkeypatch
+    wake = fx.materialize(state, world.gid, clock)
+    from suzka.r16.history_store import HistoryStoreError
+    from suzka.r19 import claim_owner as module
+
+    def broken(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise HistoryStoreError("store gone")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "SubjectHistoryRecordParticipant", broken)
+        held = fx.claim(state, wake)
+    assert (held.status, held.hold) == (ClaimStatus.HOLD, WakeHold.HISTORY_UNAVAILABLE)
+    assert state.wake_claim_owner._pending is None
+    assert fx.claim(state, wake).status is ClaimStatus.COMMITTED
+    _no_failed_events(state)

@@ -287,6 +287,7 @@ class _WakeOwnerBase:
             return raw_claims_of(self._store.operations(incarnation), wakeup_id)
         except (TypeError, ValueError):
             # An undecodable pending envelope: the history is not usable.
+            LOGGER.warning("R19 wake owner: undecodable pending claim envelope")
             raise _Hold(WakeHold.HISTORY_UNAVAILABLE) from None
 
     def _live_keys(self, *keys: str) -> frozenset[str]:
@@ -302,6 +303,7 @@ class _WakeOwnerBase:
         result: Callable[[], object],
         *,
         initial_state: object | None = None,
+        snapshot_hash: str | None = None,
     ) -> object:
         """The last pre-PREPARE checks (the raw-state collision pre-check and the
         headroom), then the pending state and the participant.  A collision
@@ -316,7 +318,8 @@ class _WakeOwnerBase:
             self._store.check_headroom(len(operation.canonical_bytes()))
         except HistoryStoreError:
             raise _Hold(WakeHold.HISTORY_CAPACITY) from None
-        snapshot_hash, _as_of = self._decision._snapshot()
+        if snapshot_hash is None:
+            snapshot_hash, _as_of = self._decision._snapshot()
         transaction_id = TransactionCoordinator.derive_transaction_id(
             event, TransactionKind.EVENT_MUTATION
         )
@@ -430,8 +433,10 @@ class WakeClaimOwnerV1(_WakeOwnerBase):
             assert superseding is None or type(superseding) is str
             return self._terminal_checked(event, wakeup_id, reason, superseding)
         except (HistoryStoreError, AgentStateLoadError):
+            self._pending = None
             return self._hold(claiming, WakeHold.HISTORY_UNAVAILABLE, wakeup_id)
         except _Hold as hold:
+            self._pending = None
             return self._hold(claiming, hold.reason, wakeup_id)
 
     @staticmethod
