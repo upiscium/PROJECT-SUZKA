@@ -156,6 +156,10 @@ TICKET_CAPACITY = 512
 IDLE_POLL_SECONDS = 0.2
 IDLE_WAIT_LIMIT_SECONDS = 30.0
 RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
+# IP-19 (condition B): a slow backstop re-runs the Assessment / Feedback chain,
+# so a lost notification (full queue, spent retries) never leaves an Outcome
+# without its follow-up until a restart.
+FEEDBACK_BACKSTOP_SECONDS = 600.0
 
 _TICKET = re.compile(r"(?P<incarnation>[0-9a-f]{16})\.(?P<token>[A-Za-z0-9_-]{22})")
 
@@ -425,6 +429,7 @@ class R16Driver:
         self._feedbacked: dict[str, None] = {}
         self._feedback_retries: dict[str, int] = {}
         self._scan_retries: dict[str, int] = {}
+        self._next_feedback_backstop = clock() + FEEDBACK_BACKSTOP_SECONDS
         self._assess_scans = 0
         self._feedback_scans = 0
         self._feedback_scan_posted = False
@@ -751,6 +756,7 @@ class R16Driver:
                     self._on_blocked_clear()
                 if self._blocked_clear_flag.is_set():
                     self._on_blocked_clear()
+                self._feedback_backstop()
                 with self._tickets_lock:
                     finished, self._done = self._done, []
                 for result in finished:
@@ -1412,6 +1418,19 @@ class R16Driver:
         self._feedback_scans = 0
         self._maybe_assess_scan()
 
+    def _feedback_backstop(self) -> None:
+        """Re-run the chain about every ``FEEDBACK_BACKSTOP_SECONDS`` while active."""
+
+        if (
+            self._feedback is None
+            or not self._feedback.enabled
+            or not self._active
+            or self._clock() < self._next_feedback_backstop
+        ):
+            return
+        self._next_feedback_backstop = self._clock() + FEEDBACK_BACKSTOP_SECONDS
+        self._on_feedback_scan()
+
     def _maybe_assess_scan(self) -> None:
         """At most ``MAX_FEEDBACK_SCANS_PER_STARTUP`` links per chain."""
 
@@ -1428,6 +1447,7 @@ class R16Driver:
         if not isinstance(value, _AssessmentResult):
             return
         if value.status is AssessmentCommitStatus.COMMITTED:
+            self._scan_retries.pop(_Stage.ASSESSMENT.value, None)
             assert value.assessment is not None and value.assessment_id is not None
             if value.assessment.positive_feedback_eligible:
                 self._maybe_feedback(value.assessment_id)
