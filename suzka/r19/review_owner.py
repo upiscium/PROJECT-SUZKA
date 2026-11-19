@@ -460,6 +460,11 @@ class WakeReviewOwnerV1(_WakeOwnerBase):
             if reason is not HoldReason.STALE_SOURCE or row is not None:
                 # The requested receipt is not representable: the cycle still
                 # closes, as STALE_SOURCE (D1 §6-1: a HOLD never ends FAILED).
+                LOGGER.warning(
+                    "R16 wake review owner: %s receipt not representable, closing as STALE_SOURCE",
+                    reason.value,
+                    exc_info=True,
+                )
                 return self._close_hold(review, value, HoldReason.STALE_SOURCE)
             # A STALE_SOURCE receipt needs only ids and digests of values that
             # were already built and validated, so this is unreachable; if it
@@ -507,6 +512,10 @@ class WakeReviewOwnerV1(_WakeOwnerBase):
             resolution = LogicalCycleResolutionV1.of_existing(review.incarnation, receipt)
             closure = CycleClosureV1(resolution, receipt)
         except (TypeError, ValueError):
+            LOGGER.warning(
+                "R16 wake review owner: existing receipt not representable, closing as STALE_SOURCE",
+                exc_info=True,
+            )
             return self._close_hold(review, value, HoldReason.STALE_SOURCE)
         LOGGER.info("R16 wake review owner result=existing_decision")
         return self._close(
@@ -553,6 +562,10 @@ class WakeReviewOwnerV1(_WakeOwnerBase):
             )
             closure = CycleClosureV1(resolution, committed)
         except (TypeError, ValueError):
+            LOGGER.warning(
+                "R16 wake review owner: closure not representable, closing as STALE_SOURCE",
+                exc_info=True,
+            )
             return self._close_hold(review, evaluated.value, HoldReason.STALE_SOURCE)
         # The slots, from raw rows (PREPARED and FINALIZED-not-terminal
         # included): a FINALIZED holder is a closed question (STALE_SOURCE), a

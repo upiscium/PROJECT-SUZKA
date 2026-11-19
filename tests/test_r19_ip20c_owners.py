@@ -877,15 +877,16 @@ def test_a_builder_failure_is_a_logged_hold_never_an_event_failure(world) -> Non
     def broken(*args, **kwargs):  # type: ignore[no-untyped-def]
         raise ValueError("a builder refused")
 
+    # A claim inside its window whose operation envelope cannot be built.
+    with monkeypatch.context() as patch:
+        patch.setattr(claim_owner, "HistoryRecordOperationV1", broken)
+        held_claim = fx.claim(state, wake)
+    assert (held_claim.status, held_claim.hold) == (ClaimStatus.HOLD, WakeHold.UNREPRESENTABLE)
     clock.advance(301)
     with monkeypatch.context() as patch:
         patch.setattr(WakeTerminalV1, "for_wake", broken)
         held = fx.terminal(state, wake, TerminalReason.EXPIRED_WAKE)
     assert (held.status, held.hold) == (TerminalStatus.HOLD, WakeHold.UNREPRESENTABLE)
-    with monkeypatch.context() as patch:
-        patch.setattr(WakeClaimV1, "for_wake", broken)
-        held_claim = fx.claim(state, wake)
-    assert held_claim.hold in (WakeHold.UNREPRESENTABLE, WakeHold.OUTSIDE_WAKE_WINDOW)
     assert _count(state) == rows
     _no_failed_events(state)
 
