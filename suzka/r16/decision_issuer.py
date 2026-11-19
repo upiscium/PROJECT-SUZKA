@@ -211,7 +211,12 @@ _COMPARE: Final = "compare_review_constraints"
 _ASSESS: Final = "assess_review_readiness"
 
 InterpretationRead = Callable[[AgentEvent, str, int], object]
-# IP-20a (A-5): the caller's instant, read lazily at the sites that need it.
+# IP-20a (A-5): a zero-argument callable returning the caller's instant as a
+# timezone-aware ``datetime``.  The sites that need an instant (the ledger's
+# approval-window closure and the deadline margin) call it lazily, so a path
+# that never needs the clock never reads it; every call within one evaluation
+# must return the same value (``_Once`` memoizes a live clock, ``_evaluate``
+# wraps one fixed ``datetime``).
 Instant = Callable[[], datetime]
 
 

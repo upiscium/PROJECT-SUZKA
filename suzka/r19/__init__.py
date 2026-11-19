@@ -1,6 +1,9 @@
-"""R19 pure values only; no Wake writer, Scheduler, Outbox or Inbox authority.
+"""R19 pure values only; the writers live in their own modules (import by module).
 
-IP-20a adds ``suzka.r19.ledger``: a pure derived Wake view (import it by module).
+IP-20a adds ``suzka.r19.ledger``: a pure derived Wake view. IP-20b adds
+``suzka.r19.materializer``: the Wake materializer, the only writer of Wakes. The
+package itself imports neither (the writers import R16 / R17, which import
+these values); there is still no Scheduler, Outbox or Inbox authority here.
 """
 
 from suzka.r19.contracts import (
