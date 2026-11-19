@@ -710,5 +710,5 @@ def test_r19_imports_stay_pure() -> None:
         name
         for name in dir(r19)
         if not name.startswith("_")
-        and name not in {"contracts", "ledger", "materializer", "claim_owner", "review_owner", "raw_state"}
+        and name not in {"contracts", "ledger", "materializer", "claim_owner", "review_owner", "raw_state", "scheduler"}
     }
