@@ -33,7 +33,7 @@ from suzka.r16.history_records import (
 from suzka.r16.history_store import HistoryPhase, HistoryStoreCapacityError
 from suzka.r16.replay_check import main as replay_main, replay_rows, replay_store
 from suzka.r16.successor_policy import (
-    CLOSED_UNCLAIMED_LEDGER,
+    CLOSED_FORWARD_LEDGER,
     CommitmentState,
     FeedbackState,
     Interpretation,
@@ -181,9 +181,9 @@ def _assert_row_2c(result) -> None:  # type: ignore[no-untyped-def]
 
 
 # The SuccessorPolicy tables before IP-17a (64e5bbe), over every state tuple
-# of the ip8b builder: V2 in full, V3 without the two closed ledger states.
+# of the ip8b builder: V2 in full, V3 without the closed forward ledger states (IP-17a's two and IP-18b's four).
 _PRE_IP17A_V2: Final = "5098da70263a8f3bfcbb9ec259caaf06d9110a6dc9c1cd006703afa790579c7c"
-_PRE_IP17A_V3_UNCLOSED: Final = "e6f7ed889087b4bf33baa14d9e828b9c012fbad4c40d287d68039d2f5ee726a6"
+_PRE_IP17A_V3_UNCLOSED: Final = "7fb412985a95a103129ab94c1b8d1d12a7d56dd0306a4c328cc31bda830ab106"
 
 
 def _table(version: PolicyKind, *, skip_closed: bool) -> tuple[str, dict[SuccessorRow, int]]:
@@ -198,7 +198,7 @@ def _table(version: PolicyKind, *, skip_closed: bool) -> tuple[str, dict[Success
         FeedbackState,
         Interpretation,
     ):
-        closed = states[4] in CLOSED_UNCLAIMED_LEDGER
+        closed = states[4] in CLOSED_FORWARD_LEDGER
         if skip_closed and closed:
             continue
         row = evaluate(_consistent(*states, version=version)).row
@@ -228,7 +228,7 @@ def test_v2_and_every_unclosed_v3_tuple_evaluate_exactly_as_before() -> None:
     assert closed[SuccessorRow.ROW_2C] > 0
 
 
-@pytest.mark.parametrize("ledger", sorted(CLOSED_UNCLAIMED_LEDGER))
+@pytest.mark.parametrize("ledger", sorted(CLOSED_FORWARD_LEDGER))
 def test_row_2c_is_v3_only_after_rows_2_and_2b(ledger: LedgerState) -> None:
     def value(version, **changes):  # type: ignore[no-untyped-def]
         states = dict(
@@ -251,14 +251,16 @@ def test_row_2c_is_v3_only_after_rows_2_and_2b(ledger: LedgerState) -> None:
     )
     assert result.history_row is PolicyRow.ROW_2C
     # V2 + closed -> 2; CONTRADICTORY + closed -> 2b (2c comes after 2b).
-    assert evaluate(value(V2)).row is SuccessorRow.ROW_2
+    if ledger in _ledger_states(V2):
+        assert evaluate(value(V2)).row is SuccessorRow.ROW_2
     assert evaluate(value(V3, interpretation=Interpretation.CONTRADICTORY)).row is SuccessorRow.ROW_2B
     # UNCERTAIN and no Commitment still re-decide to Plan A.
     assert evaluate(value(V3, interpretation=Interpretation.UNCERTAIN)).row is SuccessorRow.ROW_2C
     assert evaluate(value(V3, commitment=CommitmentState.ABSENT)).row is SuccessorRow.ROW_2C
     # Row 0's ABSENT_INITIAL rule exempts the closed states under V3 only.
     assert evaluate(value(V3, predecessor=PredecessorState.ABSENT_INITIAL)).row is SuccessorRow.ROW_2C
-    assert evaluate(value(V2, predecessor=PredecessorState.ABSENT_INITIAL)).row is SuccessorRow.ROW_0
+    if ledger in _ledger_states(V2):
+        assert evaluate(value(V2, predecessor=PredecessorState.ABSENT_INITIAL)).row is SuccessorRow.ROW_0
     pending = value(V3, ledger=LedgerState.INTENT_ISSUED, predecessor=PredecessorState.ABSENT_INITIAL)
     assert evaluate(pending).row is SuccessorRow.ROW_0
     # Earlier rows still win.

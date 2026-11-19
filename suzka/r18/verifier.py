@@ -38,7 +38,14 @@ from suzka.r18.contracts import (
     VerifiedState,
     payload_digest,
 )
-from suzka.r18.target import ArtifactState, GroupStatus, LedgerKind, TargetReader
+from suzka.r18.target import (
+    ArtifactRow,
+    ArtifactState,
+    GroupStatus,
+    LedgerKind,
+    LedgerRow,
+    TargetReader,
+)
 
 _FORWARD_REVISION: Final = 1
 
@@ -50,6 +57,18 @@ def _status(reader: TargetReader, group_key: str, target_instance_id: str) -> Gr
     if status.meta.target_instance_id != target_instance_id:
         return None  # another target: nothing here can be about this intent
     return status
+
+
+def fenced_without_artifact(forward: LedgerRow | None, artifact: ArtifactRow | None) -> bool:
+    """The one read-only "FENCED and no artifact" predicate (#411 D1 §9-4, R3-2).
+
+    True exactly when the forward ledger row is a FENCE and no artifact exists
+    for the group: the target itself proves that the write never happened.
+    ``verify_forward`` (VERIFIED_ABSENT) and the facts classification
+    (``suzka.r18.facts``) both use this function; neither keeps a copy.  A
+    FENCED row with an artifact is mixed and is NOT this (undecidable)."""
+
+    return forward is not None and forward.kind is LedgerKind.FENCED and artifact is None
 
 
 def _check_challenge(challenge: ApprovalChallengeV1, direction: Direction, intent_id: str) -> None:
@@ -95,7 +114,7 @@ def verify_forward(
     if forward.operation_key != key:
         return None
     if forward.kind is LedgerKind.FENCED:
-        if artifact is not None:
+        if not fenced_without_artifact(forward, artifact):
             return None  # an artifact without an effect row: mixed, not ABSENT
         return outcome(
             VerifiedState.VERIFIED_ABSENT,
@@ -200,4 +219,4 @@ def verify_inverse(
     )
 
 
-__all__ = ["verify_forward", "verify_inverse"]
+__all__ = ["fenced_without_artifact", "verify_forward", "verify_inverse"]

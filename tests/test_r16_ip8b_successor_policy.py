@@ -223,6 +223,7 @@ def _consistent(
             LedgerState.POLICY_DENIED,
             LedgerState.APPROVAL_EXPIRED_UNCLAIMED,
             LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT,
+            LedgerState.TARGET_UNAVAILABLE,
         ) else OUTCOME,
         feedback=feedback,
         feedback_ref=None if feedback in (FeedbackState.ABSENT, FeedbackState.INVALID) else FEEDBACK,
@@ -231,13 +232,15 @@ def _consistent(
 
 
 def _ledger_states(version: PolicyKind) -> tuple[LedgerState, ...]:
-    """IP-13: PRIOR_INCARNATION_EFFECT_PRESENT exists only in V3."""
+    """IP-13 / IP-18b: PRIOR_INCARNATION_EFFECT_PRESENT and TARGET_UNAVAILABLE
+    exist only in V3."""
 
     return tuple(
         state
         for state in LedgerState
         if version is PolicyKind.SUCCESSOR_POLICY_V3
-        or state is not LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT
+        or state
+        not in (LedgerState.PRIOR_INCARNATION_EFFECT_PRESENT, LedgerState.TARGET_UNAVAILABLE)
     )
 
 
