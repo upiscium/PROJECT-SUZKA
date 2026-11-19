@@ -67,6 +67,29 @@ from suzka.runtime.context import (
 )
 
 
+# IP-20a (IP-20 D1 r3 A-3, D-R19 §8-4): the only (event type, source) pairs
+# that may run the R15 -> R16 interpretation read. The R17 ``*_COMMIT`` events
+# of D-R19 §8-4 are not here: under IP-14b HD-1 (a) they compute no fingerprint.
+_INTERPRETATION_READ_EVENTS: frozenset[tuple[AgentEventType, AgentEventSource]] = (
+    frozenset(
+        {
+            (
+                AgentEventType.PLAN_PREVIEW_REVIEW,
+                AgentEventSource.RUNTIME_PLAN_PREVIEW_REVIEW,
+            ),
+            (
+                AgentEventType.R16_WAKE_REVIEW,
+                AgentEventSource.RUNTIME_R16_WAKE_REVIEW,
+            ),
+            (
+                AgentEventType.R19_WAKE_MATERIALIZE,
+                AgentEventSource.RUNTIME_R19_WAKE_MATERIALIZE,
+            ),
+        }
+    )
+)
+
+
 @dataclass(frozen=True, slots=True)
 class R15TechnicalSnapshot:
     relationship: RelationshipState
@@ -306,9 +329,11 @@ class R15StatePort:
     ) -> R15InterpretationRead:
         """IP-8a R15 -> R16 read: closed values only, read-only.
 
-        Allowed only inside the actual serialized R16 plan-preview review
-        event, before that event opens its R07 transaction (#374 D5 §3, P2-2).
-        Any other caller or failure is UNAVAILABLE.
+        Allowed only inside an actual serialized R16 review event, before that
+        event opens its R07 transaction (#374 D5 §3, P2-2): the plan-preview
+        review, and (IP-20a, IP-20 D1 r3 A-3 / D-R19 §8-4) the R16 Wake review
+        and the R19 Wake materializer, each with its own runtime source. Any
+        other caller, event type or failure is UNAVAILABLE.
         """
         with self._owner_lock:
             runtime = self._private_read_runtime
@@ -321,8 +346,7 @@ class R15StatePort:
                 or type(gate) is not QualifiedNarrativeSourceGate
                 or gate._runtime is not runtime
                 or runtime.current_event() is not event
-                or event.event_type is not AgentEventType.PLAN_PREVIEW_REVIEW
-                or event.source is not AgentEventSource.RUNTIME_PLAN_PREVIEW_REVIEW
+                or (event.event_type, event.source) not in _INTERPRETATION_READ_EVENTS
                 or type(event.processing_sequence) is not int
                 or type(x_event_id) is not str
                 or type(x_event_sequence) is not int

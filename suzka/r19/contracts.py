@@ -38,9 +38,10 @@ from suzka.r16.cycle_contracts import (
     prefixed,
     utc,
 )
-from suzka.r16.history_codec import PolicyRow, canonical_uuid, event_sequence
+from suzka.r16.history_codec import PolicyKind, PolicyRow, canonical_uuid, event_sequence
 from suzka.r16.successor_policy import (
     Interpretation,
+    LedgerState,
     LineageState,
     PolicyRef,
     PredecessorState,
@@ -63,6 +64,12 @@ COMMITMENT_ADMISSION_REF_KIND: Final = "commitment-admission"
 ASSESSMENT_REF_KIND: Final = "r17-assessment"
 COMMITMENT_REF_KIND: Final = "commitment"
 OBSERVATION_REF_KIND: Final = "observation"
+# IP-20a (IP-20 D1 r3 §14-9): the origin-ref kinds of a self-origin Goal's
+# ``GOAL_ADMITTED`` Wake (#411 IP-20: "MOTIVATION / EXPERIENCE / EVENT source
+# refs"). Named here next to ``GOAL_ADMISSION_REF_KIND``; pinned by a test.
+MOTIVATION_REF_KIND: Final = "motivation"
+EXPERIENCE_REF_KIND: Final = "experience"
+EVENT_REF_KIND: Final = "event"
 # IP-14b D1 r2 §4-2 (P2-2): the only Inbox trust claim the MVI makes. A
 # client that the SUZKA HTTP API admits, through the existing chat / API route
 # (direct loopback, or via Caddy from the networks the firewall already
@@ -79,6 +86,10 @@ ATTEMPT_MAX_EVENTS: Final = 4
 ATTEMPT_MAX_MODEL_CALLS: Final = 2
 ATTEMPT_MAX_SECONDS: Final = 10
 CYCLE_MAX_EVENTS: Final = 12
+# The two policy versions a Wake's fingerprint can be in (IP-20 D1 r3 A-1).
+WAKE_POLICY_KINDS: Final = frozenset(
+    {PolicyKind.SUCCESSOR_POLICY_V2, PolicyKind.SUCCESSOR_POLICY_V3}
+)
 _UTC_FORMAT: Final = "%Y-%m-%dT%H:%M:%SZ"
 
 _WAKEUP_DOMAIN: Final = b"PROJECT-SUZKA:R19:WAKEUP-ID:V1\0"
@@ -304,7 +315,13 @@ def wake_fingerprint(value: SuccessorPolicyInputV2) -> str | None:
     predecessor, lineage and interpretation are all qualified; freezing an
     UNAVAILABLE input would make every re-evaluation refuse. The fingerprint
     is SuccessorPolicyInput's own and covers the R15 ``(stage,
-    interpretation)`` pair.
+    interpretation)`` pair, in ``value.version``'s domain (a ``WakeV1`` records
+    that version as ``policy_kind``).
+
+    IP-20a (IP-20 D1 r3 A-2, HD-20-3 (a)): a ``TARGET_UNAVAILABLE`` ledger is
+    time-varying (the R18 sweep gate's 60 s bound, IP-18 §9-5 / §14-6), so it
+    is never frozen: freezing it would make the follow-up depend on an outage
+    window. The caller retries on its next scan.
     """
 
     if type(value) is not SuccessorPolicyInputV2:
@@ -314,6 +331,7 @@ def wake_fingerprint(value: SuccessorPolicyInputV2) -> str | None:
         or value.predecessor not in (PredecessorState.QUALIFIED, PredecessorState.ABSENT_INITIAL)
         or value.lineage is not LineageState.CONSISTENT
         or value.interpretation is Interpretation.UNAVAILABLE
+        or value.ledger is LedgerState.TARGET_UNAVAILABLE
     ):
         return None
     return value.evidence_fingerprint()
@@ -430,6 +448,7 @@ _WAKE_BODY: Final = (
     "logical_cycle_id",
     "not_before_utc",
     "origin_refs",
+    "policy_kind",
     "schema_version",
 )
 
@@ -443,6 +462,11 @@ class WakeV1:
     evidence behind the cause (at most 4, sorted, distinct): the Commitment
     for COMMITMENT_ADMITTED, and exactly one ``r18-outcome`` for the two
     Outcome causes (one Wake per verified Outcome revision, D-R19 §3).
+
+    ``policy_kind`` (IP-20 D1 r3 A-1) is the SuccessorPolicy version
+    (V2 / V3) whose fingerprint domain ``evidence_fingerprint`` is in: the
+    review compares the current input expressed in that version
+    (``successor_policy.as_version``).
     """
 
     kind: WakeKind
@@ -457,6 +481,7 @@ class WakeV1:
     goal_origin: GoalOrigin
     origin_refs: tuple[PolicyRef, ...]
     evidence_fingerprint: str
+    policy_kind: PolicyKind
     frozen_predecessor: FrozenPredecessor
     horizon_sequence: int
     incarnation_id: str
@@ -494,6 +519,10 @@ class WakeV1:
             raise ValueError("a Wake cites at most one Commitment")
         if self.cause is WakeCause.COMMITMENT_ADMITTED and COMMITMENT_REF_KIND not in kinds:
             raise ValueError("a COMMITMENT_ADMITTED Wake cites its Commitment")
+        if type(self.policy_kind) is not PolicyKind:
+            raise TypeError("policy_kind must be a PolicyKind")
+        if self.policy_kind not in WAKE_POLICY_KINDS:
+            raise ValueError("a Wake's policy_kind is SuccessorPolicy V2 or V3")
         if type(self.frozen_predecessor) is not FrozenPredecessor:
             raise TypeError("frozen_predecessor must be a FrozenPredecessor")
         self.frozen_predecessor.__post_init__()
@@ -557,6 +586,7 @@ class WakeV1:
             "logical_cycle_id": self.logical_cycle_id,
             "not_before_utc": self.not_before_utc,
             "origin_refs": [item.canonical_value() for item in self.origin_refs],
+            "policy_kind": self.policy_kind.value,
             "schema_version": SCHEMA_VERSION,
         }
 
@@ -589,6 +619,7 @@ class WakeV1:
                 for item in sequence(row["origin_refs"], "origin_refs", MAX_ORIGIN_REFS, json_input=True)
             ),
             evidence_fingerprint=_str(row["evidence_fingerprint"]),
+            policy_kind=parse_enum(row["policy_kind"], PolicyKind, "policy_kind"),
             frozen_predecessor=FrozenPredecessor.from_value(row["frozen_predecessor"]),
             horizon_sequence=_int(row["horizon_sequence"]),
             incarnation_id=_str(row["incarnation_id"]),

@@ -53,3 +53,20 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         raise pytest.UsageError(
             f"a test created the checkout SubjectHistory store at {CHECKOUT_HISTORY}"
         )
+
+
+@pytest.fixture(autouse=True)
+def _issuer_equivalence(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """IP-20a gate: ``SUZKA_ISSUER_EQUIVALENCE=1 pytest tests/`` runs every
+    PLAN_PREVIEW issuer call of the whole suite against the pre-refactor path
+    (``tests/issuer_equivalence.py``) and fails on any difference."""
+
+    import os
+
+    if os.environ.get("SUZKA_ISSUER_EQUIVALENCE") != "1":
+        yield
+        return
+    from issuer_equivalence import install
+
+    install(monkeypatch)
+    yield

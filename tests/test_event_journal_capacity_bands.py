@@ -125,7 +125,16 @@ def test_soft_band_allow_list_matches_the_design_table() -> None:
     assert AgentEventType.R17_ASSESSMENT_COMMIT in SOFT_BAND_ADMITTED_EVENT_TYPES
     assert AgentEventType.R17_FEEDBACK_COMMIT in SOFT_BAND_ADMITTED_EVENT_TYPES
     assert AgentEventType.GOAL_SELF_PROPOSAL_REVIEW in SOFT_BAND_ADMITTED_EVENT_TYPES
-    assert len(AgentEventType) == 28
+    # IP-20a (IP-20 D1 r3 §2, D-R19 §8-5, HP-8): the four R19 Wake events are
+    # admitted on purpose (one row each in test_r19_ip20a_foundations.py).
+    for wake_event in (
+        AgentEventType.R19_WAKE_MATERIALIZE,
+        AgentEventType.R19_WAKE_CLAIM,
+        AgentEventType.R16_WAKE_REVIEW,
+        AgentEventType.R19_WAKE_TERMINAL,
+    ):
+        assert wake_event in SOFT_BAND_ADMITTED_EVENT_TYPES
+    assert len(AgentEventType) == 32
     assert SOFT_BAND_ADMITTED_EVENT_TYPES <= set(AgentEventType)
 
 
