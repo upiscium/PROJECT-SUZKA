@@ -70,10 +70,9 @@ from suzka.r19.ledger import (
     claim_eligibility,
     cycle_key,
     derive_wake_view,
-    raw_claims_of,
     terminal_eligibility,
-    wake_clock_floor,
 )
+from suzka.r19.raw_state import raw_claims_of, wake_clock_floor
 from suzka.runtime.agent_runtime import (
     AgentEvent,
     AgentEventOutcome,
@@ -393,7 +392,7 @@ class WakeClaimOwnerV1(_WakeOwnerBase):
 
     # ------------------------------------------------------------ submission
 
-    def _submit_claim(self, wakeup_id: str) -> Future[AgentEventOutcome[object]]:
+    def _submit_wake_claim(self, wakeup_id: str) -> Future[AgentEventOutcome[object]]:
         if not _valid_id(wakeup_id):
             raise ValueError("a claim names one Wake id")
         return self._submit(AgentEventType.R19_WAKE_CLAIM, (wakeup_id,))

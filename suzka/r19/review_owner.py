@@ -125,9 +125,8 @@ from suzka.r19.ledger import (
     cycle_key,
     derive_wake_view,
     review_eligibility,
-    review_started_after,
-    wake_clock_floor,
 )
+from suzka.r19.raw_state import review_started_after, wake_clock_floor
 from suzka.runtime.agent_runtime import (
     AgentEvent,
     AgentEventOutcome,

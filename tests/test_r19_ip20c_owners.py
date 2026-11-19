@@ -127,7 +127,7 @@ def test_disabled_owners_hold_before_reading_anything(tmp_path) -> None:  # type
             owner._classify = unreadable  # type: ignore[method-assign]
             owner._clock = unreadable  # type: ignore[method-assign]
         wakeup = "wakeup-" + "0" * 64
-        claimed = claim_owner._submit_claim(wakeup).result(timeout=30).value
+        claimed = claim_owner._submit_wake_claim(wakeup).result(timeout=30).value
         assert (claimed.status, claimed.hold) == (ClaimStatus.HOLD, WakeHold.R19_DISABLED)
         ended = claim_owner._submit_terminal(wakeup, TerminalReason.EXPIRED_WAKE).result(timeout=30).value
         assert (ended.status, ended.hold) == (TerminalStatus.HOLD, WakeHold.R19_DISABLED)
@@ -181,7 +181,7 @@ def test_a_claim_outside_its_window_or_for_an_unknown_wake_writes_nothing(world)
     before = _count(state)
     held = fx.claim(state, future)
     assert (held.status, held.hold) == (ClaimStatus.HOLD, WakeHold.OUTSIDE_WAKE_WINDOW)
-    unknown = state.wake_claim_owner._submit_claim("wakeup-" + "1" * 64).result(timeout=30).value
+    unknown = state.wake_claim_owner._submit_wake_claim("wakeup-" + "1" * 64).result(timeout=30).value
     assert (unknown.status, unknown.hold) == (ClaimStatus.HOLD, WakeHold.WAKE_UNKNOWN)
     assert _count(state) == before
     # Past the window it is the claim that is refused, not an attempt.
@@ -772,7 +772,7 @@ def test_a_failed_handler_leaves_no_pending_state_behind(world) -> None:  # type
     with monkeypatch.context() as patch:
         patch.setattr(WakeClaimOwnerV1, "_prepare", failing)
         with pytest.raises(AgentRuntimeExecutionError):
-            owner._submit_claim(wake.wakeup_id).result(timeout=30)
+            owner._submit_wake_claim(wake.wakeup_id).result(timeout=30)
     assert owner._pending is None and owner._inflight is None
 
 

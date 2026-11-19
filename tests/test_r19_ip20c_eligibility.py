@@ -36,11 +36,13 @@ from suzka.r19.ledger import (
     closure_admissible,
     cycle_key,
     derive_wake_view,
+    review_eligibility,
+    terminal_eligibility,
+)
+from suzka.r19.raw_state import (
     journal_clock_floor,
     raw_claims_of,
-    review_eligibility,
     review_started_after,
-    terminal_eligibility,
     wake_clock_floor,
 )
 from suzka.runtime.agent_runtime import AgentEventType

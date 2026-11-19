@@ -206,7 +206,7 @@ def materialize(
 
 
 def claim(state: Any, wake: WakeV1) -> Any:
-    return state.wake_claim_owner._submit_claim(wake.wakeup_id).result(timeout=30).value
+    return state.wake_claim_owner._submit_wake_claim(wake.wakeup_id).result(timeout=30).value
 
 
 def review(state: Any, claim_id: str) -> Any:
