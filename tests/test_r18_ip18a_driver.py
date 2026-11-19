@@ -139,7 +139,7 @@ def test_the_gate_callback_only_posts_and_is_a_no_op_after_stop() -> None:
     ip16a2._drain(driver)
     driver._stop.set()
     gate.open()
-    assert driver._queue.empty()  # nothing posted, nothing touched
+    assert not any(isinstance(i, _GateOpen) for i in list(driver._queue.queue))  # nothing posted
     assert "d1" in driver._gate_waiting  # the driver's dicts are not touched by the gate thread
     assert len(intent.calls) == 1
 
@@ -192,3 +192,48 @@ def test_without_a_gate_the_driver_is_unchanged() -> None:
     assert driver._queue.empty()
     _row4(driver, preview)
     assert len(intent.calls) == 1
+
+
+def test_a_gate_closed_result_processed_after_the_gate_opened_is_resubmitted_at_once() -> None:
+    """Review P2-1: the driver learns of the result on its next loop; the OPEN
+    message may be handled first. The target must not wait for a later OPEN."""
+
+    gate = SweepGate(enabled=True)
+    driver, intent, preview, _policy, _clock = _gated_driver(gate)
+    driver._subscribe_gate()
+    _row4(driver, preview)
+    # The result arrives (future resolved) but the loop has not drained it ...
+    _resolve(intent.futures[-1], _gate_closed())
+    # ... the gate opens and its message is handled first (nothing waiting yet).
+    gate.open()
+    assert _pump(driver) == 1 and len(intent.calls) == 1
+    ip16a2._drain(driver)  # ... and only now the HOLD is processed
+    assert len(intent.calls) == 2 and not driver._gate_waiting
+
+
+def test_a_policy_gate_closed_result_processed_after_the_gate_opened_is_rescanned_at_once() -> None:
+    gate = SweepGate(enabled=True)
+    driver, _intent, _preview, policy, _clock = _gated_driver(gate, policy=True)
+    assert policy is not None
+    driver._subscribe_gate()
+    driver._maybe_policy("intent-a")
+    _resolve(
+        policy.futures[-1],
+        _PolicyResult(PolicyCommitStatus.HOLD, "intent-a", R18PolicyReason.ADMISSION_GATE_CLOSED),
+    )
+    gate.open()
+    _pump(driver)
+    n = len(policy.calls)
+    ip16a2._drain(driver)
+    assert policy.calls[n:] == [("scan", None)]
+
+
+def test_a_completed_submission_wakes_the_driver_loop() -> None:
+    from suzka.r16.driver import _Wake
+
+    gate = SweepGate(enabled=True)
+    driver, intent, preview, _policy, _clock = _gated_driver(gate)
+    _row4(driver, preview)
+    driver._queue.queue.clear()
+    _resolve(intent.futures[-1], _gate_closed())
+    assert any(isinstance(i, _Wake) for i in list(driver._queue.queue))

@@ -48,6 +48,7 @@ from suzka.r18.outcome_owner import (
 )
 from suzka.r18.sweep import GateState, SweepGate
 from suzka.r18.target import (
+    TargetUnavailable,
     TargetNotStarted,
     TargetReader,
     TargetStore,
@@ -853,3 +854,147 @@ def test_unqualified_bindings_are_refused(tmp_path: Path) -> None:
             runtime_instance_id=ME, gate=SweepGate(enabled=True), outcome_owner=object(),  # type: ignore[arg-type]
             read_records=lambda: AdoptedRecords(None, ()), has_exclusive_authority=lambda: True,
         )
+
+
+def test_a_transient_history_read_error_is_retried_before_the_write_is_given_up(world: _World) -> None:
+    real = world.executor._read_records
+    state = {"n": 0}
+
+    def flaky() -> AdoptedRecords:
+        state["n"] += 1
+        if state["n"] == 2:  # the first read is the sweep's; this is the adoption read
+            raise OSError("transient")
+        if state["n"] == 3:
+            return AdoptedRecords("history", ())
+        return real()
+
+    _opened(world)
+    state["n"] = 1
+    world.executor._read_records = flaky
+    world.executor.enqueue(world.claim)
+    _run(world)
+    assert world.sleeps == [0.5, 1.0]
+    assert world.writes == 1 and world.status().artifact is not None  # not burned into ABSENT
+    assert world.outcome.committed[world.claim.claim_id].outcome_state is VerifiedState.ACTIVE_VERIFIED_AUTHORIZED
+
+
+def test_a_persistent_history_read_error_still_means_do_not_write(world: _World) -> None:
+    _opened(world)
+    world.executor._read_records = lambda: AdoptedRecords("history", ())
+    world.executor.enqueue(world.claim)
+    _run(world)
+    assert world.sleeps == [0.5, 1.0] and world.writes == 0 and world.status().artifact is None
+
+
+def test_history_read_retries_stop_at_the_deadline(tmp_path: Path) -> None:
+    world = _World(tmp_path, deadline=DEADLINE)
+    try:
+        _opened(world)
+        world.clock.advance(5 * 60)
+        world.executor._read_records = lambda: AdoptedRecords("history", ())
+        world.executor.enqueue(world.claim)
+        _run(world)
+        assert world.sleeps == []
+    finally:
+        world.close()
+
+
+def test_a_persistent_not_settled_reaches_the_budget(world: _World) -> None:
+    world.outcome.script = [
+        _OutcomeResult(OutcomeStatus.HOLD, None, R18OutcomeReason.NOT_SETTLED) for _ in range(100)
+    ]
+    _opened(world)
+    world.executor.enqueue(world.claim)
+    _run(world)
+    for _ in range(3000):
+        if world.claim.claim_id not in world.executor.unsettled_ids():
+            break
+        world.clock.advance(60)
+        world.executor.tick()
+        _run(world)
+    assert len(world.outcome.calls) == OUTCOME_SUBMIT_BUDGET
+    assert world.claim.claim_id not in world.executor.unsettled_ids()
+
+
+def test_an_unexpected_sweep_error_keeps_the_gate_closed_with_backoff_then_blocked(world: _World) -> None:
+    def boom() -> AdoptedRecords:
+        raise ValueError("unexpected")
+
+    world.executor._read_records = boom
+    world.executor.start()
+    _run(world)
+    assert world.gate.state is GateState.SWEEPING
+    states = set()
+    for _ in range(60):
+        world.clock.advance(2)
+        world.executor.tick()
+        _run(world)
+        states.add(world.gate.state)
+    assert GateState.BLOCKED_TARGET in states  # never stuck at SWEEPING forever
+
+
+def test_the_probe_backoff_is_only_reset_by_a_successful_settle(world: _World) -> None:
+    _opened(world)
+    world.executor._probe_index = 4
+    world.executor._target_ok()
+    assert world.executor._probe_index == 4  # a reopened gate alone does not reset it
+    world.executor.enqueue(world.claim)
+    _run(world)
+    assert world.executor._probe_index == 0  # a settle did
+
+
+def test_s1_recovers_a_hot_rollback_journal_that_blocks_a_read_only_open(tmp_path: Path) -> None:
+    """A crash mid-transaction leaves a hot ``-journal``: a read-only open
+    fails until a read-write open recovers it, which is what S1 does first."""
+
+    import os
+    import shutil
+    import sqlite3
+
+    root = tmp_path / "hot"
+    work = root / "work"
+    work.mkdir(parents=True)
+    os.chmod(root, 0o700)
+    os.chmod(work, 0o700)
+    TargetStore.create(work / "target.sqlite3", target_namespace="review-artifact").close()
+    writer = sqlite3.connect(work / "target.sqlite3", isolation_level=None)
+    crashed = root / "crashed"
+    crashed.mkdir(mode=0o700)
+    try:
+        writer.execute("PRAGMA cache_size=2")
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("DROP TRIGGER target_artifacts_revert_only")
+        for number in range(400):  # enough pages to spill: the journal is written
+            writer.execute(
+                "INSERT INTO target_artifacts VALUES (?, 'ACTIVE', 1, ?)", (f"{number:064x}", b"x" * 1500)
+            )
+        for name in ("target.sqlite3", "target.sqlite3-journal"):
+            shutil.copy2(work / name, crashed / name)  # the state a crash leaves
+        writer.execute("ROLLBACK")
+    finally:
+        writer.close()
+    path = crashed / "target.sqlite3"
+    assert (crashed / "target.sqlite3-journal").exists()
+    with pytest.raises(TargetUnavailable):
+        TargetReader.open(path)
+    clock = _Clock()
+    gate = SweepGate(enabled=True)
+    executor = R18Executor(
+        target_path=path, runtime_instance_id=ME, gate=gate,
+        outcome_owner=_FakeOutcome(path, (None, None)),
+        read_records=lambda: AdoptedRecords(None, ()), has_exclusive_authority=lambda: True,
+        clock=clock, monotonic=clock.monotonic, threaded=False,
+    )
+    try:
+        executor.start()
+        executor.run_pending()
+        assert gate.is_open()
+        assert not (crashed / "target.sqlite3-journal").exists()
+        reader = TargetReader.open(path)  # now readable, and the half-done rows are gone
+        try:
+            assert reader.meta().runtime_instance_id == ME
+            assert reader._read("SELECT count(*) FROM target_artifacts") == [(0,)]
+        finally:
+            reader.close()
+    finally:
+        executor.stop()

@@ -23,6 +23,12 @@ retry" (F07): only a ``TargetNotStarted`` (``BEGIN IMMEDIATE`` failed, so
 nothing ran) is retried, at most twice within the Commitment deadline;
 every other failure is "unknown" and is settled by a fence, never re-sent.
 
+Known limits (documented, not defects): a settle that failed is retried by
+the reconciler on the Outcome back-off, so it can wait up to 10 minutes after
+the gate has re-opened. Gate OPEN transitions can flap when the target fails
+at each settle (each OPEN posts one Policy scan and re-submits waiting
+Intents); the probe back-off is therefore only reset by a successful settle.
+
 Structured log lines (public-safe: ids and 8-hex digest prefixes only) are
 the R20 transition trail: ``R18_EXEC ...`` and ``R18_SWEEP ...``.
 """
@@ -88,6 +94,8 @@ OUTCOME_SUBMIT_BUDGET: Final = 20
 OUTCOME_WAIT_SECONDS: Final = 120.0
 # TargetNotStarted: at most two more tries, after 1 s and 2 s.
 NOT_STARTED_RETRY_DELAYS: Final = (1.0, 2.0)
+# The adoption read before a write (review P3-c).
+HISTORY_READ_RETRY_DELAYS: Final = (0.5, 1.0)
 # BLOCKED_TARGET only after the target failed continuously for this long
 # (one full back-off round); the probe then continues every 60 s.
 BLOCKED_AFTER_SECONDS: Final = 60.0
@@ -479,7 +487,7 @@ class R18Executor:
                 self._log_exec(claim, _Stage.SETTLE, row.kind.value, "CLAIMED")
                 settled.append(claim)
             self._sweep_log("S3", f"settled={len(settled)}")
-        except (TargetError, OSError, _SweepRetry) as error:
+        except Exception as error:  # anything: the gate stays closed, with back-off
             self._reopen()
             self._target_failed(error)
             return
@@ -522,10 +530,17 @@ class R18Executor:
         self._sweep_log("FAIL", f"error={type(error).__name__} blocked={'yes' if blocked else 'no'}")
 
     def _target_ok(self) -> None:
+        # Damping (review P3-d): the probe index is NOT reset here, only when a
+        # settle succeeds (``_settle_ok``), so a target that fails at every
+        # settle backs off further on each flap instead of re-opening the gate
+        # every 1-2 s.
         with self._lock:
             self._down_since = None
-            self._probe_index = 0
         self._gate.open()
+
+    def _settle_ok(self) -> None:
+        with self._lock:
+            self._probe_index = 0
 
     # ------------------------------------------------------- the execute job
 
@@ -536,10 +551,7 @@ class R18Executor:
         chain: tuple[ActionIntentV1, ApprovalChallengeV1] | None = None
         write = True
         # 1. Adoption check. When in doubt, do not write.
-        try:
-            records = self._read_records()
-        except Exception:
-            records = None
+        records = self._read_with_retries(claim)
         if records is None or records.blocked is not None:
             write = False
             self._log_exec(claim, _Stage.ADOPTION, "ERROR(history)", "IN_DOUBT")
@@ -565,6 +577,26 @@ class R18Executor:
             return
         # 5. Hand to the Outcome event.
         self._outcome_attempt(claim.claim_id)
+
+    def _read_with_retries(self, claim: ExecutionClaimV1) -> AdoptedRecords | None:
+        """The adoption read, with up to two short bounded retries (0.5 s, 1 s)
+        within the deadline (review P3-c): a single transient read error must
+        not burn the Human's approval into VERIFIED_ABSENT. After the retries
+        the rule is unchanged: when in doubt, do not write."""
+
+        records: AdoptedRecords | None = None
+        for attempt in range(len(HISTORY_READ_RETRY_DELAYS) + 1):
+            try:
+                records = self._read_records()
+            except Exception:
+                records = None
+            if records is not None and records.blocked is None:
+                return records
+            if attempt >= len(HISTORY_READ_RETRY_DELAYS) or not self._before_deadline(claim):
+                break
+            if self._sleep(HISTORY_READ_RETRY_DELAYS[attempt]):
+                break
+        return records
 
     def _write(self, claim: ExecutionClaimV1, chain: tuple[ActionIntentV1, ApprovalChallengeV1]) -> None:
         intent, challenge = chain
@@ -624,6 +656,7 @@ class R18Executor:
             self._target_failed(error)
             return False
         self._log_exec(claim, _Stage.SETTLE, row.kind.value, "IN_DOUBT")
+        self._settle_ok()
         self._register_settled(claim)
         return True
 
@@ -639,12 +672,14 @@ class R18Executor:
             entry.settle_queued = False
             entry.next_try = self._monotonic()
 
-    def _settle_failed(self, claim_id: str) -> None:
+    def _settle_failed(self, claim_id: str, *, consumed: bool = False) -> None:
         now = self._monotonic()
         with self._lock:
             entry = self._unsettled.get(claim_id)
             if entry is None:
                 return
+            if consumed:
+                entry.submits += 1
             entry.needs_settle = True
             entry.settle_queued = False
             entry.attempts += 1
@@ -748,7 +783,9 @@ class R18Executor:
         reason = value.reason
         assert reason is not None
         if reason is R18OutcomeReason.NOT_SETTLED:
-            self._settle_failed(claim_id)
+            # Review P3-a: this submit counts, so a persistent NOT_SETTLED
+            # reaches the per-claim budget like any other HOLD.
+            self._settle_failed(claim_id, consumed=True)
         elif reason in TRANSIENT_OUTCOME_REASONS or reason in (
             R18OutcomeReason.TARGET_CORRUPT,
             R18OutcomeReason.SOURCE_UNAVAILABLE,

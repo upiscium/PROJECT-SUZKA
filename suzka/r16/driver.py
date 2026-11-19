@@ -267,6 +267,11 @@ class _PolicyScan:
 
 
 @dataclass(frozen=True, slots=True)
+class _Wake:
+    """Queue item: a result of the driver's own submission is ready."""
+
+
+@dataclass(frozen=True, slots=True)
 class _GateOpen:
     """Queue item: the AdmissionGate moved into OPEN (IP-18a, §3-6)."""
 
@@ -614,6 +619,12 @@ class R16Driver:
             # one append under a short lock; no sleep, submit or I/O here.
             with self._tickets_lock:
                 self._done.append(_Done(stage, future, context))
+            # IP-18a review P2-1: wake the loop (non-blocking, never counted as
+            # a drop), so a result is not seen only at the next 0.2 s poll.
+            try:
+                self._queue.put_nowait(_Wake())
+            except queue.Full:
+                pass
 
         return done
 
@@ -1059,6 +1070,11 @@ class R16Driver:
         self._gate_waiting[target.decision_id] = target
         while len(self._gate_waiting) > OBSERVED_CAPACITY:
             del self._gate_waiting[next(iter(self._gate_waiting))]
+        if self._gate is not None and self._gate.is_open():
+            # The gate opened while this result was in flight: its OPEN
+            # message was handled before this target was remembered.
+            self._gate_waiting.pop(target.decision_id, None)
+            self._maybe_intent_target(target)
 
     def _intent_done(self, target: _IntentTarget, value: object) -> None:
         if (
@@ -1184,6 +1200,17 @@ class R16Driver:
             if target.intent_id is not None:
                 self._policed.pop(target.intent_id, None)
                 self._policy_retries.pop(target.intent_id, None)
+            if (
+                self._gate is not None
+                and self._gate.is_open()
+                and self._active
+                and self._policy is not None
+                and self._policy.enabled
+            ):
+                # Opened while the result was in flight (review P2-1).
+                self._policy_scans = 0
+                self._policy_scan_posted = True
+                self._maybe_policy_scan(None)
             return
         if target.scan:
             # Chained on the result's intent id; a HOLD on one Intent is
