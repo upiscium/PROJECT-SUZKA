@@ -707,5 +707,8 @@ def test_r19_imports_stay_pure() -> None:
     assert not any(isinstance(node, ast.Import) for node in ast.walk(tree))
     # ``ledger`` (IP-20a) and ``materializer`` (IP-20b) are submodules, imported by module, not re-exported.
     assert set(r19.__all__) == {
-        name for name in dir(r19) if not name.startswith("_") and name not in {"contracts", "ledger", "materializer"}
+        name
+        for name in dir(r19)
+        if not name.startswith("_")
+        and name not in {"contracts", "ledger", "materializer", "claim_owner", "review_owner", "raw_state"}
     }

@@ -87,8 +87,10 @@ from suzka.r16.decision_issuer import _DecisionIssuer
 from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
 from suzka.r17.expectation_issuer import ExpectationIssuerV1
 from suzka.r17.feedback_owner import FeedbackOwnerV1
+from suzka.r19.claim_owner import WakeClaimOwnerV1
 from suzka.r19.contracts import WakeTiming
 from suzka.r19.materializer import WakeMaterializerV1
+from suzka.r19.review_owner import WakeReviewOwnerV1
 from suzka.r18.approval_api import mount_approval_api
 from suzka.r18.approval_owner import ApprovalChallengeOwnerV1
 from suzka.r18.executor import ClaimKeys, R18Executor
@@ -555,6 +557,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise StateRecoveryError("R17 feedback owner unavailable")
             return owner
 
+        # IP-20c: the Wake claim / terminal owner and the Wake review owner.
+        def _r19_wake_claim_owner_for_commit(
+            event: AgentEvent,
+        ) -> WakeClaimOwnerV1 | None:
+            owner = getattr(app.state, "wake_claim_owner", None)
+            if owner is None and event.event_type in {
+                AgentEventType.R19_WAKE_CLAIM,
+                AgentEventType.R19_WAKE_TERMINAL,
+            }:
+                raise StateRecoveryError("R19 Wake claim owner unavailable")
+            return owner
+
+        def _r19_wake_review_owner_for_commit(
+            event: AgentEvent,
+        ) -> WakeReviewOwnerV1 | None:
+            owner = getattr(app.state, "wake_review_owner", None)
+            if owner is None and event.event_type is AgentEventType.R16_WAKE_REVIEW:
+                raise StateRecoveryError("R16 Wake review owner unavailable")
+            return owner
+
         def _r19_wake_materializer_for_commit(
             event: AgentEvent,
         ) -> WakeMaterializerV1 | None:
@@ -613,6 +635,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             feedback_owner = getattr(app.state, "feedback_owner", None)
             if feedback_owner is not None:
                 feedback_owner._clear()
+            wake_claim_owner = getattr(app.state, "wake_claim_owner", None)
+            if wake_claim_owner is not None:
+                wake_claim_owner._clear()
+            wake_review_owner = getattr(app.state, "wake_review_owner", None)
+            if wake_review_owner is not None:
+                wake_review_owner._clear()
             policy_owner = getattr(app.state, "policy_owner", None)
             if policy_owner is not None:
                 policy_owner._clear()
@@ -658,6 +686,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 feedback_owner = _r17_feedback_owner_for_commit(event)
                 if feedback_owner is not None:
                     feedback_owner._validate_commit(event)
+                wake_claim_owner = _r19_wake_claim_owner_for_commit(event)
+                if wake_claim_owner is not None:
+                    wake_claim_owner._validate_commit(event)
+                wake_review_owner = _r19_wake_review_owner_for_commit(event)
+                if wake_review_owner is not None:
+                    wake_review_owner._validate_commit(event)
                 policy_owner = _r18_policy_owner_for_commit(event)
                 if policy_owner is not None:
                     policy_owner._validate_commit(event)
@@ -957,6 +991,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.intent_issuer = None
             app.state.expectation_issuer = None
             app.state.feedback_owner = None
+            app.state.wake_claim_owner = None
+            app.state.wake_review_owner = None
             app.state.policy_owner = None
             app.state.approval_owner = None
             app.state.outcome_owner = None
@@ -1021,6 +1057,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.decision_issuer,
                     app.state.agent_runtime,
                     enabled=app_settings.r18.enabled,
+                )
+                # IP-20c (#411 IP-20 D1 r3 §2): the Wake claim / terminal owner
+                # and the Wake review owner, installed beside the Decision
+                # issuer. With r19.enabled false every event HOLDs
+                # R19_DISABLED before anything is read, and no Scheduler
+                # exists to submit one (IP-20d).
+                _wake_timing = WakeTiming(
+                    goal_wake_delay_s=app_settings.r19.goal_wake_delay_s,
+                    commitment_wake_delay_s=app_settings.r19.commitment_wake_delay_s,
+                    feedback_wake_delay_s=app_settings.r19.feedback_wake_delay_s,
+                    deadline_margin_s=app_settings.r19.deadline_margin_s,
+                    claim_lease_s=app_settings.r19.claim_lease_s,
+                    tick_s=app_settings.r19.tick_s,
+                )
+                app.state.wake_claim_owner = WakeClaimOwnerV1(
+                    app.state.decision_issuer,
+                    app.state.agent_runtime,
+                    enabled=app_settings.r19.enabled,
+                    timing=_wake_timing,
+                )
+                app.state.wake_review_owner = WakeReviewOwnerV1(
+                    app.state.decision_issuer,
+                    app.state.agent_runtime,
+                    enabled=app_settings.r19.enabled,
+                    timing=_wake_timing,
                 )
                 # IP-17a (#411 D1 r7 §1/§2): the R18 Policy owner, installed
                 # and gated exactly like the Intent issuer.
