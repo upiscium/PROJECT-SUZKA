@@ -926,3 +926,27 @@ def test_a_failing_or_absent_hook_never_stops_the_driver() -> None:
     )
     assert plain._on_cause_terminal is None
     plain._cause_terminal()
+
+
+def test_an_outcome_that_does_not_reach_its_goal_is_a_binding_mismatch(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import suzka.r19.materializer as module
+
+    with TestClient(app) as client:
+        state = client.app.state
+        _gid, intent, _forecast, _claim = ip19._chain_to_claim(state)
+        _only_outcome_causes(state)
+        ip19._commit_outcome(state, intent)
+        ip19._assess(state)
+        ip19._feedback(state)
+        reader = module.SubjectHistoryReader
+        real = reader.classify
+
+        def no_chains(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            from dataclasses import replace
+
+            return replace(real(self, *args, **kwargs), chains={})
+
+        monkeypatch.setattr(reader, "classify", no_chains)
+        _assert_skip_writes_nothing(
+            state, _scan(state), [(WakeCause.FEEDBACK_ADMITTED, SkipReason.BINDING_MISMATCH)]
+        )

@@ -908,7 +908,6 @@ class WakeMaterializerV1:
 
     def _clear(self) -> None:
         self._pending = None
-        self._inflight = None
 
 
 # ------------------------------------------------------------------- values
