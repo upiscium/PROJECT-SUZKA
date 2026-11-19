@@ -8,6 +8,7 @@ The runtime consumers (the sweep, ``prior_claims()``, the Decision issuer's
 
 from __future__ import annotations
 
+import datetime as _dt
 from collections import Counter
 from hashlib import sha256
 from itertools import product
@@ -236,7 +237,7 @@ def _states(tmp_path: Path):  # type: ignore[no-untyped-def]
     store.fence(GROUP, Direction.FORWARD)
     out.append(("fenced", store, intent, challenge))
     store, intent, challenge, claim = new("effect")
-    store.forward_write(intent, challenge, claim)
+    store.forward_write(intent, challenge, claim, now=lambda: _dt.datetime(2026, 11, 16, 0, 6, tzinfo=_dt.timezone.utc))
     out.append(("effect", store, intent, challenge))
     store, intent, challenge, claim = new("mixed")
     _outside(
@@ -247,11 +248,11 @@ def _states(tmp_path: Path):  # type: ignore[no-untyped-def]
     store.fence(GROUP, Direction.FORWARD)
     out.append(("fenced_with_artifact", store, intent, challenge))
     store, intent, challenge, claim = new("gone")
-    store.forward_write(intent, challenge, claim)
+    store.forward_write(intent, challenge, claim, now=lambda: _dt.datetime(2026, 11, 16, 0, 6, tzinfo=_dt.timezone.utc))
     _outside(store, "DELETE FROM target_artifacts")
     out.append(("effect_artifact_gone", store, intent, challenge))
     store, intent, challenge, claim = new("tampered")
-    store.forward_write(intent, challenge, claim)
+    store.forward_write(intent, challenge, claim, now=lambda: _dt.datetime(2026, 11, 16, 0, 6, tzinfo=_dt.timezone.utc))
     _outside(store, "UPDATE target_artifacts SET payload = x'00'")
     out.append(("effect_foreign", store, intent, challenge))
     return out
