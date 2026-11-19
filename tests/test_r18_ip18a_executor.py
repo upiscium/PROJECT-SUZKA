@@ -934,13 +934,30 @@ def test_an_unexpected_sweep_error_keeps_the_gate_closed_with_backoff_then_block
 
 
 def test_the_probe_backoff_is_only_reset_by_a_successful_settle(world: _World) -> None:
-    _opened(world)
-    world.executor._probe_index = 4
-    world.executor._target_ok()
-    assert world.executor._probe_index == 4  # a reopened gate alone does not reset it
-    world.executor.enqueue(world.claim)
+    ex = world.executor
+    delays = []
+    for _ in range(3):  # fail, reopen, fail, reopen ...: each outage backs off further
+        before = world.clock.monotonic()
+        ex._target_failed(OSError("down"))
+        delays.append(ex._next_probe - before)
+        ex._target_ok()
+    assert delays == [1.0, 2.0, 4.0]
+    # Saturated: recovery after an outage stays within one steady period.
+    for _ in range(10):
+        ex._target_failed(OSError("down"))
+        ex._target_ok()
+    before = world.clock.monotonic()
+    ex._target_failed(OSError("down"))
+    assert ex._next_probe - before == executor_module.PROBE_STEADY_SECONDS <= 60.0
+    ex._target_ok()
+    ex.start()
     _run(world)
-    assert world.executor._probe_index == 0  # a settle did
+    ex.enqueue(world.claim)
+    _run(world)  # a successful settle resets the index
+    assert ex._probe_index == 0
+    before = world.clock.monotonic()
+    ex._target_failed(OSError("down"))
+    assert ex._next_probe - before == 1.0
 
 
 def test_s1_recovers_a_hot_rollback_journal_that_blocks_a_read_only_open(tmp_path: Path) -> None:

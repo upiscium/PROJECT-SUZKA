@@ -513,7 +513,6 @@ class R18Executor:
         with self._lock:
             if self._down_since is None:
                 self._down_since = now
-                self._probe_index = 0
             elapsed = now - self._down_since
             if self._probe_index < len(PROBE_DELAYS) and elapsed < BLOCKED_AFTER_SECONDS:
                 delay = PROBE_DELAYS[self._probe_index]
