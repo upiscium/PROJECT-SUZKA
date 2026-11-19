@@ -82,7 +82,8 @@ def _claim_check(records, wake, now=T_DUE, *, live=None, floor=None, raw=None, c
     if raw is None:
         raw = () if entry is None else entry.claims
     return claim_eligibility(
-        entry, now=now, live=live, floor=floor, raw_claims=raw, cycle_key_live=cycle_live
+        entry, incarnation_id=INC, now=now, live=live, floor=floor, raw_claims=raw,
+        cycle_key_live=cycle_live,
     )
 
 
@@ -349,7 +350,7 @@ def test_one_review_per_claim_holds_a_second() -> None:
 def _terminal_check(records, wake, reason, now, *, raw=None, cycle_live=False, floor=None, newer=None):  # type: ignore[no-untyped-def]
     entry = _entry(records, now, wake)
     return terminal_eligibility(
-        entry, reason, now=now, live=None, floor=floor,
+        entry, reason, incarnation_id=INC, now=now, live=None, floor=floor,
         raw_claims=(entry.claims if raw is None else raw),
         cycle_key_live=cycle_live, superseding=newer,
     )
@@ -563,3 +564,42 @@ def test_an_undecodable_raw_envelope_is_an_error_not_a_count(value: bytes) -> No
     )
     with pytest.raises((ValueError, TypeError)):
         raw_claims_of([bad], wake.wakeup_id)
+
+
+def test_expired_wake_waits_for_a_live_lease_and_a_corrupt_successor_is_refused() -> None:
+    """``EXPIRED_PENDING_LEASE`` writes nothing (#373 A3-3); a lease can only
+    outlive the expiry in a hand-built claim, so that is what this builds."""
+
+    from dataclasses import replace
+
+    from suzka.r19.contracts import WakeCause
+
+    wake = _wake(expires_at_utc="2026-11-16T02:10:00Z")
+    long_claim = replace(_claim(wake), claim_lease_expires_utc="2026-11-16T02:30:00Z")
+    rows = [_wake_rec(wake), _claim_rec(long_claim)]
+    now = _at("2026-11-16T02:11:00Z")
+    E = TerminalReason.EXPIRED_WAKE
+    assert _terminal_check(rows, wake, E, now).hold is WakeHold.NOT_DUE
+    assert _terminal_check(rows, wake, E, _at("2026-11-16T02:30:00Z")).proceed
+    # SUPERSEDED with a corrupt successor (a duplicate Wake record).
+    old = _wake(WakeCause.GOAL_ADMITTED)
+    new = _wake(evidence_fingerprint="e" * 64, not_before_utc="2026-11-16T01:30:00Z")
+    corrupt = _entry([_wake_rec(new), _wake_rec(new)], T_DUE, new)
+    assert corrupt is not None and corrupt.state.value == "CORRUPT"
+    held = _terminal_check([_wake_rec(old)], old, TerminalReason.SUPERSEDED, T_DUE, newer=corrupt)
+    assert held.hold is WakeHold.NOT_SUPERSEDABLE
+
+
+def test_a_wake_of_another_incarnation_is_a_mismatch_hold_for_claims_and_terminals() -> None:
+    wake = _wake()
+    entry = _entry([_wake_rec(wake)], T_DUE, wake)
+    other = "c" * 64
+    claim = claim_eligibility(
+        entry, incarnation_id=other, now=T_DUE, live=None, floor=None, raw_claims=(), cycle_key_live=False
+    )
+    assert claim.hold is WakeHold.INCARNATION_MISMATCH
+    ended = terminal_eligibility(
+        entry, TerminalReason.EXPIRED_WAKE, incarnation_id=other, now=_at(EXPIRES), live=None,
+        floor=None, raw_claims=(), cycle_key_live=False,
+    )
+    assert ended.hold is WakeHold.INCARNATION_MISMATCH

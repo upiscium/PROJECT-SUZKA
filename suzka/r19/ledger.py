@@ -580,6 +580,7 @@ def _clock_hold(
 def claim_eligibility(
     entry: WakeEntry | None,
     *,
+    incarnation_id: str,
     now: datetime,
     live: datetime | None,
     floor: datetime | None,
@@ -601,6 +602,9 @@ def claim_eligibility(
         return Eligibility(WakeHold.WAKE_UNKNOWN)
     if entry.state is WakeState.CORRUPT:
         return Eligibility(WakeHold.WAKE_CORRUPT)
+    if entry.wake.incarnation_id != incarnation_id:
+        # The trigger requires the Wake of this incarnation (a mismatch ABORTs).
+        return Eligibility(WakeHold.INCARNATION_MISMATCH)
     if entry.terminal is not None:
         return Eligibility(WakeHold.WAKE_TERMINAL)
     if entry.closure is not None:
@@ -724,6 +728,7 @@ def terminal_eligibility(
     entry: WakeEntry | None,
     reason: TerminalReason,
     *,
+    incarnation_id: str,
     now: datetime,
     live: datetime | None,
     floor: datetime | None,
@@ -744,6 +749,8 @@ def terminal_eligibility(
         return Eligibility(WakeHold.WAKE_UNKNOWN)
     if entry.state is WakeState.CORRUPT:
         return Eligibility(WakeHold.WAKE_CORRUPT)
+    if entry.wake.incarnation_id != incarnation_id:
+        return Eligibility(WakeHold.INCARNATION_MISMATCH)
     if entry.terminal is not None:
         return Eligibility(WakeHold.WAKE_TERMINAL)
     if entry.closure is not None:

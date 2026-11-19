@@ -308,6 +308,10 @@ class _WakeOwnerBase:
         headroom), then the pending state and the participant.  A collision
         that reached PREPARE would be a runtime fail-stop (IP-14b §2-6)."""
 
+        # The store refuses PREPARE of a switched-off family (a fail-stop at
+        # PREPARE): check the store's own switch, not only this owner's.
+        if not self._store._r19_enabled:
+            raise _Hold(WakeHold.R19_DISABLED)
         collisions = self._store.prepare_collisions(operation)
         if collisions.live_keys:
             raise _Hold(WakeHold.IN_FLIGHT)
@@ -437,6 +441,13 @@ class WakeClaimOwnerV1(_WakeOwnerBase):
         except _Hold as hold:
             self._pending = None
             return self._hold(claiming, hold.reason, wakeup_id)
+        except (ValueError, TypeError):
+            # A builder or decoder refused a value: nothing was prepared, and a
+            # claim or terminal has no per-event cap, so it must be a logged HOLD
+            # (never an event failure the Scheduler would re-submit every tick).
+            self._pending = None
+            LOGGER.warning("R19 wake owner: a record could not be built", exc_info=True)
+            return self._hold(claiming, WakeHold.UNREPRESENTABLE, wakeup_id)
 
     @staticmethod
     def _hold(claiming: bool, reason: WakeHold, wakeup_id: str) -> object:
@@ -478,6 +489,7 @@ class WakeClaimOwnerV1(_WakeOwnerBase):
         )
         check = claim_eligibility(
             entry,
+            incarnation_id=incarnation,
             now=now,
             live=live,
             floor=floor,
@@ -555,6 +567,7 @@ class WakeClaimOwnerV1(_WakeOwnerBase):
         check = terminal_eligibility(
             entry,
             reason,
+            incarnation_id=incarnation,
             now=now,
             live=live,
             floor=floor,

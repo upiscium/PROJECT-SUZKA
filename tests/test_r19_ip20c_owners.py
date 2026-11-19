@@ -847,3 +847,127 @@ def test_a_hold_after_the_pending_state_was_set_leaves_none_behind(world) -> Non
     assert state.wake_claim_owner._pending is None
     assert fx.claim(state, wake).status is ClaimStatus.COMMITTED
     _no_failed_events(state)
+
+
+# ---------------------------------------------------- review round (P2 fixes)
+
+
+def test_a_store_with_r19_off_is_a_hold_even_if_the_owner_is_enabled(world) -> None:  # type: ignore[no-untyped-def]
+    """The store refuses PREPARE of a switched-off family (a fail-stop); the
+    owner checks the store's own switch too."""
+
+    state, clock, monkeypatch = world.state, world.time, world.monkeypatch
+    wake = fx.materialize(state, world.gid, clock)
+    prepares = _Prepares(monkeypatch)
+    rows = _count(state)
+    monkeypatch.setattr(state.subject_history_store, "_r19_enabled", False)
+    held = fx.claim(state, wake)
+    assert (held.status, held.hold) == (ClaimStatus.HOLD, WakeHold.R19_DISABLED)
+    assert prepares.count == 0 and _count(state) == rows
+    _no_failed_events(state)
+
+
+def test_a_builder_failure_is_a_logged_hold_never_an_event_failure(world) -> None:  # type: ignore[no-untyped-def]
+    state, clock, monkeypatch = world.state, world.time, world.monkeypatch
+    wake = fx.materialize(
+        state, world.gid, clock, not_before=-600, expires=300
+    )
+    rows = _count(state)
+
+    def broken(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise ValueError("a builder refused")
+
+    clock.advance(301)
+    with monkeypatch.context() as patch:
+        patch.setattr(WakeTerminalV1, "for_wake", broken)
+        held = fx.terminal(state, wake, TerminalReason.EXPIRED_WAKE)
+    assert (held.status, held.hold) == (TerminalStatus.HOLD, WakeHold.UNREPRESENTABLE)
+    with monkeypatch.context() as patch:
+        patch.setattr(WakeClaimV1, "for_wake", broken)
+        held_claim = fx.claim(state, wake)
+    assert held_claim.hold in (WakeHold.UNREPRESENTABLE, WakeHold.OUTSIDE_WAKE_WINDOW)
+    assert _count(state) == rows
+    _no_failed_events(state)
+
+
+def test_a_review_builder_or_evaluation_failure_is_a_hold(world) -> None:  # type: ignore[no-untyped-def]
+    state, clock, monkeypatch = world.state, world.time, world.monkeypatch
+    wake = fx.materialize(state, world.gid, clock)
+    claimed = fx.claim(state, wake)
+
+    def broken(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise ValueError("evaluation refused")
+
+    rows = _count(state)
+    monkeypatch.setattr(state.decision_issuer, "_evaluate", broken)
+    held = fx.review(state, claimed.claim.claim_id)
+    assert (held.status, held.hold) == (ReviewStatus.HOLD, WakeHold.UNREPRESENTABLE)
+    assert _count(state) == rows
+    _no_failed_events(state)
+
+
+def test_an_unrepresentable_receipt_still_closes_the_cycle_as_stale(world) -> None:  # type: ignore[no-untyped-def]
+    """D1 §6-1: a HOLD never ends a cycle as FAILED, so when the requested
+    receipt cannot be built the cycle closes as STALE_SOURCE instead."""
+
+    state, clock, monkeypatch = world.state, world.time, world.monkeypatch
+    monkeypatch.setattr(state.decision_issuer, "_interpretation", lambda *args: CONTRADICTORY)
+    wake = fx.materialize(state, world.gid, clock)
+    claimed = fx.claim(state, wake)
+    real = review_owner.HoldReceiptV1
+    seen: list[object] = []
+
+    def picky(*args):  # type: ignore[no-untyped-def]
+        seen.append(args[7])
+        if args[7] is HoldReason.POLICY_HOLD:
+            raise ValueError("policy row not representable")
+        return real(*args)
+
+    monkeypatch.setattr(review_owner, "HoldReceiptV1", picky)
+    result = fx.review(state, claimed.claim.claim_id)
+    assert (result.status, result.hold_reason) == (ReviewStatus.HOLD_RECEIPT, HoldReason.STALE_SOURCE)
+    assert seen == [HoldReason.POLICY_HOLD, HoldReason.STALE_SOURCE]
+    assert _entry(world, wake).state is WakeState.CLOSED
+
+
+def test_a_review_with_a_rolled_back_clock_is_a_recorded_refusal(world) -> None:  # type: ignore[no-untyped-def]
+    """T below the Journal high-water: REFUSED(CLOCK_UNVERIFIABLE) and it counts."""
+
+    state, clock = world.state, world.time
+    wake = fx.materialize(state, world.gid, clock, not_before=-4 * 3600)
+    claimed = fx.claim(state, wake)
+    state.agent_runtime._last_admitted_at = None
+    clock.advance(-3 * 3600)
+    result = fx.review(state, claimed.claim.claim_id)
+    assert (result.status, result.refuse) == (ReviewStatus.ATTEMPT_RECORDED, RefuseReason.CLOCK_UNVERIFIABLE)
+    assert _entry(world, wake).latest_outcome.reason is RefuseReason.CLOCK_UNVERIFIABLE
+
+
+def test_the_review_bound_survives_a_fresh_owner_instance_and_a_crash_loop(world) -> None:  # type: ignore[no-untyped-def]
+    """HD-20-2 (a): the bound is read from the Journal, never from memory, so a
+    restart (a new owner object over the same Journal) adds no review."""
+
+    from suzka.r19.review_owner import WakeReviewOwnerV1
+
+    state, monkeypatch = world.state, world.monkeypatch
+    wake, claim = _claimed(world)
+    with monkeypatch.context() as patch:
+        _no_headroom(SimpleNamespace(state=state, monkeypatch=patch), wake, claim)
+        assert fx.review(state, claim.claim_id).hold is WakeHold.HISTORY_CAPACITY
+    prepares = _Prepares(monkeypatch)
+    rows = _count(state)
+    for _restart in range(5):
+        fresh = WakeReviewOwnerV1(
+            state.decision_issuer, state.agent_runtime, enabled=True, timing=state.wake_review_owner.timing
+        )
+        fresh._clock = world.time.live
+        state.wake_review_owner = fresh
+        result = fresh._submit_review(claim.claim_id).result(timeout=30).value
+        assert (result.status, result.hold) == (ReviewStatus.HOLD, WakeHold.REVIEW_ALREADY_STARTED)
+    assert prepares.count == 0 and _count(state) == rows
+    review_events = [
+        record for record in state.event_journal.inspect().records
+        if record.event_type is review_owner.AgentEventType.R16_WAKE_REVIEW
+        and record.lifecycle.value == "started"
+    ]
+    assert len(review_events) == 6  # the one that ran + five that held at their first read
