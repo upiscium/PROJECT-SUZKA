@@ -118,8 +118,10 @@ def test_soft_band_allow_list_matches_the_design_table() -> None:
         # IP-17c: the CLAIM is refused too (HP-8).
         AgentEventType.R18_EXECUTION_CLAIM,
     }
+    # IP-18a (HD-18-1): the Outcome event is ADMITTED, like the expiry.
+    assert AgentEventType.R18_OUTCOME_COMMIT in SOFT_BAND_ADMITTED_EVENT_TYPES
     assert AgentEventType.GOAL_SELF_PROPOSAL_REVIEW in SOFT_BAND_ADMITTED_EVENT_TYPES
-    assert len(AgentEventType) == 25
+    assert len(AgentEventType) == 26
     assert SOFT_BAND_ADMITTED_EVENT_TYPES <= set(AgentEventType)
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 from suzka.r18.contracts import ApprovalChannel
 
 from dataclasses import replace
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import sqlite3
@@ -56,6 +57,12 @@ from test_r18_ip13_contracts import (
 )
 
 RUNTIME = "00000000-0000-4000-8000-0000000000cc"
+
+
+def _NOW() -> datetime:
+    return datetime(2026, 11, 16, 0, 6, 0, tzinfo=timezone.utc)
+
+
 CLAIM_EVENT = "00000000-0000-4000-8000-000000000003"
 
 
@@ -196,7 +203,7 @@ def test_reader_is_read_only(tmp_path: Path) -> None:
 def test_ledger_and_effects_are_append_only(tmp_path: Path) -> None:
     store = _store(tmp_path)
     intent, challenge, claim = _forward(store)
-    store.forward_write(intent, challenge, claim)
+    store.forward_write(intent, challenge, claim, now=_NOW)
     connection = sqlite3.connect(store.path, isolation_level=None)
     for statement in (
         "UPDATE target_operations SET kind = 'FENCED'",
@@ -215,7 +222,7 @@ def test_ledger_and_effects_are_append_only(tmp_path: Path) -> None:
 def test_forward_write_and_authorized_verification(tmp_path: Path) -> None:
     store = _store(tmp_path)
     intent, challenge, claim = _forward(store)
-    receipt = store.forward_write(intent, challenge, claim)
+    receipt = store.forward_write(intent, challenge, claim, now=_NOW)
     assert (receipt.executor_result, receipt.reported_revision, receipt.reported_payload_digest) == (
         ExecutorResult.APPLIED, 1, intent.payload_digest,
     )
@@ -233,8 +240,8 @@ def test_forward_write_and_authorized_verification(tmp_path: Path) -> None:
 def test_double_execution_is_suppressed_across_reopen(tmp_path: Path) -> None:
     store = _store(tmp_path)
     intent, challenge, claim = _forward(store)
-    assert store.forward_write(intent, challenge, claim).executor_result is ExecutorResult.APPLIED
-    assert store.forward_write(intent, challenge, claim).executor_result is ExecutorResult.CAS_REJECTED
+    assert store.forward_write(intent, challenge, claim, now=_NOW).executor_result is ExecutorResult.APPLIED
+    assert store.forward_write(intent, challenge, claim, now=_NOW).executor_result is ExecutorResult.CAS_REJECTED
     store.close()
     again = TargetStore.open(store.path)
     # A new Decision of the same obligation keeps the forward key: still refused.
@@ -248,7 +255,7 @@ def test_double_execution_is_suppressed_across_reopen(tmp_path: Path) -> None:
         renewed_challenge, runtime_instance_id=RUNTIME, boot_id=BOOT,
         claim_event_id=CLAIM_EVENT, claim_sequence=40, claimed_utc="2026-11-16T00:05:00Z", approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
     )
-    assert again.forward_write(renewed, renewed_challenge, renewed_claim).executor_result is ExecutorResult.CAS_REJECTED
+    assert again.forward_write(renewed, renewed_challenge, renewed_claim, now=_NOW).executor_result is ExecutorResult.CAS_REJECTED
     assert [row.kind for row in again.ledger()] == [LedgerKind.EFFECT]
 
 
@@ -261,9 +268,9 @@ def test_the_written_bytes_must_be_the_approved_bytes(tmp_path: Path) -> None:
         claim_event_id=CLAIM_EVENT, claim_sequence=22, claimed_utc="2026-11-16T00:05:00Z", approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
     )
     with pytest.raises(TargetBindingError, match="approve"):
-        store.forward_write(intent, wrong, wrong_claim)
+        store.forward_write(intent, wrong, wrong_claim, now=_NOW)
     with pytest.raises(TargetBindingError, match="claim"):
-        store.forward_write(intent, challenge, replace(claim, nonce="0" * 64))
+        store.forward_write(intent, challenge, replace(claim, nonce="0" * 64), now=_NOW)
     other_target = replace(intent, target_instance_id="00000000-0000-4000-8000-0000000000ff")
     other_challenge = ApprovalChallengeV1.for_forward(
         other_target, "e" * 64, _allow(other_target),
@@ -274,7 +281,7 @@ def test_the_written_bytes_must_be_the_approved_bytes(tmp_path: Path) -> None:
         claim_event_id=CLAIM_EVENT, claim_sequence=22, claimed_utc="2026-11-16T00:05:00Z", approval_channel=ApprovalChannel.LOCAL_LOOPBACK_TYPED_CODE_V1,
     )
     with pytest.raises(TargetBindingError, match="another target"):
-        store.forward_write(other_target, other_challenge, other_claim)
+        store.forward_write(other_target, other_challenge, other_claim, now=_NOW)
     assert store.ledger() == ()
 
 
@@ -288,7 +295,7 @@ def test_fence_makes_a_late_cas_fail_and_verifies_absent(tmp_path: Path) -> None
     fenced = store.fence(GROUP, Direction.FORWARD)
     assert fenced.kind is LedgerKind.FENCED and fenced.operation_key == intent.forward_key
     assert store.fence(GROUP, Direction.FORWARD) == fenced  # idempotent
-    assert store.forward_write(intent, challenge, claim).executor_result is ExecutorResult.FENCED
+    assert store.forward_write(intent, challenge, claim, now=_NOW).executor_result is ExecutorResult.FENCED
     outcome = _verify(store, intent, challenge)
     assert outcome is not None and outcome.outcome_state is VerifiedState.VERIFIED_ABSENT
     assert outcome.observed_state is ObservedState.ABSENT and store.status(GROUP).artifact is None
@@ -297,7 +304,7 @@ def test_fence_makes_a_late_cas_fail_and_verifies_absent(tmp_path: Path) -> None
 def test_fencing_an_applied_key_reports_the_effect(tmp_path: Path) -> None:
     store = _store(tmp_path)
     intent, challenge, claim = _forward(store)
-    store.forward_write(intent, challenge, claim)
+    store.forward_write(intent, challenge, claim, now=_NOW)
     assert store.fence(GROUP, Direction.FORWARD).kind is LedgerKind.EFFECT
 
 
@@ -310,7 +317,7 @@ def test_a_late_cas_after_rotation_and_fence_is_definitely_not_executed(tmp_path
     intent, challenge, claim = _forward(store)
     store.rotate_runtime_instance(new_runtime_instance_id())
     store.fence(GROUP, Direction.FORWARD)
-    assert store.forward_write(intent, challenge, claim).executor_result is ExecutorResult.CAS_REJECTED
+    assert store.forward_write(intent, challenge, claim, now=_NOW).executor_result is ExecutorResult.CAS_REJECTED
     outcome = _verify(store, intent, challenge)
     assert outcome is not None and outcome.outcome_state is VerifiedState.VERIFIED_ABSENT
 
@@ -328,7 +335,7 @@ def test_two_connections_racing_apply_once(tmp_path: Path) -> None:
     other = TargetStore.open(store.path)
     intent, challenge, claim = _forward(store)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(lambda target: target.forward_write(intent, challenge, claim).executor_result, (store, other)))
+        results = list(pool.map(lambda target: target.forward_write(intent, challenge, claim, now=_NOW).executor_result, (store, other)))
     assert sorted(results) == sorted([ExecutorResult.APPLIED, ExecutorResult.CAS_REJECTED])
     assert [row.kind for row in store.ledger()] == [LedgerKind.EFFECT]
 
@@ -339,7 +346,7 @@ def test_rotated_instance_rejects_an_older_process(tmp_path: Path) -> None:
     store = _store(tmp_path)
     intent, challenge, claim = _forward(store)
     store.rotate_runtime_instance(new_runtime_instance_id())
-    receipt = store.forward_write(intent, challenge, claim)
+    receipt = store.forward_write(intent, challenge, claim, now=_NOW)
     assert receipt.executor_result is ExecutorResult.CAS_REJECTED
     assert store.ledger() == () and store.status(GROUP).artifact is None
 
@@ -350,7 +357,7 @@ def test_rotated_instance_rejects_an_older_process(tmp_path: Path) -> None:
 def test_without_a_consumed_nonce_the_effect_is_unauthorized(tmp_path: Path) -> None:
     store = _store(tmp_path)
     intent, challenge, claim = _forward(store)
-    assert store.forward_write(intent, challenge, claim).executor_result is ExecutorResult.APPLIED
+    assert store.forward_write(intent, challenge, claim, now=_NOW).executor_result is ExecutorResult.APPLIED
     for consumed in (None, "0" * 64):
         outcome = _verify(store, intent, challenge, consumed)
         assert outcome is not None
@@ -365,7 +372,7 @@ def test_authorization_needs_this_challenges_nonce(tmp_path: Path) -> None:
 
     store = _store(tmp_path)
     intent, challenge, claim = _forward(store)
-    store.forward_write(intent, challenge, claim)
+    store.forward_write(intent, challenge, claim, now=_NOW)
     later = replace(challenge, nonce="9" * 64)
     outcome = _verify(store, intent, later, consumed=NONCE)
     assert outcome is not None and outcome.outcome_state is VerifiedState.UNAUTHORIZED_EFFECT
@@ -376,7 +383,7 @@ def test_authorization_needs_this_challenges_nonce(tmp_path: Path) -> None:
 def test_receipt_says_applied_but_the_effect_is_gone(tmp_path: Path) -> None:
     store = _store(tmp_path)
     intent, challenge, claim = _forward(store)
-    receipt = store.forward_write(intent, challenge, claim)
+    receipt = store.forward_write(intent, challenge, claim, now=_NOW)
     assert receipt.executor_result is ExecutorResult.APPLIED
     _outside(store, "DELETE FROM target_artifacts")
     assert _verify(store, intent, challenge) is None  # never ABSENT from a receipt alone
@@ -390,7 +397,7 @@ def test_an_effect_without_a_ledger_row_is_not_ours(tmp_path: Path) -> None:
         "INSERT INTO target_artifacts (obligation_group_key, state, revision, payload) VALUES (?, 'ACTIVE', 1, ?)",
         parameters=(GROUP, intent.artifact.payload_bytes()),
     )
-    assert store.forward_write(intent, challenge, claim).executor_result is ExecutorResult.CAS_REJECTED
+    assert store.forward_write(intent, challenge, claim, now=_NOW).executor_result is ExecutorResult.CAS_REJECTED
     assert _verify(store, intent, challenge) is None
     store.fence(GROUP, Direction.FORWARD)
     assert _verify(store, intent, challenge) is None  # fenced but an artifact exists: mixed
@@ -406,7 +413,7 @@ def test_an_effect_without_a_ledger_row_is_not_ours(tmp_path: Path) -> None:
 def test_an_outside_change_is_foreign_and_unauthorized(tmp_path: Path, statement: str) -> None:
     store = _store(tmp_path)
     intent, challenge, claim = _forward(store)
-    store.forward_write(intent, challenge, claim)
+    store.forward_write(intent, challenge, claim, now=_NOW)
     _outside(store, statement)
     outcome = _verify(store, intent, challenge)
     assert outcome is not None
@@ -419,7 +426,7 @@ def test_an_outside_change_is_foreign_and_unauthorized(tmp_path: Path, statement
 def test_inverse_reverts_once_and_verifies(tmp_path: Path) -> None:
     store = _store(tmp_path)
     intent, challenge, claim = _forward(store)
-    store.forward_write(intent, challenge, claim)
+    store.forward_write(intent, challenge, claim, now=_NOW)
     inverse, inverse_challenge, inverse_claim = _inverse_for(store, intent)
     receipt = store.inverse_write(inverse, inverse_challenge, inverse_claim)
     assert (receipt.executor_result, receipt.reported_revision, receipt.reported_payload_digest) == (ExecutorResult.APPLIED, 2, None)
@@ -441,13 +448,13 @@ def test_inverse_reverts_once_and_verifies(tmp_path: Path) -> None:
             VerifiedState.REVERTED, authorization, ObservedState.ABSENT,
         )
     # The forward cannot be written again after a revert.
-    assert store.forward_write(intent, challenge, claim).executor_result is ExecutorResult.CAS_REJECTED
+    assert store.forward_write(intent, challenge, claim, now=_NOW).executor_result is ExecutorResult.CAS_REJECTED
 
 
 def test_fenced_inverse_verifies_absent_and_keeps_the_forward(tmp_path: Path) -> None:
     store = _store(tmp_path)
     intent, challenge, claim = _forward(store)
-    store.forward_write(intent, challenge, claim)
+    store.forward_write(intent, challenge, claim, now=_NOW)
     inverse, inverse_challenge, inverse_claim = _inverse_for(store, intent)
     assert store.fence(GROUP, Direction.INVERSE).kind is LedgerKind.FENCED
     assert store.inverse_write(inverse, inverse_challenge, inverse_claim).executor_result is ExecutorResult.FENCED
@@ -487,7 +494,7 @@ def test_forward_stops_at_the_reserve_fences_keep_the_inverse_room_and_every_und
         for index in range(10_000):
             group = payload_digest(index.to_bytes(4, "big"))
             intent, challenge, claim = _forward(store, group=group)
-            store.forward_write(intent, challenge, claim)
+            store.forward_write(intent, challenge, claim, now=_NOW)
             applied.append(intent)
     assert applied
     effects = len(store.ledger())

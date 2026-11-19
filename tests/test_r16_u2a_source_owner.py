@@ -66,8 +66,11 @@ class _Provider(DummyProvider):
         return self.loss_value
 
 
-def _app(settings, *, unavailable=False):
+def _app(settings, *, unavailable=False, executor=False):
     app = create_app(settings)
+    # IP-18a test seam: the IP-12..IP-17 harness runs the R18 owners with no
+    # executor (the gate is opened by hand); IP-18a tests pass executor=True.
+    app.state.r18_executor_enabled = executor
     app.state.model_provider = _Provider(unavailable=unavailable)
     app.state.memory_system = DualMemorySystem(settings)
     app.state.adapter_registry = AdapterRegistry(settings)

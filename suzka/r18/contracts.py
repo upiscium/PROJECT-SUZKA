@@ -1283,6 +1283,9 @@ class ExecutorResult(str, Enum):
     # Expected revision or runtime_instance_id did not match: not executed
     # (#380 D2 addendum 2; a definite result, not IN_DOUBT).
     CAS_REJECTED = "CAS_REJECTED"
+    # IP-18a (HP-7 (a)): the Commitment deadline passed before the target
+    # transaction could commit: not executed, nothing written. Receipt only.
+    DEADLINE_ELAPSED = "DEADLINE_ELAPSED"
 
 
 _RECEIPT_BODY: Final = (

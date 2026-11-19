@@ -312,6 +312,7 @@ class _DecisionIssuer:
         clock: Callable[[], datetime] | None = None,
         *,
         target_path: Path | None = None,
+        blocked_target: Callable[[], bool] | None = None,
     ) -> None:
         from suzka.r16.plan_preview import _PlanPreviewOwner
 
@@ -333,6 +334,10 @@ class _DecisionIssuer:
         self._pending: _PendingIssue | None = None
         # IP-16b: the obligation secret lives next to the R18 target (§3a).
         self._target_path = None if target_path is None else _absolute(target_path)
+        # IP-18a (IP-18 D1 r4 §9-5): the SweepGate's read-only "BLOCKED_TARGET"
+        # view (no I/O). Always False in IP-18a; IP-18b's ``_ledger`` reads it
+        # once per evaluation. ``None`` (tests, R18 off) means never blocked.
+        self._blocked_target: Callable[[], bool] = blocked_target or (lambda: False)
 
     # ------------------------------------------------------------ handler
 

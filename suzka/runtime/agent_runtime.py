@@ -53,6 +53,9 @@ class AgentEventType(str, Enum):
     # IP-17c (#411 D1 r7 §1 / §6): nonce consumption + EXECUTION_CLAIM in ONE
     # R07 event, from an operator confirm. Refused in the soft band (HP-8).
     R18_EXECUTION_CLAIM = "r18_execution_claim"
+    # IP-18a (#411 D1 r4 §5-§6): the independent Outcome for one adopted
+    # claim. ADMITTED in the soft band (HD-18-1): it records a terminal fact.
+    R18_OUTCOME_COMMIT = "r18_outcome_commit"
 
 
 class AgentEventSource(str, Enum):
@@ -92,6 +95,7 @@ class AgentEventSource(str, Enum):
     RUNTIME_R18_POLICY_COMMIT = "runtime.r18.policy_commit"
     API_R18_APPROVAL = "api.r18.approval"
     RUNTIME_R18_APPROVAL_EXPIRE = "runtime.r18.approval_expire"
+    RUNTIME_R18_OUTCOME_COMMIT = "runtime.r18.outcome_commit"
 
 
 class AgentRuntimeStatus(str, Enum):
