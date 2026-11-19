@@ -418,6 +418,42 @@ def test_supersession_needs_all_four_conditions() -> None:
     assert not may_supersede(old, outcome_wake)
 
 
+def test_a_commitment_wake_supersedes_only_an_older_goal_wake() -> None:
+    """IP-20 D1 A-11 / HD-20-5 (b): the Goal-then-Commitment case. A new
+    COMMITMENT_ADMITTED Wake cancels an unclaimed GOAL_ADMITTED Wake of the same
+    Goal under the same four conditions; no other cause pair changes."""
+
+    goal = _wake(WakeCause.GOAL_ADMITTED)
+    commitment = _wake(
+        WakeCause.COMMITMENT_ADMITTED, evidence_fingerprint="e" * 64, commitment_deadline_utc=EXPIRES
+    )
+    assert may_supersede(goal, commitment)
+    # The four conditions still hold for the new pair.
+    for changes in (
+        {"goal_revision": 2},
+        {"context_id": "context-2"},
+        {"incarnation_id": H},
+        {
+            "not_before_utc": "2026-11-30T00:00:00Z",
+            "expires_at_utc": "2026-12-01T00:00:00Z",
+            "commitment_deadline_utc": "2026-12-01T00:00:00Z",
+        },
+    ):
+        assert not may_supersede(goal, replace(commitment, **changes)), changes
+    assert not may_supersede(goal, goal)
+    # Not the other way round, and not over another Commitment / Outcome Wake.
+    assert not may_supersede(commitment, goal)
+    assert not may_supersede(
+        _wake(WakeCause.COMMITMENT_ADMITTED, commitment_deadline_utc=EXPIRES), commitment
+    )
+    assert not may_supersede(_wake(WakeCause.FEEDBACK_ADMITTED), commitment)
+    assert not may_supersede(
+        _wake(WakeCause.OUTCOME_VERIFIED_NO_FEEDBACK, evidence_fingerprint="d" * 64), commitment
+    )
+    # A new GOAL_ADMITTED Wake never supersedes anything.
+    assert not may_supersede(commitment, replace(goal, evidence_fingerprint="d" * 64))
+
+
 # --------------------------------------------------------------- completion
 
 

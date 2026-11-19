@@ -87,6 +87,8 @@ from suzka.r16.decision_issuer import _DecisionIssuer
 from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
 from suzka.r17.expectation_issuer import ExpectationIssuerV1
 from suzka.r17.feedback_owner import FeedbackOwnerV1
+from suzka.r19.contracts import WakeTiming
+from suzka.r19.materializer import WakeMaterializerV1
 from suzka.r18.approval_api import mount_approval_api
 from suzka.r18.approval_owner import ApprovalChallengeOwnerV1
 from suzka.r18.executor import ClaimKeys, R18Executor
@@ -553,6 +555,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise StateRecoveryError("R17 feedback owner unavailable")
             return owner
 
+        def _r19_wake_materializer_for_commit(
+            event: AgentEvent,
+        ) -> WakeMaterializerV1 | None:
+            owner = getattr(app.state, "wake_materializer", None)
+            if owner is None and event.event_type is AgentEventType.R19_WAKE_MATERIALIZE:
+                raise StateRecoveryError("R19 Wake materializer unavailable")
+            return owner
+
         def _r18_policy_owner_for_commit(
             event: AgentEvent,
         ) -> ReviewArtifactPolicyV1 | None:
@@ -612,6 +622,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             outcome_owner = getattr(app.state, "outcome_owner", None)
             if outcome_owner is not None:
                 outcome_owner._clear()
+            # IP-20b: the R19 Wake materializer (None unless installed).
+            wake_materializer = getattr(app.state, "wake_materializer", None)
+            if wake_materializer is not None:
+                wake_materializer._clear()
 
         def _internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
             nonlocal committed_snapshot, committed_snapshot_hash
@@ -653,6 +667,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 outcome_owner = _r18_outcome_owner_for_commit(event)
                 if outcome_owner is not None:
                     outcome_owner._validate_commit(event)
+                wake_materializer = _r19_wake_materializer_for_commit(event)
+                if wake_materializer is not None:
+                    wake_materializer._validate_commit(event)
                 validate_belief_commit = getattr(
                     app.state.main_loop, "_validate_belief_event_commit", None
                 )
@@ -943,6 +960,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.policy_owner = None
             app.state.approval_owner = None
             app.state.outcome_owner = None
+            app.state.wake_materializer = None
             app.state.r18_executor = None
             # IP-18a: one runtime_instance_id per process; the SweepGate is
             # closed from construction (DISABLED, never opened, with
@@ -1087,6 +1105,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         if app.state.r18_executor is None
                         else app.state.r18_executor.enqueue
                     ),
+                )
+            if app.state.decision_issuer is not None:
+                # IP-20b (IP-20 D1 §8): the Wake materializer, installed beside
+                # the issuer. With r19.enabled false every event would HOLD
+                # R19_DISABLED before reading anything, and nothing submits one
+                # (no Scheduler exists until IP-20d, and none without r19).
+                app.state.wake_materializer = WakeMaterializerV1(
+                    app.state.decision_issuer,
+                    app.state.agent_runtime,
+                    enabled=app_settings.r19.enabled,
+                    timing=WakeTiming(
+                        goal_wake_delay_s=app_settings.r19.goal_wake_delay_s,
+                        commitment_wake_delay_s=app_settings.r19.commitment_wake_delay_s,
+                        feedback_wake_delay_s=app_settings.r19.feedback_wake_delay_s,
+                        deadline_margin_s=app_settings.r19.deadline_margin_s,
+                        claim_lease_s=app_settings.r19.claim_lease_s,
+                        tick_s=app_settings.r19.tick_s,
+                    ),
+                    max_age_s=app_settings.r19.materialize_max_age_s,
                 )
             # IP-6b (#370 R20-DRV): the R16 driver exists only with every
             # owner bound; it runs only after the unique activation event.
