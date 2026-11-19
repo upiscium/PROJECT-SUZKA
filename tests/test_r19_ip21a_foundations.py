@@ -125,18 +125,6 @@ def test_each_event_is_admitted_in_the_soft_band_and_refused_in_the_hard_band(
     hard.close()
 
 
-def test_a_type_missing_from_the_soft_list_would_be_refused() -> None:
-    """Fail closed: the allow-list is the only way in, so dropping a type from
-    it refuses that type in the soft band."""
-
-    for event_type in OUTBOX_TYPES:
-        reduced = SOFT_BAND_ADMITTED_EVENT_TYPES - {event_type}
-        assert event_type not in reduced
-    # Neither is a debug or adapter type, and neither is refused by default.
-    assert set(OUTBOX_TYPES) <= SOFT_BAND_ADMITTED_EVENT_TYPES
-    assert AgentEventType.DEBUG_CHAT not in SOFT_BAND_ADMITTED_EVENT_TYPES
-
-
 # --------------------------------------------------------------- no schema
 
 

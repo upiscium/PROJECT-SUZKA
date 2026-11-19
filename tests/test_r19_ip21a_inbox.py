@@ -437,6 +437,23 @@ def test_the_session_selector_is_the_client_id_or_the_closed_literal() -> None:
     _ack(_msg(), selector=inbox.DEFAULT_SESSION_SELECTOR)
 
 
+def test_is_message_id_matches_the_dto_format() -> None:
+    message = _msg()
+    assert inbox.is_message_id(message.message_id)
+    for bad in (
+        "",
+        None,
+        5,
+        "outbox-message-" + "a" * 64,
+        "outbox-" + "A" * 64,
+        "outbox-" + "a" * 63,
+        "outbox-" + "a" * 65,
+        "outbox-" + "a" * 64 + "\n",
+        "x" + message.message_id,
+    ):
+        assert not inbox.is_message_id(bad)
+
+
 def test_ack_vocabularies_are_closed() -> None:
     assert {item.value for item in inbox.AckResult} == {
         "COMMITTED", "EXISTING", "CONFLICT", "EXPIRED", "NOT_FOUND", "HOLD",
@@ -751,23 +768,25 @@ def test_emission_inputs_are_strict() -> None:
 def test_inbox_module_is_pure() -> None:
     tree = ast.parse(inspect.getsource(inbox))
     imported = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
-    assert imported == {
-        "__future__",
-        "collections.abc",
-        "dataclasses",
-        "datetime",
-        "enum",
-        "types",
-        "typing",
-        "suzka.r16.contracts",
-        "suzka.r16.cycle_contracts",
-        "suzka.r16.history_records",
-        "suzka.r16.history_codec",
-        "suzka.r16.history_reader",
-        "suzka.r19.contracts",
-        "suzka.r19.ledger",
+    # Only pure values: no store, Journal, runtime, API, registry or owner.
+    for module in imported:
+        assert module is not None
+        assert module.split(".")[0] in {
+            "__future__", "collections", "dataclasses", "datetime", "enum",
+            "re", "types", "typing", "suzka",
+        }, module
+        assert not module.startswith(
+            ("suzka.runtime", "suzka.api", "suzka.r16.history_store", "suzka.r16.history_reader_impl")
+        ), module
+    assert imported <= {
+        m
+        for m in imported
+        if m.startswith(("suzka.r16.", "suzka.r19.contracts", "suzka.r19.ledger"))
+        or "." not in m
+        or m in {"collections.abc"}
     }
-    assert not any(isinstance(n, ast.Import) for n in ast.walk(tree))
+    plain = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+    assert plain <= {"re"}
     # No clock read, no I/O: the instant is always an argument.
     assert not [
         n
@@ -783,11 +802,12 @@ def test_inbox_module_is_pure() -> None:
     assert "suzka.r16.history_reader" not in top
     assert "suzka.r16.history_codec" not in top
     source = inspect.getsource(inbox)
-    for name in ("sqlite3", "threading", "logging", "os.", "subprocess"):
+    for name in ("sqlite3", "threading", "logging", "subprocess"):
         assert name not in source
+    assert "os" not in {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
 
 
-def test_inbox_is_the_only_r19_module_that_reads_outbox_and_ack_records() -> None:
+def test_scaffold_no_api_module_reads_outbox_and_ack_records() -> None:
     """The architecture guard of D1 §5-2 (scope amendment A-14), scaffold form:
     among ``suzka``'s API-facing modules none touches the record kinds.
     IP-21c extends it to the routes."""

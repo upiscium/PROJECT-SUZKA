@@ -7,6 +7,7 @@ persisted or delivered.
 from __future__ import annotations
 
 import ast
+import pkgutil
 from dataclasses import replace
 import inspect
 import json
@@ -705,20 +706,11 @@ def test_r19_imports_stay_pure() -> None:
         "suzka.r18.contracts",
     }
     assert not any(isinstance(node, ast.Import) for node in ast.walk(tree))
-    # ``ledger`` (IP-20a), ``materializer`` (IP-20b) and ``inbox`` (IP-21a) are submodules, imported by module, not re-exported.
+    # Submodules (the writers, ledger, scheduler, inbox ...) are imported by
+    # module and never re-exported: derive them from the package, so a new
+    # submodule needs no edit here (21b / 21c add several in parallel).
+    submodules = {item.name for item in pkgutil.iter_modules(r19.__path__)}
+    assert "contracts" in submodules and "inbox" in submodules
     assert set(r19.__all__) == {
-        name
-        for name in dir(r19)
-        if not name.startswith("_")
-        and name
-        not in {
-            "contracts",
-            "ledger",
-            "materializer",
-            "claim_owner",
-            "review_owner",
-            "raw_state",
-            "scheduler",
-            "inbox",
-        }
+        name for name in dir(r19) if not name.startswith("_") and name not in submodules
     }

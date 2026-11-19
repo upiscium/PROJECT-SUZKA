@@ -24,6 +24,7 @@ module reads for a response are ``OUTBOX_MESSAGE`` and ``INBOX_ACK`` (A-14).
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
 
 from suzka.r19.contracts import (
     MAX_MESSAGE_TTL,
+    MESSAGE_ID_PREFIX,
     AckStatus,
     InboxAckV1,
     OutboxMessageV1,
@@ -375,6 +377,22 @@ def adopted_message_ids(records: Iterable[AdoptedRecord]) -> frozenset[str]:
 # --------------------------------------------------------------------- ACK
 
 
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def is_message_id(value: object) -> bool:
+    """True for a well-formed message id: ``MESSAGE_ID_PREFIX`` (``outbox-``)
+    and 64 lowercase hex digits, as ``OutboxMessageV1.message_id`` builds it.
+    (D1 §5-4 step 2 writes ``outbox-message-<64 hex>``; that is a slip, the
+    merged DTO is the authority. IP-21c validates with this function.)"""
+
+    return (
+        type(value) is str
+        and value.startswith(MESSAGE_ID_PREFIX)
+        and _HEX64.fullmatch(value[len(MESSAGE_ID_PREFIX) :]) is not None
+    )
+
+
 def ack_selector(client_session_id: str | None) -> str:
     """The ACK row's ``session_selector`` (D1 §5-3, A-11): the client's own id
     when given, else the closed literal ``context-only``."""
@@ -589,10 +607,10 @@ def plan_emission(
         identity = _build(entry, _PROBE_CREATED, _PROBE_EXPIRES)
     except (ValueError, TypeError):
         return held(OutboxHold.UNREPRESENTABLE)
-    if identity.context_id != entry.wake.context_id:
-        return held(OutboxHold.UNREPRESENTABLE, identity.message_id)
     if identity.message_id in adopted_ids:
         return held(OutboxHold.NONE_LEFT, identity.message_id)
+    if identity.context_id != entry.wake.context_id:
+        return held(OutboxHold.UNREPRESENTABLE, identity.message_id)
     lower = closing_lower_bound(entry)
     if lower is None:
         return held(OutboxHold.UNREPRESENTABLE, identity.message_id)
@@ -660,6 +678,7 @@ __all__ = [
     "ack_selector",
     "adopted_message_ids",
     "closing_lower_bound",
+    "is_message_id",
     "decision_row_of",
     "derive_inbox_view",
     "emission_candidates",
