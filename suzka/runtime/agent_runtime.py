@@ -61,6 +61,13 @@ class AgentEventType(str, Enum):
     # it. Both are cognition (HP-8, D-R17 §5): ADMITTED in the soft band.
     R17_ASSESSMENT_COMMIT = "r17_assessment_commit"
     R17_FEEDBACK_COMMIT = "r17_feedback_commit"
+    # IP-20a (#411 IP-20 D1 r3 §2): the R19 Wake cognition events. All four
+    # are ADMITTED in the soft band (D-R19 §8-5, HP-8); only the Scheduler
+    # submits them and only while ``r19.enabled`` (§3-3, §8).
+    R19_WAKE_MATERIALIZE = "r19_wake_materialize"
+    R19_WAKE_CLAIM = "r19_wake_claim"
+    R16_WAKE_REVIEW = "r16_wake_review"
+    R19_WAKE_TERMINAL = "r19_wake_terminal"
 
 
 class AgentEventSource(str, Enum):
@@ -103,6 +110,10 @@ class AgentEventSource(str, Enum):
     RUNTIME_R18_OUTCOME_COMMIT = "runtime.r18.outcome_commit"
     RUNTIME_R17_ASSESSMENT_COMMIT = "runtime.r17.assessment_commit"
     RUNTIME_R17_FEEDBACK_COMMIT = "runtime.r17.feedback_commit"
+    RUNTIME_R19_WAKE_MATERIALIZE = "runtime.r19.wake_materialize"
+    RUNTIME_R19_WAKE_CLAIM = "runtime.r19.wake_claim"
+    RUNTIME_R16_WAKE_REVIEW = "runtime.r16.wake_review"
+    RUNTIME_R19_WAKE_TERMINAL = "runtime.r19.wake_terminal"
 
 
 class AgentRuntimeStatus(str, Enum):
@@ -274,6 +285,25 @@ class AgentRuntime:
 
         with self._condition:
             return len(self._pending)
+
+    def is_idle(self) -> bool:
+        """True when nothing waits, runs or is being admitted; read-only.
+
+        IP-20a (D1 r3 A-17 / HD-20-6 (a)): ``pending_count`` sees waiting
+        events only and ``current_event`` works on the worker thread only, so
+        the R19 Scheduler thread could not tell a running handler from an
+        empty runtime. This reads the runtime's own state under its condition
+        lock and changes nothing. A runtime that is not accepting events is
+        never idle (a Wake must not be claimed on it).
+        """
+
+        with self._condition:
+            return (
+                self._status is AgentRuntimeStatus.ACCEPTING
+                and not self._pending
+                and self._active is None
+                and not self._admission_in_progress
+            )
 
     def current_event(self) -> AgentEvent | None:
         """Return the event only while its handler runs on the worker thread."""

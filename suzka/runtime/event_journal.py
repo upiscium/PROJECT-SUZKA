@@ -1296,7 +1296,12 @@ class EventJournalAdmissionBand(str, Enum):
 # obligation;
 # IP-19 added R17_ASSESSMENT_COMMIT and R17_FEEDBACK_COMMIT, ADMITTED on
 # purpose (D-R17 §5, HP-8): they record R17's reading of a terminal Outcome and
-# create no obligation, and refusing them would leave the lineage at row 6).
+# create no obligation, and refusing them would leave the lineage at row 6;
+# IP-20a added the four R19 Wake events, ADMITTED on purpose (D-R19 §8-5,
+# HP-8): the materializer only records a scheduled re-evaluation, the claim and
+# the review are cognition (a refusal here would starve a Wake, never end it),
+# and the terminal only closes a Wake (no obligation, no external effect);
+# refusing it would leave expired Wakes derived-only until the Journal shrinks).
 # Cognition continues; DEBUG_CHAT, ADAPTER_EVALUATE and ADAPTER_UPDATE (Human
 # decision 2026-11-10) are refused, and so is every type not listed here,
 # including any type added later (R18/R19 external effects).
@@ -1323,6 +1328,11 @@ SOFT_BAND_ADMITTED_EVENT_TYPES: frozenset[AgentEventType] = frozenset(
         # IP-19 (D-R17 §5): R17 comparison / Feedback are cognition; admitted.
         AgentEventType.R17_ASSESSMENT_COMMIT,
         AgentEventType.R17_FEEDBACK_COMMIT,
+        # IP-20a (D-R19 §8-5, HP-8): the R19 Wake cognition events; admitted.
+        AgentEventType.R19_WAKE_MATERIALIZE,
+        AgentEventType.R19_WAKE_CLAIM,
+        AgentEventType.R16_WAKE_REVIEW,
+        AgentEventType.R19_WAKE_TERMINAL,
     }
 )
 

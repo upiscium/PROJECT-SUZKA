@@ -4,8 +4,9 @@ R16 must not import ``suzka.r15`` (#374 D1 §3-1).  This adapter is the only
 runtime module allowed to call ``R15StatePort.read_interpretation`` and
 returns plain closed strings; mapping them to the R16 interpretation enum
 (SETTLED / UNCERTAIN / CONTRADICTORY / NOT_REVIEWED / UNAVAILABLE) belongs to
-IP-8b.  Read-only; call it inside the R16 plan-preview review event before
-that event opens its R07 transaction.
+IP-8b.  Read-only; call it inside the R16 plan-preview review event, or (IP-20a,
+D-R19 §8-4) the R16 Wake review / R19 Wake materialize event, before that
+event opens its R07 transaction.
 """
 
 from __future__ import annotations

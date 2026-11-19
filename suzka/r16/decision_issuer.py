@@ -50,6 +50,13 @@ operation with no forecast, or a Feedback that does not bind to its Assessment,
 Outcome and forecast, is INVALID (row 0).  With no R17 / R18 data nothing is
 read and the sealed input is unchanged.
 
+IP-20a (IP-20 D1 r3 §5, A-5): the evaluation (steps 1-4) is ``_evaluate``,
+which takes the instant ``now`` and the ``before_sequence`` it is to use and
+sets no ``_pending``; PLAN_PREVIEW_REVIEW calls it with its own clock and its
+own sequence and keeps the same tail, so its bytes do not change (a golden
+equivalence test with a fixed clock is the gate).  The R19 Wake materializer
+and the R16 Wake review (IP-20b / IP-20c) call it with their frozen T.
+
 Known limits: HOLD is not persisted (R19,
 #376 v2 §2); the R15 interpretation is sealed as its closed enum only; the
 Context ref is the frame's last-modified revision, not a digest of the
@@ -204,6 +211,24 @@ _COMPARE: Final = "compare_review_constraints"
 _ASSESS: Final = "assess_review_readiness"
 
 InterpretationRead = Callable[[AgentEvent, str, int], object]
+# IP-20a (A-5): the caller's instant, read lazily at the sites that need it.
+Instant = Callable[[], datetime]
+
+
+class _Once:
+    """One memoized clock read per issuer call, shared by every site that needs
+    an instant (the ledger's window closure and the deadline margin).  It reads
+    lazily, so a path that never needed the clock still never reads it
+    (reads: 2 -> 1, 0 -> 0, never more than before)."""
+
+    def __init__(self, read: Callable[[], datetime]) -> None:
+        self._read = read
+        self._value: datetime | None = None
+
+    def __call__(self) -> datetime:
+        if self._value is None:
+            self._value = self._read()
+        return self._value
 
 
 class DecisionIssueStatus(str, Enum):
@@ -268,6 +293,33 @@ class _PendingIssue:
     transaction_id: str
     committed: CommittedDecisionV1
     initial_state: object
+
+
+@dataclass(frozen=True, slots=True)
+class _Evaluation:
+    """Steps 1-4 of a qualified evaluation (IP-20 D1 r3 §5-1): the sealed
+    input and the policy result, with what the tail needs.  No store write."""
+
+    q: _QualifiedPreview
+    value: SuccessorPolicyInputV2
+    result: SuccessorPolicyResult
+    head: HistoryHead | None
+    incarnation: str | None
+    scope: str
+    predecessor: PredecessorState
+    snapshot_hash: str
+    as_of: int
+    initial: object
+
+
+@dataclass(frozen=True, slots=True)
+class _Unqualified:
+    """The sources did not qualify (CONFLICT / UNAVAILABLE): the sealed input
+    of row 0 / row 1 and its result.  ``state`` is the source state."""
+
+    state: RequiredSourceState
+    value: SuccessorPolicyInputV2
+    result: SuccessorPolicyResult
 
 
 class _IssuerHold(Exception):
@@ -361,26 +413,15 @@ class _DecisionIssuer:
     # ------------------------------------------------------------ handler
 
     def _issue(self, event: AgentEvent, goal_id: str) -> object:
-        from suzka.r16.plan_preview import _PlanSourceConflict, _PlanSourceUnavailable
-
         self._pending = None
-        initial = self._preview._state_snapshot()
-        state: RequiredSourceState | None
+        # As before the refactor, qualification runs outside the try below:
+        # only the Unqualified input and the tail are guarded.
+        qualified = self._qualify_twice(event, goal_id)
         try:
-            before = self._preview._qualify(goal_id, event)
-            after = self._preview._qualify(goal_id, event)
-            if after != before or self._preview._state_snapshot() != initial:
-                raise _PlanSourceUnavailable("Decision source changed")
-        except _PlanSourceConflict:
-            state = RequiredSourceState.CONFLICT
-        except _PlanSourceUnavailable:
-            state = RequiredSourceState.UNAVAILABLE
-        else:
-            state = None
-        try:
-            if state is not None:
-                return self._unqualified(event, state)
-            return self._issue_qualified(event, before, initial)
+            if isinstance(qualified, RequiredSourceState):
+                return self._unqualified(event, qualified)
+            q, initial = qualified
+            return self._issue_qualified(event, q, initial)
         except (HistoryStoreError, AgentStateLoadError):
             # Review P2-3: a temporary store/state read failure is a HOLD.
             hold = _IssuerHold(R16OwnerReason.SOURCE_UNAVAILABLE)
@@ -394,11 +435,82 @@ class _DecisionIssuer:
                 DecisionIssueStatus.HOLD, None, None, None, hold.reason
             )
 
+    def _issue_qualified(
+        self, event: AgentEvent, q: _QualifiedPreview, initial: object
+    ) -> object:
+        """PLAN_PREVIEW_REVIEW (IP-20a, A-5): evaluate at the issuer's own clock
+        and the event's own sequence, then the tail.  The clock is read once and
+        that one instant goes to every site that used to read it (the ledger's
+        approval-window closure and the deadline margin)."""
+
+        now = _Once(self._clock)
+        evaluated = self._evaluate_qualified(
+            event, q, initial, now=now, before_sequence=_sequence(event)
+        )
+        if isinstance(evaluated, _Unqualified):
+            return self._hold_result(evaluated.result)
+        return self._issue_evaluated(event, evaluated, now=now)
+
+    def _evaluate(
+        self,
+        event: AgentEvent,
+        goal_id: str,
+        *,
+        now: datetime,
+        before_sequence: int,
+    ) -> _Evaluation | _Unqualified:
+        """Steps 1-4 (IP-20 D1 r3 §5-1, A-5): qualify twice, lineage and head,
+        Commitment, interpretation, predecessor, ledger, the sealed input and
+        ``evaluate``.  Sets no ``_pending`` and writes nothing.
+
+        ``now`` replaces the clock in the ledger's approval-window closure (the
+        PLAN_PREVIEW path passes its live clock, so its bytes are unchanged; a
+        Wake-origin caller passes its frozen T).  ``before_sequence`` bounds the
+        Feedback witness: it is the evaluating event's own sequence for the
+        materializer and the review alike, never the Wake's stored horizon
+        (A-14: that would hide evidence admitted after the Wake).  The sealed
+        ``now_utc`` stays ``event.requested_at``.  Raises ``_IssuerHold`` and the
+        store errors; the caller decides what a failure means.
+        """
+
+        qualified = self._qualify_twice(event, goal_id)
+        if isinstance(qualified, RequiredSourceState):
+            return self._unqualified_input(event, qualified)
+        q, initial = qualified
+        return self._evaluate_qualified(
+            event, q, initial, now=lambda: now, before_sequence=before_sequence
+        )
+
+    def _qualify_twice(
+        self, event: AgentEvent, goal_id: str
+    ) -> tuple[_QualifiedPreview, object] | RequiredSourceState:
+        """Step 1: qualify the sources twice (equal), or the source state
+        (CONFLICT / UNAVAILABLE) whose row-0 / row-1 input the caller builds."""
+
+        from suzka.r16.plan_preview import _PlanSourceConflict, _PlanSourceUnavailable
+
+        initial = self._preview._state_snapshot()
+        try:
+            before = self._preview._qualify(goal_id, event)
+            after = self._preview._qualify(goal_id, event)
+            if after != before or self._preview._state_snapshot() != initial:
+                raise _PlanSourceUnavailable("Decision source changed")
+        except _PlanSourceConflict:
+            return RequiredSourceState.CONFLICT
+        except _PlanSourceUnavailable:
+            return RequiredSourceState.UNAVAILABLE
+        return before, initial
+
     def _unqualified(
         self, event: AgentEvent, state: RequiredSourceState
     ) -> _DecisionIssueResult:
         """Sources did not qualify: still a policy row (0 or 1), no refs."""
 
+        return self._hold_result(self._unqualified_input(event, state).result)
+
+    def _unqualified_input(
+        self, event: AgentEvent, state: RequiredSourceState
+    ) -> _Unqualified:
         snapshot_hash, as_of = self._snapshot()
         value = SuccessorPolicyInputV2(
             required_source=state,
@@ -425,7 +537,7 @@ class _DecisionIssuer:
             now_utc=utc_timestamp(event.requested_at),
             version=POLICY_KIND,
         )
-        return self._hold_result(evaluate(value))
+        return _Unqualified(state, value, evaluate(value))
 
     @staticmethod
     def _hold_result(result: SuccessorPolicyResult) -> _DecisionIssueResult:
@@ -447,9 +559,15 @@ class _DecisionIssuer:
             snapshot.last_processed_event_sequence,
         )
 
-    def _issue_qualified(
-        self, event: AgentEvent, q: _QualifiedPreview, initial: object
-    ) -> object:
+    def _evaluate_qualified(
+        self,
+        event: AgentEvent,
+        q: _QualifiedPreview,
+        initial: object,
+        *,
+        now: Instant,
+        before_sequence: int,
+    ) -> _Evaluation | _Unqualified:
         scope = lineage_scope_for(q.experience_id)
         snapshot_hash, as_of = self._snapshot()
         now_utc = utc_timestamp(event.requested_at)
@@ -463,9 +581,9 @@ class _DecisionIssuer:
             head, incarnation, scope, as_of, snapshot_hash, attested, q.self_origin
         )
         try:
-            ledger = self._ledger(classified, predecessor, q, _sequence(event))
+            ledger = self._ledger(classified, predecessor, q, before_sequence, now)
         except _LedgerSourceUnavailable:
-            return self._unqualified(event, RequiredSourceState.UNAVAILABLE)
+            return self._unqualified_input(event, RequiredSourceState.UNAVAILABLE)
         value = SuccessorPolicyInputV2(
             required_source=RequiredSourceState.QUALIFIED,
             source_refs=_required_refs(q),
@@ -491,7 +609,28 @@ class _DecisionIssuer:
             now_utc=now_utc,
             version=POLICY_KIND,
         )
-        result = evaluate(value)
+        return _Evaluation(
+            q,
+            value,
+            evaluate(value),
+            head,
+            incarnation,
+            scope,
+            predecessor,
+            snapshot_hash,
+            as_of,
+            initial,
+        )
+
+    def _issue_evaluated(
+        self, event: AgentEvent, evaluated: _Evaluation, *, now: Instant
+    ) -> object:
+        """The PLAN_PREVIEW tail: compare the head, then HOLD, EXISTING or a
+        Decision with its slot checks and its pending state (step 5)."""
+
+        q, value, result = evaluated.q, evaluated.value, evaluated.result
+        head, incarnation = evaluated.head, evaluated.incarnation
+        predecessor = evaluated.predecessor
         if (
             predecessor is PredecessorState.QUALIFIED
             and head is not None
@@ -503,12 +642,14 @@ class _DecisionIssuer:
         if result.is_hold:
             return self._hold_result(result)
         assert incarnation is not None
-        committed = self._committed(event, q, value, result, incarnation, scope, head)
+        committed = self._committed(
+            event, q, value, result, incarnation, evaluated.scope, head
+        )
         self._check_slots(committed, incarnation)
-        self._check_deadline(q)
+        self._check_deadline(q, now=now)
         # The sources must not move while we built the Decision.
         if self._preview._qualify(q.goal_id, event) != q or (
-            self._preview._state_snapshot() != initial
+            self._preview._state_snapshot() != evaluated.initial
         ):
             raise _IssuerHold(R16OwnerReason.SOURCE_UNAVAILABLE)
         transaction_id = TransactionCoordinator.derive_transaction_id(
@@ -518,11 +659,11 @@ class _DecisionIssuer:
             event,
             q,
             incarnation,
-            snapshot_hash,
+            evaluated.snapshot_hash,
             operations_digest(self._store.operations(incarnation)),
             transaction_id,
             committed,
-            initial,
+            evaluated.initial,
         )
         LOGGER.info("R16 issuer result=issued row=%s", result.row.value)
         participant = SubjectHistoryParticipant(
@@ -602,7 +743,8 @@ class _DecisionIssuer:
         classified: ReaderClassification | None,
         predecessor: PredecessorState,
         q: _QualifiedPreview,
-        before_sequence: int | None = None,
+        before_sequence: int | None,
+        now: Instant,
     ) -> LedgerRead:
         """IP-16b §5: the ledger of this lineage's obligation group.
 
@@ -664,19 +806,22 @@ class _DecisionIssuer:
         real = derive_ledger(
             records,
             group_key,
-            # IP-17a (§3a / §12-3): the issuer's clock closes an unclaimed
-            # forward Intent whose approval window has ended.  IP-20 note: a
-            # Wake-origin evaluation at a frozen time T must pass T here, not
-            # the live clock, or its closure would not match its sealed T.
-            self._clock(),
+            # IP-17a (§3a / §12-3): ``now`` closes an unclaimed forward Intent
+            # whose approval window has ended.  IP-20a (A-5): the caller passes
+            # it (PLAN_PREVIEW its live clock, a Wake its frozen T) so the
+            # closure matches the instant the caller seals.
+            now(),
             prior_claim=prior,
         )
         if prior is None and before_sequence is not None and real.state is not LedgerState.CORRUPT:
             # IP-19 (#367 D2-1, D-R17 §5): the Feedback witness, as of this
             # Decision's own event.  A claim of another incarnation, a facts
             # state and CORRUPT carry no R17 record of this incarnation, so
-            # they keep ABSENT.  IP-20 note: a Wake-origin evaluation passes
-            # its frozen horizon here, like the clock above.
+            # they keep ABSENT.  IP-20a (A-14): ``before_sequence`` is always
+            # the evaluating event's own sequence, also for a Wake-origin
+            # evaluation (the materializer and the review): the Wake's stored
+            # horizon would hide evidence admitted after the Wake, so a stale
+            # Wake could never see new Feedback / Outcome records.
             feedback = read_feedback(records, forward_key, real.state, before_sequence)
             real = replace(real, feedback=feedback.state, feedback_ref=feedback.ref)
         # §9-5: substitute LAST, and only over an empty ledger.
@@ -868,7 +1013,12 @@ class _DecisionIssuer:
         incarnation: str,
         scope: str,
         head: HistoryHead | None,
+        review_intent_key: str | None = None,
     ) -> CommittedDecisionV1:
+        """``review_intent_key`` overrides the PLAN_PREVIEW formula: a Wake-origin
+        Decision passes ``wake_review_intent_key(...)`` so every retry of one
+        cycle has one key (IP-20 D1 r3 §5-1)."""
+
         predecessor = (
             head.decision
             if head is not None and head.status is HeadStatus.ADOPTED
@@ -876,9 +1026,13 @@ class _DecisionIssuer:
         )
         predecessor_key = GENESIS if predecessor is None else predecessor.decision_id
         policy_bytes = value.canonical_bytes()
-        intent = checksum(
-            _INTENT_DOMAIN,
-            [incarnation, predecessor_key, value.evidence_fingerprint(), value.version.value],
+        intent = (
+            checksum(
+                _INTENT_DOMAIN,
+                [incarnation, predecessor_key, value.evidence_fingerprint(), value.version.value],
+            )
+            if review_intent_key is None
+            else review_intent_key
         )
         identity = decision_id_for(
             incarnation,
@@ -926,12 +1080,21 @@ class _DecisionIssuer:
         ):
             raise _IssuerHold(R16OwnerReason.DECISION_SLOT_OCCUPIED)
 
-    def _check_deadline(self, q: _QualifiedPreview) -> None:
+    def _check_deadline(
+        self,
+        q: _QualifiedPreview,
+        *,
+        now: Instant,
+        margin: timedelta = DEADLINE_MARGIN,
+    ) -> None:
+        """``now`` returns the caller's instant (A-5), read only here.  The Wake
+        review passes its live clock with a wider margin (IP-20 D1 r3 §6 step 4: 15 s)."""
+
         if q.commitment_id is None:
             return
         record = self._preview._loop._commitment_system.get(q.commitment_id)
         at = None if record is None else record.deadline.at
-        if at is not None and at - self._clock() < DEADLINE_MARGIN:
+        if at is not None and at - now() < margin:
             # Not yet elapsed, but too close to commit safely (D2 P2-2).
             raise _IssuerHold(R16OwnerReason.DEADLINE_ELAPSED)
 

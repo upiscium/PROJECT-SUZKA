@@ -363,9 +363,46 @@ class R18Settings(StrictBaseModel):
 
 
 class R19Settings(StrictBaseModel):
-    """IP-14a (#411 §1, HP-6): Wakes, Scheduler and Outbox (IP-14b / IP-20)."""
+    """IP-14a (#411 §1, HP-6): Wakes, Scheduler and Outbox (IP-14b / IP-20).
+
+    IP-20a (IP-20 D1 r3 §4-7, A-9): the D-R19 §5 numbers, in seconds. They
+    are validated through ``WakeTiming`` (``suzka.r19.contracts``), whose
+    bounds the ``Field`` limits below repeat so a bad value fails at the field.
+    Every default is the D-R19 §5 value, so ``/etc`` config needs no change and
+    ``enabled`` stays false.
+    """
 
     enabled: StrictBool = False
+    goal_wake_delay_s: StrictInt = Field(default=3600, ge=0, le=604_800)
+    commitment_wake_delay_s: StrictInt = Field(default=3600, ge=0, le=604_800)
+    feedback_wake_delay_s: StrictInt = Field(default=60, ge=0, le=604_800)
+    # IP-20 D1 §3-1: at least 1, so ``not_before == expires`` cannot arise.
+    deadline_margin_s: StrictInt = Field(default=600, ge=1, le=604_800)
+    # IP-20 D1 §4-5 / §4-4 reason with a lease of at most 120 s (the gap rule,
+    # the review wait bound and the T-vs-L skew limit); a longer lease would
+    # void those arguments, so it is capped at D-R19 §5's own number.
+    claim_lease_s: StrictInt = Field(default=120, ge=1, le=120)
+    tick_s: StrictInt = Field(default=30, ge=1, le=604_800)
+    # IP-20 D1 §3-3: the sparse materialize backstop (every scan writes Journal
+    # records even when it finds nothing).
+    rescan_s: StrictInt = Field(default=1800, ge=1, le=604_800)
+    # IP-20 D1 HD-20-1 (a): the materializer's scope floor. A cause older than
+    # this is never given a Wake; the default is the Wake TTL (7 days).
+    materialize_max_age_s: StrictInt = Field(default=604_800, ge=1, le=604_800)
+
+    @model_validator(mode="after")
+    def validate_wake_timing(self) -> "R19Settings":
+        from suzka.r19.contracts import WakeTiming
+
+        WakeTiming(
+            goal_wake_delay_s=self.goal_wake_delay_s,
+            commitment_wake_delay_s=self.commitment_wake_delay_s,
+            feedback_wake_delay_s=self.feedback_wake_delay_s,
+            deadline_margin_s=self.deadline_margin_s,
+            claim_lease_s=self.claim_lease_s,
+            tick_s=self.tick_s,
+        )
+        return self
 
 
 class SubjectHistorySettings(StrictBaseModel):

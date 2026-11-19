@@ -107,6 +107,7 @@ def _wake(cause: WakeCause = WakeCause.FEEDBACK_ADMITTED, **changes: Any) -> Wak
         goal_origin=GoalOrigin.USER_REQUEST,
         origin_refs=ORIGIN_REFS[cause],
         evidence_fingerprint=FP,
+        policy_kind=PolicyKind.SUCCESSOR_POLICY_V2,
         frozen_predecessor=FrozenPredecessor.decision("decision-" + "d" * 64, H),
         horizon_sequence=19,
         incarnation_id=INC,
@@ -668,4 +669,7 @@ def test_r19_imports_stay_pure() -> None:
         "suzka.r18.contracts",
     }
     assert not any(isinstance(node, ast.Import) for node in ast.walk(tree))
-    assert set(r19.__all__) == {name for name in dir(r19) if not name.startswith("_") and name != "contracts"}
+    # ``ledger`` (IP-20a) is a submodule, imported by module, not re-exported.
+    assert set(r19.__all__) == {
+        name for name in dir(r19) if not name.startswith("_") and name not in {"contracts", "ledger"}
+    }

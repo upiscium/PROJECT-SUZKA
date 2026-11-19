@@ -1,4 +1,7 @@
-"""R19 pure values only; no Wake ledger, Scheduler, Outbox or Inbox authority."""
+"""R19 pure values only; no Wake writer, Scheduler, Outbox or Inbox authority.
+
+IP-20a adds ``suzka.r19.ledger``: a pure derived Wake view (import it by module).
+"""
 
 from suzka.r19.contracts import (
     ACK_ID_PREFIX,
@@ -11,6 +14,8 @@ from suzka.r19.contracts import (
     COMMITMENT_ADMISSION_REF_KIND,
     COMMITMENT_REF_KIND,
     CYCLE_MAX_EVENTS,
+    EVENT_REF_KIND,
+    EXPERIENCE_REF_KIND,
     GOAL_ADMISSION_REF_KIND,
     INBOX_ASSURANCE,
     InboxAckV1,
@@ -21,6 +26,7 @@ from suzka.r19.contracts import (
     MAX_RECORD_BYTES,
     MAX_WAKE_TTL,
     MESSAGE_ID_PREFIX,
+    MOTIVATION_REF_KIND,
     OBSERVATION_REF_KIND,
     OutboxMessageV1,
     OutboxReason,
@@ -31,6 +37,7 @@ from suzka.r19.contracts import (
     STORED_ATTEMPT_OUTCOMES,
     TERMINAL_ID_PREFIX,
     TerminalReason,
+    WAKE_POLICY_KINDS,
     WAKEUP_ID_PREFIX,
     WakeAttemptOutcomeV1,
     WakeCause,
@@ -61,6 +68,8 @@ __all__ = [
     "COMMITMENT_ADMISSION_REF_KIND",
     "COMMITMENT_REF_KIND",
     "CYCLE_MAX_EVENTS",
+    "EVENT_REF_KIND",
+    "EXPERIENCE_REF_KIND",
     "GOAL_ADMISSION_REF_KIND",
     "INBOX_ASSURANCE",
     "InboxAckV1",
@@ -71,6 +80,7 @@ __all__ = [
     "MAX_RECORD_BYTES",
     "MAX_WAKE_TTL",
     "MESSAGE_ID_PREFIX",
+    "MOTIVATION_REF_KIND",
     "OBSERVATION_REF_KIND",
     "OutboxMessageV1",
     "OutboxReason",
@@ -81,6 +91,7 @@ __all__ = [
     "STORED_ATTEMPT_OUTCOMES",
     "TERMINAL_ID_PREFIX",
     "TerminalReason",
+    "WAKE_POLICY_KINDS",
     "WAKEUP_ID_PREFIX",
     "WakeAttemptOutcomeV1",
     "WakeCause",
