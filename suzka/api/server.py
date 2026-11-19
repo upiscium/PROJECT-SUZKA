@@ -88,7 +88,8 @@ from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
 from suzka.r17.expectation_issuer import ExpectationIssuerV1
 from suzka.r18.approval_api import mount_approval_api
 from suzka.r18.approval_owner import ApprovalChallengeOwnerV1
-from suzka.r18.executor import R18Executor
+from suzka.r18.executor import ClaimKeys, R18Executor
+from suzka.r18.facts import FactsHolder
 from suzka.r18.outcome_owner import OutcomeOwnerV1
 from suzka.r18.policy_owner import ReviewArtifactPolicyV1
 from suzka.r18.sweep import SweepGate
@@ -930,6 +931,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             runtime_instance_id = new_runtime_instance_id()
             r18_gate = SweepGate(enabled=app_settings.r18.enabled)
             app.state.r18_gate = r18_gate
+            # IP-18b: the sweep publishes the target facts here; the Decision
+            # issuer reads them (no I/O).
+            r18_facts = FactsHolder()
+            app.state.r18_facts = r18_facts
             history_store = getattr(app.state, "subject_history_store", None)
             if history_store is not None and preview_owner is not None:
                 interpretation_reader = R15InterpretationReader(
@@ -946,8 +951,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     # secret next to the R18 target (read only when the
                     # store holds R17 / R18 data).
                     target_path=app_settings.r18.target_path,
-                    # IP-18a: a read-only view; always False until IP-18b.
-                    blocked_target=lambda: False,
+                    # IP-18b: the gate's read-only BLOCKED_TARGET view (with
+                    # the 5-minute clear dwell) and the sweep's TargetFacts.
+                    blocked_target=r18_gate.blocked_target,
+                    target_facts=r18_facts.get,
                 )
                 preview_owner._bind_issuer(app.state.decision_issuer)
                 # IP-16a-2 (#411 D1 §1/§3): the R18 Intent issuer lives beside
@@ -1002,6 +1009,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             app.state.event_journal, decision_issuer._store
                         ).adopted_records()
 
+                    def _read_claim_keys() -> ClaimKeys:
+                        reader = SubjectHistoryReader(
+                            app.state.event_journal, decision_issuer._store
+                        )
+                        incarnation = reader.classify().incarnation
+                        if not incarnation:
+                            # No incarnation: facts would misread this
+                            # process' own effects as prior. Fail the sweep.
+                            raise RuntimeError("no current incarnation")
+                        return ClaimKeys(
+                            decision_issuer._store.prior_claims(incarnation),
+                            decision_issuer._store.current_claim_keys(incarnation),
+                        )
+
                     app.state.r18_executor = R18Executor(
                         target_path=app_settings.r18.target_path,
                         runtime_instance_id=runtime_instance_id,
@@ -1011,6 +1032,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         has_exclusive_authority=lambda: bool(
                             app.state.event_journal.has_exclusive_authority
                         ),
+                        read_claim_keys=_read_claim_keys,
+                        facts=r18_facts,
                     )
                 elif app_settings.r18.enabled:
                     r18_gate.open()  # the test seam above: no executor, no sweep

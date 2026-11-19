@@ -56,6 +56,7 @@ from suzka.r18.contracts import (
     ExecutorResult,
     VerifiedOutcomeV1,
 )
+from suzka.r18.facts import FactsHolder, compute_target_facts
 from suzka.r18.outcome_owner import (
     TRANSIENT_OUTCOME_REASONS,
     OutcomeOwnerV1,
@@ -66,6 +67,7 @@ from suzka.r18.outcome_owner import (
 from suzka.r18.sweep import SweepGate, rotate_if_needed
 from suzka.r18.target import (
     TargetBindingError,
+    TargetCapacityError,
     TargetError,
     TargetNotStarted,
     TargetStore,
@@ -113,6 +115,17 @@ class _Stage(str, Enum):
     SETTLE = "settle"
     OUTCOME_SUBMIT = "outcome_submit"
     OUTCOME_COMMIT = "outcome_commit"
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimKeys:
+    """What the sweep needs from SubjectHistory beyond the adopted claims
+    (IP-18b): the forward claims of earlier incarnations as
+    ``(operation_key, obligation_group_key)``, and every forward key with a
+    Claim in the current incarnation (adopted or not)."""
+
+    prior: tuple[tuple[str, str], ...]
+    current: frozenset[str]
 
 
 @dataclass(slots=True)
@@ -260,6 +273,8 @@ class R18Executor:
         outcome_owner: OutcomeOwnerV1,
         read_records: Callable[[], AdoptedRecords],
         has_exclusive_authority: Callable[[], bool],
+        read_claim_keys: Callable[[], ClaimKeys] | None = None,
+        facts: FactsHolder | None = None,
         clock: Callable[[], datetime] = _utc_now,
         monotonic: Callable[[], float] = time.monotonic,
         threaded: bool = True,
@@ -277,6 +292,10 @@ class R18Executor:
         self._outcome = outcome_owner
         self._read_records = read_records
         self._authority = has_exclusive_authority
+        # IP-18b: S2-B / S4 run only when both are given (the server passes
+        # them); without them the sweep is IP-18a's.
+        self._read_claim_keys = read_claim_keys
+        self._facts = facts
         self._clock = clock
         self._monotonic = monotonic
         self._threaded = threaded
@@ -459,7 +478,9 @@ class R18Executor:
                 self._sweep_queued = False
 
     def _sweep(self) -> None:
-        """S1 rotate, S2-A scan, S3 settle, S5 open (S4 and S2-B are IP-18b)."""
+        """S1 rotate, S2 scan (A: source -> target, incl. prior-incarnation
+        claims; B: target -> source), S3 settle, S4 publish ``TargetFacts``,
+        S5 open."""
 
         with self._lock:
             self._sweep_queued = False
@@ -486,7 +507,32 @@ class R18Executor:
                 row = store.fence(chain[0].obligation_group_key, Direction.FORWARD)
                 self._log_exec(claim, _Stage.SETTLE, row.kind.value, "CLAIMED")
                 settled.append(claim)
-            self._sweep_log("S3", f"settled={len(settled)}")
+            claim_keys = None if self._read_claim_keys is None else self._read_claim_keys()
+            fenced_prior = 0
+            if claim_keys is not None:
+                done = {claim.operation_key for claim in settled}
+                for forward_key, group_key in claim_keys.prior:
+                    if forward_key in done:
+                        continue
+                    try:
+                        store.fence(group_key, Direction.FORWARD)
+                    except TargetCapacityError:
+                        # One key past the fence reserve is that key's problem
+                        # (D1 §8): it keeps CLAIMED(prior), row 2, and must not
+                        # keep the gate (and the subject's WRITE path) closed.
+                        self._sweep_log("S3", f"prior_key={forward_key[:8]} capacity")
+                        continue
+                    fenced_prior += 1
+            self._sweep_log("S3", f"settled={len(settled)} prior={fenced_prior}")
+            if claim_keys is not None and self._facts is not None:
+                # S2-B / S4. The target is read FIRST, the claim keys after:
+                # a Claim precedes its effect, so every row in the snapshot
+                # whose claim belongs to this incarnation is excluded.
+                snapshot = store.forward_snapshot()
+                current = self._read_claim_keys() if self._read_claim_keys else claim_keys
+                facts = compute_target_facts(snapshot, current.current)
+                self._facts.publish(facts)
+                self._sweep_log("S4", f"facts={len(facts)}")
         except Exception as error:  # anything: the gate stays closed, with back-off
             self._reopen()
             self._target_failed(error)
@@ -849,6 +895,11 @@ class R18Executor:
                 self.restarts += 1
                 LOGGER.warning("R18 executor worker died; restarting")
                 self._start_worker()
+        # IP-18b: let BLOCKED_TARGET clear on time alone (hysteresis dwell).
+        try:
+            self._gate.poll()
+        except Exception:  # pragma: no cover - defensive
+            LOGGER.warning("R18 gate poll failed")
         # The probe of a failed target (a full, idempotent sweep).
         with self._lock:
             probe = not self._sweep_done and now >= self._next_probe and not self._sweep_queued

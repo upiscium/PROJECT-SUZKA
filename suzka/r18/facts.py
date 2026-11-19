@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
+from threading import Lock
 from typing import Final
 
 from suzka.r16.contracts import checksum
@@ -66,6 +67,23 @@ class TargetFacts:
 
 
 EMPTY_FACTS: Final = TargetFacts({})
+
+
+class FactsHolder:
+    """The process's published ``TargetFacts``: replaced atomically by the
+    sweep's S4, read by the Decision issuer (no I/O)."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._facts = EMPTY_FACTS
+
+    def get(self) -> TargetFacts:
+        with self._lock:
+            return self._facts
+
+    def publish(self, facts: TargetFacts) -> None:
+        with self._lock:
+            self._facts = facts
 
 
 def classify_forward(forward: LedgerRow | None, artifact: ArtifactRow | None) -> TargetFact | None:
@@ -179,6 +197,7 @@ def with_target_blocked(
 
 __all__ = [
     "EMPTY_FACTS",
+    "FactsHolder",
     "TARGET_BLOCKED_REF_KIND",
     "TARGET_EFFECT_REF_KIND",
     "TARGET_FENCE_REF_KIND",
