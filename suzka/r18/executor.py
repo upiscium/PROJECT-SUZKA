@@ -275,6 +275,7 @@ class R18Executor:
         has_exclusive_authority: Callable[[], bool],
         read_claim_keys: Callable[[], ClaimKeys] | None = None,
         facts: FactsHolder | None = None,
+        on_outcome: Callable[[], None] | None = None,
         clock: Callable[[], datetime] = _utc_now,
         monotonic: Callable[[], float] = time.monotonic,
         threaded: bool = True,
@@ -296,6 +297,9 @@ class R18Executor:
         # them); without them the sweep is IP-18a's.
         self._read_claim_keys = read_claim_keys
         self._facts = facts
+        # IP-19: told (O(1), no argument) after an Outcome is committed or
+        # found, so the R17 driver can run its Assessment / Feedback chain.
+        self._on_outcome = on_outcome
         self._clock = clock
         self._monotonic = monotonic
         self._threaded = threaded
@@ -831,6 +835,7 @@ class R18Executor:
                 claim, _Stage.OUTCOME_COMMIT, value.status.value, value.outcome.outcome_state.value
             )
             self._drop(claim_id)
+            self._notify_outcome()
             return
         reason = value.reason
         assert reason is not None
@@ -850,6 +855,17 @@ class R18Executor:
             self._log_exec(claim, _Stage.OUTCOME_COMMIT, "HOLD", f"BLOCKED:{reason.value}")
             return
         self._log_exec(claim, _Stage.OUTCOME_COMMIT, "HOLD", f"IN_DOUBT:{reason.value}")
+
+    def _notify_outcome(self) -> None:
+        """IP-19: a failing hook never changes the Outcome path."""
+
+        callback = self._on_outcome
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            LOGGER.warning("R18 on_outcome hook failed")
 
     def _outcome_retry(self, claim_id: str, *, consumed: bool) -> None:
         now = self._monotonic()

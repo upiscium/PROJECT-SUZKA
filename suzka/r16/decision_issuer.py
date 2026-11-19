@@ -43,7 +43,14 @@ issuer's clock, so an unclaimed forward Intent whose approval window has
 ended reads APPROVAL_EXPIRED_UNCLAIMED with no event; under SuccessorPolicy V3
 that state and POLICY_DENIED are row 2c (Plan A, no WRITE).
 
-Known limits: Feedback stays ABSENT (IP-19); HOLD is not persisted (R19,
+IP-19 (#367 D2-1, D-R17 §5): the Feedback witness is read from the same
+classification (``suzka.r17.feedback_read``), as of this Decision's own event.
+An Assessment without a Feedback is ABSENT (row 6); a claimed forward
+operation with no forecast, or a Feedback that does not bind to its Assessment,
+Outcome and forecast, is INVALID (row 0).  With no R17 / R18 data nothing is
+read and the sealed input is unchanged.
+
+Known limits: HOLD is not persisted (R19,
 #376 v2 §2); the R15 interpretation is sealed as its closed enum only; the
 Context ref is the frame's last-modified revision, not a digest of the
 Context's contents (#371 D6-3).
@@ -52,7 +59,7 @@ Context's contents (#371 D6-3).
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from hashlib import sha256
@@ -131,6 +138,7 @@ from suzka.r16.successor_policy import (
     interpretation_from_r15,
     utc_timestamp,
 )
+from suzka.r17.feedback_read import read_feedback
 from suzka.r18.contracts import Direction, operation_key
 from suzka.r18.facts import (
     EMPTY_FACTS,
@@ -455,7 +463,7 @@ class _DecisionIssuer:
             head, incarnation, scope, as_of, snapshot_hash, attested, q.self_origin
         )
         try:
-            ledger = self._ledger(classified, predecessor, q)
+            ledger = self._ledger(classified, predecessor, q, _sequence(event))
         except _LedgerSourceUnavailable:
             return self._unqualified(event, RequiredSourceState.UNAVAILABLE)
         value = SuccessorPolicyInputV2(
@@ -471,8 +479,8 @@ class _DecisionIssuer:
             ledger=ledger.state,
             ledger_refs=ledger.refs,
             inverse_authorization=ledger.inverse_authorization,
-            feedback=FeedbackState.ABSENT,
-            feedback_ref=None,
+            feedback=ledger.feedback,
+            feedback_ref=ledger.feedback_ref,
             verified_outcome_ref=ledger.verified_outcome_ref,
             interpretation=interpretation,
             interpretation_stage=stage,
@@ -594,6 +602,7 @@ class _DecisionIssuer:
         classified: ReaderClassification | None,
         predecessor: PredecessorState,
         q: _QualifiedPreview,
+        before_sequence: int | None = None,
     ) -> LedgerRead:
         """IP-16b §5: the ledger of this lineage's obligation group.
 
@@ -649,11 +658,11 @@ class _DecisionIssuer:
             if prior is None:
                 LOGGER.info("R16 issuer ledger=CORRUPT reason=prior_claim_row")
                 return CORRUPT_LEDGER
+        records = tuple(
+            RecordAt(item.record, item.processing_sequence) for item in classified.records
+        )
         real = derive_ledger(
-            (
-                RecordAt(item.record, item.processing_sequence)
-                for item in classified.records
-            ),
+            records,
             group_key,
             # IP-17a (§3a / §12-3): the issuer's clock closes an unclaimed
             # forward Intent whose approval window has ended.  IP-20 note: a
@@ -662,6 +671,14 @@ class _DecisionIssuer:
             self._clock(),
             prior_claim=prior,
         )
+        if prior is None and before_sequence is not None and real.state is not LedgerState.CORRUPT:
+            # IP-19 (#367 D2-1, D-R17 §5): the Feedback witness, as of this
+            # Decision's own event.  A claim of another incarnation, a facts
+            # state and CORRUPT carry no R17 record of this incarnation, so
+            # they keep ABSENT.  IP-20 note: a Wake-origin evaluation passes
+            # its frozen horizon here, like the clock above.
+            feedback = read_feedback(records, forward_key, real.state, before_sequence)
+            real = replace(real, feedback=feedback.state, feedback_ref=feedback.ref)
         # §9-5: substitute LAST, and only over an empty ledger.
         return with_target_blocked(
             real, blocked=blocked, has_obligation=has_obligation, has_prior_claim=prior is not None

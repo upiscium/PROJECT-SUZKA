@@ -56,6 +56,11 @@ class AgentEventType(str, Enum):
     # IP-18a (#411 D1 r4 §5-§6): the independent Outcome for one adopted
     # claim. ADMITTED in the soft band (HD-18-1): it records a terminal fact.
     R18_OUTCOME_COMMIT = "r18_outcome_commit"
+    # IP-19 (#411 D1 r4 / D-R17 §3 / §4): the R17 comparison and attribution
+    # of one terminal forward Outcome, and the positive Feedback that follows
+    # it. Both are cognition (HP-8, D-R17 §5): ADMITTED in the soft band.
+    R17_ASSESSMENT_COMMIT = "r17_assessment_commit"
+    R17_FEEDBACK_COMMIT = "r17_feedback_commit"
 
 
 class AgentEventSource(str, Enum):
@@ -96,6 +101,8 @@ class AgentEventSource(str, Enum):
     API_R18_APPROVAL = "api.r18.approval"
     RUNTIME_R18_APPROVAL_EXPIRE = "runtime.r18.approval_expire"
     RUNTIME_R18_OUTCOME_COMMIT = "runtime.r18.outcome_commit"
+    RUNTIME_R17_ASSESSMENT_COMMIT = "runtime.r17.assessment_commit"
+    RUNTIME_R17_FEEDBACK_COMMIT = "runtime.r17.feedback_commit"
 
 
 class AgentRuntimeStatus(str, Enum):

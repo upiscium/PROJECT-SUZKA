@@ -86,6 +86,7 @@ from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinato
 from suzka.r16.decision_issuer import _DecisionIssuer
 from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
 from suzka.r17.expectation_issuer import ExpectationIssuerV1
+from suzka.r17.feedback_owner import FeedbackOwnerV1
 from suzka.r18.approval_api import mount_approval_api
 from suzka.r18.approval_owner import ApprovalChallengeOwnerV1
 from suzka.r18.executor import ClaimKeys, R18Executor
@@ -541,6 +542,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise StateRecoveryError("R17 expectation issuer unavailable")
             return issuer
 
+        def _r17_feedback_owner_for_commit(
+            event: AgentEvent,
+        ) -> FeedbackOwnerV1 | None:
+            owner = getattr(app.state, "feedback_owner", None)
+            if owner is None and event.event_type in {
+                AgentEventType.R17_ASSESSMENT_COMMIT,
+                AgentEventType.R17_FEEDBACK_COMMIT,
+            }:
+                raise StateRecoveryError("R17 feedback owner unavailable")
+            return owner
+
         def _r18_policy_owner_for_commit(
             event: AgentEvent,
         ) -> ReviewArtifactPolicyV1 | None:
@@ -588,6 +600,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             expectation_issuer = getattr(app.state, "expectation_issuer", None)
             if expectation_issuer is not None:
                 expectation_issuer._clear()
+            feedback_owner = getattr(app.state, "feedback_owner", None)
+            if feedback_owner is not None:
+                feedback_owner._clear()
             policy_owner = getattr(app.state, "policy_owner", None)
             if policy_owner is not None:
                 policy_owner._clear()
@@ -626,6 +641,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 expectation_issuer = _r17_expectation_issuer_for_commit(event)
                 if expectation_issuer is not None:
                     expectation_issuer._validate_commit(event)
+                feedback_owner = _r17_feedback_owner_for_commit(event)
+                if feedback_owner is not None:
+                    feedback_owner._validate_commit(event)
                 policy_owner = _r18_policy_owner_for_commit(event)
                 if policy_owner is not None:
                     policy_owner._validate_commit(event)
@@ -921,6 +939,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.decision_issuer = None
             app.state.intent_issuer = None
             app.state.expectation_issuer = None
+            app.state.feedback_owner = None
             app.state.policy_owner = None
             app.state.approval_owner = None
             app.state.outcome_owner = None
@@ -978,6 +997,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.agent_runtime,
                     enabled=app_settings.r18.enabled,
                 )
+                # IP-19 (#367 D-R17 §3/§4): the R17 Assessment / Feedback
+                # owner, installed and gated exactly like the forecast issuer.
+                app.state.feedback_owner = FeedbackOwnerV1(
+                    app.state.decision_issuer,
+                    app.state.agent_runtime,
+                    enabled=app_settings.r18.enabled,
+                )
                 # IP-17a (#411 D1 r7 §1/§2): the R18 Policy owner, installed
                 # and gated exactly like the Intent issuer.
                 app.state.policy_owner = ReviewArtifactPolicyV1(
@@ -1003,6 +1029,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state, "r18_executor_enabled", True
                 ):
                     decision_issuer = app.state.decision_issuer
+
+                    def _notify_outcome() -> None:
+                        driver = getattr(app.state, "r16_driver", None)
+                        if driver is not None:
+                            driver.notify_outcome_committed()
 
                     def _read_adopted_records() -> Any:
                         return SubjectHistoryReader(
@@ -1034,6 +1065,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         ),
                         read_claim_keys=_read_claim_keys,
                         facts=r18_facts,
+                        # IP-19: an Outcome starts the driver's Assessment /
+                        # Feedback chain (late-bound: the driver is built
+                        # after the executor; a no-op until it exists).
+                        on_outcome=_notify_outcome,
                     )
                 elif app_settings.r18.enabled:
                     r18_gate.open()  # the test seam above: no executor, no sweep
@@ -1061,6 +1096,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 intent_issuer = app.state.intent_issuer
                 expectation_issuer = app.state.expectation_issuer
                 policy_owner = app.state.policy_owner
+                feedback_owner = app.state.feedback_owner
                 app.state.r16_driver = R16Driver(
                     app.state.agent_runtime,
                     app.state._motivation_source_owner,
@@ -1091,6 +1127,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         else None
                     ),
                     gate=r18_gate if app_settings.r18.enabled else None,
+                    feedback_owner=(
+                        feedback_owner
+                        if feedback_owner is not None and feedback_owner.enabled
+                        else None
+                    ),
                 )
         except BaseException:
             app.state.event_journal.close()

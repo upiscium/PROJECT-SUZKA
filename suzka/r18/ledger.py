@@ -53,6 +53,7 @@ from suzka.r16.history_records import (
 )
 from suzka.r16.successor_policy import (
     MAX_LEDGER_REFS,
+    FeedbackState,
     InverseAuthorization,
     LedgerState,
     PolicyRef,
@@ -101,6 +102,11 @@ class LedgerRead:
     refs: tuple[PolicyRef, ...]
     inverse_authorization: InverseAuthorization | None
     verified_outcome_ref: PolicyRef | None
+    # IP-19: the R17 Feedback witness.  ``derive_ledger`` never sets it (the
+    # ledger is R18's); the Decision issuer fills it from ``read_feedback``,
+    # so every pre-IP-19 value keeps its ABSENT / None default.
+    feedback: FeedbackState = FeedbackState.ABSENT
+    feedback_ref: PolicyRef | None = None
 
 
 # The production witness while the store holds no R17 / R18 data (§5): the
