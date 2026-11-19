@@ -134,7 +134,14 @@ def test_soft_band_allow_list_matches_the_design_table() -> None:
         AgentEventType.R19_WAKE_TERMINAL,
     ):
         assert wake_event in SOFT_BAND_ADMITTED_EVENT_TYPES
-    assert len(AgentEventType) == 32
+    # IP-21a (D1 r3 §3, HP-8): the Outbox message and the Inbox ACK are admitted
+    # on purpose (one row each in test_r19_ip21a_foundations.py).
+    for outbox_event in (
+        AgentEventType.R19_WAKE_COMPLETE,
+        AgentEventType.R19_INBOX_ACK,
+    ):
+        assert outbox_event in SOFT_BAND_ADMITTED_EVENT_TYPES
+    assert len(AgentEventType) == 34
     assert SOFT_BAND_ADMITTED_EVENT_TYPES <= set(AgentEventType)
 
 

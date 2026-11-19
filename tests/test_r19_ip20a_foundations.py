@@ -171,11 +171,7 @@ def test_the_four_wake_event_kinds_and_sources_exist() -> None:
         "runtime.r16.wake_review",
         "runtime.r19.wake_terminal",
     ]
-    # IP-21's two kinds are not defined here.
-    assert not {item.name for item in AgentEventType} & {
-        "R19_WAKE_COMPLETE",
-        "R19_INBOX_ACK",
-    }
+    # IP-21's two kinds are IP-21a's (tests/test_r19_ip21a_foundations.py).
 
 
 @pytest.mark.parametrize("event_type", WAKE_TYPES)

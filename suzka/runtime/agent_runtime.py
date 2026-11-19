@@ -68,6 +68,10 @@ class AgentEventType(str, Enum):
     R19_WAKE_CLAIM = "r19_wake_claim"
     R16_WAKE_REVIEW = "r16_wake_review"
     R19_WAKE_TERMINAL = "r19_wake_terminal"
+    # IP-21a (#411 IP-21 D1 r3 §3): the R19 Outbox message and the Inbox ACK.
+    # Both are bookkeeping, ADMITTED in the soft band (D-R19 §8-5, HP-8).
+    R19_WAKE_COMPLETE = "r19_wake_complete"
+    R19_INBOX_ACK = "r19_inbox_ack"
 
 
 class AgentEventSource(str, Enum):
@@ -114,6 +118,8 @@ class AgentEventSource(str, Enum):
     RUNTIME_R19_WAKE_CLAIM = "runtime.r19.wake_claim"
     RUNTIME_R16_WAKE_REVIEW = "runtime.r16.wake_review"
     RUNTIME_R19_WAKE_TERMINAL = "runtime.r19.wake_terminal"
+    RUNTIME_R19_WAKE_COMPLETE = "runtime.r19.wake_complete"
+    API_R19_INBOX_ACK = "api.r19.inbox_ack"
 
 
 class AgentRuntimeStatus(str, Enum):
