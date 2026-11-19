@@ -424,6 +424,7 @@ class R16Driver:
         # this incarnation's scan state (links per chain, bounded).
         self._feedbacked: dict[str, None] = {}
         self._feedback_retries: dict[str, int] = {}
+        self._scan_retries: dict[str, int] = {}
         self._assess_scans = 0
         self._feedback_scans = 0
         self._feedback_scan_posted = False
@@ -1432,9 +1433,27 @@ class R16Driver:
                 self._maybe_feedback(value.assessment_id)
             self._maybe_assess_scan()
             return
+        if self._retry_scan(_Stage.ASSESSMENT, _AssessmentTarget(), value.reason):
+            return
         # NONE_LEFT or a HOLD ends the Assessment links; the Feedback scan
         # catches an Assessment whose Feedback never followed.
         self._maybe_feedback_scan()
+
+    def _retry_scan(self, stage: _Stage, target: object, reason: object) -> bool:
+        """A transient HOLD of a scan is retried with the bounded delays
+        (review P2-1), so an Outcome is not left waiting for the next one."""
+
+        key = stage.value
+        if reason not in TRANSIENT_FEEDBACK_REASONS:
+            self._scan_retries.pop(key, None)
+            return False
+        attempt = self._scan_retries.get(key, 0)
+        if attempt >= len(RETRY_DELAYS_SECONDS):
+            self._scan_retries.pop(key, None)
+            return False
+        self._scan_retries[key] = attempt + 1
+        self._retries.append(_Retry(self._clock() + RETRY_DELAYS_SECONDS[attempt], 0, stage, target))
+        return True
 
     def _maybe_feedback(self, assessment_id: str) -> None:
         """One Feedback request per Assessment this incarnation."""
@@ -1466,6 +1485,8 @@ class R16Driver:
             # The scan: only a COMMITTED continues it.
             if value.status is FeedbackCommitStatus.COMMITTED:
                 self._maybe_feedback_scan()
+            else:
+                self._retry_scan(_Stage.FEEDBACK, target, value.reason)
             return
         if value.reason not in TRANSIENT_FEEDBACK_REASONS:
             self._feedback_retries.pop(target.assessment_id, None)

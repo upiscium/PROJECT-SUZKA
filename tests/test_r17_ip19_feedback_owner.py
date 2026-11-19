@@ -248,6 +248,9 @@ def test_a_feedback_admitted_at_t_survives_a_later_inverse_intent(app, monkeypat
         assert seen.last.feedback_ref == feedback.policy_ref()
         assert result.row is SuccessorRow.ROW_2  # the current inverse state
         # No new Feedback is written once the operation is no longer ACTIVE_VERIFIED_AUTHORIZED.
+        assert _feedback(state).status is FeedbackCommitStatus.NONE_LEFT
+        held = _feedback(state, feedback.assessment_id)
+        assert held.status is FeedbackCommitStatus.EXISTING  # the one admitted at T
         _no_failed_events(state)
 
 

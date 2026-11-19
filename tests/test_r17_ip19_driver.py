@@ -137,12 +137,16 @@ def test_a_hold_on_the_assessment_scan_still_runs_the_feedback_scan() -> None:
     )
     ip16a2._drain(driver)
     assert owner.calls == [("assessment", None), ("feedback", None)]
-    _resolve(
-        owner.futures[-1],
-        _FeedbackResult(FeedbackCommitStatus.HOLD, None, None, R17FeedbackReason.IN_FLIGHT),
-    )
-    ip16a2._drain(driver)
-    assert len(owner.calls) == 2  # a scan HOLD ends the chain; no retry loop
+    # A transient scan HOLD is retried (bounded); the retry also ends the chain.
+    for _ in range(4):
+        _resolve(
+            owner.futures[-1],
+            _FeedbackResult(FeedbackCommitStatus.HOLD, None, None, R17FeedbackReason.IN_FLIGHT),
+        )
+        ip16a2._drain(driver)
+        driver._clock.now += 10  # type: ignore[attr-defined]
+        ip16a2._drain(driver)
+    assert len(owner.calls) == 2 + 3
 
 
 def test_a_transient_feedback_hold_is_retried_with_the_bounded_delays() -> None:
