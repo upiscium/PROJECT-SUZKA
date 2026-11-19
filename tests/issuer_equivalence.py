@@ -90,6 +90,11 @@ def _label(value: object) -> str:
 
 
 def install(monkeypatch: pytest.MonkeyPatch) -> Recorder:
+    active = getattr(_DecisionIssuer._issue, "recorder", None)
+    if active is not None:
+        # Already installed (the conftest gate plus a wrapper module): share it,
+        # never nest a dual run inside a dual run.
+        return active  # type: ignore[no-any-return]
     recorder = Recorder()
     refactored = _DecisionIssuer._issue
 
@@ -150,6 +155,7 @@ def install(monkeypatch: pytest.MonkeyPatch) -> Recorder:
             raise raised
         return actual[1]
 
+    dual.recorder = recorder  # type: ignore[attr-defined]
     monkeypatch.setattr(_DecisionIssuer, "_issue", dual)
     return recorder
 
