@@ -66,7 +66,13 @@ Stages (#370 D0 §2, D1, D2):
   HOLD, or ``MAX_FEEDBACK_SCANS_PER_STARTUP`` links, and is followed by a
   ``R17_FEEDBACK_COMMIT(scan)`` chain that catches an Assessment whose Feedback
   was lost to a restart.  The driver never reads a store or decides eligibility.
-  Only with the Feedback owner installed and ``r18.enabled`` true.
+  Only with the Feedback owner installed and ``r18.enabled`` true;
+- IP-20b (IP-20 D1 r3 §3-3): an optional ``on_cause_terminal()`` callback, called
+  (non-blocking, errors swallowed and logged) after a Goal is ADOPTED, a
+  Commitment ACCEPTED, and an Assessment or Feedback result COMMITTED or
+  EXISTING: the four causes of an R19 Wake.  The driver still imports no R19
+  and reads no store; the callback is the Scheduler's nudge and is None unless
+  R19 is enabled.
 
 Tickets (#370 D1 2-1, 2-2, D2 P1-3/P1-5, addendum P1-A): a 128-bit random
 capability per command, held in a bounded in-memory ring. Nothing about
@@ -394,6 +400,7 @@ class R16Driver:
         policy_owner: ReviewArtifactPolicyV1 | None = None,
         gate: SweepGate | None = None,
         feedback_owner: FeedbackOwnerV1 | None = None,
+        on_cause_terminal: Callable[[], None] | None = None,
     ) -> None:
         self._runtime = runtime
         self._source = source_owner
@@ -422,6 +429,8 @@ class R16Driver:
         self._policy_retries: dict[str, int] = {}
         self._policy_scan_posted = False
         self._policy_scans = 0
+        # IP-20b: the R19 Scheduler's nudge (None unless r19.enabled).
+        self._on_cause_terminal = on_cause_terminal
         # IP-19: present only when installed with r18.enabled (server).
         self._feedback = feedback_owner
         # Assessments whose Feedback was submitted, transient retries made, and
@@ -578,6 +587,18 @@ class R16Driver:
         ):
             return
         self._post(_FeedbackScan())
+
+    def _cause_terminal(self) -> None:
+        """IP-20b: a cause of an R19 Wake is terminal.  Non-blocking by contract
+        (the Scheduler's nudge); a failing callback never stops the driver."""
+
+        callback = self._on_cause_terminal
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            LOGGER.info("R16 driver cause-terminal hook failed")
 
     def _post_forecast_scan(self) -> None:
         """IP-16a-3 (D1 §2): one forecast scan when the driver is active."""
@@ -1088,6 +1109,7 @@ class R16Driver:
                 while len(self._adopted_goal) > OBSERVED_CAPACITY:
                     self._adopted_goal.pop(next(iter(self._adopted_goal)))
             self._maybe_preview(value.subject_id, "adopted")
+            self._cause_terminal()
             return
         if value.status is R16OwnerStatus.ACCEPTED:
             self._finish(ticket_id, R16TicketStatus.ACCEPTED)
@@ -1098,6 +1120,7 @@ class R16Driver:
             )
             if goal_id is not None:
                 self._maybe_preview(goal_id, "commitment_accepted")
+            self._cause_terminal()
 
     def _u2a_terminal(
         self, waiting: _U2a, sequence: int | None, value: object
@@ -1446,7 +1469,10 @@ class R16Driver:
     def _assessment_done(self, value: object) -> None:
         if not isinstance(value, _AssessmentResult):
             return
+        if value.status is AssessmentCommitStatus.EXISTING:
+            self._cause_terminal()
         if value.status is AssessmentCommitStatus.COMMITTED:
+            self._cause_terminal()
             self._scan_retries.pop(_Stage.ASSESSMENT.value, None)
             assert value.assessment is not None and value.assessment_id is not None
             if value.assessment.positive_feedback_eligible:
@@ -1501,6 +1527,8 @@ class R16Driver:
     def _feedback_done(self, target: _FeedbackTarget, value: object) -> None:
         if not isinstance(value, _FeedbackResult):
             return
+        if value.status in (FeedbackCommitStatus.COMMITTED, FeedbackCommitStatus.EXISTING):
+            self._cause_terminal()
         if target.assessment_id is None:
             # The scan: only a COMMITTED continues it.
             if value.status is FeedbackCommitStatus.COMMITTED:

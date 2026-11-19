@@ -635,13 +635,24 @@ class WakeV1:
 
 
 def may_supersede(old: WakeV1, new: WakeV1) -> bool:
-    """D-R19 §3 / #369 A2-3: may a new FEEDBACK_ADMITTED Wake cancel an older,
-    unclaimed same-Goal Wake? Otherwise both stay. Whether ``old`` is still
-    unclaimed is the caller's (store) fact."""
+    """D-R19 §3 / #369 A2-3, extended by IP-20 D1 A-11 (HD-20-5 (b)): may a new
+    Wake cancel an older, unclaimed same-Goal Wake? Otherwise both stay. Whether
+    ``old`` is still unclaimed is the caller's (store) fact.
+
+    A new FEEDBACK_ADMITTED Wake may. So may a new COMMITMENT_ADMITTED Wake over
+    an older GOAL_ADMITTED one (the Goal-then-Commitment case: the Goal's
+    fingerprint has changed once a Commitment exists, so its own review would
+    only end STALE_SOURCE). Nothing else supersedes."""
 
     if type(old) is not WakeV1 or type(new) is not WakeV1:
         raise TypeError("expected WakeV1 values")
-    if new.cause is not WakeCause.FEEDBACK_ADMITTED or old.wakeup_id == new.wakeup_id:
+    if old.wakeup_id == new.wakeup_id:
+        return False
+    if new.cause is WakeCause.FEEDBACK_ADMITTED:
+        pass
+    elif not (
+        new.cause is WakeCause.COMMITMENT_ADMITTED and old.cause is WakeCause.GOAL_ADMITTED
+    ):
         return False
     old_commitment, new_commitment = old.commitment_ref(), new.commitment_ref()
     same_commitment = old_commitment is None or (
