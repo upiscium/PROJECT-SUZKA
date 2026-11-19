@@ -277,6 +277,11 @@ class _GateOpen:
 
 
 @dataclass(frozen=True, slots=True)
+class _BlockedClear:
+    """Queue item: BLOCKED_TARGET cleared (after its dwell; IP-18b, §3-6 item 5)."""
+
+
+@dataclass(frozen=True, slots=True)
 class _ChatTerminal:
     ref: _MotivationSourceRef
     experience_id: str | None
@@ -380,6 +385,10 @@ class R16Driver:
         self._gate = gate
         self._gate_waiting: dict[str, _IntentTarget] = {}
         self._gate_subscribed = False
+        # IP-18b (§3-6 item 5): (goal, trigger) previews that ran while the
+        # target was blocked (bounded); re-previewed once when it clears.
+        self._blocked_previews: dict[tuple[str, str], None] = {}
+        self._blocked_clear_flag = Event()
         self.incarnation = secrets.token_hex(8)
         self._active = active
         # IP-11: the self path also needs its own unique activation marker.
@@ -463,6 +472,17 @@ class R16Driver:
             return
         self._gate_subscribed = True
         self._gate.subscribe(self._on_gate_open_callback)
+        subscribe_unblocked = getattr(self._gate, "subscribe_unblocked", None)
+        if subscribe_unblocked is not None:
+            subscribe_unblocked(self._on_blocked_clear_callback)
+
+    def _on_blocked_clear_callback(self) -> None:
+        if self._stop.is_set():
+            return
+        # A flag as well as a message: a full queue drops the message, and the
+        # gate fires the clear only once; the idle poll sees the flag.
+        self._blocked_clear_flag.set()
+        self._post(_BlockedClear())
 
     def _on_gate_open_callback(self) -> None:
         if self._stop.is_set():
@@ -649,6 +669,10 @@ class R16Driver:
                     self._maybe_policy_scan(None)
                 elif isinstance(item, _GateOpen):
                     self._on_gate_open()
+                elif isinstance(item, _BlockedClear):
+                    self._on_blocked_clear()
+                if self._blocked_clear_flag.is_set():
+                    self._on_blocked_clear()
                 with self._tickets_lock:
                     finished, self._done = self._done, []
                 for result in finished:
@@ -925,6 +949,7 @@ class R16Driver:
             return
         if item.stage is _Stage.PLAN_PREVIEW:
             LOGGER.info("R16 driver preview completed")
+            self._note_blocked_result(item.context, outcome.value)
             self._maybe_intent(outcome.value)
             return
         if item.stage is _Stage.ACTION_INTENT:
@@ -1022,7 +1047,47 @@ class R16Driver:
             return
         self._previewed[key] = None
         _bound(self._previewed)
+        blocked = getattr(self._gate, "blocked_target", None)
+        if blocked is not None and blocked():
+            # Sealed as Plan A (TARGET_UNAVAILABLE) at best: remember it, so the
+            # clear can bring the subject back to row 4 without an unrelated
+            # trigger (N4).
+            self._blocked_previews[key] = None
+            _bound(self._blocked_previews)
         self._submit(_Stage.PLAN_PREVIEW, goal_id)
+
+    def _note_blocked_result(self, goal_id: object, value: object) -> None:
+        """P3-2: the block can begin after the preview was submitted but before
+        the issuer read it. A Plan A (row 2c) result seen while the witness is
+        latched is remembered too, so the clear re-previews that goal."""
+
+        blocked = getattr(self._gate, "blocked_target", None)
+        if (
+            blocked is None
+            or not isinstance(goal_id, str)
+            or getattr(value, "row", None) is not SuccessorRow.ROW_2C
+            or not blocked()
+            or any(goal == goal_id for goal, _trigger in self._blocked_previews)
+        ):
+            return
+        self._blocked_previews[(goal_id, "blocked_result")] = None
+        _bound(self._blocked_previews)
+
+    def _on_blocked_clear(self) -> None:
+        """§3-6 item 5: BLOCKED_TARGET cleared (after the dwell): clear the
+        ``_previewed`` keys of the goals previewed while blocked and post ONE
+        PLAN_PREVIEW per such goal. One round per clear, and a clear needs
+        5 continuous minutes of OPEN, so at most one return per dwell."""
+
+        self._blocked_clear_flag.clear()
+        pairs = list(self._blocked_previews)
+        self._blocked_previews.clear()
+        first: dict[str, str] = {}
+        for goal_id, trigger in pairs:
+            self._previewed.pop((goal_id, trigger), None)
+            first.setdefault(goal_id, trigger)
+        for goal_id, trigger in first.items():
+            self._maybe_preview(goal_id, trigger)
 
     def _maybe_intent(self, value: object) -> None:
         """IP-16a-2 (D1 §2): one Intent per row-4 Decision this incarnation."""

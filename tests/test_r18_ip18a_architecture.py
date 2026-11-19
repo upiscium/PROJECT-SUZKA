@@ -83,7 +83,8 @@ def test_the_real_gate_replaces_the_always_open_gate_at_the_install_sites() -> N
     assert text.count("admission_gate=r18_gate") == 3
     # The gate is built BEFORE the Decision issuer and handed a read-only view.
     assert text.index("r18_gate = SweepGate(") < text.index("app.state.decision_issuer = _DecisionIssuer(")
-    assert "blocked_target=lambda: False" in text
+    assert "blocked_target=r18_gate.blocked_target" in text
+    assert "target_facts=r18_facts.get" in text
 
 
 def test_one_runtime_instance_id_per_process_reaches_the_owner_and_the_executor() -> None:

@@ -145,6 +145,7 @@
  "tests/test_r18_ip18a_executor.py": 10.0,
  "tests/test_r18_ip18a_flow.py": 130.0,
  "tests/test_r18_ip18a_target_gate.py": 20.0,
+ "tests/test_r18_ip18b_facts_sweep.py": 50.0,
  "tests/test_r19_ip13b_contracts.py": 1.0,
  "tests/test_response_postprocessor.py": 1.0,
  "tests/test_semantic_context_projection.py": 1.0,

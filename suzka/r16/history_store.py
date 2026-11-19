@@ -1731,6 +1731,47 @@ class SubjectHistoryStore:
             )
         )
 
+    def prior_claims(self, current_incarnation: str) -> tuple[tuple[str, str], ...]:
+        """IP-18b (IP-18 D1 r4 §3-1 S2-A): the forward claims of every
+        incarnation other than ``current_incarnation``, as
+        ``(operation_key, obligation_group_key)``.
+
+        ``execution_claims`` has no ``intent_id`` column, so the group key
+        comes from the same incarnation's FORWARD ``action_intents`` row through
+        ``operation_key``. Read-only; no schema change."""
+
+        rows = self._read(
+            "SELECT c.operation_key, i.obligation_group_key FROM execution_claims c "
+            "JOIN action_intents i ON i.operation_key = c.operation_key "
+            "AND i.incarnation_id = c.incarnation_id AND i.direction = 'FORWARD' "
+            "WHERE c.direction = 'FORWARD' AND c.incarnation_id <> ? "
+            "ORDER BY c.operation_key",
+            (current_incarnation,),
+        )
+        return tuple((str(row[0]), str(row[1])) for row in rows)
+
+    def current_claim_keys(self, incarnation: str) -> frozenset[str]:
+        """IP-18b (§9-4): every forward key with a Claim in ``incarnation``,
+        adopted or not: the claim rows, plus the live ``claim:`` reservations
+        of an unfinished claim operation."""
+
+        found = {
+            str(row[0])
+            for row in self._read(
+                "SELECT operation_key FROM execution_claims "
+                "WHERE direction = 'FORWARD' AND incarnation_id = ?",
+                (incarnation,),
+            )
+        }
+        for row in self._read(
+            "SELECT reserved_key FROM history_operation_keys "
+            "WHERE live = 1 AND incarnation_id = ? "
+            "AND reserved_key >= 'claim:' AND reserved_key < 'claim;'",
+            (incarnation,),
+        ):
+            found.add(str(row[0])[len("claim:") :])
+        return frozenset(found)
+
     def live_key_owner(self, key: str) -> tuple[str, str] | None:
         """The (incarnation, transaction) holding one live key, if any (§5)."""
 

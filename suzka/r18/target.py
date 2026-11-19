@@ -462,6 +462,40 @@ class _Connection:
             for row in self._read(f"SELECT {_LEDGER_COLUMNS} FROM target_operations ORDER BY operation_key")
         )
 
+    def forward_snapshot(self) -> tuple[tuple[LedgerRow, ArtifactRow | None], ...]:
+        """Every forward ledger row with its group's artifact, in one read
+        transaction (the sweep's target -> source direction, IP-18b)."""
+
+        with self._lock:
+            connection = self._connection
+            try:
+                connection.execute("BEGIN")
+                try:
+                    rows = connection.execute(
+                        f"SELECT {_LEDGER_COLUMNS} FROM target_operations "
+                        "WHERE direction = 'FORWARD' ORDER BY operation_key"
+                    ).fetchall()
+                    artifact_rows = connection.execute(
+                        "SELECT obligation_group_key, state, revision, payload FROM target_artifacts"
+                    ).fetchall()
+                finally:
+                    connection.execute("COMMIT")
+            except sqlite3.Error as error:
+                raise _error(error, "read") from error
+        artifacts: dict[str, ArtifactRow] = {}
+        for group, state, revision, payload in artifact_rows:
+            try:
+                artifacts[str(group)] = ArtifactRow(
+                    str(group), ArtifactState(state), int(str(revision)), _blob(payload)
+                )
+            except (TypeError, ValueError) as error:
+                raise TargetCorrupt("target artifact row is invalid") from error
+        result = []
+        for raw in rows:
+            row = _ledger(raw)
+            result.append((row, artifacts.get(row.obligation_group_key)))
+        return tuple(result)
+
     def status(self, group_key: str) -> GroupStatus:
         """``READ_REVIEW_ARTIFACT_STATUS_V1`` for one obligation group, read
         in one snapshot (one read transaction)."""

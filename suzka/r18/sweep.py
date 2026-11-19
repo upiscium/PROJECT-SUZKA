@@ -18,10 +18,17 @@ from collections.abc import Callable
 from enum import Enum
 import logging
 from threading import Lock
+import time
+from typing import Final
 
 from suzka.r18.target import TargetStore
 
 LOGGER = logging.getLogger(__name__)
+
+# IP-18b (D1 r4 §9-5, R3-4): BLOCKED_TARGET clears only after the gate has
+# been OPEN continuously for this long, so a flapping target cannot churn
+# Plan A <-> row 4 Decisions faster than one return per dwell.
+BLOCKED_MIN_DWELL_SECONDS: Final = 300.0
 
 
 class GateState(str, Enum):
@@ -34,9 +41,21 @@ class GateState(str, Enum):
 class SweepGate:
     """Closed until the sweep has settled every unresolved key."""
 
-    def __init__(self, *, enabled: bool) -> None:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        monotonic: Callable[[], float] = time.monotonic,
+        blocked_dwell_seconds: float = BLOCKED_MIN_DWELL_SECONDS,
+    ) -> None:
         if type(enabled) is not bool:
             raise TypeError("enabled must be a bool")
+        self._monotonic = monotonic
+        self._dwell = blocked_dwell_seconds
+        # The latch: set on entering BLOCKED_TARGET, cleared after the dwell.
+        self._latched = False
+        self._open_since: float | None = None
+        self._unblocked_subscribers: list[Callable[[], None]] = []
         self._lock = Lock()
         self._state = GateState.SWEEPING if enabled else GateState.DISABLED
         self._subscribers: list[Callable[[], None]] = []
@@ -49,8 +68,42 @@ class SweepGate:
         return self._state is GateState.OPEN
 
     def blocked_target(self) -> bool:
-        """True only in BLOCKED_TARGET (never DISABLED / SWEEPING)."""
-        return self._state is GateState.BLOCKED_TARGET
+        """The Decision issuer's view (§9-5): True in BLOCKED_TARGET and, after
+        the target returns, until the gate has been OPEN continuously for the
+        minimum dwell (hysteresis). Never True in DISABLED / SWEEPING unless
+        the latch is still pending. No I/O. When this call is the one that
+        observes the dwell elapsed, the unblocked subscribers run."""
+
+        return self._evaluate_latch()
+
+    def _evaluate_latch(self) -> bool:
+        with self._lock:
+            if not self._latched:
+                return False
+            if self._state is GateState.OPEN and self._open_since is not None:
+                if self._monotonic() - self._open_since >= self._dwell:
+                    self._latched = False
+                    subscribers = list(self._unblocked_subscribers)
+                else:
+                    return True
+            else:
+                return True
+        for callback in subscribers:
+            self._call(callback)
+        return False
+
+    def poll(self) -> None:
+        """Let the latch clear on time alone (the executor's reconciler tick
+        calls this), so the unblocked subscribers fire without a Decision."""
+
+        self._evaluate_latch()
+
+    def subscribe_unblocked(self, callback: Callable[[], None]) -> None:
+        """``callback`` runs once each time BLOCKED_TARGET clears (after the
+        dwell); like ``subscribe`` it only posts to its owner's queue."""
+
+        with self._lock:
+            self._unblocked_subscribers.append(callback)
 
     # ------------------------------------------------------------ transitions
 
@@ -59,6 +112,10 @@ class SweepGate:
             if self._state is GateState.DISABLED or self._state is state:
                 return
             self._state = state
+            if state is GateState.BLOCKED_TARGET:
+                self._latched = True
+            # The dwell is "OPEN continuously": any leave of OPEN restarts it.
+            self._open_since = self._monotonic() if state is GateState.OPEN else None
             subscribers = list(self._subscribers) if state is GateState.OPEN else []
         for callback in subscribers:
             self._call(callback)

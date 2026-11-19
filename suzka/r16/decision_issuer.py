@@ -132,6 +132,13 @@ from suzka.r16.successor_policy import (
     utc_timestamp,
 )
 from suzka.r18.contracts import Direction, operation_key
+from suzka.r18.facts import (
+    EMPTY_FACTS,
+    TARGET_UNAVAILABLE_LEDGER,
+    TargetFacts,
+    facts_ledger,
+    with_target_blocked,
+)
 from suzka.r18.ledger import (
     CORRUPT_LEDGER,
     NO_LEDGER,
@@ -313,6 +320,7 @@ class _DecisionIssuer:
         *,
         target_path: Path | None = None,
         blocked_target: Callable[[], bool] | None = None,
+        target_facts: Callable[[], TargetFacts] | None = None,
     ) -> None:
         from suzka.r16.plan_preview import _PlanPreviewOwner
 
@@ -338,6 +346,9 @@ class _DecisionIssuer:
         # view (no I/O). Always False in IP-18a; IP-18b's ``_ledger`` reads it
         # once per evaluation. ``None`` (tests, R18 off) means never blocked.
         self._blocked_target: Callable[[], bool] = blocked_target or (lambda: False)
+        # IP-18b (§9-4): the sweep's published TargetFacts (no I/O); ``None``
+        # (tests, R18 off) means no facts.
+        self._target_facts: Callable[[], TargetFacts] = target_facts or (lambda: EMPTY_FACTS)
 
     # ------------------------------------------------------------ handler
 
@@ -599,10 +610,36 @@ class _DecisionIssuer:
             not in (PredecessorState.ABSENT_INITIAL, PredecessorState.QUALIFIED)
         ):
             return NO_LEDGER
-        if not self._store.has_record_operations() and not self._store.has_live_claim_keys():
-            return NO_LEDGER
-        group_key = self._group_key(q)
+        # IP-18b (§9-4 / §9-5): both views are read once per evaluation.
+        facts = self._target_facts()
+        blocked = self._blocked_target()
+        has_obligation = q.commitment_id is not None
+        if (
+            not self._store.has_record_operations()
+            and not self._store.has_live_claim_keys()
+            and not facts
+        ):
+            # No R17 / R18 data and no facts: the real ledger is NONE with no
+            # prior claim, so no group key is needed to decide the §9-5 witness.
+            return with_target_blocked(
+                NO_LEDGER, blocked=blocked, has_obligation=has_obligation, has_prior_claim=False
+            )
+        try:
+            group_key = self._group_key(q)
+        except _LedgerSourceUnavailable:
+            if blocked and has_obligation:
+                # A lost target usually takes the obligation secret next to it:
+                # without this the subject would be held (row 1) by the very
+                # outage the witness exists to keep it free of.
+                return TARGET_UNAVAILABLE_LEDGER
+            raise
         forward_key = operation_key(group_key, Direction.FORWARD)
+        # N5: facts, once complete, take precedence; ``derive_ledger`` is
+        # skipped (it would report CORRUPT on a forward record, or CLAIMED
+        # with the prior-claim ref).
+        fact_ledger = facts_ledger(facts, forward_key)
+        if fact_ledger is not None:
+            return fact_ledger
         prior = None
         owner = self._store.live_key_owner(f"claim:{forward_key}")
         if owner is not None and owner[0] != classified.incarnation:
@@ -612,7 +649,7 @@ class _DecisionIssuer:
             if prior is None:
                 LOGGER.info("R16 issuer ledger=CORRUPT reason=prior_claim_row")
                 return CORRUPT_LEDGER
-        return derive_ledger(
+        real = derive_ledger(
             (
                 RecordAt(item.record, item.processing_sequence)
                 for item in classified.records
@@ -624,6 +661,10 @@ class _DecisionIssuer:
             # the live clock, or its closure would not match its sealed T.
             self._clock(),
             prior_claim=prior,
+        )
+        # §9-5: substitute LAST, and only over an empty ledger.
+        return with_target_blocked(
+            real, blocked=blocked, has_obligation=has_obligation, has_prior_claim=prior is not None
         )
 
     def _group_key(self, q: _QualifiedPreview) -> str:
