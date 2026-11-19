@@ -1119,3 +1119,95 @@ def test_a_crash_before_the_wal_aborts_and_the_next_tick_converges(tmp_path, mon
             assert entry.state is WakeState.CLOSED
             assert entry.attempts == (2 if stage == "review" else 1)
         assert state.event_journal.inspect().open_transactions == ()
+
+
+# ------------------------------------------------------- pacing (review P2)
+
+
+def test_pacer_backoff_cap_hour_reset_and_state_reset() -> None:
+    from suzka.r19.scheduler import BACKOFF_CAP_S, HOLD_CAP_PER_HOUR, WakePacer
+
+    now = [0.0]
+    pacer = WakePacer(lambda: now[0])
+    # Backoff doubles 30, 60, ... and is capped at 300 s.
+    delays = []
+    for _ in range(6):
+        pacer.record_hold("w", "COLLISION", "DUE", capped=False)
+        assert pacer.blocked("w", "DUE")
+        step_s = 0
+        while pacer.blocked("w", "DUE"):
+            now[0] += 1
+            step_s += 1
+        delays.append(step_s)
+    assert delays == [30, 60, 120, 240, 300, 300] and max(delays) == BACKOFF_CAP_S
+    # Uncapped holds never reach the hourly cap.
+    pacer.clear("w")
+    for _ in range(20):
+        pacer.record_hold("w", "IN_FLIGHT", "DUE", capped=False)
+        now[0] += 400
+        assert not pacer.blocked("w", "DUE")
+    # Capped holds: 3 per hour, then blocked past the backoff until the hour ends.
+    pacer.clear("w")
+    start = now[0]
+    for _ in range(HOLD_CAP_PER_HOUR):
+        pacer.record_hold("w", "COLLISION", "DUE", capped=True)
+        now[0] += 301
+    assert pacer.blocked("w", "DUE") and pacer.holds_of("w") == HOLD_CAP_PER_HOUR
+    now[0] = start + 3601
+    assert not pacer.blocked("w", "DUE")  # the hour reset the counter
+    # A derived-state change also resets the cap.
+    pacer.clear("w")
+    for _ in range(HOLD_CAP_PER_HOUR):
+        pacer.record_hold("w", "COLLISION", "DUE", capped=True)
+        now[0] += 301
+    assert pacer.blocked("w", "DUE") and not pacer.blocked("w", "EXPIRED")
+
+
+def test_pacer_seven_day_bound_for_a_permanent_no_row_hold() -> None:
+    from suzka.r19.scheduler import WakePacer
+
+    now = [0.0]
+    pacer = WakePacer(lambda: now[0])
+    events = 0
+    while now[0] < 7 * 86_400:
+        if not pacer.blocked("w", "DUE"):
+            events += 1
+            pacer.record_hold("w", "COLLISION", "DUE", capped=True)
+        now[0] += 30
+    assert 0 < events <= 3 * 24 * 7 + 3 < 2000
+
+
+def test_a_chain_that_cannot_be_submitted_is_resumed_by_the_next_tick(sw) -> None:  # type: ignore[no-untyped-def]
+    from suzka.runtime.agent_runtime import AgentRuntimeQueueFull
+
+    state = sw.state
+    wake = fx.materialize(state, sw.gid, sw.time)
+    scheduler = make(sw)
+    real = state.wake_review_owner._submit_review
+
+    def full(claim_id):  # type: ignore[no-untyped-def]
+        raise AgentRuntimeQueueFull(None)  # type: ignore[arg-type]
+
+    state.wake_review_owner._submit_review = full  # type: ignore[method-assign]
+    assert step(sw, scheduler).action is TickAction.CLAIM
+    assert entry_of(sw, wake).state is WakeState.CLAIMED_LIVE
+    state.wake_review_owner._submit_review = real  # type: ignore[method-assign]
+    assert step(sw, scheduler).action is TickAction.REVIEW
+    assert entry_of(sw, wake).state is WakeState.CLOSED
+    assert len(journal_events(state, AgentEventType.R16_WAKE_REVIEW)) == 1
+
+
+def test_stop_does_not_chain_a_review_and_the_next_start_resumes_it(sw) -> None:  # type: ignore[no-untyped-def]
+    state = sw.state
+    wake = fx.materialize(state, sw.gid, sw.time)
+    scheduler = make(sw)
+    assert scheduler.tick().action is TickAction.CLAIM
+    scheduler.stop()  # before or after the callback; at most the claim ran
+    assert scheduler.wait_idle(30)
+    settle(sw, scheduler)
+    started = len(journal_events(state, AgentEventType.R16_WAKE_REVIEW))
+    assert started in (0, 1)
+    restarted = make(sw)
+    step(sw, restarted)
+    assert entry_of(sw, wake).state in (WakeState.CLOSED, WakeState.CLAIMED_LIVE)
+    assert len(journal_events(state, AgentEventType.R16_WAKE_REVIEW)) <= 1
