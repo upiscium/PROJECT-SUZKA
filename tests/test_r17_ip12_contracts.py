@@ -676,5 +676,6 @@ def test_r17_imports_stay_pure() -> None:
         if not name.startswith("_")
         # IP-16a-3: the forecast owner is a submodule (an attribute once it
         # is imported); the package still exports only the pure values.
-        and name not in {"contracts", "expectation_issuer"}
+        # IP-19: the Feedback owner and reader are submodules too.
+        and name not in {"contracts", "expectation_issuer", "feedback_owner", "feedback_read"}
     }

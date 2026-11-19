@@ -56,7 +56,17 @@ Stages (#370 D0 §2, D1, D2):
   admitted (the soft band), or after ``MAX_POLICY_SCANS_PER_STARTUP`` scans.
   Every HOLD is bounded anyway: an unattended Intent closes at its approval
   window's end with no event (§3a).  Only with the Policy owner installed and
-  ``r18.enabled`` true.
+  ``r18.enabled`` true;
+- IP-19 (#367 D-R17 §3 / §4): once per driver incarnation when the driver is
+  (or becomes) active, and again after every Outcome the executor commits
+  (``notify_outcome_committed``), an ``R17_ASSESSMENT_COMMIT(scan)`` chain: each
+  COMMITTED Assessment of an authorized Outcome is followed by one
+  ``R17_FEEDBACK_COMMIT(assessment_id)`` (a transient HOLD is retried with the
+  bounded delays) and the next Assessment scan; the chain ends at NONE_LEFT, a
+  HOLD, or ``MAX_FEEDBACK_SCANS_PER_STARTUP`` links, and is followed by a
+  ``R17_FEEDBACK_COMMIT(scan)`` chain that catches an Assessment whose Feedback
+  was lost to a restart.  The driver never reads a store or decides eligibility.
+  Only with the Feedback owner installed and ``r18.enabled`` true.
 
 Tickets (#370 D1 2-1, 2-2, D2 P1-3/P1-5, addendum P1-A): a 128-bit random
 capability per command, held in a bounded in-memory ring. Nothing about
@@ -96,6 +106,14 @@ from suzka.r17.expectation_issuer import (
     ExpectationCommitStatus,
     _ExpectationResult,
 )
+from suzka.r17.feedback_owner import (
+    MAX_FEEDBACK_SCANS_PER_STARTUP,
+    TRANSIENT_FEEDBACK_REASONS,
+    AssessmentCommitStatus,
+    FeedbackCommitStatus,
+    _AssessmentResult,
+    _FeedbackResult,
+)
 from suzka.r18.intent_issuer import (
     IntentIssueStatus,
     R18IntentReason,
@@ -124,6 +142,7 @@ if TYPE_CHECKING:
     from suzka.r16.plan_preview import _PlanPreviewOwner
     from suzka.r16.source_owner import _MotivationSourceOwner
     from suzka.r17.expectation_issuer import ExpectationIssuerV1
+    from suzka.r17.feedback_owner import FeedbackOwnerV1
     from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
     from suzka.r18.policy_owner import ReviewArtifactPolicyV1
     from suzka.r18.sweep import SweepGate
@@ -137,6 +156,10 @@ TICKET_CAPACITY = 512
 IDLE_POLL_SECONDS = 0.2
 IDLE_WAIT_LIMIT_SECONDS = 30.0
 RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
+# IP-19 (condition B): a slow backstop re-runs the Assessment / Feedback chain,
+# so a lost notification (full queue, spent retries) never leaves an Outcome
+# without its follow-up until a restart.
+FEEDBACK_BACKSTOP_SECONDS = 600.0
 
 _TICKET = re.compile(r"(?P<incarnation>[0-9a-f]{16})\.(?P<token>[A-Za-z0-9_-]{22})")
 
@@ -230,6 +253,9 @@ class _Stage(str, Enum):
     EXPECTATION = "expectation"
     # IP-17a (#411 D1 r7 §2): the R18 Policy verdict for one Intent, or a scan.
     POLICY = "policy"
+    # IP-19 (#367 D-R17 §3 / §4): the R17 Assessment scan and Feedback.
+    ASSESSMENT = "assessment"
+    FEEDBACK = "feedback"
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +290,23 @@ class _PolicyTarget:
 @dataclass(frozen=True, slots=True)
 class _PolicyScan:
     """Queue item: start the once-per-incarnation Policy scan."""
+
+
+@dataclass(frozen=True, slots=True)
+class _AssessmentTarget:
+    """The Assessment scan (the owner picks the Outcome; no ids here)."""
+
+
+@dataclass(frozen=True, slots=True)
+class _FeedbackTarget:
+    """One Assessment's id (public-safe), or ``None`` for the owner's scan."""
+
+    assessment_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FeedbackScan:
+    """Queue item: (re)start the Assessment -> Feedback scan chain."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +393,7 @@ class R16Driver:
         expectation_issuer: ExpectationIssuerV1 | None = None,
         policy_owner: ReviewArtifactPolicyV1 | None = None,
         gate: SweepGate | None = None,
+        feedback_owner: FeedbackOwnerV1 | None = None,
     ) -> None:
         self._runtime = runtime
         self._source = source_owner
@@ -378,6 +422,17 @@ class R16Driver:
         self._policy_retries: dict[str, int] = {}
         self._policy_scan_posted = False
         self._policy_scans = 0
+        # IP-19: present only when installed with r18.enabled (server).
+        self._feedback = feedback_owner
+        # Assessments whose Feedback was submitted, transient retries made, and
+        # this incarnation's scan state (links per chain, bounded).
+        self._feedbacked: dict[str, None] = {}
+        self._feedback_retries: dict[str, int] = {}
+        self._scan_retries: dict[str, int] = {}
+        self._next_feedback_backstop = clock() + FEEDBACK_BACKSTOP_SECONDS
+        self._assess_scans = 0
+        self._feedback_scans = 0
+        self._feedback_scan_posted = False
         # IP-18a (#411 IP-18 D1 r4 §3-6): an Intent / Policy stage met a closed
         # AdmissionGate and was dropped from ``_intended`` / ``_policed``;
         # its target is remembered (bounded) and re-submitted on every
@@ -443,6 +498,7 @@ class R16Driver:
         if started:
             self._post_forecast_scan()
             self._post_policy_scan()
+            self._post_feedback_scan()
 
     def activate_self_goal(self) -> None:
         """IP-11: called after the unique self-Goal activation has completed."""
@@ -461,6 +517,7 @@ class R16Driver:
         if self._active:
             self._post_forecast_scan()
             self._post_policy_scan()
+            self._post_feedback_scan()
         self._subscribe_gate()
 
     def _subscribe_gate(self) -> None:
@@ -497,6 +554,30 @@ class R16Driver:
             return
         self._policy_scan_posted = True
         self._post(_PolicyScan())
+
+    def _post_feedback_scan(self) -> None:
+        """IP-19: one Assessment / Feedback scan chain when the driver is active
+        (restart recovery of an Outcome or Assessment with no follow-up)."""
+
+        if self._feedback is None or not self._feedback.enabled or self._feedback_scan_posted:
+            return
+        self._feedback_scan_posted = True
+        self._post(_FeedbackScan())
+
+    def notify_outcome_committed(self) -> None:
+        """IP-19: the executor committed (or found) an Outcome.  Called from the
+        executor's thread: it only posts to this driver's own queue, and is a
+        no-op while the driver is inactive (the activation scan then covers it)
+        or stopped."""
+
+        if (
+            self._feedback is None
+            or not self._feedback.enabled
+            or not self._active
+            or self._stop.is_set()
+        ):
+            return
+        self._post(_FeedbackScan())
 
     def _post_forecast_scan(self) -> None:
         """IP-16a-3 (D1 §2): one forecast scan when the driver is active."""
@@ -667,12 +748,15 @@ class R16Driver:
                     self._maybe_scan()
                 elif isinstance(item, _PolicyScan):
                     self._maybe_policy_scan(None)
+                elif isinstance(item, _FeedbackScan):
+                    self._on_feedback_scan()
                 elif isinstance(item, _GateOpen):
                     self._on_gate_open()
                 elif isinstance(item, _BlockedClear):
                     self._on_blocked_clear()
                 if self._blocked_clear_flag.is_set():
                     self._on_blocked_clear()
+                self._feedback_backstop()
                 with self._tickets_lock:
                     finished, self._done = self._done, []
                 for result in finished:
@@ -892,6 +976,12 @@ class R16Driver:
                 return _untyped(self._policy._submit_scan(context.after))
             assert context.intent_id is not None
             return _untyped(self._policy._submit_policy(context.intent_id))
+        if stage is _Stage.ASSESSMENT:
+            assert isinstance(context, _AssessmentTarget) and self._feedback is not None
+            return _untyped(self._feedback._submit_assessment(None))
+        if stage is _Stage.FEEDBACK:
+            assert isinstance(context, _FeedbackTarget) and self._feedback is not None
+            return _untyped(self._feedback._submit_feedback(context.assessment_id))
         assert isinstance(context, str)
         return _untyped(self._preview._submit_preview(context))
 
@@ -963,6 +1053,14 @@ class R16Driver:
         if item.stage is _Stage.POLICY:
             assert isinstance(item.context, _PolicyTarget)
             self._policy_done(item.context, outcome.value)
+            return
+        if item.stage is _Stage.ASSESSMENT:
+            assert isinstance(item.context, _AssessmentTarget)
+            self._assessment_done(outcome.value)
+            return
+        if item.stage is _Stage.FEEDBACK:
+            assert isinstance(item.context, _FeedbackTarget)
+            self._feedback_done(item.context, outcome.value)
             return
         value = outcome.value
         command = _command_of(item.context)
@@ -1307,6 +1405,128 @@ class R16Driver:
             )
         )
 
+    # -- IP-19: Assessment -> Feedback ------------------------------------------
+
+    def _on_feedback_scan(self) -> None:
+        """A new chain (activation, or an Outcome was committed): the per-chain
+        link counters restart, so a steady stream of Outcomes is never starved
+        by an earlier chain that used its links."""
+
+        if self._feedback is None or not self._feedback.enabled:
+            return
+        self._assess_scans = 0
+        self._feedback_scans = 0
+        self._maybe_assess_scan()
+
+    def _feedback_backstop(self) -> None:
+        """Re-run the chain about every ``FEEDBACK_BACKSTOP_SECONDS`` while active."""
+
+        if (
+            self._feedback is None
+            or not self._feedback.enabled
+            or not self._active
+            or self._clock() < self._next_feedback_backstop
+        ):
+            return
+        self._next_feedback_backstop = self._clock() + FEEDBACK_BACKSTOP_SECONDS
+        self._on_feedback_scan()
+
+    def _maybe_assess_scan(self) -> None:
+        """At most ``MAX_FEEDBACK_SCANS_PER_STARTUP`` links per chain."""
+
+        if (
+            self._feedback is None
+            or not self._feedback.enabled
+            or self._assess_scans >= MAX_FEEDBACK_SCANS_PER_STARTUP
+        ):
+            return
+        self._assess_scans += 1
+        self._submit(_Stage.ASSESSMENT, _AssessmentTarget())
+
+    def _assessment_done(self, value: object) -> None:
+        if not isinstance(value, _AssessmentResult):
+            return
+        if value.status is AssessmentCommitStatus.COMMITTED:
+            self._scan_retries.pop(_Stage.ASSESSMENT.value, None)
+            assert value.assessment is not None and value.assessment_id is not None
+            if value.assessment.positive_feedback_eligible:
+                self._maybe_feedback(value.assessment_id)
+            self._maybe_assess_scan()
+            return
+        if self._retry_scan(_Stage.ASSESSMENT, _AssessmentTarget(), value.reason):
+            return
+        # NONE_LEFT or a HOLD ends the Assessment links; the Feedback scan
+        # catches an Assessment whose Feedback never followed.
+        self._maybe_feedback_scan()
+
+    def _retry_scan(self, stage: _Stage, target: object, reason: object) -> bool:
+        """A transient HOLD of a scan is retried with the bounded delays
+        (review P2-1), so an Outcome is not left waiting for the next one."""
+
+        key = stage.value
+        if reason not in TRANSIENT_FEEDBACK_REASONS:
+            self._scan_retries.pop(key, None)
+            return False
+        attempt = self._scan_retries.get(key, 0)
+        if attempt >= len(RETRY_DELAYS_SECONDS):
+            self._scan_retries.pop(key, None)
+            return False
+        self._scan_retries[key] = attempt + 1
+        self._retries.append(_Retry(self._clock() + RETRY_DELAYS_SECONDS[attempt], 0, stage, target))
+        return True
+
+    def _maybe_feedback(self, assessment_id: str) -> None:
+        """One Feedback request per Assessment this incarnation."""
+
+        if (
+            self._feedback is None
+            or not self._feedback.enabled
+            or assessment_id in self._feedbacked
+        ):
+            return
+        self._feedbacked[assessment_id] = None
+        _bound(self._feedbacked)
+        self._submit(_Stage.FEEDBACK, _FeedbackTarget(assessment_id))
+
+    def _maybe_feedback_scan(self) -> None:
+        if (
+            self._feedback is None
+            or not self._feedback.enabled
+            or self._feedback_scans >= MAX_FEEDBACK_SCANS_PER_STARTUP
+        ):
+            return
+        self._feedback_scans += 1
+        self._submit(_Stage.FEEDBACK, _FeedbackTarget(None))
+
+    def _feedback_done(self, target: _FeedbackTarget, value: object) -> None:
+        if not isinstance(value, _FeedbackResult):
+            return
+        if target.assessment_id is None:
+            # The scan: only a COMMITTED continues it.
+            if value.status is FeedbackCommitStatus.COMMITTED:
+                self._maybe_feedback_scan()
+            else:
+                self._retry_scan(_Stage.FEEDBACK, target, value.reason)
+            return
+        if value.reason not in TRANSIENT_FEEDBACK_REASONS:
+            self._feedback_retries.pop(target.assessment_id, None)
+            return
+        attempt = self._feedback_retries.get(target.assessment_id, 0)
+        if attempt >= len(RETRY_DELAYS_SECONDS):
+            self._feedback_retries.pop(target.assessment_id, None)
+            return
+        self._feedback_retries[target.assessment_id] = attempt + 1
+        while len(self._feedback_retries) > OBSERVED_CAPACITY:
+            del self._feedback_retries[next(iter(self._feedback_retries))]
+        self._retries.append(
+            _Retry(
+                self._clock() + RETRY_DELAYS_SECONDS[attempt],
+                0,
+                _Stage.FEEDBACK,
+                target,
+            )
+        )
+
     def _on_rescan(self, item: _Rescan) -> None:
         """#370 D0 §5: PROPOSED records left without a review, once each."""
 
@@ -1349,6 +1569,11 @@ def _result_code(value: object) -> str:
         return value.status.value
     if isinstance(value, _PolicyResult):
         # IP-17a: a closed status and reason only, never verdict contents.
+        if value.reason is not None:
+            return f"{value.status.value}:{value.reason.value}"
+        return value.status.value
+    if isinstance(value, (_AssessmentResult, _FeedbackResult)):
+        # IP-19: a closed status and reason only, never record contents.
         if value.reason is not None:
             return f"{value.status.value}:{value.reason.value}"
         return value.status.value

@@ -1,4 +1,9 @@
-"""R17 pure values (contracts); the forecast owner lives in ``expectation_issuer`` (IP-16a-3)."""
+"""R17 pure values (contracts).
+
+Submodules (not re-exported here): ``expectation_issuer`` (forecast owner, IP-16a-3),
+``feedback_owner`` (Assessment / Feedback owner, IP-19) and ``feedback_read``
+(the Decision issuer's as-of Feedback projection, IP-19).
+"""
 
 from suzka.r17.contracts import (
     Comparison,

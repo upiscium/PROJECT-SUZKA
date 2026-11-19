@@ -1293,7 +1293,10 @@ class EventJournalAdmissionBand(str, Enum):
 # IP-17c added R18_EXECUTION_CLAIM, refused by HP-8 like the challenge;
 # IP-18a added R18_OUTCOME_COMMIT, ADMITTED by HD-18-1 like the expiry: it
 # records a terminal fact of an already-claimed effect and creates no
-# obligation).
+# obligation;
+# IP-19 added R17_ASSESSMENT_COMMIT and R17_FEEDBACK_COMMIT, ADMITTED on
+# purpose (D-R17 §5, HP-8): they record R17's reading of a terminal Outcome and
+# create no obligation, and refusing them would leave the lineage at row 6).
 # Cognition continues; DEBUG_CHAT, ADAPTER_EVALUATE and ADAPTER_UPDATE (Human
 # decision 2026-11-10) are refused, and so is every type not listed here,
 # including any type added later (R18/R19 external effects).
@@ -1317,6 +1320,9 @@ SOFT_BAND_ADMITTED_EVENT_TYPES: frozenset[AgentEventType] = frozenset(
         AgentEventType.R18_APPROVAL_EXPIRE,
         # IP-18a (HD-18-1): an Outcome records a terminal fact; it is admitted.
         AgentEventType.R18_OUTCOME_COMMIT,
+        # IP-19 (D-R17 §5): R17 comparison / Feedback are cognition; admitted.
+        AgentEventType.R17_ASSESSMENT_COMMIT,
+        AgentEventType.R17_FEEDBACK_COMMIT,
     }
 )
 

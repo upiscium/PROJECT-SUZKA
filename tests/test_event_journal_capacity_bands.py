@@ -120,8 +120,12 @@ def test_soft_band_allow_list_matches_the_design_table() -> None:
     }
     # IP-18a (HD-18-1): the Outcome event is ADMITTED, like the expiry.
     assert AgentEventType.R18_OUTCOME_COMMIT in SOFT_BAND_ADMITTED_EVENT_TYPES
+    # IP-19 (D-R17 §5, HP-8): the R17 Assessment and Feedback are cognition and
+    # are admitted on purpose, not by default.
+    assert AgentEventType.R17_ASSESSMENT_COMMIT in SOFT_BAND_ADMITTED_EVENT_TYPES
+    assert AgentEventType.R17_FEEDBACK_COMMIT in SOFT_BAND_ADMITTED_EVENT_TYPES
     assert AgentEventType.GOAL_SELF_PROPOSAL_REVIEW in SOFT_BAND_ADMITTED_EVENT_TYPES
-    assert len(AgentEventType) == 26
+    assert len(AgentEventType) == 28
     assert SOFT_BAND_ADMITTED_EVENT_TYPES <= set(AgentEventType)
 
 
