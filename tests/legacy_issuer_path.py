@@ -1,7 +1,7 @@
 """IP-20a: the PRE-refactor PLAN_PREVIEW issuer path, verbatim (IP-20 D1 r3 §5-1).
 
 ``_Legacy`` is ``_DecisionIssuer`` with ``_issue``, ``_issue_qualified``,
-``_ledger``, ``_check_deadline`` and ``_committed`` exactly as they were at
+``_ledger``, ``_check_deadline``, ``_committed`` and ``_unqualified`` exactly as they were at
 ``origin/rebuild/develop@37b018d`` (before ``_evaluate``). The equivalence test
 runs it next to the refactored issuer on the same event and compares the
 results byte for byte with one fixed clock. Delete this file only together with
@@ -51,6 +51,39 @@ class _Legacy(_DecisionIssuer):
             return _DecisionIssueResult(
                 DecisionIssueStatus.HOLD, None, None, None, hold.reason
             )
+
+    def _unqualified(
+        self, event: AgentEvent, state: RequiredSourceState
+    ) -> _DecisionIssueResult:
+        """Sources did not qualify: still a policy row (0 or 1), no refs."""
+
+        snapshot_hash, as_of = self._snapshot()
+        value = SuccessorPolicyInputV2(
+            required_source=state,
+            source_refs=(),
+            predecessor=PredecessorState.UNAVAILABLE,
+            predecessor_ref=None,
+            lineage=LineageState.UNAVAILABLE,
+            lineage_ref=None,
+            commitment=CommitmentState.ABSENT,
+            commitment_ref=None,
+            commitment_deadline_utc=None,
+            ledger=LedgerState.NONE,
+            ledger_refs=(),
+            inverse_authorization=None,
+            feedback=FeedbackState.ABSENT,
+            feedback_ref=None,
+            verified_outcome_ref=None,
+            interpretation=Interpretation.UNAVAILABLE,
+            interpretation_stage=InterpretationStage.NONE,
+            as_of_r07_sequence=as_of,
+            as_of_snapshot_hash=snapshot_hash,
+            event_id=event.event_id,
+            event_sequence=_sequence(event),
+            now_utc=utc_timestamp(event.requested_at),
+            version=POLICY_KIND,
+        )
+        return self._hold_result(evaluate(value))
 
     def _issue_qualified(
         self, event: AgentEvent, q: _QualifiedPreview, initial: object
@@ -302,7 +335,14 @@ def _rebind_to_live_module_globals() -> None:
 
     import types
 
-    for name in ("_issue", "_issue_qualified", "_ledger", "_check_deadline", "_committed"):
+    for name in (
+        "_unqualified",
+        "_issue",
+        "_issue_qualified",
+        "_ledger",
+        "_check_deadline",
+        "_committed",
+    ):
         function = _Legacy.__dict__[name]
         rebound = types.FunctionType(
             function.__code__,

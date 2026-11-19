@@ -665,3 +665,103 @@ def test_with_r19_disabled_nothing_r19_starts_and_the_subject_runs(
             for item in state.event_journal.records
             if item.event_type in WAKE_TYPES
         ]
+
+
+def test_review_intent_key_override_reaches_the_decision_and_its_id(
+    tmp_path: Path,
+) -> None:
+    """§5-1: a Wake-origin Decision carries the cycle's key, not the PLAN_PREVIEW one."""
+
+    from suzka.r16.decision_issuer import _Unqualified  # noqa: F401
+
+    with TestClient(_app(_settings(tmp_path / "key"))) as client:
+        state = client.app.state
+        _x, goal_id = _qualified_goal(state)
+        issuer, runtime = state.decision_issuer, state.agent_runtime
+        seen: dict[str, Any] = {}
+
+        def handle() -> str:
+            event = runtime.current_event()
+            assert event is not None
+            ev = issuer._evaluate(
+                event,
+                goal_id,
+                now=event.requested_at,
+                before_sequence=event.processing_sequence,
+            )
+            assert type(ev) is _Evaluation
+            args = (event, ev.q, ev.value, ev.result, ev.incarnation, ev.scope, ev.head)
+            seen["default"] = issuer._committed(*args)
+            seen["wake"] = issuer._committed(*args, "e" * 64)
+            return "ok"
+
+        runtime.submit(
+            AgentEventType.R16_WAKE_REVIEW,
+            AgentEventSource.RUNTIME_R16_WAKE_REVIEW,
+            handle,
+        ).result(timeout=30)
+        assert seen["wake"].review_intent_key == "e" * 64
+        assert seen["default"].review_intent_key != "e" * 64
+        assert seen["wake"].decision_id != seen["default"].decision_id
+        assert seen["wake"].policy_input_bytes == seen["default"].policy_input_bytes
+
+
+def test_evaluate_returns_the_unqualified_input_at_a_wake_instant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from suzka.r16.decision_issuer import _LedgerSourceUnavailable, _Unqualified
+    from suzka.r16.plan_preview import _PlanSourceConflict, _PlanSourceUnavailable
+    from suzka.r16.successor_policy import RequiredSourceState
+
+    with TestClient(_app(_settings(tmp_path / "unq"))) as client:
+        state = client.app.state
+        _x, goal_id = _qualified_goal(state)
+        issuer, runtime = state.decision_issuer, state.agent_runtime
+        real_qualify = issuer._preview._qualify
+
+        def evaluate() -> Any:
+            box: dict[str, Any] = {}
+
+            def handle() -> str:
+                event = runtime.current_event()
+                assert event is not None
+                box["ev"] = issuer._evaluate(
+                    event,
+                    goal_id,
+                    now=event.requested_at,
+                    before_sequence=event.processing_sequence,
+                )
+                return "ok"
+
+            runtime.submit(
+                AgentEventType.R19_WAKE_MATERIALIZE,
+                AgentEventSource.RUNTIME_R19_WAKE_MATERIALIZE,
+                handle,
+            ).result(timeout=30)
+            return box["ev"]
+
+        def raising(error: Exception):  # type: ignore[no-untyped-def]
+            def qualify(*args: object) -> object:
+                raise error
+
+            return qualify
+
+        for error, expected in (
+            (_PlanSourceConflict("x"), RequiredSourceState.CONFLICT),
+            (_PlanSourceUnavailable("x"), RequiredSourceState.UNAVAILABLE),
+        ):
+            monkeypatch.setattr(issuer._preview, "_qualify", raising(error))
+            result = evaluate()
+            assert type(result) is _Unqualified and result.state is expected
+        monkeypatch.setattr(issuer._preview, "_qualify", real_qualify)
+        monkeypatch.setattr(
+            issuer,
+            "_ledger",
+            lambda *args: (_ for _ in ()).throw(_LedgerSourceUnavailable()),
+        )
+        result = evaluate()
+        assert (
+            type(result) is _Unqualified
+            and result.state is RequiredSourceState.UNAVAILABLE
+        )
+        assert state.subject_history_store.has_operations() is False

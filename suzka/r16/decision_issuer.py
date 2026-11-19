@@ -396,10 +396,12 @@ class _DecisionIssuer:
 
     def _issue(self, event: AgentEvent, goal_id: str) -> object:
         self._pending = None
+        # As before the refactor, qualification runs outside the try below:
+        # only the Unqualified input and the tail are guarded.
+        qualified = self._qualify_twice(event, goal_id)
         try:
-            qualified = self._qualify_twice(event, goal_id)
-            if isinstance(qualified, _Unqualified):
-                return self._hold_result(qualified.result)
+            if isinstance(qualified, RequiredSourceState):
+                return self._unqualified(event, qualified)
             q, initial = qualified
             return self._issue_qualified(event, q, initial)
         except (HistoryStoreError, AgentStateLoadError):
@@ -454,8 +456,8 @@ class _DecisionIssuer:
         """
 
         qualified = self._qualify_twice(event, goal_id)
-        if isinstance(qualified, _Unqualified):
-            return qualified
+        if isinstance(qualified, RequiredSourceState):
+            return self._unqualified_input(event, qualified)
         q, initial = qualified
         return self._evaluate_qualified(
             event, q, initial, now=now, before_sequence=before_sequence
@@ -463,8 +465,9 @@ class _DecisionIssuer:
 
     def _qualify_twice(
         self, event: AgentEvent, goal_id: str
-    ) -> tuple[_QualifiedPreview, object] | _Unqualified:
-        """Step 1: qualify the sources twice (equal), or the row-0 / row-1 input."""
+    ) -> tuple[_QualifiedPreview, object] | RequiredSourceState:
+        """Step 1: qualify the sources twice (equal), or the source state
+        (CONFLICT / UNAVAILABLE) whose row-0 / row-1 input the caller builds."""
 
         from suzka.r16.plan_preview import _PlanSourceConflict, _PlanSourceUnavailable
 
@@ -475,9 +478,9 @@ class _DecisionIssuer:
             if after != before or self._preview._state_snapshot() != initial:
                 raise _PlanSourceUnavailable("Decision source changed")
         except _PlanSourceConflict:
-            return self._unqualified_input(event, RequiredSourceState.CONFLICT)
+            return RequiredSourceState.CONFLICT
         except _PlanSourceUnavailable:
-            return self._unqualified_input(event, RequiredSourceState.UNAVAILABLE)
+            return RequiredSourceState.UNAVAILABLE
         return before, initial
 
     def _unqualified(
