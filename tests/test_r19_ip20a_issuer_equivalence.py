@@ -58,8 +58,8 @@ def test_the_gate_covered_issued_existing_and_hold_paths() -> None:
     outcomes = {item[0] for item in _ALL}
     assert {"ISSUED", "EXISTING", "HOLD"} <= outcomes, outcomes
     assert len(_ALL) >= 10
-    # The refactor reads the clock exactly once per call (the old path read it 0, 1 or 2 times).
-    assert {item[2] for item in _ALL} == {1}
+    # Lazy and shared: never more clock reads than the old path (2 -> 1, 0 -> 0).
+    assert all(new <= legacy and new <= 1 for _o, legacy, new in _ALL)
 
 
 def test_the_gate_detects_a_changed_byte(

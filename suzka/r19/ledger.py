@@ -207,6 +207,10 @@ def derive_wake_view(
 ) -> WakeView:
     """The view of ``records`` (adopted records) at ``now_utc``.
 
+    Raises ``TypeError`` when an adopted record's ``record`` is not the exact
+    type its ``record_kind`` names (a programming or decoding error, never a
+    state): the IP-20d tick must catch it, log it and do nothing that tick.
+
     ``records`` need only carry ``record_kind``, ``record``, ``event_id`` and
     ``processing_sequence`` (an ``AdoptedRecord``). Entries are ordered by
     ``(not_before_utc, cause_sequence, wakeup_id)``, the Scheduler's claim

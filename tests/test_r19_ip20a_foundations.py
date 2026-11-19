@@ -119,6 +119,7 @@ def test_r19_settings_defaults_are_the_d_r19_numbers_and_r19_stays_off() -> None
     "changes",
     [
         {"claim_lease_s": 0},
+        {"claim_lease_s": 121},  # D1 §4-4 / §4-5 reason with a lease <= 120 s
         {"tick_s": 0},
         {"deadline_margin_s": 0},  # not_before == expires must be impossible
         {"rescan_s": 0},
@@ -520,7 +521,7 @@ def test_the_ledger_takes_the_callers_instant_and_the_callers_sequence(
     issuer._clock = lambda: pytest.fail("the live clock must not be read")  # type: ignore[assignment]
     frozen = datetime(2026, 11, 16, 2, 0, 0, tzinfo=timezone.utc)
     q = SimpleNamespace(commitment_id="commitment-1")
-    issuer._ledger(classified, PredecessorState.ABSENT_INITIAL, q, 77, frozen)  # type: ignore[arg-type]
+    issuer._ledger(classified, PredecessorState.ABSENT_INITIAL, q, 77, lambda: frozen)  # type: ignore[arg-type]
     assert spy == {"now": frozen, "before_sequence": 77}
 
 
@@ -536,13 +537,13 @@ def test_the_deadline_check_uses_the_callers_instant_and_margin() -> None:
         _loop=SimpleNamespace(_commitment_system=SimpleNamespace(get=commitments.get))
     )
     q = SimpleNamespace(commitment_id="c1")
-    issuer._check_deadline(q, now=now)  # type: ignore[arg-type]  # 12 s left, 5 s margin
+    issuer._check_deadline(q, now=lambda: now)  # type: ignore[arg-type]  # 12 s left, 5 s margin
     # The Wake review's wider margin (5 s + 10 s handler budget, D1 §6 step 4).
     with pytest.raises(_IssuerHold) as hold:
-        issuer._check_deadline(q, now=now, margin=timedelta(seconds=15))  # type: ignore[arg-type]
+        issuer._check_deadline(q, now=lambda: now, margin=timedelta(seconds=15))  # type: ignore[arg-type]
     assert hold.value.reason is R16OwnerReason.DEADLINE_ELAPSED
     with pytest.raises(_IssuerHold):
-        issuer._check_deadline(q, now=now + timedelta(seconds=8))  # type: ignore[arg-type]  # 4 s < 5 s
+        issuer._check_deadline(q, now=lambda: now + timedelta(seconds=8))  # type: ignore[arg-type]  # 4 s < 5 s
     issuer._check_deadline(
         SimpleNamespace(commitment_id=None), now=now, margin=timedelta(days=1)
     )  # type: ignore[arg-type]
@@ -765,3 +766,73 @@ def test_evaluate_returns_the_unqualified_input_at_a_wake_instant(
             and result.state is RequiredSourceState.UNAVAILABLE
         )
         assert state.subject_history_store.has_operations() is False
+
+
+def test_the_instant_is_read_lazily_once_and_shared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-1: clock reads go 2 -> 1 and 0 -> 0, never up."""
+
+    issuer = _DecisionIssuer.__new__(_DecisionIssuer)
+    reads: list[int] = []
+    moment = datetime(2026, 11, 16, 2, 0, 0, tzinfo=timezone.utc)
+
+    def clock() -> datetime:
+        reads.append(1)
+        return moment
+
+    issuer._clock = clock  # type: ignore[assignment]
+    captured: dict[str, Any] = {}
+
+    def fake_evaluate(
+        event: object, q: object, initial: object, *, now: Any, before_sequence: int
+    ) -> object:
+        captured["now"] = now
+        captured["before"] = before_sequence
+        return issuer_module._Unqualified(
+            None,
+            None,
+            SimpleNamespace(row=SimpleNamespace(value="1"), hold_reason=None),
+        )  # type: ignore[arg-type]
+
+    monkeypatch.setattr(issuer, "_evaluate_qualified", fake_evaluate)
+    monkeypatch.setattr(issuer, "_hold_result", lambda result: "held")
+    event = SimpleNamespace(processing_sequence=12)
+    assert issuer._issue_qualified(event, None, None) == "held"  # type: ignore[arg-type]
+    assert reads == []  # a path that never asks for the instant never reads the clock
+    assert captured["before"] == 12
+    assert captured["now"]() == moment and captured["now"]() == moment
+    assert reads == [1]  # two sites, one read
+
+
+def test_wake_worst_case_record_fits_the_bound_with_policy_kind() -> None:
+    """MAX_RECORD_BYTES headroom: longest identifiers, four origin refs, the
+    cause ref, a Decision predecessor, V3."""
+
+    from suzka.r16.cycle_contracts import FrozenPredecessor
+    from suzka.r16.successor_policy import PolicyRef
+    from suzka.r18.contracts import GoalOrigin
+
+    long = "g" * 128
+    h = "a" * 64
+    refs = tuple(
+        PolicyRef(kind, ("%s%d" % (kind, i)).ljust(128, "x"), 2**31 - 1, h)
+        for i, kind in enumerate(
+            ("commitment", "r18-outcome", "motivation", "observation")
+        )
+    )
+    wake = _wake(
+        goal_id=long,
+        experience_id="e" * 128,
+        context_id="c" * 128,
+        journal_lineage_id="l" * 128,
+        goal_origin=GoalOrigin.SUBJECT_MOTIVATION,
+        origin_refs=tuple(sorted(refs, key=lambda item: item.sort_key)),
+        policy_kind=V3,
+        cause_ref=PolicyRef("r17-feedback", "f" * 128, 2**31 - 1, h),
+        frozen_predecessor=FrozenPredecessor.decision("decision-" + "d" * 64, h),
+    )
+    size = len(wake.canonical_bytes())
+    assert size <= contracts.MAX_RECORD_BYTES
+    assert contracts.MAX_RECORD_BYTES - size >= 100, size  # headroom, not a squeeze
+    assert WakeV1.from_json(wake.canonical_bytes()) == wake

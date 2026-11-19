@@ -211,6 +211,24 @@ _COMPARE: Final = "compare_review_constraints"
 _ASSESS: Final = "assess_review_readiness"
 
 InterpretationRead = Callable[[AgentEvent, str, int], object]
+# IP-20a (A-5): the caller's instant, read lazily at the sites that need it.
+Instant = Callable[[], datetime]
+
+
+class _Once:
+    """One memoized clock read per issuer call, shared by every site that needs
+    an instant (the ledger's window closure and the deadline margin).  It reads
+    lazily, so a path that never needed the clock still never reads it
+    (reads: 2 -> 1, 0 -> 0, never more than before)."""
+
+    def __init__(self, read: Callable[[], datetime]) -> None:
+        self._read = read
+        self._value: datetime | None = None
+
+    def __call__(self) -> datetime:
+        if self._value is None:
+            self._value = self._read()
+        return self._value
 
 
 class DecisionIssueStatus(str, Enum):
@@ -425,7 +443,7 @@ class _DecisionIssuer:
         that one instant goes to every site that used to read it (the ledger's
         approval-window closure and the deadline margin)."""
 
-        now = self._clock()
+        now = _Once(self._clock)
         evaluated = self._evaluate_qualified(
             event, q, initial, now=now, before_sequence=_sequence(event)
         )
@@ -460,7 +478,7 @@ class _DecisionIssuer:
             return self._unqualified_input(event, qualified)
         q, initial = qualified
         return self._evaluate_qualified(
-            event, q, initial, now=now, before_sequence=before_sequence
+            event, q, initial, now=lambda: now, before_sequence=before_sequence
         )
 
     def _qualify_twice(
@@ -547,7 +565,7 @@ class _DecisionIssuer:
         q: _QualifiedPreview,
         initial: object,
         *,
-        now: datetime,
+        now: Instant,
         before_sequence: int,
     ) -> _Evaluation | _Unqualified:
         scope = lineage_scope_for(q.experience_id)
@@ -605,7 +623,7 @@ class _DecisionIssuer:
         )
 
     def _issue_evaluated(
-        self, event: AgentEvent, evaluated: _Evaluation, *, now: datetime
+        self, event: AgentEvent, evaluated: _Evaluation, *, now: Instant
     ) -> object:
         """The PLAN_PREVIEW tail: compare the head, then HOLD, EXISTING or a
         Decision with its slot checks and its pending state (step 5)."""
@@ -726,7 +744,7 @@ class _DecisionIssuer:
         predecessor: PredecessorState,
         q: _QualifiedPreview,
         before_sequence: int | None,
-        now: datetime,
+        now: Instant,
     ) -> LedgerRead:
         """IP-16b §5: the ledger of this lineage's obligation group.
 
@@ -792,7 +810,7 @@ class _DecisionIssuer:
             # whose approval window has ended.  IP-20a (A-5): the caller passes
             # it (PLAN_PREVIEW its live clock, a Wake its frozen T) so the
             # closure matches the instant the caller seals.
-            now,
+            now(),
             prior_claim=prior,
         )
         if prior is None and before_sequence is not None and real.state is not LedgerState.CORRUPT:
@@ -1066,17 +1084,17 @@ class _DecisionIssuer:
         self,
         q: _QualifiedPreview,
         *,
-        now: datetime,
+        now: Instant,
         margin: timedelta = DEADLINE_MARGIN,
     ) -> None:
-        """``now`` is the caller's instant (A-5).  The Wake review passes its
-        live clock with a wider margin (IP-20 D1 r3 §6 step 4: 15 s)."""
+        """``now`` returns the caller's instant (A-5), read only here.  The Wake
+        review passes its live clock with a wider margin (IP-20 D1 r3 §6 step 4: 15 s)."""
 
         if q.commitment_id is None:
             return
         record = self._preview._loop._commitment_system.get(q.commitment_id)
         at = None if record is None else record.deadline.at
-        if at is not None and at - now < margin:
+        if at is not None and at - now() < margin:
             # Not yet elapsed, but too close to commit safely (D2 P2-2).
             raise _IssuerHold(R16OwnerReason.DEADLINE_ELAPSED)
 

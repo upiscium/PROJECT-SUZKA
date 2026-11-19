@@ -378,7 +378,10 @@ class R19Settings(StrictBaseModel):
     feedback_wake_delay_s: StrictInt = Field(default=60, ge=0, le=604_800)
     # IP-20 D1 §3-1: at least 1, so ``not_before == expires`` cannot arise.
     deadline_margin_s: StrictInt = Field(default=600, ge=1, le=604_800)
-    claim_lease_s: StrictInt = Field(default=120, ge=1, le=604_800)
+    # IP-20 D1 §4-5 / §4-4 reason with a lease of at most 120 s (the gap rule,
+    # the review wait bound and the T-vs-L skew limit); a longer lease would
+    # void those arguments, so it is capped at D-R19 §5's own number.
+    claim_lease_s: StrictInt = Field(default=120, ge=1, le=120)
     tick_s: StrictInt = Field(default=30, ge=1, le=604_800)
     # IP-20 D1 §3-3: the sparse materialize backstop (every scan writes Journal
     # records even when it finds nothing).

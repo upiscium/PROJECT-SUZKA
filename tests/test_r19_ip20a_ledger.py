@@ -438,3 +438,62 @@ def test_the_view_is_pure() -> None:
         for name in dir(ledger)
         if name.startswith("write") or name.startswith("submit")
     ]
+
+
+# --------------------------------------------- Commitment deadline vs expiry
+
+
+def _with_deadline(wake: WakeV1, deadline: str) -> WakeV1:
+    """``WakeV1`` forbids a deadline before its expiry, so a deadline earlier
+    than ``expires_at_utc`` cannot be constructed; the view still takes
+    ``min(expires, deadline)`` (defensive, D1 §4-2), exercised by forcing it."""
+
+    object.__setattr__(wake, "commitment_deadline_utc", deadline)
+    return wake
+
+
+def test_the_deadline_equal_to_the_expiry_is_the_end_of_every_window() -> None:
+    wake = _wake(commitment_deadline_utc=EXPIRES)
+    rows = [_wake_rec(wake)]
+    assert _state(rows, "2026-11-22T23:59:59Z", wake) is S.DUE
+    assert _state(rows, EXPIRES, wake) is S.EXPIRED
+    first = _claim(wake)
+    lapsed = [_wake_rec(wake), _claim_rec(first)]
+    assert _state(lapsed, "2026-11-22T23:59:59Z", wake) is S.RETRYABLE
+    assert _state(lapsed, EXPIRES, wake) is S.EXPIRED
+    entry = derive_wake_view(rows, NOT_BEFORE, clock_floor=None).entries[0]
+    assert entry.expiry_utc == EXPIRES
+
+
+def test_a_deadline_after_the_expiry_does_not_extend_it() -> None:
+    wake = _wake(commitment_deadline_utc="2026-12-31T00:00:00Z")
+    assert _state([_wake_rec(wake)], EXPIRES, wake) is S.EXPIRED
+
+
+def test_the_view_takes_the_earlier_of_expiry_and_deadline() -> None:
+    deadline = "2026-11-17T00:00:00Z"
+    wake = _with_deadline(_wake(), deadline)
+    rows = [_wake_rec(wake)]
+    assert _state(rows, "2026-11-16T23:59:59Z", wake) is S.DUE
+    assert _state(rows, deadline, wake) is S.EXPIRED  # DUE -> EXPIRED at the deadline
+    lapsed = [_wake_rec(wake), _claim_rec(_claim(wake))]
+    assert _state(lapsed, "2026-11-16T23:59:59Z", wake) is S.RETRYABLE
+    assert _state(lapsed, deadline, wake) is S.EXPIRED  # RETRYABLE -> EXPIRED
+    late = WakeClaimV1(
+        wake.wakeup_id,
+        wake.logical_cycle_id,
+        wake.evidence_fingerprint,
+        wake.incarnation_id,
+        1,
+        EVENT_C,
+        21,
+        "2026-11-17T00:01:00Z",
+    )
+    pending = [_wake_rec(wake), _claim_rec(late)]
+    assert _state(pending, "2026-11-17T00:00:30Z", wake) is S.EXPIRED_PENDING_LEASE
+    assert _state(pending, "2026-11-17T00:01:00Z", wake) is S.EXPIRED
+
+
+def test_a_wrong_typed_adopted_record_raises_and_says_so() -> None:
+    assert "TypeError" in (derive_wake_view.__doc__ or "")
+    assert "IP-20d" in (derive_wake_view.__doc__ or "")

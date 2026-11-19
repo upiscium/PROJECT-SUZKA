@@ -136,9 +136,9 @@ def install(monkeypatch: pytest.MonkeyPatch) -> Recorder:
             assert _pending(legacy._pending) == _pending(self._pending)
         else:
             assert expected[1] == actual[1]
+        # Never more reads than before (2 -> 1, 0 -> 0): the instant is lazy and shared.
+        assert reads["new"] <= reads["legacy"], reads
         assert reads["new"] <= 1, reads
-        if reads["legacy"]:
-            assert reads["new"] <= reads["legacy"], reads
         recorder.runs.append(
             (
                 _label(actual[1]) if actual[0] == "value" else "RAISED",
@@ -152,3 +152,17 @@ def install(monkeypatch: pytest.MonkeyPatch) -> Recorder:
 
     monkeypatch.setattr(_DecisionIssuer, "_issue", dual)
     return recorder
+
+
+def gate_fixture():  # type: ignore[no-untyped-def]
+    """An autouse fixture that runs a wrapper module's tests under the dual run
+    and checks the gate saw at least one issuer call (so a rename cannot make
+    the wrapper vacuous)."""
+
+    @pytest.fixture(autouse=True)
+    def _dual_run(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
+        recorder = install(monkeypatch)
+        yield recorder
+        assert recorder.runs, "no PLAN_PREVIEW issuer call reached the dual run"
+
+    return _dual_run
