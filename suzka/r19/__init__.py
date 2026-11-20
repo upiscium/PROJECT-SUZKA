@@ -4,8 +4,9 @@ IP-20a adds ``suzka.r19.ledger``: a pure derived Wake view. IP-20b adds
 ``suzka.r19.materializer``: the Wake materializer, the only writer of Wakes;
 IP-20c the claim / review owners; IP-20d ``suzka.r19.scheduler``, the only
 submitter of their events. The package itself imports none of them (the writers
-import R16 / R17, which import these values); there is no Outbox or Inbox
-authority here (IP-21).
+import R16 / R17, which import these values). IP-21a adds ``suzka.r19.inbox``:
+the pure Inbox / Outbox functions (projection, message state, emission plan,
+ACK pre-check); the Outbox / ACK writers are IP-21b / IP-21c.
 """
 
 from suzka.r19.contracts import (

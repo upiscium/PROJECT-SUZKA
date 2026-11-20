@@ -389,6 +389,9 @@ class R19Settings(StrictBaseModel):
     # IP-20 D1 HD-20-1 (a): the materializer's scope floor. A cause older than
     # this is never given a Wake; the default is the Wake TTL (7 days).
     materialize_max_age_s: StrictInt = Field(default=604_800, ge=1, le=604_800)
+    # IP-21 D1 r3 §4-4 / A-8: how long an Outbox message lives (7 days at most,
+    # the OutboxMessageV1 bound; the emitter further caps it at result + 7 days).
+    outbox_ttl_s: StrictInt = Field(default=604_800, ge=60, le=604_800)
 
     @model_validator(mode="after")
     def validate_wake_timing(self) -> "R19Settings":

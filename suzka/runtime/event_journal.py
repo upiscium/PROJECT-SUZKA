@@ -1301,7 +1301,12 @@ class EventJournalAdmissionBand(str, Enum):
 # HP-8): the materializer only records a scheduled re-evaluation, the claim and
 # the review are cognition (a refusal here would starve a Wake, never end it),
 # and the terminal only closes a Wake (no obligation, no external effect);
-# refusing it would leave expired Wakes derived-only until the Journal shrinks).
+# refusing it would leave expired Wakes derived-only until the Journal shrinks;
+# IP-21a added R19_WAKE_COMPLETE and R19_INBOX_ACK, ADMITTED on purpose (D-R19
+# §8-5, HP-8): each writes one private Outbox / ACK row and has no external
+# effect, no obligation and no reader in cognition; in the hard band neither is
+# admitted, so a due message stays derived-only and the ACK route answers
+# 503 JOURNAL_FULL, and neither blocks cognition).
 # Cognition continues; DEBUG_CHAT, ADAPTER_EVALUATE and ADAPTER_UPDATE (Human
 # decision 2026-11-10) are refused, and so is every type not listed here,
 # including any type added later (R18/R19 external effects).
@@ -1333,6 +1338,9 @@ SOFT_BAND_ADMITTED_EVENT_TYPES: frozenset[AgentEventType] = frozenset(
         AgentEventType.R19_WAKE_CLAIM,
         AgentEventType.R16_WAKE_REVIEW,
         AgentEventType.R19_WAKE_TERMINAL,
+        # IP-21a (D-R19 §8-5, HP-8): the Outbox message and the Inbox ACK.
+        AgentEventType.R19_WAKE_COMPLETE,
+        AgentEventType.R19_INBOX_ACK,
     }
 )
 
