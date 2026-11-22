@@ -13,8 +13,11 @@ Per tick, by priority, the first eligible item of the first non-empty class:
 2. a supersession: an unclaimed Wake that a newer Wake may supersede;
 3. a review (first or resumed): a live claim with no attempt outcome and no
    ``STARTED`` review after it in the retained Journal (HD-20-2 (a));
-4. the materialize scan: a nudge, the startup scan or the ``rescan_s`` backstop;
-5. a claim: the oldest ``DUE`` / ``RETRYABLE`` Wake, only on an idle runtime
+4. a completion (IP-21b): the first closed (``CLOSED`` / ``FAILED``) Wake whose
+   Outbox message is not adopted yet, derived each tick, no periodic event; it is
+   bookkeeping with one tiny event, so it is not held back for an idle runtime;
+5. the materialize scan: a nudge, the startup scan or the ``rescan_s`` backstop;
+6. a claim: the oldest ``DUE`` / ``RETRYABLE`` Wake, only on an idle runtime
    (HD-20-6 (a), ``AgentRuntime.is_idle``).
 
 A claim that commits is followed at once by ``R16_WAKE_REVIEW`` of that claim,
@@ -38,8 +41,9 @@ Goal or Commitment; the SubjectHistory store serializes every call with its own
 lock and ``EventJournal.inspect`` is already read from other threads (§4-1).
 It is constructed (and its thread started) only when ``r19.enabled``, the
 SubjectHistory is adopted and the issuer and owners are installed; a disabled
-R19 has no thread and submits no event.  IP-21 adds ``R19_WAKE_COMPLETE``; no
-Outbox or Inbox authority exists here.
+R19 has no thread and submits no event.  IP-21b adds ``R19_WAKE_COMPLETE``
+(``outbox_owner``); the Scheduler still holds no Outbox or Inbox authority: it
+only submits the owner's event for a candidate the pure ``inbox`` functions derive.
 """
 
 from __future__ import annotations
@@ -61,6 +65,12 @@ from suzka.r16.history_store import HistoryOperationRow, HistoryStoreError
 from suzka.r16.successor_policy import utc_timestamp
 from suzka.r19.claim_owner import ClaimStatus, TerminalStatus, WakeClaimOwnerV1
 from suzka.r19.contracts import TerminalReason, WakeTiming, may_supersede
+from suzka.r19.inbox import (
+    PERMANENT_OUTBOX_HOLDS,
+    OutboxHold,
+    adopted_message_ids,
+    emission_candidates,
+)
 from suzka.r19.ledger import (
     SETTLED_STATES,
     UNCAPPED_HOLDS,
@@ -76,6 +86,7 @@ from suzka.r19.ledger import (
     terminal_eligibility,
     ReviewStep,
 )
+from suzka.r19.outbox_owner import OutboxOwnerV1, OutboxStatus
 from suzka.r19.materializer import (
     MaterializeReason,
     MaterializeStatus,
@@ -121,6 +132,10 @@ _NO_SUPERSEDER: Final = frozenset(
     }
 )
 _EVENT_FAILED: Final = "EVENT_FAILED"
+# A closed Wake whose message may still be owed (its pacing outlives the settling).
+_COMPLETABLE: Final = frozenset({WakeState.CLOSED, WakeState.FAILED})
+# Transient states of the runtime or the store: never counted against the cap.
+_UNCAPPED_OUTBOX_HOLDS: Final = frozenset({OutboxHold.QUEUE_DELAY, OutboxHold.IN_FLIGHT})
 
 
 class TickAction(str, Enum):
@@ -142,6 +157,7 @@ class TickAction(str, Enum):
     REVIEW = "review"
     MATERIALIZE = "materialize"
     CLAIM = "claim"
+    COMPLETE = "complete"
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +177,7 @@ _SUBMITTING: Final = frozenset(
         TickAction.REVIEW,
         TickAction.MATERIALIZE,
         TickAction.CLAIM,
+        TickAction.COMPLETE,
     }
 )
 
@@ -274,6 +291,8 @@ class _Read:
     rows: tuple[HistoryOperationRow, ...]
     now: datetime
     view: WakeView
+    # Every adopted Outbox message id (IP-21b dedupe; adopted records, no Journal).
+    adopted_ids: frozenset[str] = frozenset()
 
 
 def _default_clock() -> datetime:
@@ -295,6 +314,7 @@ class WakeScheduler:
         claim_owner: WakeClaimOwnerV1,
         review_owner: WakeReviewOwnerV1,
         *,
+        outbox_owner: OutboxOwnerV1 | None = None,
         timing: WakeTiming,
         rescan_s: int,
         clock: Callable[[], datetime] = _default_clock,
@@ -307,6 +327,7 @@ class WakeScheduler:
             or type(materializer) is not WakeMaterializerV1
             or type(claim_owner) is not WakeClaimOwnerV1
             or type(review_owner) is not WakeReviewOwnerV1
+            or (outbox_owner is not None and type(outbox_owner) is not OutboxOwnerV1)
             or type(timing) is not WakeTiming
             or type(rescan_s) is not int
             or rescan_s < 1
@@ -317,7 +338,11 @@ class WakeScheduler:
         ):
             # Constructed only for an enabled R19 (D1 §4-1, §8).
             raise ValueError("the Wake Scheduler needs enabled R19 owners")
-        if claim_owner._store is not review_owner._store:
+        if outbox_owner is not None and not outbox_owner.enabled:
+            raise ValueError("the Wake Scheduler needs an enabled Outbox owner")
+        if claim_owner._store is not review_owner._store or (
+            outbox_owner is not None and outbox_owner._store is not claim_owner._store
+        ):
             raise ValueError("the Wake owners must share one SubjectHistory store")
         self._runtime = runtime
         self._journal = journal
@@ -325,6 +350,10 @@ class WakeScheduler:
         self._materializer = materializer
         self._claims = claim_owner
         self._reviews = review_owner
+        self._outbox = outbox_owner
+        # Wakes whose completion a handler refused for a permanent reason: not
+        # submitted again in this process (D1 §4-5, last paragraph).
+        self._stuck: set[str] = set()
         self._timing = timing
         self._rescan_s = rescan_s
         self._clock = clock
@@ -464,14 +493,27 @@ class WakeScheduler:
         if view.orphans and not self._logged_orphans:
             self._logged_orphans = True
             LOGGER.warning("R19 scheduler: %d adopted R19 record(s) name no Wake", len(view.orphans))
-        read = _Read(inspection, classified.incarnation, classified.rows, now, view)
-        self._pacer.prune(
-            frozenset(e.wakeup_id for e in view.entries if e.state not in SETTLED_STATES)
+        read = _Read(
+            inspection,
+            classified.incarnation,
+            classified.rows,
+            now,
+            view,
+            adopted_message_ids(classified.records),
         )
+        live = frozenset(
+            e.wakeup_id
+            for e in view.entries
+            if e.state not in SETTLED_STATES or e.state in _COMPLETABLE
+        )
+        self._pacer.prune(live)
+        with self._lock:
+            self._stuck &= live
         for step in (
             self._next_terminal,
             self._next_supersede,
             self._next_review,
+            self._next_complete,
             self._next_scan,
             self._next_claim,
         ):
@@ -617,6 +659,37 @@ class WakeScheduler:
             return self._submit(
                 _Ctx(TickAction.REVIEW, entry.wakeup_id, entry.state.value),
                 partial(self._reviews._submit_review, claim.claim_id),
+            )
+        return None
+
+    def _next_complete(self, read: _Read) -> TickOutcome | None:
+        """IP-21b: the first closed Wake whose message is not adopted yet.
+
+        Derived each tick from the closed Wakes (``emission_candidates``, D1
+        §4-5): there is no periodic scan event.  The pre-filter is the handler's
+        own pure steps with no Journal read (an adopted id is skipped first, then
+        the record-byte age bound); it submits only a message the handler would
+        build.  A completion is not held back for an idle runtime (HD-20-6 (a)
+        covers claims only)."""
+
+        owner = self._outbox
+        if owner is None:
+            return None
+        plans = emission_candidates(
+            read.view, read.adopted_ids, outbox_ttl_s=owner.outbox_ttl_s
+        )
+        for plan in plans:
+            if (
+                not plan.ready
+                or plan.wakeup_id in self._stuck
+                or self._pacer.blocked(plan.wakeup_id, plan.state.value)
+            ):
+                continue
+            if self._store.live_keys((f"outbox:{plan.message_id}",)):
+                continue
+            return self._submit(
+                _Ctx(TickAction.COMPLETE, plan.wakeup_id, plan.state.value),
+                partial(owner._submit_complete, plan.wakeup_id),
             )
         return None
 
@@ -779,6 +852,16 @@ class WakeScheduler:
         elif ctx.action in (TickAction.TERMINAL, TickAction.SUPERSEDE):
             if status is TerminalStatus.HOLD:
                 self._wake_hold(ctx, getattr(value, "hold", None))
+            else:
+                self._pacer.clear(ctx.target)
+        elif ctx.action is TickAction.COMPLETE:
+            if status is OutboxStatus.HOLD:
+                hold = getattr(value, "hold", None)
+                if hold in PERMANENT_OUTBOX_HOLDS:
+                    with self._lock:
+                        self._stuck.add(ctx.target)
+                reason = hold.value if isinstance(hold, OutboxHold) else _EVENT_FAILED
+                self._hold(ctx, reason, capped=hold not in _UNCAPPED_OUTBOX_HOLDS)
             else:
                 self._pacer.clear(ctx.target)
         elif ctx.action is TickAction.MATERIALIZE:

@@ -94,6 +94,8 @@ _SOURCES: Final = {
     AgentEventType.R19_WAKE_CLAIM: AgentEventSource.RUNTIME_R19_WAKE_CLAIM,
     AgentEventType.R19_WAKE_TERMINAL: AgentEventSource.RUNTIME_R19_WAKE_TERMINAL,
     AgentEventType.R16_WAKE_REVIEW: AgentEventSource.RUNTIME_R16_WAKE_REVIEW,
+    # IP-21b: the Outbox owner (``outbox_owner.py``) shares this submission base.
+    AgentEventType.R19_WAKE_COMPLETE: AgentEventSource.RUNTIME_R19_WAKE_COMPLETE,
 }
 _TERMINAL_KIND: Final = {
     TerminalReason.EXPIRED_WAKE: WakeTerminalKind.FAILED_TERMINAL,
