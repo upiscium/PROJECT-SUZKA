@@ -170,7 +170,7 @@ async def _json_body(request: Request) -> dict[str, object] | None:
         return None
     try:
         value = json.loads(b"".join(chunks).decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -274,6 +274,8 @@ def build_router(limits: InboxLimits) -> APIRouter:
         # One ACK event in flight in the process: a further one is a 429.
         if not limits.event_lock.acquire(blocking=False):
             return _rate()
+        # The slot is released by the worker thread when the event is done, never
+        # by the coroutine: a cancelled request must not free it early.
         try:
             handler = owner.ack_handler(
                 message_id,
@@ -281,9 +283,10 @@ def build_router(limits: InboxLimits) -> APIRouter:
                 status,
                 session if type(session) is str else None,
             )
-            outcome = await run_in_threadpool(_submit, request, handler)
-        finally:
+        except BaseException:
             limits.event_lock.release()
+            raise
+        outcome = await run_in_threadpool(_submit, request, handler, limits.event_lock)
         if isinstance(outcome, JSONResponse):
             return outcome
         return _outcome_response(outcome.result, outcome.hold, status)
@@ -291,10 +294,17 @@ def build_router(limits: InboxLimits) -> APIRouter:
     return router
 
 
-def _submit(request: Request, handler: Any) -> Any:
+def _submit(request: Request, handler: Any, slot: threading.Lock) -> Any:
     """Submit the one ACK event; a runtime refusal is a closed 503, never an
     exception text (a full Journal never blocks chat; it only refuses this)."""
 
+    try:
+        return _run_event(request, handler)
+    finally:
+        slot.release()
+
+
+def _run_event(request: Request, handler: Any) -> Any:
     runtime = request.app.state.agent_runtime
     try:
         event = execute_with_event(

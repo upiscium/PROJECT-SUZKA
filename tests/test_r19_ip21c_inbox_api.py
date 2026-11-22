@@ -917,23 +917,37 @@ def test_a_sentinel_secret_reaches_no_message_response_or_log(world, caplog) -> 
         assert SECRET.encode() not in row.pending_bytes
 
 
-def test_every_response_string_is_closed() -> None:
-    """The GET body schema: only the projection's fields; every string is a
-    code-owned value, a timestamp or the message id (D1 §10-2)."""
+def test_every_response_body_is_closed(world) -> None:  # type: ignore[no-untyped-def]
+    """Collected from real responses: an error body is one closed status."""
 
-    assert set(inbox.InboxItem.__dataclass_fields__) == {
-        "message_id", "template", "reason_code", "text",
-        "created_utc", "expires_utc", "state", "acked_utc",
-    }
-    for body in (
-        {"status": status}
-        for status in (
-            "BAD_REQUEST", "RATE_LIMITED", "NOT_FOUND", "EXPIRED", "CONFLICT",
-            "ACK_FAILED", "UNSUPPORTED_MEDIA_TYPE", "BODY_TOO_LARGE",
-            *(hold.value for hold in AckHold),
-        )
-    ):
-        assert set(body) == {"status"}
+    message = _message(world)
+    url = f"{BASE}/messages/{message.message_id}/ack"
+    bodies = [
+        world.client.post(url, content="{", headers=HEADERS),
+        world.client.post(url, content="[" * 3500, headers=HEADERS),
+        world.client.post(url, content=json.dumps(_ack_body("x")), headers={"content-type": "text/plain"}),
+        world.client.post(url, json=_ack_body("other-context")),
+        world.client.get(f"{BASE}/messages"),
+    ]
+    for response in bodies:
+        assert response.status_code in (400, 404, 415), response.text
+        assert set(response.json()) == {"status"}
+        assert response.json()["status"] in {
+            "BAD_REQUEST", "NOT_FOUND", "UNSUPPORTED_MEDIA_TYPE",
+        }
+
+
+def test_a_chunked_oversized_body_is_413(world) -> None:  # type: ignore[no-untyped-def]
+    message = _message(world)
+    url = f"{BASE}/messages/{message.message_id}/ack"
+
+    def chunks():  # type: ignore[no-untyped-def]
+        yield b'{"context_id": "x", "pad": "'
+        yield b"x" * 5000
+        yield b'"}'
+
+    response = world.client.post(url, content=chunks(), headers=HEADERS)
+    assert response.status_code == 413 and response.json() == {"status": "BODY_TOO_LARGE"}
 
 
 # ----------------------------------------------------------- architecture
