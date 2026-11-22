@@ -209,22 +209,26 @@ class OutboxOwnerV1(_WakeOwnerBase):
         entry = view.get(wakeup_id)
         if entry is None:
             raise _Stop(OutboxHold.WAKE_UNKNOWN)
-        # The Journal high-water (the only Journal read, here and not in the
-        # Scheduler's pre-filter): truncated to the second, as ``T`` is.
-        floor = wake_clock_floor(
-            inspection.records,
-            entry.latest_claim,
-            claim_lease_s=self._timing.claim_lease_s,
-            before_event_id=event.event_id,
-        )
-        # 3-5 (and the Context binding): dedupe first, then the clock, then build.
-        plan = plan_emission(
-            entry,
-            now_utc,
-            outbox_ttl_s=self._outbox_ttl_s,
-            adopted_ids=adopted_message_ids(classified.records),
-            clock_floor=None if floor is None else utc_timestamp(floor),
-        )
+        adopted = adopted_message_ids(classified.records)
+        ttl = self._outbox_ttl_s
+        # Dedupe first (D1 step 4): no Journal read for an adopted message.
+        plan = plan_emission(entry, now_utc, outbox_ttl_s=ttl, adopted_ids=adopted)
+        if plan.hold is None or plan.hold is OutboxHold.CLOCK_UNVERIFIABLE or plan.hold is OutboxHold.TOO_OLD:
+            # The Journal high-water (the only Journal read, here and not in the
+            # Scheduler's pre-filter): truncated to the second, as ``T`` is.
+            floor = wake_clock_floor(
+                inspection.records,
+                entry.latest_claim,
+                claim_lease_s=self._timing.claim_lease_s,
+                before_event_id=event.event_id,
+            )
+            plan = plan_emission(
+                entry,
+                now_utc,
+                outbox_ttl_s=ttl,
+                adopted_ids=adopted,
+                clock_floor=None if floor is None else utc_timestamp(floor),
+            )
         if plan.hold is OutboxHold.NONE_LEFT:
             assert plan.message_id is not None
             LOGGER.info("R19 outbox owner result=existing")

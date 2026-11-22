@@ -499,7 +499,9 @@ class WakeScheduler:
             classified.rows,
             now,
             view,
-            adopted_message_ids(classified.records),
+            adopted_message_ids(classified.records)
+            if self._outbox is not None
+            else frozenset(),
         )
         live = frozenset(
             e.wakeup_id
