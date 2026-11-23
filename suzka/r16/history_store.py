@@ -1264,6 +1264,14 @@ class SubjectHistoryStore:
         self._r19_enabled = r19_enabled
         self._plan_hold_receipts = plan_hold_receipts
 
+    @property
+    def plan_hold_receipts_enabled(self) -> bool:
+        """The HD-3 (a) switch this store was opened with (PREPARE of an
+        ``R16_PLAN_HOLD`` is refused while it is false); read by the issuer so
+        its pre-check and the store's refusal can never disagree."""
+
+        return self._plan_hold_receipts
+
     # ------------------------------------------------------------------ open
 
     @classmethod

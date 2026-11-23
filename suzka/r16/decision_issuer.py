@@ -57,7 +57,18 @@ own sequence and keeps the same tail, so its bytes do not change (a golden
 equivalence test with a fixed clock is the gate).  The R19 Wake materializer
 and the R16 Wake review (IP-20b / IP-20c) call it with their frozen T.
 
-Known limits: HOLD is not persisted (R19,
+IP-14b-3 (#411 IP-14b D1 r2 FINAL, HD-3 (a)): with the store's
+``subject_history.plan_hold_receipts`` switch on (lab R20 subjects only; the
+default is off and nothing below runs) a *policy* HOLD row (0, 1, 2, 2b, 7) of
+a qualified PLAN_PREVIEW_REVIEW seals one ``R16_PLAN_HOLD`` receipt per
+``(incarnation, review_intent_key)`` as an R07 transaction.  Every pre-check
+(switch, active store, unchanged sources, free ``plan-hold:`` key, headroom)
+runs immediately before the ``CoordinatedResult`` is returned and, when one
+fails, the unchanged HOLD is returned with no transaction and
+``PLAN_HOLD_RECEIPT_SKIPPED`` is logged: PREPARE can then not raise.  Past that
+point a failure is a restartable runtime fail-stop, as for a Decision.
+
+Known limits: any other HOLD is not persisted (R19,
 #376 v2 §2); the R15 interpretation is sealed as its closed enum only; the
 Context ref is the frame's last-modified revision, not a digest of the
 Context's contents (#371 D6-3).
@@ -102,9 +113,16 @@ from suzka.r16.history_codec import (
     decision_id_for,
     policy_input_digest,
 )
+from suzka.r16.cycle_contracts import PlanHoldReceiptV1
 from suzka.r16.history_participant import (
     JournalCommitProofSource,
     SubjectHistoryParticipant,
+    SubjectHistoryRecordParticipant,
+)
+from suzka.r16.history_records import (
+    HistoryOperationKind,
+    HistoryRecordOperationV1,
+    RecordKind,
 )
 from suzka.r16.history_reader import (
     HeadBlockReason,
@@ -115,7 +133,9 @@ from suzka.r16.history_reader import (
     SubjectHistoryReader,
 )
 from suzka.r16.history_store import (
+    HistoryMetaPhase,
     HistoryPhase,
+    HistoryStoreCapacityError,
     HistoryStoreError,
     SubjectHistoryStore,
     decision_slot_occupied,
@@ -209,6 +229,10 @@ _PLAN_B: Final = "responsibility_review"
 _VERIFY: Final = "verify_goal_source"
 _COMPARE: Final = "compare_review_constraints"
 _ASSESS: Final = "assess_review_readiness"
+_PLAN_HOLD_ROWS: Final = frozenset(
+    {SuccessorRow.ROW_0, SuccessorRow.ROW_1, SuccessorRow.ROW_2, SuccessorRow.ROW_2B, SuccessorRow.ROW_7}
+)
+PLAN_HOLD_RECEIPT_SKIPPED: Final = "PLAN_HOLD_RECEIPT_SKIPPED"
 
 InterpretationRead = Callable[[AgentEvent, str, int], object]
 # IP-20a (A-5): a zero-argument callable returning the caller's instant as a
@@ -297,6 +321,19 @@ class _PendingIssue:
     rows_digest: tuple[int, str]
     transaction_id: str
     committed: CommittedDecisionV1
+    initial_state: object
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingPlanHold:
+    """HD-3 (a): the PREPAREd-but-not-yet-committed plan-hold receipt."""
+
+    event: AgentEvent
+    incarnation: str
+    snapshot_hash: str
+    rows_digest: tuple[int, str]
+    transaction_id: str
+    operation: HistoryRecordOperationV1
     initial_state: object
 
 
@@ -404,7 +441,7 @@ class _DecisionIssuer:
         self._state_store = state_store
         self._interpretation = interpretation
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._pending: _PendingIssue | None = None
+        self._pending: _PendingIssue | _PendingPlanHold | None = None
         # IP-16b: the obligation secret lives next to the R18 target (§3a).
         self._target_path = None if target_path is None else _absolute(target_path)
         # IP-18a (IP-18 D1 r4 §9-5): the SweepGate's read-only "BLOCKED_TARGET"
@@ -645,7 +682,7 @@ class _DecisionIssuer:
             if existing is not None:
                 return existing
         if result.is_hold:
-            return self._hold_result(result)
+            return self._hold_or_receipt(event, evaluated)
         assert incarnation is not None
         committed = self._committed(
             event, q, value, result, incarnation, evaluated.scope, head
@@ -688,6 +725,139 @@ class _DecisionIssuer:
             ),
             (participant,),
         )
+
+    # ------------------------------------------------------------ plan hold
+
+    def _hold_or_receipt(self, event: AgentEvent, evaluated: _Evaluation) -> object:
+        """A policy HOLD row of PLAN_PREVIEW_REVIEW.  The HOLD value is always
+        ``_hold_result``'s; with the plan-hold switch off (the default, and eve)
+        nothing else is read, so the path is today's byte for byte.  With it on,
+        a receipt transaction is returned when every pre-check passes, else the
+        same HOLD with no transaction (never an exception, never a Decision
+        slot, never a block on the subject: HD-3 (a) condition B)."""
+
+        hold = self._hold_result(evaluated.result)
+        if not self._store.plan_hold_receipts_enabled:
+            return hold
+        try:
+            coordinated = self._plan_hold_receipt(event, evaluated, hold)
+        except Exception:
+            self._pending = None
+            LOGGER.warning(
+                "%s reason=unexpected", PLAN_HOLD_RECEIPT_SKIPPED, exc_info=True
+            )
+            return hold
+        return hold if coordinated is None else coordinated
+
+    def _plan_hold_receipt(
+        self, event: AgentEvent, evaluated: _Evaluation, hold: _DecisionIssueResult
+    ) -> CoordinatedResult[_DecisionIssueResult] | None:
+        """The HD-3 (a) gate, last thing before the handler returns.  None is
+        "no receipt": not an eligible HOLD (silent) or a failed pre-check
+        (logged ``PLAN_HOLD_RECEIPT_SKIPPED``).  Each pre-check mirrors a
+        condition PREPARE / FINALIZE would otherwise refuse by raising."""
+
+        value, incarnation, head = evaluated.value, evaluated.incarnation, evaluated.head
+        if incarnation is None or not _plan_hold_eligible(evaluated):
+            return None
+        if evaluated.predecessor is PredecessorState.ABSENT_INITIAL:
+            predecessor_key, predecessor_digest = GENESIS, None
+        else:
+            assert head is not None and head.decision is not None
+            predecessor_key = head.decision.decision_id
+            predecessor_digest = head.decision.content_digest
+        hold_reason = evaluated.result.hold_reason
+        if hold_reason is None:
+            return None
+        try:
+            receipt = PlanHoldReceiptV1(
+                incarnation_id=incarnation,
+                lineage_scope=evaluated.scope,
+                review_intent_key=_review_intent_key(incarnation, predecessor_key, value),
+                predecessor_key=predecessor_key,
+                predecessor_digest=predecessor_digest,
+                event_id=event.event_id,
+                event_sequence=_sequence(event),
+                policy_kind=value.version,
+                policy_row=evaluated.result.row,
+                hold_reason=hold_reason,
+                policy_input_bytes=value.canonical_bytes(),
+                prepare_checked_at_utc=value.now_utc,
+            )
+            operation = HistoryRecordOperationV1(
+                HistoryOperationKind.R16_PLAN_HOLD,
+                incarnation,
+                event.event_id,
+                _sequence(event),
+                TransactionKind.EVENT_MUTATION.value,
+                RecordKind.PLAN_HOLD,
+                receipt,
+            )
+        except (TypeError, ValueError):
+            return self._skipped("NOT_REPRESENTABLE")
+        # Mirrors of PREPARE / FINALIZE, over fresh raw state.
+        try:
+            if not self._store_active():
+                return self._skipped("STORE_NOT_ACTIVE")
+            if self._incarnation_changed(incarnation):
+                return self._skipped("INCARNATION_CHANGED")
+            if self._sources_moved(event, evaluated):
+                return self._skipped("SOURCES_MOVED")
+            if self._store.prepare_collisions(operation).live_keys:
+                return self._skipped("KEY_LIVE")
+            self._store.check_headroom(len(operation.canonical_bytes()))
+            rows_digest = operations_digest(self._store.operations(incarnation))
+        except HistoryStoreCapacityError:
+            return self._skipped("HEADROOM")
+        except (HistoryStoreError, AgentStateLoadError):
+            return self._skipped("STORE_UNAVAILABLE")
+        transaction_id = TransactionCoordinator.derive_transaction_id(
+            event, TransactionKind.EVENT_MUTATION
+        )
+        participant = SubjectHistoryRecordParticipant(
+            self._store,
+            incarnation,
+            operation,
+            JournalCommitProofSource(self._journal, self._recovery),
+        )
+        self._pending = _PendingPlanHold(
+            event,
+            incarnation,
+            evaluated.snapshot_hash,
+            rows_digest,
+            transaction_id,
+            operation,
+            evaluated.initial,
+        )
+        LOGGER.info("R16 issuer plan_hold=sealed row=%s", evaluated.result.row.value)
+        return CoordinatedResult(hold, (participant,))
+
+    def _store_active(self) -> bool:
+        return self._store.meta().phase is HistoryMetaPhase.ACTIVE
+
+    def _incarnation_changed(self, incarnation: str) -> bool:
+        from suzka.r16.history_adoption import HistoryAdoptionError, current_incarnation
+
+        try:
+            return current_incarnation(self._journal, self._store) != incarnation
+        except HistoryAdoptionError:
+            return True
+
+    @staticmethod
+    def _skipped(reason: str) -> None:
+        LOGGER.info("%s reason=%s", PLAN_HOLD_RECEIPT_SKIPPED, reason)
+        return None
+
+    def _sources_moved(self, event: AgentEvent, evaluated: _Evaluation) -> bool:
+        from suzka.r16.plan_preview import _PlanSourceConflict, _PlanSourceUnavailable
+
+        try:
+            return bool(
+                self._preview._qualify(evaluated.q.goal_id, event) != evaluated.q
+                or self._preview._state_snapshot() != evaluated.initial
+            )
+        except (_PlanSourceConflict, _PlanSourceUnavailable):
+            return True
 
     # ------------------------------------------------------------ adapters
 
@@ -1032,10 +1202,7 @@ class _DecisionIssuer:
         predecessor_key = GENESIS if predecessor is None else predecessor.decision_id
         policy_bytes = value.canonical_bytes()
         intent = (
-            checksum(
-                _INTENT_DOMAIN,
-                [incarnation, predecessor_key, value.evidence_fingerprint(), value.version.value],
-            )
+            _review_intent_key(incarnation, predecessor_key, value)
             if review_intent_key is None
             else review_intent_key
         )
@@ -1132,6 +1299,17 @@ class _DecisionIssuer:
         rows = self._store.operations(pending.incarnation)
         own = [row for row in rows if row.transaction_id == pending.transaction_id]
         others = tuple(row for row in rows if row.transaction_id != pending.transaction_id)
+        if isinstance(pending, _PendingPlanHold):
+            if (
+                len(own) != 1
+                or own[0].phase is not HistoryPhase.PREPARED
+                or own[0].operation_kind is not HistoryOperationKind.R16_PLAN_HOLD
+                or own[0].pending_bytes != pending.operation.canonical_bytes()
+                or own[0].operation_digest != pending.operation.operation_digest
+                or operations_digest(others) != pending.rows_digest
+            ):
+                raise _PlanSourceUnavailable("SubjectHistory changed before WAL")
+            return
         if (
             len(own) != 1
             or own[0].phase is not HistoryPhase.PREPARED
@@ -1152,6 +1330,41 @@ class _DecisionIssuer:
 def _absolute(path: Path) -> Path:
     path = path.expanduser()
     return path if path.is_absolute() else Path(os.getcwd()) / path
+
+
+def _review_intent_key(
+    incarnation: str, predecessor_key: str, value: SuccessorPolicyInputV2
+) -> str:
+    """The PLAN_PREVIEW review-intent formula: one key per distinct evidence on
+    one predecessor (a Decision's slot and a plan-hold receipt's dedupe key)."""
+
+    return checksum(
+        _INTENT_DOMAIN,
+        [incarnation, predecessor_key, value.evidence_fingerprint(), value.version.value],
+    )
+
+
+def _plan_hold_eligible(evaluated: _Evaluation) -> bool:
+    """HD-3 (a) "which HOLDs": a policy HOLD row of a qualified evaluation whose
+    predecessor can be named (ABSENT_INITIAL, or a verified head).  Not recorded:
+    a row that comes from an UNAVAILABLE state (a transient refusal, not a
+    result: sources, lineage, predecessor, the R15 read, the ledger target), a
+    conflicting or unverified predecessor, and any path with no incarnation."""
+
+    value = evaluated.value
+    return (
+        evaluated.result.is_hold
+        and evaluated.result.row in _PLAN_HOLD_ROWS
+        and evaluated.incarnation is not None
+        and evaluated.predecessor
+        in (PredecessorState.ABSENT_INITIAL, PredecessorState.QUALIFIED)
+        and value.required_source is RequiredSourceState.QUALIFIED
+        and value.lineage is LineageState.CONSISTENT
+        and value.interpretation is not Interpretation.UNAVAILABLE
+        and value.ledger is not LedgerState.TARGET_UNAVAILABLE
+        and (evaluated.predecessor is PredecessorState.ABSENT_INITIAL or (
+            evaluated.head is not None and evaluated.head.decision is not None))
+    )
 
 
 def _sequence(event: AgentEvent) -> int:
@@ -1276,6 +1489,7 @@ def _decision_record(
 __all__ = [
     "DEADLINE_MARGIN",
     "NO_DEADLINE_UTC",
+    "PLAN_HOLD_RECEIPT_SKIPPED",
     "DecisionIssueStatus",
     "lineage_scope_for",
 ]
