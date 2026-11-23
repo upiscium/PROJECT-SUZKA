@@ -30,6 +30,7 @@ from suzka.config.schema import ApiSettings
 from test_fastapi_backend import _settings
 
 ROOT = Path(__file__).resolve().parents[1]
+R18 = "/api/r18"
 LAN_HOST = "10.12.0.2:8080"
 LAN_ORIGIN = f"http://{LAN_HOST}"
 SAFE = {"GET", "HEAD", "OPTIONS"}
@@ -132,7 +133,7 @@ def test_every_non_safe_api_route_is_refused_cross_origin(app) -> None:  # type:
     spy = Spy(app)
     seen = 0
     for route in app.routes:
-        if not isinstance(route, APIRoute) or not is_guarded_path(route.path):
+        if not isinstance(route, APIRoute) or not is_guarded_path(route.path, R18):
             continue
         for method in sorted(route.methods - SAFE):
             path = re.sub(r"\{[^}]+\}", "x", route.path)
@@ -204,9 +205,10 @@ def test_the_guard_adds_no_cors_headers_and_a_dev_cors_origin_still_works(app) -
 def test_r18_paths_are_left_to_their_own_guard(app) -> None:  # type: ignore[no-untyped-def]
     # r18 is disabled in this app: 404, never this guard's 403.
     assert _send(app, "POST", "/api/r18/approvals/x/confirm", "evil.example").status_code == 404
-    assert not is_guarded_path("/api/r18") and not is_guarded_path("/api/r18/approve")
-    assert is_guarded_path("/api") and is_guarded_path("/api/chat")
-    assert not is_guarded_path("/health") and not is_guarded_path("/apix")
+    assert not is_guarded_path("/api/r18", R18) and not is_guarded_path("/api/r18/approve", R18)
+    assert is_guarded_path("/api", R18) and is_guarded_path("/api/chat", R18)
+    assert is_guarded_path("/api/r18x", R18)
+    assert not is_guarded_path("/health", R18) and not is_guarded_path("/apix", R18)
 
 
 def test_configured_allowed_hosts_and_origins(tmp_path: Path) -> None:
@@ -397,7 +399,7 @@ def test_every_api_route_is_covered_by_this_guard_or_its_own_guard(app) -> None:
             path.startswith("/api/") or path in allowed_outside_api
         ), f"route {path} is neither under /api nor a known non-API route"
         if path.startswith("/api/"):
-            assert is_guarded_path(path) or path.startswith("/api/r18/"), path
+            assert is_guarded_path(path, R18) or path.startswith("/api/r18/"), path
     # the middleware is installed on the app, outside CORS, and the r18 guard
     # (own guard) is the only other thing that may own an /api prefix
     classes = [m.cls.__name__ for m in app.user_middleware]

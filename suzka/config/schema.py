@@ -262,7 +262,7 @@ class ApiSettings(StrictBaseModel):
     # is still accepted so existing config files keep loading.
     admin_token_env: str | None = Field(default=None, exclude=True)
     cors_origins: list[str]
-    # Origin/Host guard for /api/* outside /api/r18/* (see
+    # Origin/Host guard for /api/* outside the R18 approval API (see
     # ``suzka/api/origin_guard.py``).  Both are optional: IP literals,
     # ``localhost`` and the cors origins are accepted without any entry.
     allowed_hosts: list[str] = Field(default_factory=list)

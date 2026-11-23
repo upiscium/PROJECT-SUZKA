@@ -1436,7 +1436,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # a refusal carries no CORS headers.  The R18 guard (mounted below) is
     # outside this one and owns /api/r18/*.
     app.add_middleware(
-        ApiOriginGuard, config=OriginGuardConfig.from_settings(app_settings.api)
+        ApiOriginGuard,
+        config=OriginGuardConfig.from_settings(app_settings.api),
+        exempt_prefix="/api/r18",
     )
 
     @app.get("/health")

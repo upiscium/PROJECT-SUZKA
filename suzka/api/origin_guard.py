@@ -1,9 +1,9 @@
-"""Origin / Host guard for the HTTP API outside ``/api/r18/*``.
+"""Origin / Host guard for the HTTP API outside the R18 approval API.
 
 The WebUI/Admin token layer is gone, so a browser page on another origin could
 send a simple (body-less or ``text/plain``) request to a state-changing route
 (CSRF) or, after a DNS rebinding, read a GET route.  This pure ASGI middleware
-refuses both, for every ``/api`` path EXCEPT ``/api/r18/*`` (the approval API
+refuses both, for every ``/api`` path EXCEPT the one prefix the server wiring names as exempt (the R18 approval API
 keeps its own, stricter guard, ``R18RequestGuard``, which this module neither
 reuses for decisions nor changes).
 
@@ -54,9 +54,6 @@ from suzka.config.schema import ApiSettings, parse_approval_origin
 
 LOGGER = logging.getLogger(__name__)
 API_PREFIX: Final = "/api"
-# Owned by the R18 approval API's own guard (not imported: an architecture test
-# keeps every other module from naming that module).
-R18_PREFIX: Final = "/api/r18"
 SAFE_METHODS: Final = frozenset({"GET", "HEAD", "OPTIONS"})
 # Starlette's TestClient default Host (every test client uses it).
 DEFAULT_HOSTS: Final = frozenset({"localhost", "testserver"})
@@ -67,8 +64,8 @@ _NAME: Final = re.compile(r"([0-9a-z.-]+)(?::([1-9][0-9]{0,4}))?")
 _ORIGIN: Final = re.compile(r"(https?)://([^/?#@\s]+)")
 
 
-def is_r18_path(path: str) -> bool:
-    return path == R18_PREFIX or path.startswith(R18_PREFIX + "/")
+def _under(path: str, prefix: str) -> bool:
+    return path == prefix or path.startswith(prefix + "/")
 
 
 def _headers(raw: Iterable[tuple[bytes, bytes]]) -> dict[str, list[str]]:
@@ -86,10 +83,12 @@ class Refusal(str, Enum):
     FETCH_SITE = "api_cross_site_request_refused"
 
 
-def is_guarded_path(path: str) -> bool:
-    """Whether this guard covers ``path`` (``/api`` outside ``/api/r18``)."""
+def is_guarded_path(path: str, exempt: str) -> bool:
+    """Whether this guard covers ``path``: under ``/api``, not under ``exempt``
+    (the prefix of the API that has its own guard; named by the server wiring,
+    which is the only place that knows it)."""
 
-    return (path == API_PREFIX or path.startswith(API_PREFIX + "/")) and not is_r18_path(path)
+    return _under(path, API_PREFIX) and not _under(path, exempt)
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,9 +201,11 @@ class ApiOriginGuard:
         self,
         app: Callable[[Scope, Receive, Send], Awaitable[None]],
         config: OriginGuardConfig,
+        exempt_prefix: str,
     ) -> None:
         self._app = app
         self._config = config
+        self._exempt = exempt_prefix
         self._log = _RefusalLog()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -213,14 +214,17 @@ class ApiOriginGuard:
             await self._app(scope, receive, send)  # lifespan
             return
         # Guard both spellings of the path (``root_path`` stripped or not); a
-        # path either spelling of which is under /api/r18 belongs to the R18
-        # guard, exactly as that guard decides it.
+        # path either spelling of which is under the exempt prefix belongs to its
+        # own guard, exactly as that guard decides it.
         raw_path = str(scope.get("path", ""))
         route_path = str(get_route_path(scope))
-        if is_r18_path(raw_path) or is_r18_path(route_path):
+        if _under(raw_path, self._exempt) or _under(route_path, self._exempt):
             await self._app(scope, receive, send)
             return
-        if not (is_guarded_path(raw_path) or is_guarded_path(route_path)):
+        if not (
+            is_guarded_path(raw_path, self._exempt)
+            or is_guarded_path(route_path, self._exempt)
+        ):
             await self._app(scope, receive, send)
             return
         try:
