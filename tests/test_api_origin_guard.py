@@ -392,7 +392,7 @@ def test_parse_authority_is_total() -> None:
 
 
 def test_every_api_route_is_covered_by_this_guard_or_its_own_guard(app) -> None:  # type: ignore[no-untyped-def]
-    allowed_outside_api = {"/health", "/docs", "/docs/oauth2-redirect", "/openapi.json", "/redoc"}
+    allowed_outside_api = {"/health", "/health/dc", "/docs", "/docs/oauth2-redirect", "/openapi.json", "/redoc"}
     for route in app.routes:
         path = getattr(route, "path", "")
         assert (
