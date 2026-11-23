@@ -89,9 +89,11 @@ from suzka.r16.decision_issuer import _DecisionIssuer
 from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
 from suzka.r17.expectation_issuer import ExpectationIssuerV1
 from suzka.r17.feedback_owner import FeedbackOwnerV1
+from suzka.r19.ack_owner import InboxAckOwnerV1
 from suzka.r19.claim_owner import WakeClaimOwnerV1
 from suzka.r19.outbox_owner import OutboxOwnerV1
 from suzka.r19.contracts import WakeTiming
+from suzka.r19.inbox_api import mount_inbox_api
 from suzka.r19.materializer import WakeMaterializerV1
 from suzka.r19.review_owner import WakeReviewOwnerV1
 from suzka.r19.scheduler import WakeScheduler
@@ -597,6 +599,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise StateRecoveryError("R19 Wake materializer unavailable")
             return owner
 
+        # IP-21c: the Inbox ACK owner.
+        def _r19_inbox_ack_owner_for_commit(
+            event: AgentEvent,
+        ) -> InboxAckOwnerV1 | None:
+            owner = getattr(app.state, "inbox_ack_owner", None)
+            if owner is None and event.event_type is AgentEventType.R19_INBOX_ACK:
+                raise StateRecoveryError("R19 Inbox ACK owner unavailable")
+            return owner
+
         def _r18_policy_owner_for_commit(
             event: AgentEvent,
         ) -> ReviewArtifactPolicyV1 | None:
@@ -669,6 +680,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             wake_materializer = getattr(app.state, "wake_materializer", None)
             if wake_materializer is not None:
                 wake_materializer._clear()
+            # IP-21c: the R19 Inbox ACK owner (None unless installed).
+            inbox_ack_owner = getattr(app.state, "inbox_ack_owner", None)
+            if inbox_ack_owner is not None:
+                inbox_ack_owner._clear()
 
         def _internal_commit_checkpoint(event: AgentEvent) -> InternalCommitEvidence:
             nonlocal committed_snapshot, committed_snapshot_hash
@@ -722,6 +737,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 wake_materializer = _r19_wake_materializer_for_commit(event)
                 if wake_materializer is not None:
                     wake_materializer._validate_commit(event)
+                inbox_ack_owner = _r19_inbox_ack_owner_for_commit(event)
+                if inbox_ack_owner is not None:
+                    inbox_ack_owner._validate_commit(event)
                 validate_belief_commit = getattr(
                     app.state.main_loop, "_validate_belief_event_commit", None
                 )
@@ -1102,6 +1120,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.agent_runtime,
                     enabled=app_settings.r19.enabled,
                     timing=_wake_timing,
+                )
+                # IP-21c (IP-21 D1 r3 §3, §5-3): the Inbox ACK owner.  It reads
+                # the ContextRegistry only through ``registry.get`` on the
+                # runtime thread (no Context is created or selected).
+                app.state.inbox_ack_owner = InboxAckOwnerV1(
+                    app.state.decision_issuer,
+                    app.state.agent_runtime,
+                    enabled=app_settings.r19.enabled,
+                    timing=_wake_timing,
+                    registry=lambda: getattr(
+                        getattr(app.state, "main_loop", None), "context_registry", None
+                    ),
                 )
                 # IP-21b: the Outbox owner (R19_WAKE_COMPLETE), built only with
                 # r19.enabled; without it no Scheduler exists to submit an event.
@@ -1494,6 +1524,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if app_settings.r18.enabled:
         require_approval_binding(app_settings.api.host, app_settings.r18)
         mount_approval_api(app, app_settings.r18)
+    # IP-21c (IP-21 D1 r3 §5-1, A-7): the Inbox routes, on the same server with
+    # the chat route's authentication / CORS / exposure, exist only with
+    # r19.enabled; otherwise every /api/r19/inbox path is a 404.
+    if app_settings.r19.enabled:
+        mount_inbox_api(app)
 
     return app
 
