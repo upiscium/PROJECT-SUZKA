@@ -379,14 +379,35 @@ def test_a_refusal_at_restart_keeps_the_process_alive_and_re_evaluates(
 
 
 @pytest.mark.parametrize("signal_error", [KeyboardInterrupt, SystemExit])
-def test_shutdown_signals_are_not_failures(
+def test_exit_signals_inside_a_cycle_are_a_visible_re_evaluated_refusal(
     supervisors: Any, signal_error: type[BaseException]
 ) -> None:
-    sup, cycles, _status, _app = make([raises(lambda: signal_error())])
+    sup, cycles, status, _app = make([raises(lambda: signal_error()), ok()], reeval_delay=0.2)
     supervisors(sup).start()
-    wait_until(lambda: sup._thread is not None and not sup._thread.is_alive())
-    assert cycles.launches == 1
-    assert sup.phase is not DcState.REFUSED_RUNNING
+    wait_until(phase_is(sup, DcState.REFUSED_RUNNING))
+    assert status.snapshot()["dc_reason"] == f"cycle_exit_requested:{signal_error.__name__}"
+    wait_until(phase_is(sup, SERVING))  # not a dead supervisor
+    assert cycles.launches == 2
+
+
+def test_an_error_in_the_supervisor_itself_still_proves_the_stop_before_the_next_cycle() -> None:
+    holder: dict[str, ZombieOwner] = {}
+    calls = {"n": 0}
+
+    def flaky_ready(app: Any) -> ReadyReport:
+        calls["n"] += 1
+        raise RuntimeError("ready report failed")
+
+    sup, cycles, status, _app = make([_zombie_step(holder), ok()], t_teardown_max_s=0.2)
+    sup._ready_report = flaky_ready
+    sup.start()
+    try:
+        wait_until(lambda: sup.terminal, what="terminal: the zombie was not stopped")
+        assert cycles.launches == 1  # no second cycle on top of a live thread
+        assert status.snapshot()["dc_reason"].startswith("threads_not_stopped:")
+    finally:
+        holder["owner"].free()
+        sup.shutdown(timeout=2.0)
 
 
 def test_a_ready_cycle_without_a_started_runtime_is_reconciling_and_re_evaluated(

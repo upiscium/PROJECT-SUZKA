@@ -201,6 +201,7 @@ class _Cycle:
         self.failure: CycleFailure | None = None
         self.restart_reason: str | None = None
         self.shutdown_signal = False
+        self.exit_label: str | None = None
         self.teardown_label: str | None = None
 
 
@@ -296,6 +297,9 @@ class SubjectSupervisor:
         with self._cv:
             if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("SubjectSupervisor is already running")
+            previous = self._handle
+            if previous is not None and not previous.done:
+                raise RuntimeError("the previous subject cycle is still running")
             self._stopping = False
             self._shutdown_deadline = None
             self._terminal = False
@@ -365,6 +369,7 @@ class SubjectSupervisor:
             LOGGER.critical("subject supervisor ended unexpectedly: %s", label)
             self._publish(DcState.REFUSED_RUNNING, label)
             self._terminal = True
+            self._abandon_cycle()  # a live cycle is told to tear down, not left
 
     def _loop(self) -> None:
         reeval_n = 0
@@ -392,7 +397,14 @@ class SubjectSupervisor:
                     restart_run=restart_run,
                     failed_at=failed_at,
                 )
-                self._abandon_cycle()
+                # Never launch the next cycle without the stop proof (P2-1).
+                live = self._handle
+                if live is not None:
+                    proof, alive = self._conclude(live)
+                    if proof == _Proof.ABORTED:
+                        outcome = self._aborted(live)
+                    elif proof == _Proof.NOT_PROVEN:
+                        outcome = self._terminal_refusal(alive)
             kind_first = False
             if outcome.finished:
                 return
@@ -437,11 +449,17 @@ class SubjectSupervisor:
         if proof == _Proof.NOT_PROVEN:
             return self._terminal_refusal(alive)
         if handle.shutdown_signal:
-            # KeyboardInterrupt / SystemExit / cancellation in the cycle: not a
-            # failure of the subject, a shutdown request.
-            with self._cv:
-                self._stopping = True
-            return _Outcome(finished=True)
+            # KeyboardInterrupt / SystemExit / cancellation raised INSIDE a
+            # cycle thread cannot end the process (it is not the main thread):
+            # a visible, re-evaluated refusal, never a silent dead supervisor.
+            label = "cycle_exit_requested:" + (handle.exit_label or "BaseException")
+            self._publish(DcState.REFUSED_RUNNING, label)
+            return _Outcome(
+                delay=self._reeval_delay(reeval_n),
+                reeval_n=reeval_n + 1,
+                restart_run=restart_run,
+                failed_at=failed_at,
+            )
         if handle.restart_reason is not None:
             restart_run += 1
             if restart_run > int(self._settings.cycle_restart_cap):
@@ -712,6 +730,7 @@ class SubjectSupervisor:
                 handle.restart_reason = restart
             elif propagate:
                 handle.shutdown_signal = True
+                handle.exit_label = type(error).__name__
             else:
                 handle.failure = failure
         if after_ready:
@@ -800,7 +819,9 @@ class SubjectSupervisor:
         self._close_r18_gate()
         LOGGER.critical("subject cycle threads did not stop: %s", ",".join(alive))
         self._publish(DcState.REFUSED_RUNNING, reason)
-        if self._settings.exit_on_threads_not_stopped:
+        with self._cv:
+            stopping = self._stopping
+        if self._settings.exit_on_threads_not_stopped and not stopping:
             self._exit_code = EXIT_CODE_THREADS_NOT_STOPPED
             self._exit_fn(EXIT_CODE_THREADS_NOT_STOPPED)
         # Terminal: idle until the process is told to stop.
