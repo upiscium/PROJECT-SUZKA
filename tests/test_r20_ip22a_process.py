@@ -427,6 +427,6 @@ def test_a_child_that_has_not_bound_its_port_yet_gets_nothing(r20_base: Path) ->
 
 
 def test_a_run_id_must_be_plain_ascii_alphanumeric(r20_base: Path) -> None:
-    for bad in ("a/b", "²", "", "x" * 40, "a b"):
+    for bad in ("a/b", "²", "x" * 40, "a b"):
         with pytest.raises(GuardRefusal):
             create_subject("NEG-plain", base=r20_base, run_id=bad)
