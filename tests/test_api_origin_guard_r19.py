@@ -24,7 +24,7 @@ def _post(w, message, headers):  # type: ignore[no-untyped-def]
     )
 
 
-def test_cross_origin_ack_is_refused_with_no_event_and_no_row(world) -> None:  # type: ignore[no-untyped-def]
+def test_cross_origin_ack_is_refused_with_no_event_and_no_row(world) -> None:  # type: ignore[no-untyped-def]  # noqa: F811
     message = _message(world)
     submits = _AckSubmits(world.state, world.monkeypatch)
     journal = _journal_len(world.state)
@@ -47,7 +47,7 @@ def test_cross_origin_ack_is_refused_with_no_event_and_no_row(world) -> None:  #
     assert _journal_len(world.state) == journal
 
 
-def test_same_origin_and_no_origin_acks_still_work(world) -> None:  # type: ignore[no-untyped-def]
+def test_same_origin_and_no_origin_acks_still_work(world) -> None:  # type: ignore[no-untyped-def]  # noqa: F811
     first, second = _message(world), _message(world, another=True)
     same = _post(
         world, first, {"Host": LAN, "Origin": f"http://{LAN}", "Sec-Fetch-Site": "same-origin"}
