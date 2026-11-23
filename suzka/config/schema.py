@@ -350,8 +350,13 @@ class DegradedContinuationSettings(StrictBaseModel):
     """
 
     # "refuse" is the exact legacy behaviour: no supervisor, no quarantine, no
-    # ladder.
-    mode: Literal["continue", "refuse"] = "continue"
+    # ladder.  DEFAULT "refuse" (DC-5 decision, to be confirmed by the Human at
+    # the deploy that flips it): the production config does not set this key,
+    # so a deploy of the supervisor must not change eve's start-up semantics
+    # (a start-time refusal exits the process; a FAILED Runtime stays FAILED)
+    # until the Human turns "continue" on.  The D1's HD-F15-1 (a) "continue is
+    # the default" is therefore a later, explicit flip of this one default.
+    mode: Literal["continue", "refuse"] = "refuse"
     # Manifests and the HARD-band log only; ``None`` -> ``<journal dir>/quarantine``.
     quarantine_dir: Path | None = None
     # T_retry: one shared deadline per start attempt.

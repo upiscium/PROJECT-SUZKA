@@ -6,6 +6,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, cast
 
+import asyncio
 import logging
 
 import uvicorn
@@ -84,7 +85,13 @@ from suzka.r16.history_adoption import (
 from suzka.r16.history_store import SubjectHistoryStore
 from suzka.r16.driver import R16Driver, rescan_from, self_goal_targets
 from suzka.r16.source_owner import _MotivationSourceRef
-from suzka.runtime.degraded_continuation import DegradedContinuationStatus
+from suzka.api.supervisor import (
+    ReadyReport,
+    SubjectPhaseMiddleware,
+    SubjectSupervisor,
+    phase_detail,
+)
+from suzka.runtime.degraded_continuation import DcState, DegradedContinuationStatus
 from suzka.runtime.event_journal import EventJournalAdmissionBand
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
 from suzka.r16.decision_issuer import _DecisionIssuer
@@ -123,6 +130,29 @@ from suzka.runtime.semantic_receipt_retention import (
 )
 
 
+def _release_cycle_resources(app: FastAPI) -> None:
+    """Idempotent failure-path cleanup of a supervised cycle (D1 sec. 5.3
+    item 8): close the SubjectHistory store (the cycle body closes it only on
+    a clean teardown) and the Journal with its lease.  Each close is attempted
+    on its own; none raises.  Chroma (``DualMemorySystem``) has no ``close``:
+    its handles go with the references the supervisor drops (``app.state``
+    reset plus ``gc.collect()``)."""
+
+    log = logging.getLogger(__name__)
+    store = getattr(app.state, "subject_history_store", None)
+    if store is not None:
+        try:
+            store.close()
+        except Exception:
+            log.warning("SubjectHistory store did not close cleanly")
+    journal = getattr(app.state, "event_journal", None)
+    if journal is not None:
+        try:
+            journal.close()
+        except Exception:
+            log.warning("EventJournal did not close cleanly")
+
+
 def _sleep_learning_gate(journal: EventJournal) -> Callable[[], str | None]:
     """Veto Sleep training outside the normal Journal band (IP-4b)."""
 
@@ -143,7 +173,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app_settings = settings or get_settings()
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    async def _subject_cycle(app: FastAPI) -> AsyncIterator[None]:
+        # One start-up / teardown of the subject.  With degraded_continuation
+        # mode "refuse" (the default) this IS the app lifespan, unchanged; with
+        # "continue" the supervisor runs it once per cycle (F15 DC-5).
         existing_journal = getattr(app.state, "event_journal", None)
         journal_lease: EventJournalLease | None = None
         initial_committed_read_views: object | None = None
@@ -1420,12 +1453,63 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if getattr(app.state, "subject_history_store", None) is not None:
                 app.state.subject_history_store.close()
 
-    app = FastAPI(title=app_settings.project.name, lifespan=lifespan)
+    dc_settings = app_settings.degraded_continuation
+    supervised = dc_settings.mode == "continue"
+
+    @asynccontextmanager
+    async def _supervised_cycle(app: FastAPI) -> AsyncIterator[None]:
+        """One supervised cycle: the unchanged cycle body plus the mandatory
+        failure-path cleanup (D1 sec. 5.3 item 8).  Whatever the body leaves
+        open on a failed start or a failed teardown is released here, so a
+        refused cycle leaks no descriptor, lease or store."""
+
+        try:
+            async with _subject_cycle(app):
+                yield
+        finally:
+            _release_cycle_resources(app)
+
+    def _ready_report(app: FastAPI) -> ReadyReport:
+        runtime = getattr(app.state, "agent_runtime", None)
+        if getattr(runtime, "status", None) is AgentRuntimeStatus.ACCEPTING:
+            return ReadyReport(serving=True)
+        base = _health_base()
+        return ReadyReport(
+            serving=False, reason=base.get("reason") or "agent_runtime_unavailable"
+        )
+
+    @asynccontextmanager
+    async def _supervised_lifespan(app: FastAPI) -> AsyncIterator[None]:
+        supervisor: SubjectSupervisor = app.state.dc_supervisor
+        supervisor.start()
+        try:
+            yield  # at once: /health and the 503 middleware answer from here
+        finally:
+            # SIGTERM: bounded by T_shutdown_join, and off the server loop.
+            await asyncio.get_running_loop().run_in_executor(
+                None, supervisor.shutdown
+            )
+
+    app = FastAPI(
+        title=app_settings.project.name,
+        lifespan=_supervised_lifespan if supervised else _subject_cycle,
+    )
     app.state.settings = app_settings
-    # F15 DC-1: inert until the supervisor (DC-5) publishes into it.  The two
-    # health routes close over this object, so reading it needs no app.state.
+    # F15 DC-1: the record behind /health's dc_* fields and /health/dc.  The
+    # two health routes close over this object, so reading it needs no
+    # app.state.  Only the supervisor (mode "continue") publishes into it.
     dc_status = DegradedContinuationStatus()
     app.state.dc_status = dc_status
+    dc_supervisor: SubjectSupervisor | None = None
+    if supervised:
+        dc_supervisor = SubjectSupervisor(
+            app,
+            dc_settings,
+            dc_status,
+            cycle_factory=_supervised_cycle,
+            ready_report=_ready_report,
+        )
+        app.state.dc_supervisor = dc_supervisor
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error_handler(
@@ -1480,7 +1564,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def health() -> dict[str, str]:
         # ``dc_*`` fields are added only when the degraded-continuation record
         # has something to say; while it is inactive the answer is unchanged.
-        return {**_health_base(), **dc_status.health_fields()}
+        if dc_supervisor is None:
+            return {**_health_base(), **dc_status.health_fields()}
+        return {**_supervised_health_base(dc_supervisor), **dc_status.health_fields()}
 
     @app.get("/health/dc")
     def health_dc() -> dict[str, str]:
@@ -1488,6 +1574,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         value, so it answers in every phase (including a failed start)."""
 
         return dc_status.snapshot()
+
+    def _supervised_health_base(supervisor: SubjectSupervisor) -> dict[str, str]:
+        """Mode "continue": computed from the supervisor first; ``app.state``
+        is read only while SERVING (a cycle may be tearing it down)."""
+
+        phase = supervisor.phase
+        if phase is DcState.SERVING:
+            try:
+                return _health_base()
+            except AttributeError:
+                phase = DcState.RESTARTING  # the cycle ended under this request
+        reason = phase_detail(phase)
+        if phase is DcState.RECONCILING:
+            # today's DEGRADED-UP reason, as the cycle reported it
+            reason = dc_status.snapshot().get("dc_reason") or reason
+        return {
+            "status": "degraded",
+            "project": app_settings.project.name,
+            "reason": reason,
+        }
 
     def _health_base() -> dict[str, str]:
         if app.state.external_reconciliation_required:
@@ -1563,6 +1669,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # r19.enabled; otherwise every /api/r19/inbox path is a 404.
     if app_settings.r19.enabled:
         mount_inbox_api(app)
+
+    if dc_supervisor is not None:
+        # Outermost (added last): every path except /health and /health/dc is
+        # a 503 with the phase while the subject is not SERVING.
+        app.add_middleware(SubjectPhaseMiddleware, supervisor=dc_supervisor)
+        # Every key set so far (settings, dc_*, the mounts' limits and guard
+        # config) belongs to the app, not to a cycle: the reset keeps them.
+        dc_supervisor.capture_baseline()
 
     return app
 

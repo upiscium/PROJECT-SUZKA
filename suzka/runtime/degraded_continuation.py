@@ -62,6 +62,7 @@ from suzka.runtime.thread_liveness import ThreadLedger, ThreadsAlive
 __all__ = [
     "BackoffSchedule",
     "CycleFailure",
+    "CycleRestart",
     "Deadline",
     "DegradedContinuationStatus",
     "DcState",
@@ -195,6 +196,18 @@ class CycleFailure:
 
     label: str
     verdict: IntegrityVerdict
+
+
+class CycleRestart(Exception):
+    """Raised from inside a subject cycle (DC-4 after a quarantine, DC-6 after
+    a ladder rung) to end the cycle and ask the supervisor for an immediate new
+    one.  It is NOT a failure: the supervisor does not count it, but it caps
+    ``cycle_restart_cap`` of them in a row (D1 sec. 4.1).  ``reason`` is a short
+    label (it is shown in ``dc_reason`` when the cap is hit)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def must_propagate(error: BaseException) -> bool:

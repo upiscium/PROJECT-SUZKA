@@ -265,6 +265,9 @@ class AgentRuntime:
         self._active: tuple[_PendingEvent, AgentEvent] | None = None
         self._handler_event: AgentEvent | None = None
         self._failed_phase: AgentRuntimeDurabilityPhase | None = None
+        # F15 DC-5: optional observer of the FAILED transition; unset = no
+        # behaviour.  See ``set_on_failed``.
+        self._on_failed: Callable[[AgentRuntimeDurabilityPhase], None] | None = None
         self._allow_volatile = allow_volatile
         self._durability_configured = all(
             callback is not None
@@ -351,6 +354,35 @@ class AgentRuntime:
                 self._status = AgentRuntimeStatus.CREATED
                 raise
             self._thread_ledger.register(worker)
+
+    def set_on_failed(
+        self, callback: Callable[[AgentRuntimeDurabilityPhase], None] | None
+    ) -> None:
+        """Install the FAILED observer (F15 DC-5; ``None`` removes it).
+
+        ``callback(phase)`` runs once per fail-stop, right after the status
+        flips, on whichever thread failed the runtime and UNDER the runtime's
+        condition lock: it must be non-blocking and must not call back into
+        this runtime.  An exception it raises is swallowed.  When the runtime
+        is already FAILED the callback runs at once, so a failure that happened
+        before installation is not missed.  It never changes the runtime:
+        ``start()`` still refuses a FAILED instance."""
+
+        with self._condition:
+            self._on_failed = callback
+            if callback is not None and self._status is AgentRuntimeStatus.FAILED:
+                self._notify_failed_locked(self._failed_phase)
+
+    def _notify_failed_locked(
+        self, phase: AgentRuntimeDurabilityPhase | None
+    ) -> None:
+        callback = self._on_failed
+        if callback is None or phase is None:
+            return
+        try:
+            callback(phase)
+        except Exception:
+            pass
 
     def threads_alive(self) -> tuple[str, ...]:
         """Names of this runtime's threads that are still alive (read-only;
@@ -674,6 +706,7 @@ class AgentRuntime:
                 ),
             )
         self._condition.notify_all()
+        self._notify_failed_locked(failure_phase)
 
     def _finish_active_locked(self) -> None:
         self._active = None

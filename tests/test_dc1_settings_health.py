@@ -33,7 +33,8 @@ def _raw(path: Path) -> dict[str, Any]:
 
 def test_defaults_match_the_approved_design() -> None:
     d = DegradedContinuationSettings()
-    assert d.mode == "continue"
+    # DC-5: off by default so a deploy does not change eve; "continue" is opt-in.
+    assert d.mode == "refuse"
     assert d.quarantine_dir is None
     assert (d.t_retry_s, d.t_hash_s) == (60, 30)
     assert d.t_boot_max_s == 240  # HD-new-3, not the older 120
@@ -58,7 +59,7 @@ def test_an_existing_config_without_the_section_stays_valid(path: Path) -> None:
     assert "degraded_continuation" not in raw  # as an installed config is today
     settings = Settings.model_validate(raw)
     assert settings.degraded_continuation == DegradedContinuationSettings()
-    assert load_settings(path).degraded_continuation.mode == "continue"
+    assert load_settings(path).degraded_continuation.mode == "refuse"
 
 
 @pytest.mark.parametrize("path", CONFIGS, ids=lambda p: p.name)
