@@ -84,6 +84,7 @@ from suzka.r16.history_adoption import (
 from suzka.r16.history_store import SubjectHistoryStore
 from suzka.r16.driver import R16Driver, rescan_from, self_goal_targets
 from suzka.r16.source_owner import _MotivationSourceRef
+from suzka.runtime.degraded_continuation import DegradedContinuationStatus
 from suzka.runtime.event_journal import EventJournalAdmissionBand
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
 from suzka.r16.decision_issuer import _DecisionIssuer
@@ -1421,6 +1422,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title=app_settings.project.name, lifespan=lifespan)
     app.state.settings = app_settings
+    # F15 DC-1: inert until the supervisor (DC-5) publishes into it.  The two
+    # health routes close over this object, so reading it needs no app.state.
+    dc_status = DegradedContinuationStatus()
+    app.state.dc_status = dc_status
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error_handler(
@@ -1473,6 +1478,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict[str, str]:
+        # ``dc_*`` fields are added only when the degraded-continuation record
+        # has something to say; while it is inactive the answer is unchanged.
+        return {**_health_base(), **dc_status.health_fields()}
+
+    @app.get("/health/dc")
+    def health_dc() -> dict[str, str]:
+        """Read-only degraded-continuation state.  Touches no ``app.state``
+        value, so it answers in every phase (including a failed start)."""
+
+        return dc_status.snapshot()
+
+    def _health_base() -> dict[str, str]:
         if app.state.external_reconciliation_required:
             return {
                 "status": "degraded",
@@ -1481,6 +1498,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 or "external_reconciliation_required",
             }
         retention_band: EventJournalAdmissionBand | None
+        journal_unreadable = False
         try:
             retention_status = app.state.event_journal.admission_status()
             retention_available = retention_status.available
@@ -1488,6 +1506,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except EventJournalError:
             retention_available = False
             retention_band = None
+            journal_unreadable = True
         if (
             not retention_available
             or not app.state.startup_retention_admission_available
@@ -1495,12 +1514,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             hard = retention_band is EventJournalAdmissionBand.HARD or (
                 app.state.startup_retention_reason == "journal_hard_limit"
             )
+            if hard:
+                reason = "journal_hard_limit"
+            elif journal_unreadable:
+                # Not retention: the Journal could not be inspected at all.
+                reason = "event_journal_unavailable"
+            else:
+                reason = "event_journal_retention_exhausted"
             return {
                 "status": "degraded",
                 "project": app_settings.project.name,
-                "reason": "journal_hard_limit"
-                if hard
-                else "event_journal_retention_exhausted",
+                "reason": reason,
             }
         if app.state.agent_runtime.status is not AgentRuntimeStatus.ACCEPTING:
             return {

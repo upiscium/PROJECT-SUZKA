@@ -106,6 +106,7 @@ from suzka.r16.goal_owner import _GoalSourceSelection, _SelfGoalSelection
 from suzka.r16.outcomes import R16OwnerOutcome, R16OwnerReason, R16OwnerStatus
 from suzka.r16.source_owner import INTEREST_APPLIED, _MotivationSourceRef
 from suzka.r16.successor_policy import SuccessorRow
+from suzka.runtime.thread_liveness import ThreadLedger
 from suzka.r17.expectation_issuer import (
     MAX_SCANS_PER_STARTUP,
     TRANSIENT_REASONS,
@@ -467,6 +468,7 @@ class R16Driver:
         self._queue: queue.Queue[object] = queue.Queue(maxsize=QUEUE_CAPACITY)
         self._stop = Event()
         self._thread: Thread | None = None
+        self._thread_ledger = ThreadLedger()
         self._lifecycle = Lock()
         self._tickets_lock = Lock()
         self._tickets: OrderedDict[str, _Ticket] = OrderedDict()
@@ -521,6 +523,7 @@ class R16Driver:
             self._stop.clear()
             self._thread = Thread(target=self._run, name="r16-driver", daemon=True)
             self._thread.start()
+            self._thread_ledger.register(self._thread)
         if rescan is not None and self._active:
             self._post(rescan)
         if self._active:
@@ -611,6 +614,12 @@ class R16Driver:
             return
         self._scan_posted = True
         self._post(_ForecastScan())
+
+    def threads_alive(self) -> tuple[str, ...]:
+        """Names of this owner's threads that are still alive (read-only;
+        remembers a thread that ``stop()`` timed out on and abandoned)."""
+
+        return self._thread_ledger.alive()
 
     def stop(self) -> None:
         """Stop and join before the runtime shuts down (#370 D2 P2-3)."""

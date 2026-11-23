@@ -106,6 +106,7 @@ from suzka.runtime.agent_runtime import (
 )
 from suzka.runtime.agent_state import AgentStateLoadError
 from suzka.runtime.event_journal import EventJournal, EventJournalError, EventJournalInspection
+from suzka.runtime.thread_liveness import ThreadLedger
 
 LOGGER = logging.getLogger(__name__)
 
@@ -369,6 +370,7 @@ class WakeScheduler:
         self._lock = threading.Lock()
         self._slot = threading.Condition(self._lock)
         self._thread: threading.Thread | None = None
+        self._thread_ledger = ThreadLedger()
         self._tick_lock = threading.Lock()
         self._future: Future[AgentEventOutcome[object]] | None = None
         self._ctx: _Ctx | None = None
@@ -399,6 +401,13 @@ class WakeScheduler:
             with self._lock:
                 self._thread = None
             raise
+        self._thread_ledger.register(thread)
+
+    def threads_alive(self) -> tuple[str, ...]:
+        """Names of this owner's threads that are still alive (read-only;
+        remembers a thread that ``stop()`` timed out on and abandoned)."""
+
+        return self._thread_ledger.alive()
 
     def stop(self) -> None:
         """Stop and join before the runtime shuts down.  An accepted event is
