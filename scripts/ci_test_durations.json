@@ -111,6 +111,7 @@
  "tests/test_r16_ip14a_history_v2.py": 7.6,
  "tests/test_r16_ip14b1_history_v4.py": 8.5,
  "tests/test_r16_ip14b2_participant_reader.py": 42.9,
+ "tests/test_r16_ip14b3_plan_hold_writer.py": 118.0,
  "tests/test_r16_ip16b_ledger_reader.py": 109.6,
  "tests/test_r16_ip4c_past_retention.py": 12.9,
  "tests/test_r16_ip5_owner_reasons.py": 11.2,
