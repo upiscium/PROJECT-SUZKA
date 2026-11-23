@@ -205,6 +205,13 @@ class ApiOriginGuard:
     ) -> None:
         self._app = app
         self._config = config
+        if (
+            not exempt_prefix.startswith(API_PREFIX + "/")
+            or exempt_prefix.endswith("/")
+            or not exempt_prefix.isascii()
+        ):
+            # An empty or malformed prefix would exempt everything (fail open).
+            raise ValueError("the exempt prefix is a path under /api without a trailing slash")
         self._exempt = exempt_prefix
         self._log = _RefusalLog()
 

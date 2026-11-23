@@ -430,9 +430,19 @@ def test_no_websocket_routes_and_the_guard_closes_a_websocket_handshake(app) -> 
 
     assert not [r for r in app.routes if isinstance(r, APIWebSocketRoute)]
     client = app.state.guard_test_client
-    with pytest.raises(WebSocketDisconnect):
+    with pytest.raises(WebSocketDisconnect) as closed:
         with client.websocket_connect("/api/ws", headers={"Origin": "https://evil.example"}):
             pass
+    assert closed.value.code == 1008
+
+
+@pytest.mark.parametrize("prefix", ["", "/", "/api", "/api/", "/api/x/", "/other", "api/x"])
+def test_a_malformed_exempt_prefix_is_refused_at_construction(prefix: str) -> None:
+    async def noop(*args: Any) -> None:  # pragma: no cover
+        return None
+
+    with pytest.raises(ValueError):
+        ApiOriginGuard(noop, CONFIG, prefix)
 
 
 def test_scheme_and_port_edge_cases() -> None:
