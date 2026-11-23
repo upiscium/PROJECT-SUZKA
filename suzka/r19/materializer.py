@@ -309,11 +309,10 @@ class _Candidate:
     # Outcome causes: the Feedback / Assessment and the latest Outcome it names.
     cause_record: DecisionFeedbackV1 | OutcomeAssessmentV1 | None = None
     outcome: VerifiedOutcomeV1 | None = None
-    # APPROVAL_CLOSED: the closed Intent and the closure instant (the DENY /
-    # third expiry Journal time, or the window end); None when it cannot be
-    # established (an archived event), which is an OUT_OF_SCOPE skip.
+    # APPROVAL_CLOSED: the closed Intent and its derived closed state; the
+    # closure instant is computed in ``_scope`` (None there = OUT_OF_SCOPE).
     intent: ActionIntentV1 | None = None
-    closed_at: datetime | None = None
+    closed_state: LedgerState | None = None
 
     @property
     def sort_key(self) -> tuple[int, int, str]:
@@ -643,7 +642,7 @@ class WakeMaterializerV1:
                     intent.admitting_sequence,
                     PolicyRef(INTENT_REF_KIND, intent.intent_id, 1, intent.intent_digest),
                     intent=intent,
-                    closed_at=_closure_instant(scan, intent, read.state),
+                    closed_state=read.state,
                 )
             )
         return found
@@ -727,9 +726,13 @@ class WakeMaterializerV1:
             # admission (up to the approval window, at most 86400 s, earlier).
             # ``cause_utc`` stays the admission time (``wake_window`` reads it
             # only for "a Wake is created at or after its cause").
-            if candidate.closed_at is None:
+            # Computed here, after CAUSE_ALREADY_WOKEN, so an old closed Intent
+            # costs no Journal lookup and a failure stays a per-candidate skip.
+            assert candidate.intent is not None and candidate.closed_state is not None
+            closed_at = _closure_instant(scan, candidate.intent, candidate.closed_state)
+            if closed_at is None:
                 raise _Skip(SkipReason.OUT_OF_SCOPE)
-            if scan.event.requested_at - candidate.closed_at > self._max_age:
+            if scan.event.requested_at - closed_at > self._max_age:
                 raise _Skip(SkipReason.OUT_OF_SCOPE)
             floor = journal_clock_floor(
                 scan.inspection.records, before_event_id=scan.event.event_id

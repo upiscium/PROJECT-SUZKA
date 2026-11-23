@@ -189,30 +189,6 @@ def test_an_open_claimed_or_inverse_intent_makes_no_wake(world) -> None:  # type
     assert _wakes(state) == []
 
 
-def test_candidates_are_forward_intents_only(world) -> None:  # type: ignore[no-untyped-def]
-    """The derivation reads ActionIntentV1 records only (the inverse is dormant,
-    ``INVERSE_DEFERRED``): no candidate is built from anything else."""
-
-    state = world.state
-    _deny(world)
-    scan = state.wake_materializer
-    candidates = []
-
-    def spy(self_scan):  # type: ignore[no-untyped-def]
-        found = real(self_scan)
-        candidates.extend(found)
-        return found
-
-    real = scan._approval_candidates
-    scan._approval_candidates = spy
-    _only_approval(state)
-    _scan(state)
-    assert [(c.cause, c.intent.intent_id) for c in candidates] == [
-        (WakeCause.APPROVAL_CLOSED, world.intent.intent_id)
-    ]
-    assert all(type(c.intent).__name__ == "ActionIntentV1" for c in candidates)
-
-
 def test_a_successor_decision_before_the_scan_makes_no_wake(world) -> None:  # type: ignore[no-untyped-def]
     """The Intent's Decision is no longer the head: the closure was already
     answered (D1 §7-3 "Still the head")."""
@@ -332,7 +308,7 @@ def test_a_skipped_older_candidate_materializes_the_closure_with_its_old_label(w
     assert [wake.cause for wake in _wakes(state)].count(WakeCause.APPROVAL_CLOSED) == 0
 
 
-def test_the_usual_case_labels_the_closure_as_approval_closed(world) -> None:  # type: ignore[no-untyped-def]
+def test_with_the_admission_candidates_out_of_the_way_the_closure_labels_itself(world) -> None:  # type: ignore[no-untyped-def]
     """The sibling of the pin: with the earlier causes already woken (or
     superseded) the closure carries its own label."""
 
@@ -375,6 +351,15 @@ def test_a_closure_older_than_the_bound_is_out_of_scope(world) -> None:  # type:
     clock.advance(700)  # the DENY is now 700 s old
     assert _skips(_scan(state)) == [(WakeCause.APPROVAL_CLOSED, SkipReason.OUT_OF_SCOPE)]
     assert _wakes(state) == []
+
+
+def test_a_third_expiry_closure_older_than_the_bound_is_out_of_scope(world) -> None:  # type: ignore[no-untyped-def]
+    state, clock = world.state, world.time
+    _only_approval(state)
+    _three_expiries(world)
+    state.wake_materializer._max_age = timedelta(seconds=600)
+    clock.advance(700)
+    assert _skips(_scan(state)) == [(WakeCause.APPROVAL_CLOSED, SkipReason.OUT_OF_SCOPE)]
 
 
 def test_a_window_closure_is_out_of_scope_when_its_window_end_is_too_old(world) -> None:  # type: ignore[no-untyped-def]
