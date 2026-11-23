@@ -70,3 +70,7 @@ def _issuer_equivalence(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
     install(monkeypatch)
     yield
+
+
+# IP-22a (R20 harness): the throwaway-base fixture used by tests/test_r20_*.py.
+from r20_fixtures import r20_base  # noqa: E402,F401
