@@ -598,9 +598,9 @@ def test_n2_every_refusal_writes_nothing_and_submits_no_event(app) -> None:  # t
         # a body over 16 KiB
         _refused(post(base + "/confirm", _local(post=True), "x" * (MAX_BODY_BYTES + 1)), Refusal.BODY_SIZE)
         # the admin proxy's exact request shape: Host 127.0.0.1:8000 / localhost:8000,
-        # only Content-Type + X-SUZKA-Admin-Token, on GET and on POST.
+        # only Content-Type (no token any more), on GET and on POST.
         for host, reason in (("127.0.0.1:8000", Refusal.HOST), ("localhost:8000", Refusal.DATA_HEADER)):
-            proxy = {"Host": host, "Content-Type": "application/json", "X-SUZKA-Admin-Token": ip16a2.TOKEN}
+            proxy = {"Host": host, "Content-Type": "application/json"}
             _refused(client.get("/api/r18/approvals", headers=proxy), reason)
             _refused(client.get(base + "/status", headers=proxy), reason)
             _refused(client.post(base + "/review", headers=proxy, content="{}"), reason)
@@ -637,7 +637,7 @@ def test_health_and_other_routes_are_unaffected_by_the_guards(app) -> None:  # t
     with TestClient(app, base_url="http://testserver") as client:
         # A Host the approval guards would refuse still reaches every other route.
         assert client.get("/health").status_code == 200
-        assert client.get("/api/contexts").status_code in (401, 503)  # the admin dependency answers
+        assert client.get("/api/contexts").status_code == 200  # no auth dependency any more
         assert client.get("/api/r18/approvals").status_code == 403  # the guard answers
 
 

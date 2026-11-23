@@ -70,11 +70,6 @@ def app(tmp_path):  # type: ignore[no-untyped-def]
     return _app(_settings(tmp_path / "ip17b"))
 
 
-@pytest.fixture
-def _admin_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", ip16a2.TOKEN)
-
-
 # ----------------------------------------------------------------- helpers
 
 
@@ -354,14 +349,14 @@ def test_a_review_holds_until_there_is_an_allow(app) -> None:  # type: ignore[no
         assert _approval_rows(state) == [] and _approval_events(state) == 0
 
 
-def test_a_review_of_a_denied_intent_holds(app, _admin_token) -> None:  # type: ignore[no-untyped-def]
+def test_a_review_of_a_denied_intent_holds(app) -> None:  # type: ignore[no-untyped-def]
     from suzka.r16.review_value import REVIEW_VALUE_ID
 
     with TestClient(app) as client:
         state = client.app.state
         _gid, _decision, intent, _forecast = _forward(state)
         for action in ("freeze", "unfreeze"):
-            assert client.post(f"/api/values/{REVIEW_VALUE_ID}/{action}", headers=ip16a2.ADMIN).status_code == 200
+            assert client.post(f"/api/values/{REVIEW_VALUE_ID}/{action}").status_code == 200
         assert state.policy_owner._submit_policy(intent.intent_id).result(timeout=30).value.verdict
         denied = state.approval_owner.review(intent.intent_id)
         assert denied.reason is R18ApprovalReason.POLICY_DENIED
@@ -896,7 +891,7 @@ def test_only_the_approval_owner_submits_the_approval_events() -> None:
 # ============================================== §8a: no stop hinders the subject
 
 
-def test_drift_after_the_allow_holds_the_confirm_and_closes_at_the_window(app, _admin_token, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_drift_after_the_allow_holds_the_confirm_and_closes_at_the_window(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     from suzka.r16.review_value import REVIEW_VALUE_ID
 
     with TestClient(app) as client:
@@ -907,7 +902,7 @@ def test_drift_after_the_allow_holds_the_confirm_and_closes_at_the_window(app, _
         review = owner.review(intent.intent_id)
         assert review.challenge is not None
         for action in ("freeze", "unfreeze"):
-            assert client.post(f"/api/values/{REVIEW_VALUE_ID}/{action}", headers=ip16a2.ADMIN).status_code == 200
+            assert client.post(f"/api/values/{REVIEW_VALUE_ID}/{action}").status_code == 200
         held = owner.issue(intent.intent_id, review.challenge.nonce, review.challenge.confirmation_code)
         assert (held.status, held.reason) == (ApprovalStatus.HOLD, R18ApprovalReason.SOURCE_NOT_CURRENT)
         assert _approval_rows(state) == []

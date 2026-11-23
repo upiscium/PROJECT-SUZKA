@@ -460,7 +460,6 @@ def test_closed_context_refuses_old_stance(
         assert current is not None
         response = client.post(
             f"/api/contexts/{current[0].context_id}/close",
-            headers={"X-SUZKA-Admin-Token": "not-real"},
         )
         assert response.status_code == 200
         assert _latest_committed_technical_evidence(client, episode) is None
@@ -539,7 +538,6 @@ def test_debug_chat_invalidates_prior_projection_and_stance(
         with patch.object(provider, "generate", return_value="diagnostic reply"):
             r = client.post(
                 "/api/chat/debug",
-                headers={"X-SUZKA-Admin-Token": "not-real"},
                 json={
                     "message": "later debug event; no per-turn speaker proof",
                     "attachments": [],
@@ -811,7 +809,6 @@ def test_closed_sibling_context_remains_a_raw_token_collision(
         assert other_context_id != first[0].context_id
         closed = client.post(
             f"/api/contexts/{other_context_id}/close",
-            headers={"X-SUZKA-Admin-Token": "not-real"},
         )
         assert closed.status_code == 200, closed.text[:200]
         from suzka.runtime.context import ContextStatus

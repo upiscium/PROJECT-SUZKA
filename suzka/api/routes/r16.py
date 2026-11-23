@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
-from suzka.api.dependencies import get_agent_runtime, require_admin
+from suzka.api.dependencies import get_agent_runtime
 from suzka.api.runtime_execution import execute
 from suzka.r16.activation import (
     R16DriverAlreadyActive,
@@ -15,7 +15,7 @@ from suzka.runtime import AgentEventSource, AgentEventType, AgentRuntime
 
 
 router = APIRouter(
-    prefix="/api/r16", tags=["r16"], dependencies=[Depends(require_admin)]
+    prefix="/api/r16", tags=["r16"]
 )
 
 

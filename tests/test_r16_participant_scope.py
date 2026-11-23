@@ -21,7 +21,6 @@ from suzka.runtime.event_journal import EventLifecycle
 from test_r16_ip4c_past_retention import app  # noqa: F401
 from test_r16_ip6b_driver import (  # noqa: F401
     _activate,
-    _admin_token,
     _chat,
     _interest,
     _settled,

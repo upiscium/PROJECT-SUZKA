@@ -71,10 +71,13 @@ adapter_registry:
 api:
   host: 127.0.0.1
   port: 8000
-  admin_token_env: SUZKA_ADMIN_TOKEN
   cors_origins:
     - http://localhost:3000
     - http://127.0.0.1:3000
+  # Optional Origin/Host guard (default: empty). Host: IP literals, localhost and
+  # these names; Origin: same authority as Host, these origins and cors_origins.
+  allowed_hosts: []
+  allowed_origins: []
 
 frontend:
   base_url: http://localhost:3000

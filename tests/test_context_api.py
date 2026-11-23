@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from suzka.memory.working_memory_resolver import MemoryWorkingMemoryResolver
 
-from test_fastapi_backend import PRIVATE_SENTINEL, _client, admin_headers
+from test_fastapi_backend import PRIVATE_SENTINEL, _client
 from suzka.runtime import EventLifecycle
 
 
@@ -32,11 +32,10 @@ def _seed(client: TestClient) -> tuple[str, str]:
     )
 
 
-def test_context_api_requires_admin_and_projects_deterministically(tmp_path: Path) -> None:
+def test_context_api_projects_deterministically_without_a_token(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         first, second = _seed(client)
-        assert client.get("/api/contexts").status_code == 401
-        response = client.get("/api/contexts", headers=admin_headers())
+        response = client.get("/api/contexts")
         assert response.status_code == 200
         assert [item["context_id"] for item in response.json()["contexts"]] == sorted(
             (first, second)
@@ -62,13 +61,12 @@ def test_context_api_lifecycle_and_relation_are_runtime_mutations(tmp_path: Path
     with _client(tmp_path) as client:
         first, second = _seed(client)
         response = client.post(
-            f"/api/contexts/{first}/suspend", headers=admin_headers()
+            f"/api/contexts/{first}/suspend"
         )
         assert response.status_code == 200
         assert response.json()["status"] == "suspended"
         response = client.post(
             f"/api/contexts/{first}/relations",
-            headers=admin_headers(),
             json={"related_context_id": second},
         )
         assert response.status_code == 200
@@ -98,7 +96,7 @@ def test_context_api_current_lifecycle_durability_and_restart_semantics(
         assert created.status_code == 200
         context_id = next(
             item["context_id"]
-            for item in client.get("/api/contexts", headers=admin_headers()).json()[
+            for item in client.get("/api/contexts").json()[
                 "contexts"
             ]
             if item["source_session_id"] == "current-lifecycle"
@@ -106,12 +104,12 @@ def test_context_api_current_lifecycle_durability_and_restart_semantics(
         registry = client.app.state.main_loop.context_registry
 
         suspended = client.post(
-            f"/api/contexts/{context_id}/suspend", headers=admin_headers()
+            f"/api/contexts/{context_id}/suspend"
         )
         assert suspended.status_code == 200
         assert suspended.json()["status"] == "suspended"
         assert suspended.json()["is_current"] is False
-        assert client.get("/api/contexts", headers=admin_headers()).json()[
+        assert client.get("/api/contexts").json()[
             "current_context_id"
         ] is None
         _assert_durable_context_event(client, "api.contexts.suspend")
@@ -131,7 +129,7 @@ def test_context_api_current_lifecycle_durability_and_restart_semantics(
         )
 
         resumed = client.post(
-            f"/api/contexts/{context_id}/resume", headers=admin_headers()
+            f"/api/contexts/{context_id}/resume"
         )
         assert resumed.status_code == 200
         assert resumed.json()["status"] == "active"
@@ -151,7 +149,7 @@ def test_context_api_current_lifecycle_durability_and_restart_semantics(
         assert registry.current_context_id == context_id
 
         closed = client.post(
-            f"/api/contexts/{context_id}/close", headers=admin_headers()
+            f"/api/contexts/{context_id}/close"
         )
         assert closed.status_code == 200
         assert closed.json()["status"] == "closed"
@@ -202,7 +200,7 @@ def test_context_api_active_current_pointer_survives_restart(tmp_path: Path) -> 
         assert after == before
         assert after.current_context_id == current_id
         frame = restarted.get(
-            f"/api/contexts/{current_id}", headers=admin_headers()
+            f"/api/contexts/{current_id}"
         ).json()
         assert frame["status"] == "active"
         assert frame["is_current"] is True
@@ -213,20 +211,19 @@ def test_context_api_transitions_are_idempotent_and_close_preserves_frame(
 ) -> None:
     with _client(tmp_path) as client:
         first, _ = _seed(client)
-        headers = admin_headers()
         suspended = client.post(
-            f"/api/contexts/{first}/suspend", headers=headers
+            f"/api/contexts/{first}/suspend"
         ).json()
-        again = client.post(f"/api/contexts/{first}/suspend", headers=headers).json()
+        again = client.post(f"/api/contexts/{first}/suspend").json()
         assert again == suspended
-        resumed = client.post(f"/api/contexts/{first}/resume", headers=headers).json()
+        resumed = client.post(f"/api/contexts/{first}/resume").json()
         assert resumed["status"] == "active"
         assert resumed["is_current"] is False
-        closed = client.post(f"/api/contexts/{first}/close", headers=headers).json()
+        closed = client.post(f"/api/contexts/{first}/close").json()
         assert closed["status"] == "closed"
         assert closed["context_id"] == first
         assert (
-            client.post(f"/api/contexts/{first}/close", headers=headers).json()
+            client.post(f"/api/contexts/{first}/close").json()
             == closed
         )
 
@@ -237,13 +234,13 @@ def test_context_api_reads_are_pure_and_unknown_is_not_found(tmp_path: Path) -> 
         registry = client.app.state.main_loop.context_registry
         before_state = registry.state
         before_records = client.app.state.event_journal.records
-        first = client.get("/api/contexts", headers=admin_headers()).json()
-        second = client.get("/api/contexts", headers=admin_headers()).json()
+        first = client.get("/api/contexts").json()
+        second = client.get("/api/contexts").json()
         assert first == second
         assert registry.state == before_state
         assert client.app.state.event_journal.records == before_records
         assert (
-            client.get("/api/contexts/missing", headers=admin_headers()).json()
+            client.get("/api/contexts/missing").json()
             == {"detail": "Context not found"}
         )
 
@@ -314,13 +311,13 @@ def test_context_api_reads_preserve_all_authority_hashes(tmp_path: Path) -> None
         before_emotion = client.app.state.main_loop.emotion_engine.state
 
         for _ in range(3):
-            assert client.get("/api/contexts", headers=admin_headers()).status_code == 200
+            assert client.get("/api/contexts").status_code == 200
             assert (
-                client.get(f"/api/contexts/{first}", headers=admin_headers()).status_code
+                client.get(f"/api/contexts/{first}").status_code
                 == 200
             )
             assert (
-                client.get(f"/api/contexts/{second}", headers=admin_headers()).status_code
+                client.get(f"/api/contexts/{second}").status_code
                 == 200
             )
             registry.compatibility(first, first)
@@ -357,7 +354,7 @@ def test_context_api_privacy_keeps_raw_chat_in_memory_only(tmp_path: Path) -> No
             json={"message": PRIVATE_SENTINEL, "attachments": []},
         )
         assert response.status_code == 200
-        contexts = client.get("/api/contexts", headers=admin_headers())
+        contexts = client.get("/api/contexts")
         assert contexts.status_code == 200
         assert PRIVATE_SENTINEL not in contexts.text
 
@@ -385,7 +382,7 @@ def test_context_api_handler_failure_rolls_back_real_lifecycle_mutation(
         assert created.status_code == 200
         context_id = next(
             item["context_id"]
-            for item in client.get("/api/contexts", headers=admin_headers()).json()[
+            for item in client.get("/api/contexts").json()[
                 "contexts"
             ]
             if item["source_session_id"] == "failure-lifecycle"
@@ -401,7 +398,7 @@ def test_context_api_handler_failure_rolls_back_real_lifecycle_mutation(
         monkeypatch.setattr(registry, "suspend", mutate_then_fail)
         with pytest.raises(RuntimeError, match=PRIVATE_SENTINEL):
             client.post(
-                f"/api/contexts/{context_id}/suspend", headers=admin_headers()
+                f"/api/contexts/{context_id}/suspend"
             )
 
         assert registry.state == before
@@ -464,17 +461,16 @@ def test_context_api_invalid_ids_are_bounded_and_not_admitted(tmp_path: Path) ->
         _seed(client)
         before = client.app.state.event_journal.records
         response = client.post(
-            "/api/contexts/../suspend", headers=admin_headers()
+            "/api/contexts/../suspend"
         )
         assert response.status_code in {404, 422}
         response = client.post(
-            "/api/contexts/bad%20value/suspend", headers=admin_headers()
+            "/api/contexts/bad%20value/suspend"
         )
         assert response.status_code == 422
         assert "bad value" not in response.text
         response = client.post(
             "/api/contexts/ctx-a/relations",
-            headers=admin_headers(),
             json={"related_context_id": "bad value"},
         )
         assert response.status_code == 422

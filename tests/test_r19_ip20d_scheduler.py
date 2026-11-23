@@ -211,7 +211,6 @@ def test_disabled_has_no_scheduler_no_thread_and_submits_no_r19_event(tmp_path) 
 
 
 def test_enabled_scheduler_waits_for_the_driver_then_runs_the_startup_scan(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", ip16a2.TOKEN)
     base = ip16a2._settings(tmp_path / "on")
     settings = base.model_copy(
         update={"r19": base.r19.model_copy(update={"enabled": True, "tick_s": 1})}
@@ -227,7 +226,7 @@ def test_enabled_scheduler_waits_for_the_driver_then_runs_the_startup_scan(tmp_p
         # No activation event: the Scheduler exists and does nothing.
         real_time.sleep(2.5)
         assert not journal_events(state, AgentEventType.R19_WAKE_MATERIALIZE, EventLifecycle.ACCEPTED)
-        assert client.post("/api/r16/driver/activate", headers=ip16a2.ADMIN).status_code == 200
+        assert client.post("/api/r16/driver/activate").status_code == 200
         scheduler.nudge()
         deadline = real_time.monotonic() + 20
         while not journal_events(state, AgentEventType.R19_WAKE_MATERIALIZE, EventLifecycle.ACCEPTED):

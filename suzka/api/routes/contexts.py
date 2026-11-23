@@ -8,7 +8,7 @@ from suzka.api.context_read_model import (
     PublishedContextView,
 )
 
-from suzka.api.dependencies import get_agent_runtime, get_main_loop, require_admin
+from suzka.api.dependencies import get_agent_runtime, get_main_loop
 from suzka.api.runtime_execution import execute
 from suzka.api.schemas.context import (
     ContextFrameResponse,
@@ -29,7 +29,7 @@ from suzka.runtime import (
 
 
 router = APIRouter(
-    prefix="/api/contexts", tags=["contexts"], dependencies=[Depends(require_admin)]
+    prefix="/api/contexts", tags=["contexts"]
 )
 
 

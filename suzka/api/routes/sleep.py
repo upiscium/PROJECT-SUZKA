@@ -7,7 +7,6 @@ from fastapi import APIRouter, Depends
 from suzka.api.dependencies import (
     get_agent_runtime,
     get_sleep_cycle_manager,
-    require_admin,
 )
 from suzka.api.runtime_execution import execute
 from suzka.api.schemas.sleep import SleepRunResponse
@@ -16,7 +15,7 @@ from suzka.runtime import AgentEventSource, AgentEventType, AgentRuntime
 
 
 router = APIRouter(
-    prefix="/api/sleep", tags=["sleep"], dependencies=[Depends(require_admin)]
+    prefix="/api/sleep", tags=["sleep"]
 )
 
 

@@ -320,13 +320,12 @@ def test_self_proposal_needs_its_owner_to_commit(app) -> None:
 
 
 def _self_activation_records(client):  # type: ignore[no-untyped-def]
-    from test_r16_ip6b_driver import ADMIN
     from test_r16_ip6a_driver_plumbing import _chat as plain_chat
 
     from suzka.runtime.journal_compaction import JournalCompactionPolicy
 
     state = client.app.state
-    assert client.post("/api/r16/self-goal/activate", headers=ADMIN).status_code == 200
+    assert client.post("/api/r16/self-goal/activate").status_code == 200
     for number in range(8):
         plain_chat(client, f"fill {number}")
     journal = state.event_journal
@@ -347,7 +346,6 @@ def _self_activation_records(client):  # type: ignore[no-untyped-def]
 def test_c11_marker_is_carried_verified_and_kind_checked(tmp_path, monkeypatch) -> None:
     """C11 (D4 §1): the self-Goal marker survives compaction like C9's."""
 
-    from test_r16_ip6b_driver import TOKEN
     from test_r16_ip4c_past_retention import app as _unused  # noqa: F401
 
     from suzka.runtime.event_journal import (
@@ -356,8 +354,6 @@ def test_c11_marker_is_carried_verified_and_kind_checked(tmp_path, monkeypatch) 
         EventJournalIntegrityError,
         EventLifecycle,
     )
-
-    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", TOKEN)
     settings = _settings(tmp_path / "c11", small_journal=True)
     with TestClient(_app(settings)) as client:
         records, boundary, compaction = _self_activation_records(client)
@@ -385,12 +381,9 @@ def test_c11_marker_is_carried_verified_and_kind_checked(tmp_path, monkeypatch) 
 
 
 def test_a_compaction_without_the_marker_keeps_its_bytes(tmp_path, monkeypatch) -> None:
-    from test_r16_ip6b_driver import TOKEN
     from test_r16_ip6a_driver_plumbing import _chat as plain_chat
 
     from suzka.runtime.journal_compaction import JournalCompactionPolicy
-
-    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", TOKEN)
     with TestClient(_app(_settings(tmp_path / "nomarker", small_journal=True))) as client:
         state = client.app.state
         for number in range(8):
@@ -540,16 +533,14 @@ def test_s1_shape_end_to_end_without_any_user_request(tmp_path, monkeypatch) -> 
     """#379 R20 S1 shape: CHAT X -> U2a INTEREST -> self proposal -> adoption
     -> Plan preview, all chained by the driver; the only user input is X."""
 
-    from test_r16_ip6b_driver import ADMIN, TOKEN, _chat, _until
-
-    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", TOKEN)
+    from test_r16_ip6b_driver import _chat, _until
     settings = _settings(tmp_path / "s1", min_strength=0.15)
     with TestClient(_app(settings)) as client:
         state = client.app.state
-        assert client.post("/api/r16/driver/activate", headers=ADMIN).status_code == 200
-        response = client.post("/api/r16/self-goal/activate", headers=ADMIN)
+        assert client.post("/api/r16/driver/activate").status_code == 200
+        response = client.post("/api/r16/self-goal/activate")
         assert response.status_code == 200
-        assert client.post("/api/r16/self-goal/activate", headers=ADMIN).status_code == 409
+        assert client.post("/api/r16/self-goal/activate").status_code == 409
         x = _chat(client, "something worth looking into later, I think")
 
         def adopted():
@@ -820,12 +811,10 @@ def test_preview_alone_holds_a_self_goal_with_a_commitment(tmp_path) -> None:
 def test_real_app_driver_without_the_self_marker_never_proposes(tmp_path, monkeypatch) -> None:
     import time
 
-    from test_r16_ip6b_driver import ADMIN, TOKEN, _chat, _until
-
-    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", TOKEN)
+    from test_r16_ip6b_driver import _chat, _until
     with TestClient(_app(_settings(tmp_path / "nomark", min_strength=0.15))) as client:
         state = client.app.state
-        assert client.post("/api/r16/driver/activate", headers=ADMIN).status_code == 200
+        assert client.post("/api/r16/driver/activate").status_code == 200
         x = _chat(client, "something worth looking into later, I think")
         _until(
             lambda: any(
@@ -840,18 +829,16 @@ def test_real_app_driver_without_the_self_marker_never_proposes(tmp_path, monkey
 def test_restart_rescan_adopts_a_proposed_self_goal_once(tmp_path, monkeypatch) -> None:
     """Rescan (b) and no double proposal after restart (review P2-2)."""
 
-    from test_r16_ip6b_driver import ADMIN, TOKEN, _until
-
-    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", TOKEN)
+    from test_r16_ip6b_driver import _until
     settings = _settings(tmp_path / "rescan", min_strength=0.15)
     with TestClient(_app(settings)) as client:
         state = client.app.state
-        assert client.post("/api/r16/self-goal/activate", headers=ADMIN).status_code == 200
+        assert client.post("/api/r16/self-goal/activate").status_code == 200
         x = _interest(state)
         goal_id = _propose(state, x).subject_id  # crash before adoption
     with TestClient(_app(settings)) as client:
         state = client.app.state
-        assert client.post("/api/r16/driver/activate", headers=ADMIN).status_code == 200
+        assert client.post("/api/r16/driver/activate").status_code == 200
     with TestClient(_app(settings)) as client:
         state = client.app.state
         goal = _until(
@@ -866,13 +853,11 @@ def test_restart_rescan_adopts_a_proposed_self_goal_once(tmp_path, monkeypatch) 
 def test_occupied_x_is_reported_on_the_users_ticket(tmp_path, monkeypatch) -> None:
     """D3 P1-2(c): the user sees the closed reason on the ticket."""
 
-    from test_r16_ip6b_driver import ADMIN, TOKEN, _chat, _settled, _until
-
-    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", TOKEN)
+    from test_r16_ip6b_driver import _chat, _settled, _until
     with TestClient(_app(_settings(tmp_path / "ticket", min_strength=0.15))) as client:
         state = client.app.state
-        assert client.post("/api/r16/driver/activate", headers=ADMIN).status_code == 200
-        assert client.post("/api/r16/self-goal/activate", headers=ADMIN).status_code == 200
+        assert client.post("/api/r16/driver/activate").status_code == 200
+        assert client.post("/api/r16/self-goal/activate").status_code == 200
         x = _chat(client, "something worth looking into later, I think")
         _until(
             lambda: any(

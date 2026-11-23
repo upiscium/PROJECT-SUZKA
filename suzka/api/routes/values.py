@@ -6,7 +6,6 @@ from suzka.api.dependencies import (
     get_agent_runtime,
     get_api_settings,
     get_main_loop,
-    require_admin,
 )
 from suzka.api.runtime_execution import execute
 from suzka.api.schemas.value import (
@@ -41,7 +40,7 @@ from suzka.runtime import (
 
 
 router = APIRouter(
-    prefix="/api/values", tags=["values"], dependencies=[Depends(require_admin)]
+    prefix="/api/values", tags=["values"]
 )
 
 

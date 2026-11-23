@@ -15,13 +15,13 @@ import pytest
 
 from suzka.api.context_read_model import ContextPublicationStatus
 from suzka.runtime import AgentEventType
-from test_fastapi_backend import ThinkingProvider, _client, admin_headers
+from test_fastapi_backend import ThinkingProvider, _client
 from test_g1p_context_publication import _BarrierProvider, _public, _send_chat
 
 
 def _get(client, path: str, *, query: str | None = None):
     args = {"params": {"query": query}} if query is not None else {}
-    return client.get(path, headers=admin_headers(), **args)
+    return client.get(path, **args)
 
 
 def _seed_cross_reader_fixtures(client) -> tuple[str, str]:
@@ -74,16 +74,14 @@ def _external_reader_probe(
         if expected_context_status == 503:
             assert "x-context-terminal-sequence" not in response.headers
 
-    # The admin-only Context router MUST deny a missing or forged token even
-    # when the trusted caller is in a 503 publication window.
-    assert client.get("/api/contexts").status_code == 401
-    assert client.get(f"/api/contexts/{candidate_id}").status_code == 401
-    forged_headers = {"X-SUZKA-Admin-Token": "cp7-invalid-credential"}
-    assert client.get("/api/contexts", headers=forged_headers).status_code == 401
-    assert (
-        client.get(f"/api/contexts/{candidate_id}", headers=forged_headers).status_code
-        == 401
+    # A stray legacy token header is ignored: same answer as without it.
+    stray_headers = {"X-SUZKA-Admin-Token": "cp7-invalid-credential"}
+    assert client.get("/api/contexts", headers=stray_headers).status_code == (
+        listed.status_code
     )
+    assert client.get(
+        f"/api/contexts/{candidate_id}", headers=stray_headers
+    ).status_code == detail.status_code
 
     # Positive existing DB1/DB2 source IDs are fixture-only, not proof of G2.
     # A CHAT cannot mutate the R11 Value root under this event; if the configured
@@ -295,7 +293,6 @@ def test_cp7_second_debug_event_cannot_export_prompt_before_first_terminal(
         def debug_request():
             return client.post(
                 "/api/chat/debug",
-                headers=admin_headers(),
                 json={
                     "message": "CP7 queued debug request",
                     "attachments": [],

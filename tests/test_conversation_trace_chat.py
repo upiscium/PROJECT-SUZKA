@@ -12,7 +12,7 @@ from suzka.runtime.conversation_trace import (
     TraceTurnKind,
 )
 
-from test_fastapi_backend import ThinkingProvider, _client, _settings, admin_headers
+from test_fastapi_backend import ThinkingProvider, _client, _settings
 
 CTX = "conversation.default"
 EXPERIENCE = "experience-00000000-0000-4000-8000-000000000001"
@@ -101,7 +101,6 @@ def test_debug_chat_reads_the_trace_without_changing_it(tmp_path: Path) -> None:
         before = trace.state
         response = client.post(
             "/api/chat/debug",
-            headers=admin_headers(),
             json={"message": "debug turn", "attachments": [], "debug": True},
         )
         assert response.status_code == 200, response.text
@@ -157,7 +156,6 @@ def test_a_missing_episode_is_kept_hidden_and_logged_once(tmp_path: Path, caplog
         assert "episode-that-does-not-exist" in episode_ids
         response = client.post(
             "/api/chat/debug",
-            headers=admin_headers(),
             json={"message": "debug", "attachments": [], "debug": True},
         )
         missing = [i for i in response.json()["conversation_trace"]["items"]

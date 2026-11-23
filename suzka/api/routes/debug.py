@@ -6,7 +6,6 @@ from suzka.api.dependencies import (
     get_agent_runtime,
     get_api_settings,
     get_main_loop,
-    require_admin,
 )
 from suzka.api.runtime_execution import execute
 from suzka.api.routes.chat import (
@@ -43,7 +42,7 @@ from suzka.runtime import (
 from suzka.runtime.main_loop import ChatDiagnostics
 
 
-router = APIRouter(prefix="/api", tags=["debug"], dependencies=[Depends(require_admin)])
+router = APIRouter(prefix="/api", tags=["debug"])
 
 
 @router.post("/chat/debug", response_model=DebugChatResponse)

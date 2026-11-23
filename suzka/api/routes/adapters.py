@@ -7,7 +7,6 @@ from suzka.api.dependencies import (
     get_agent_runtime,
     get_api_settings,
     get_model_provider,
-    require_admin,
 )
 from suzka.api.runtime_execution import execute
 from suzka.api.schemas.adapter import (
@@ -28,7 +27,7 @@ from suzka.runtime import AgentEventSource, AgentEventType, AgentRuntime
 
 
 router = APIRouter(
-    prefix="/api/adapters", tags=["adapters"], dependencies=[Depends(require_admin)]
+    prefix="/api/adapters", tags=["adapters"]
 )
 
 

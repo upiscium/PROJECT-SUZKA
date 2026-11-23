@@ -770,38 +770,33 @@ def test_end_to_end_chat_to_intent_and_forecast_then_row_2(tmp_path) -> None:  #
 
     from test_r16_ip6b_driver import _interest, _settled
 
-    os.environ["SUZKA_P1B_TEST_TOKEN"] = ip16a2.TOKEN
-    try:
-        with TestClient(_app(_settings(tmp_path / "e2e"))) as client:
-            state = client.app.state
-            assert client.post("/api/r16/driver/activate", headers=ip16a2.ADMIN).status_code == 200
-            x = ip16a2._chat(client, "something wonderful happened today")
-            _interest(client, x["experience_id"])
-            review = ip16a2._chat(client, f"REVIEW_EXPERIENCE:{x['experience_id']}")
-            assert _settled(client, review["command_ticket"]["ticket_id"])["status"] == "adopted"
-            commit = ip16a2._chat(client, f"COMMIT_REVIEW_EXPERIENCE:1:{x['experience_id']}")
-            assert _settled(client, commit["command_ticket"]["ticket_id"])["status"] == "accepted"
-            reader = SubjectHistoryReader(state.event_journal, state.subject_history_store)
-            # IP-17a: the driver's Policy stage follows the forecast (ALLOW).
-            ip16a2._until(lambda: len(reader.adopted_records().records) >= 3, timeout=30)
-            time.sleep(0.5)
-            records = reader.adopted_records()
-            kinds = [item.record_kind for item in records.records]
-            assert kinds == [R.ACTION_INTENT, R.ACTION_FORECAST, R.POLICY_VERDICT]
-            intent = records.records[0].record
-            assert type(intent) is ActionIntentV1
-            assert type(records.records[1].record) is ExpectedObservationV1
-            head = SubjectHistoryReader(state.event_journal, state.subject_history_store).head(intent.lineage_scope)
-            assert head.status is HeadStatus.ADOPTED and head.decision.decision_id == intent.decision_id
-            goal = [ref for ref in head.decision.source_refs if ref.kind == "goal"][0].ref_id
-            before = len(ip10._history_transactions(state))
-            after = _issue(state, goal)
-            assert (after.status, after.row) == (DecisionIssueStatus.HOLD, SuccessorRow.ROW_2)
-            assert len(ip10._history_transactions(state)) == before
-            _no_failed_events(state)
-    finally:
-        del os.environ["SUZKA_P1B_TEST_TOKEN"]
-
+    with TestClient(_app(_settings(tmp_path / "e2e"))) as client:
+        state = client.app.state
+        assert client.post("/api/r16/driver/activate").status_code == 200
+        x = ip16a2._chat(client, "something wonderful happened today")
+        _interest(client, x["experience_id"])
+        review = ip16a2._chat(client, f"REVIEW_EXPERIENCE:{x['experience_id']}")
+        assert _settled(client, review["command_ticket"]["ticket_id"])["status"] == "adopted"
+        commit = ip16a2._chat(client, f"COMMIT_REVIEW_EXPERIENCE:1:{x['experience_id']}")
+        assert _settled(client, commit["command_ticket"]["ticket_id"])["status"] == "accepted"
+        reader = SubjectHistoryReader(state.event_journal, state.subject_history_store)
+        # IP-17a: the driver's Policy stage follows the forecast (ALLOW).
+        ip16a2._until(lambda: len(reader.adopted_records().records) >= 3, timeout=30)
+        time.sleep(0.5)
+        records = reader.adopted_records()
+        kinds = [item.record_kind for item in records.records]
+        assert kinds == [R.ACTION_INTENT, R.ACTION_FORECAST, R.POLICY_VERDICT]
+        intent = records.records[0].record
+        assert type(intent) is ActionIntentV1
+        assert type(records.records[1].record) is ExpectedObservationV1
+        head = SubjectHistoryReader(state.event_journal, state.subject_history_store).head(intent.lineage_scope)
+        assert head.status is HeadStatus.ADOPTED and head.decision.decision_id == intent.decision_id
+        goal = [ref for ref in head.decision.source_refs if ref.kind == "goal"][0].ref_id
+        before = len(ip10._history_transactions(state))
+        after = _issue(state, goal)
+        assert (after.status, after.row) == (DecisionIssueStatus.HOLD, SuccessorRow.ROW_2)
+        assert len(ip10._history_transactions(state)) == before
+        _no_failed_events(state)
 
 # -------------------------------------------------------------- switching off
 
