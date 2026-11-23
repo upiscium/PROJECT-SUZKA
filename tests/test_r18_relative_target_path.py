@@ -39,7 +39,8 @@ def test_a_relative_target_path_opens_the_gate(tmp_path: Path, monkeypatch: pyte
     with TestClient(app) as client:
         state = client.app.state
         _until(lambda: state.r18_gate.state is GateState.OPEN)
-    assert settings.r18.target_path == Path("t/target.sqlite3")  # caller's settings untouched
+    assert app.state.settings is settings
+    assert settings.r18.target_path == root / "t" / "target.sqlite3"
 
 
 def test_an_absolute_target_path_is_unchanged(tmp_path: Path) -> None:

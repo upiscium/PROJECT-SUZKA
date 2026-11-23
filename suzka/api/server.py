@@ -143,14 +143,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # A relative r18.target_path resolves against the process cwd, once, here,
     # before any consumer (executor, owners, issuers, approval) reads it, so all
     # of them see the same absolute path. An absolute path is left untouched.
+    # In place, so ``app.state.settings is settings`` still holds; idempotent.
     if not app_settings.r18.target_path.is_absolute():
-        app_settings = app_settings.model_copy(
-            update={
-                "r18": app_settings.r18.model_copy(
-                    update={"target_path": Path.cwd() / app_settings.r18.target_path}
-                )
-            }
-        )
+        app_settings.r18.target_path = Path.cwd() / app_settings.r18.target_path
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
