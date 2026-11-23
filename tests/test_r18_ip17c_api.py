@@ -637,7 +637,7 @@ def test_health_and_other_routes_are_unaffected_by_the_guards(app) -> None:  # t
     with TestClient(app, base_url="http://testserver") as client:
         # A Host the approval guards would refuse still reaches every other route.
         assert client.get("/health").status_code == 200
-        assert client.get("/api/contexts").status_code in (401, 503)  # the admin dependency answers
+        assert client.get("/api/contexts").status_code == 200  # no auth dependency any more
         assert client.get("/api/r18/approvals").status_code == 403  # the guard answers
 
 
