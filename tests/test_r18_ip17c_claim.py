@@ -110,7 +110,7 @@ def _target_bytes(state) -> str:  # type: ignore[no-untyped-def]
 def _issued(state, intent_id):  # type: ignore[no-untyped-def]
     """review -> issue only (the challenge is written, not claimed)."""
 
-    review = state.approval_owner.review(intent_id)
+    review = ip17b._review_settled(state, intent_id)
     assert review.challenge is not None, review
     issued = state.approval_owner.issue(
         intent_id, review.challenge.nonce, review.challenge.confirmation_code
@@ -120,7 +120,7 @@ def _issued(state, intent_id):  # type: ignore[no-untyped-def]
 
 
 def _confirm(state, intent_id):  # type: ignore[no-untyped-def]
-    review = state.approval_owner.review(intent_id)
+    review = ip17b._review_settled(state, intent_id)
     assert review.challenge is not None, review
     return review.challenge, state.approval_owner.confirm(
         intent_id, review.challenge.nonce, review.challenge.confirmation_code

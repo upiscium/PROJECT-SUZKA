@@ -120,10 +120,46 @@ def _adopted(state, record_type):  # type: ignore[no-untyped-def]
     return [item.record for item in found.records if type(item.record) is record_type]
 
 
+_TRANSIENT_REVIEW_HOLDS = frozenset(
+    {
+        R18ApprovalReason.HISTORY_UNAVAILABLE,
+        R18ApprovalReason.JOURNAL_UNAVAILABLE,
+        R18ApprovalReason.REVIEW_BUSY,
+    }
+)
+
+
+def _review_settled(state, intent_id, timeout: float = 30.0):  # type: ignore[no-untyped-def]
+    """``review`` for a test that has just (re)started the app.
+
+    Right after a restart the startup scan (and the executor sweep) may still
+    be between PREPARE and the journal commit of their own event; a review in
+    that window is a bounded, re-evaluable HOLD (``HISTORY_UNAVAILABLE`` from
+    an unresolved operation / a briefly unreadable journal), and a computed
+    HOLD is reused for ``MIN_REVIEW_INTERVAL``.  The product ends such a stop
+    by itself, so the test waits for that instead of asserting on the first
+    read; any other HOLD is returned at once."""
+
+    import time
+
+    owner = state.approval_owner
+    scan = owner._scan_thread
+    deadline = time.monotonic() + timeout
+    if scan is not None:
+        scan.join(timeout=max(deadline - time.monotonic(), 0.0))
+    while True:
+        review = owner.review(intent_id)
+        if review.challenge is not None or review.reason not in _TRANSIENT_REVIEW_HOLDS:
+            return review
+        if time.monotonic() >= deadline:
+            return review
+        time.sleep(0.25)
+
+
 def _confirm(state, intent_id):  # type: ignore[no-untyped-def]
     """review -> issue with the shown code (what the confirm route does)."""
 
-    review = state.approval_owner.review(intent_id)
+    review = _review_settled(state, intent_id)
     assert review.challenge is not None, review
     return review, state.approval_owner.issue(
         intent_id, review.challenge.nonce, review.challenge.confirmation_code
@@ -603,7 +639,7 @@ def test_restarts_without_a_confirm_use_no_attempt_and_close_at_the_window(tmp_p
         with TestClient(_app(settings)) as client:
             state = client.app.state
             assert _adopted(state, ApprovalChallengeV1) == []
-            assert state.approval_owner.review(intent.intent_id).attempt == 1
+            assert _review_settled(state, intent.intent_id).attempt == 1
     with TestClient(_app(settings)) as client:
         state = client.app.state
         ip17a._assert_row_2c(ip17a._closed_preview(state, gid, intent, monkeypatch))
@@ -978,7 +1014,7 @@ def test_a_crash_after_prepare_is_tombstoned_and_the_confirm_can_retry(tmp_path)
         assert state.event_journal.inspect().open_transactions == ()
         assert [r.phase for r in _approval_rows(state)] == [HistoryPhase.ABORTED]
         # Nothing was written: attempt 1 again, in a new process.
-        assert state.approval_owner.review(intent.intent_id).attempt == 1
+        assert _review_settled(state, intent.intent_id).attempt == 1
 
 
 def test_validate_commit_sees_exactly_its_own_prepared_row(app) -> None:  # type: ignore[no-untyped-def]
