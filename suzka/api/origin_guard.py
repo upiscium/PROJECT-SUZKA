@@ -208,8 +208,9 @@ class ApiOriginGuard:
         self._log = _RefusalLog()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
-            await self._app(scope, receive, send)
+        kind = scope["type"]
+        if kind not in ("http", "websocket"):
+            await self._app(scope, receive, send)  # lifespan
             return
         # Guard both spellings of the path (``root_path`` stripped or not); a
         # path either spelling of which is under /api/r18 belongs to the R18
@@ -233,6 +234,10 @@ class ApiOriginGuard:
                 self._log.note(refusal)
             except Exception:  # noqa: BLE001 - logging must not break a refusal
                 pass
+            if kind == "websocket":
+                # Closed before accept: a handshake is a cross-site read too.
+                await send({"type": "websocket.close", "code": 1008})
+                return
             response = JSONResponse(
                 {"status": "refused", "reason": refusal.value},
                 status_code=403,

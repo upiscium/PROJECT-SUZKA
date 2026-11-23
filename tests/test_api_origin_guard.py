@@ -420,3 +420,24 @@ def test_r18_mount_keeps_its_guard_outermost_and_this_guard_inside(tmp_path: Pat
     names = [m.cls.__name__ for m in app.user_middleware]
     assert names[0] == "R18RequestGuard"
     assert names.index("ApiOriginGuard") < names.index("CORSMiddleware")
+
+
+def test_no_websocket_routes_and_the_guard_closes_a_websocket_handshake(app) -> None:  # type: ignore[no-untyped-def]
+    from fastapi.routing import APIWebSocketRoute
+    from starlette.websockets import WebSocketDisconnect
+
+    assert not [r for r in app.routes if isinstance(r, APIWebSocketRoute)]
+    client = app.state.guard_test_client
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/api/ws", headers={"Origin": "https://evil.example"}):
+            pass
+
+
+def test_scheme_and_port_edge_cases() -> None:
+    assert _check("GET", host="10.0.0.1:65536") == Refusal.HOST
+    assert _check("GET", host="[::1]:0") == Refusal.HOST
+    assert _check("POST", host="suzka.lan:443", origin="https://suzka.lan") == Refusal.ORIGIN
+    wild = OriginGuardConfig.from_settings(
+        ApiSettings(host="127.0.0.1", port=8000, cors_origins=["*"])
+    )
+    assert wild.origins == frozenset()
