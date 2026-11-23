@@ -62,6 +62,10 @@ REPLY_ID_PREFIX: Final = "inbox-reply-"
 GOAL_ADMISSION_REF_KIND: Final = "goal-admission"
 COMMITMENT_ADMISSION_REF_KIND: Final = "commitment-admission"
 ASSESSMENT_REF_KIND: Final = "r17-assessment"
+# The R18 Intent ref kind (``suzka.r18.ledger.INTENT_REF_KIND``; not imported:
+# ``r18.ledger`` -> ``r16.history_records`` -> this module is a cycle).  A test
+# pins the two equal.
+INTENT_REF_KIND: Final = "r18-intent"
 COMMITMENT_REF_KIND: Final = "commitment"
 OBSERVATION_REF_KIND: Final = "observation"
 # IP-20a (IP-20 D1 r3 §14-9): the origin-ref kinds of a self-origin Goal's
@@ -121,6 +125,13 @@ class WakeCause(str, Enum):
     FEEDBACK_ADMITTED = "FEEDBACK_ADMITTED"
     # Never a feedback-positive R20 PASS (#369 A1-2).
     OUTCOME_VERIFIED_NO_FEEDBACK = "OUTCOME_VERIFIED_NO_FEEDBACK"
+    # IP-21d (#411 IP-21 D1 r3 §7): an unclaimed forward Intent closed by a
+    # DENY, the third challenge expiry or the end of its approval window.  The
+    # cause event is the Intent's admitting event (no DDL, no new event type).
+    # A store that holds an APPROVAL_CLOSED Wake is not readable by pre-IP-21d
+    # code (``parse_enum`` rejects the value); see the compatibility test in
+    # ``tests/test_r19_ip21d_approval_closed.py`` for what that does.
+    APPROVAL_CLOSED = "APPROVAL_CLOSED"
 
 
 class AttemptOutcome(str, Enum):
@@ -195,10 +206,15 @@ _CAUSE_REF_KIND: Final = {
     WakeCause.COMMITMENT_ADMITTED: COMMITMENT_ADMISSION_REF_KIND,
     WakeCause.FEEDBACK_ADMITTED: FEEDBACK_REF_KIND,
     WakeCause.OUTCOME_VERIFIED_NO_FEEDBACK: ASSESSMENT_REF_KIND,
+    WakeCause.APPROVAL_CLOSED: INTENT_REF_KIND,
 }
 _OUTCOME_CAUSES: Final = frozenset(
     {WakeCause.FEEDBACK_ADMITTED, WakeCause.OUTCOME_VERIFIED_NO_FEEDBACK}
 )
+# The causes timed from the creation instant (not from the cause instant).
+_CREATION_TIMED_CAUSES: Final = _OUTCOME_CAUSES | {WakeCause.APPROVAL_CLOSED}
+# The admission Wakes a new APPROVAL_CLOSED Wake may cancel (``may_supersede``).
+_ADMISSION_CAUSES: Final = frozenset({WakeCause.GOAL_ADMITTED, WakeCause.COMMITMENT_ADMITTED})
 _FAILED_REASONS: Final = frozenset({TerminalReason.EXPIRED_WAKE, TerminalReason.ATTEMPTS_EXHAUSTED})
 _TEMPLATE_REASONS: Final = {
     OutboxTemplate.DECISION_ISSUED: frozenset({OutboxReason.PLAN_SELECTED, OutboxReason.NO_ACTION}),
@@ -379,14 +395,16 @@ def wake_window(
     - GOAL: cause time (the admission's ``requested_at``) + goal delay.
     - COMMITMENT: cause time + commitment delay, but no later than the
       Commitment deadline − margin.
-    - FEEDBACK / OUTCOME: creation time + feedback delay, but no later than
-      expires − margin.
+    - FEEDBACK / OUTCOME / APPROVAL_CLOSED (IP-21d, A-6): creation time +
+      feedback delay, but no later than expires − margin.  The caller passes
+      the Intent's admission time as ``cause_utc`` of an APPROVAL_CLOSED Wake
+      (only the "a Wake is created at or after its cause" check reads it).
     - expires = min(created + 7 days, Goal deadline, Commitment deadline).
 
     No Wake is made when not_before is later than expires − margin: the
     deadline is not silently lost (#369 D2-A3); the caller records
     ``wake_not_schedulable``. For FEEDBACK / OUTCOME the cap makes that
-    literal rule unreachable, so for those two causes no Wake is made either
+    literal rule unreachable, so for those causes no Wake is made either
     when expires − margin is already before the creation time. GOAL /
     COMMITMENT keep the literal rule (a late materialize may be due at once).
     """
@@ -419,7 +437,7 @@ def wake_window(
         not_before = min(created + timedelta(seconds=timing.feedback_wake_delay_s), expires - margin)
     if not_before > expires - margin:
         return None
-    if cause in _OUTCOME_CAUSES and expires - margin < created:
+    if cause in _CREATION_TIMED_CAUSES and expires - margin < created:
         return None
     return _stamp(not_before), _stamp(expires)
 
@@ -642,7 +660,13 @@ def may_supersede(old: WakeV1, new: WakeV1) -> bool:
     A new FEEDBACK_ADMITTED Wake may. So may a new COMMITMENT_ADMITTED Wake over
     an older GOAL_ADMITTED one (the Goal-then-Commitment case: the Goal's
     fingerprint has changed once a Commitment exists, so its own review would
-    only end STALE_SOURCE). Nothing else supersedes."""
+    only end STALE_SOURCE). IP-21d (A-6, HD-21-5 (a)): so may a new
+    APPROVAL_CLOSED Wake over an older GOAL_ADMITTED / COMMITMENT_ADMITTED one,
+    for the same reason: the closure moved the fingerprint, so the admission
+    Wake's own review would end STALE_SOURCE.  It extends only admission Wakes:
+    a closed, unclaimed Intent has no claim, hence no Outcome and no Outcome
+    cause Wake of its own; an older FEEDBACK / NO_FEEDBACK Wake belongs to
+    another Intent and its own evidence (D1 §7-2).  Nothing else supersedes."""
 
     if type(old) is not WakeV1 or type(new) is not WakeV1:
         raise TypeError("expected WakeV1 values")
@@ -650,6 +674,9 @@ def may_supersede(old: WakeV1, new: WakeV1) -> bool:
         return False
     if new.cause is WakeCause.FEEDBACK_ADMITTED:
         pass
+    elif new.cause is WakeCause.APPROVAL_CLOSED:
+        if old.cause not in _ADMISSION_CAUSES:
+            return False
     elif not (
         new.cause is WakeCause.COMMITMENT_ADMITTED and old.cause is WakeCause.GOAL_ADMITTED
     ):

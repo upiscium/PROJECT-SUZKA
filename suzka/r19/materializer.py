@@ -7,12 +7,24 @@ or ``HOLD(reason)``.  Wakes are created *after* the cause event is terminal,
 from adopted records only (D-R19 §8-1); no R17 / R18 operation kind or handler
 changes (A-6).
 
-The four causes (D1 §3-2): ``GOAL_ADMITTED`` (the Goal's immutable
+The five causes (D1 §3-2; the fifth is IP-21d, below): ``GOAL_ADMITTED`` (the Goal's immutable
 ``GoalSubjectAdmission``), ``COMMITMENT_ADMITTED`` (the Commitment's
 ``CommitmentSubjectAdmission``), ``FEEDBACK_ADMITTED`` (an adopted
 ``DecisionFeedbackV1``) and ``OUTCOME_VERIFIED_NO_FEEDBACK`` (an adopted
 ``OutcomeAssessmentV1`` whose state is the terminal "not eligible" verdict
 ``VERIFIED_ABSENT`` / ``UNAUTHORIZED_EFFECT``, never "no Feedback row yet").
+``APPROVAL_CLOSED`` (IP-21d, IP-21 D1 r3 §7, HD-21-5 (a)) is a forward
+``ActionIntentV1`` that is closed and unclaimed (``POLICY_DENIED`` or
+``APPROVAL_EXPIRED_UNCLAIMED``, derived by ``derive_ledger`` at T): its cause
+event is the Intent's admitting event (no DDL), its ``cause_utc`` the Intent's
+admission time, and its scope floor (HD-20-1 (a)) is the **closure instant**
+(the DENY / third expiry event, or ``approval_window_end_utc``) rather than the
+admission.  Caveat (HD-21-5): the window end is a clock derivation, so a clock
+that jumps forward closes an approval early, and this cause then lets the
+subject re-decide (a Plan A Decision, row 2c under V3, which closes the group
+for good) with no user action.  The wake clock floor, the 60 s delay and the
+age bound reduce this; they do not remove it.  Only the 1800 s backstop scan
+finds it: no driver or R18 hook is involved.
 A scan takes its candidates in cause order (oldest cause first) and picks the
 first that qualifies.  A candidate that does not is **skipped with a closed,
 logged reason** (``SkipReason``), so one broken Goal never blocks the others
@@ -44,7 +56,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from enum import Enum
 import logging
 from typing import Final
@@ -77,6 +89,8 @@ from suzka.r16.history_reader import (
     SubjectHistoryReader,
 )
 from suzka.r16.history_records import (
+    MAX_CHALLENGES_PER_INTENT,
+    ApprovalExpirationV1,
     HistoryOperationKind,
     HistoryRecordOperationV1,
     RecordKind,
@@ -84,6 +98,7 @@ from suzka.r16.history_records import (
 from suzka.r16.history_store import HistoryPhase, HistoryStoreError
 from suzka.r16.successor_policy import (
     CommitmentState,
+    LedgerState,
     PolicyRef,
     PredecessorState,
     SuccessorPolicyInputV2,
@@ -96,8 +111,11 @@ from suzka.r18.contracts import (
     GoalOrigin,
     Direction,
     ExecutionClaimV1,
+    PolicyVerdict,
+    PolicyVerdictV1,
     VerifiedOutcomeV1,
 )
+from suzka.r18.ledger import RecordAt, derive_ledger
 from suzka.r19.contracts import (
     ASSESSMENT_REF_KIND,
     COMMITMENT_ADMISSION_REF_KIND,
@@ -105,6 +123,7 @@ from suzka.r19.contracts import (
     EVENT_REF_KIND,
     EXPERIENCE_REF_KIND,
     GOAL_ADMISSION_REF_KIND,
+    INTENT_REF_KIND,
     MAX_WAKE_TTL,
     MOTIVATION_REF_KIND,
     WakeCause,
@@ -114,6 +133,7 @@ from suzka.r19.contracts import (
     wake_window,
     wakeup_id,
 )
+from suzka.r19.raw_state import journal_clock_floor
 from suzka.runtime.agent_runtime import (
     AgentEvent,
     AgentEventOutcome,
@@ -147,7 +167,13 @@ _CAUSE_RANK: Final = {
     WakeCause.COMMITMENT_ADMITTED: 1,
     WakeCause.FEEDBACK_ADMITTED: 2,
     WakeCause.OUTCOME_VERIFIED_NO_FEEDBACK: 3,
+    WakeCause.APPROVAL_CLOSED: 4,
 }
+# IP-21d: the two closed, unclaimed forward ledger states that start a Wake
+# (the states row 2c reads, IP-17 §12-2).  A claimed Intent is an Outcome cause.
+_APPROVAL_CLOSED_STATES: Final = frozenset(
+    {LedgerState.POLICY_DENIED, LedgerState.APPROVAL_EXPIRED_UNCLAIMED}
+)
 
 
 class MaterializeStatus(str, Enum):
@@ -208,6 +234,13 @@ class SkipReason(str, Enum):
     BINDING_MISMATCH = "binding_mismatch"
     # A value could not be built (a closed ValueError / TypeError): logged.
     INVALID_WAKE = "invalid_wake"
+    # IP-21d (APPROVAL_CLOSED): the Intent's Decision is no longer the head of
+    # its lineage, so a Decision already answered the closure.
+    SUPERSEDED_DECISION = "superseded_decision"
+    # IP-21d: T is below the retained Journal's admission high-water (a rolled
+    # back clock): the window closure is derived from the clock, so an
+    # unverifiable clock must not create it.
+    CLOCK_UNVERIFIABLE = "clock_unverifiable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +309,11 @@ class _Candidate:
     # Outcome causes: the Feedback / Assessment and the latest Outcome it names.
     cause_record: DecisionFeedbackV1 | OutcomeAssessmentV1 | None = None
     outcome: VerifiedOutcomeV1 | None = None
+    # APPROVAL_CLOSED: the closed Intent and the closure instant (the DENY /
+    # third expiry Journal time, or the window end); None when it cannot be
+    # established (an archived event), which is an OUT_OF_SCOPE skip.
+    intent: ActionIntentV1 | None = None
+    closed_at: datetime | None = None
 
     @property
     def sort_key(self) -> tuple[int, int, str]:
@@ -467,6 +505,7 @@ class WakeMaterializerV1:
     def _candidates(self, scan: _Scan) -> list[_Candidate]:
         found = self._admission_candidates()
         found.extend(self._outcome_candidates(scan))
+        found.extend(self._approval_candidates(scan))
         return found
 
     def _admission_candidates(self) -> list[_Candidate]:
@@ -573,6 +612,42 @@ class WakeMaterializerV1:
             )
         return found
 
+    @staticmethod
+    def _approval_candidates(scan: _Scan) -> list[_Candidate]:
+        """APPROVAL_CLOSED (IP-21d): every adopted forward Intent whose ledger
+        at T is ``POLICY_DENIED`` or ``APPROVAL_EXPIRED_UNCLAIMED`` (an
+        unclaimed Intent: a claimed one is ``CLAIMED`` or an Outcome state and
+        belongs to the Outcome causes).  Inverse Intents are dormant.  The
+        ledger is the issuer's own derivation (``derive_ledger``); the
+        evaluation re-checks it (``_qualify``).
+
+        HD-21-5 caveat: the window end is a clock derivation.  A forward clock
+        jump can close an approval early, and the Wake this makes can then end
+        in a Plan A Decision (row 2c under V3) without any user action; the
+        wake clock floor, the 60 s delay and the age bound only reduce that."""
+
+        now = scan.event.requested_at
+        records = tuple(RecordAt(item.record, item.processing_sequence) for item in scan.records)
+        found: list[_Candidate] = []
+        for item in scan.records:
+            intent = item.record
+            if type(intent) is not ActionIntentV1:
+                continue
+            read = derive_ledger(records, intent.obligation_group_key, now)
+            if read.state not in _APPROVAL_CLOSED_STATES:
+                continue
+            found.append(
+                _Candidate(
+                    WakeCause.APPROVAL_CLOSED,
+                    intent.admitting_event_id,
+                    intent.admitting_sequence,
+                    PolicyRef(INTENT_REF_KIND, intent.intent_id, 1, intent.intent_digest),
+                    intent=intent,
+                    closed_at=_closure_instant(scan, intent, read.state),
+                )
+            )
+        return found
+
     # ------------------------------------------------------------ one candidate
 
     def _operation(self, scan: _Scan, candidate: _Candidate) -> HistoryRecordOperationV1:
@@ -647,7 +722,21 @@ class WakeMaterializerV1:
         if stage is not JournalSourceStage.RETAINED:
             raise _Skip(SkipReason.OUT_OF_SCOPE)
         caused = min(row.timestamp for row in rows)
-        if scan.event.requested_at - caused > self._max_age:
+        if candidate.cause is WakeCause.APPROVAL_CLOSED:
+            # The age bound is measured from the closure, not from the Intent's
+            # admission (up to the approval window, at most 86400 s, earlier).
+            # ``cause_utc`` stays the admission time (``wake_window`` reads it
+            # only for "a Wake is created at or after its cause").
+            if candidate.closed_at is None:
+                raise _Skip(SkipReason.OUT_OF_SCOPE)
+            if scan.event.requested_at - candidate.closed_at > self._max_age:
+                raise _Skip(SkipReason.OUT_OF_SCOPE)
+            floor = journal_clock_floor(
+                scan.inspection.records, before_event_id=scan.event.event_id
+            )
+            if floor is not None and scan.event.requested_at < floor:
+                raise _Skip(SkipReason.CLOCK_UNVERIFIABLE)
+        elif scan.event.requested_at - caused > self._max_age:
             raise _Skip(SkipReason.OUT_OF_SCOPE)
         return utc_timestamp(caused)
 
@@ -657,6 +746,18 @@ class WakeMaterializerV1:
         its Intent -> the adopted Decision -> its GOAL source ref.  None for the
         two admission causes."""
 
+        if candidate.cause is WakeCause.APPROVAL_CLOSED:
+            # Intent -> its Decision (still adopted in the Intent's lineage
+            # chain) -> its GOAL source ref.
+            approval = candidate.intent
+            assert approval is not None
+            for node in scan.classified.chains.get(approval.lineage_scope, ()):
+                if (
+                    node.decision.decision_id == approval.decision_id
+                    and node.decision.content_digest == approval.decision_committed_digest
+                ):
+                    return _goal_binding(node.decision)
+            raise _Skip(SkipReason.BINDING_MISMATCH)
         if candidate.cause not in _OUTCOME_CAUSES:
             return None
         outcome = candidate.outcome
@@ -744,6 +845,8 @@ class WakeMaterializerV1:
                 raise _Skip(SkipReason.STALE_CAUSE)
         else:
             assert binding is not None
+            if candidate.cause is WakeCause.APPROVAL_CLOSED:
+                _qualify_approval(candidate, evaluated)
             if (q.goal_revision, q.goal_digest) != (binding.goal_revision, binding.goal_digest):
                 raise _Skip(SkipReason.STALE_CAUSE)
             if lineage_scope_for(q.experience_id) != binding.lineage_scope:
@@ -966,6 +1069,11 @@ def _origin_refs(
             ]
     elif candidate.cause is WakeCause.COMMITMENT_ADMITTED:
         refs = [_commitment_ref(value)]
+    elif candidate.cause is WakeCause.APPROVAL_CLOSED:
+        # No Outcome ref (an unclaimed Intent has none); the Goal's Commitment
+        # ref when it has one, so ``may_supersede`` can reason about it.
+        if value.commitment_ref is not None:
+            refs.append(_commitment_ref(value))
     else:
         assert candidate.outcome is not None
         outcome = candidate.outcome
@@ -980,6 +1088,80 @@ def _origin_refs(
         if value.commitment_ref is not None:
             refs.append(_commitment_ref(value))
     return tuple(sorted(refs, key=lambda item: item.sort_key))
+
+
+def _closure_instant(
+    scan: _Scan, intent: ActionIntentV1, state: LedgerState
+) -> datetime | None:
+    """The earliest instant at which the Intent's closure holds (HD-20-1 (a)
+    scope floor for APPROVAL_CLOSED), or None when it cannot be established.
+
+    A DENY closes at the verdict event's Journal time; the third expiry at its
+    event's time; the window end is a clock derivation with no event
+    (``approval_window_end_utc``).  A closure by DENY has only the verdict
+    event; a closure by expiry / window takes the earlier of the window end
+    (when it has passed) and the third expiry.  An archived event is not
+    retained: its instant is unknown."""
+
+    def journal_time(event_id: str, sequence: int) -> datetime | None:
+        stage, rows = locate_journal_source(scan.inspection, event_id, sequence)
+        if stage is not JournalSourceStage.RETAINED:
+            return None
+        return min(row.timestamp for row in rows)
+
+    if state is LedgerState.POLICY_DENIED:
+        denials = [
+            item
+            for item in scan.records
+            if type(item.record) is PolicyVerdictV1
+            and item.record.intent_id == intent.intent_id
+            and item.record.verdict is PolicyVerdict.DENY
+        ]
+        if len(denials) != 1:
+            return None
+        return journal_time(denials[0].event_id, denials[0].processing_sequence)
+    instants: list[datetime] = []
+    if scan.event.requested_at >= intent.approval_window_end:
+        instants.append(intent.approval_window_end)
+    expiries = sorted(
+        (
+            item
+            for item in scan.records
+            if type(item.record) is ApprovalExpirationV1
+            and item.record.intent_id == intent.intent_id
+        ),
+        key=lambda item: item.processing_sequence,
+    )
+    if len(expiries) >= MAX_CHALLENGES_PER_INTENT:
+        third = expiries[MAX_CHALLENGES_PER_INTENT - 1]
+        moment = journal_time(third.event_id, third.processing_sequence)
+        if moment is not None:
+            instants.append(moment)
+    return min(instants) if instants else None
+
+
+def _qualify_approval(candidate: _Candidate, evaluated: _Evaluation) -> None:
+    """The evaluation agrees with the candidate's derivation: the sealed ledger
+    is a closed, unclaimed state naming this Intent, and this Intent's Decision
+    is still the head of its lineage (a Decision issued after the closure, by a
+    PLAN_PREVIEW or an earlier Wake, already answered it)."""
+
+    intent = candidate.intent
+    assert intent is not None
+    value = evaluated.value
+    if value.ledger not in _APPROVAL_CLOSED_STATES or not any(
+        ref.kind == INTENT_REF_KIND
+        and ref.ref_id == intent.intent_id
+        and ref.digest == intent.intent_digest
+        for ref in value.ledger_refs
+    ):
+        raise _Skip(SkipReason.STALE_CAUSE)
+    head = evaluated.head.decision if evaluated.head is not None else None
+    if head is None or (head.decision_id, head.content_digest) != (
+        intent.decision_id,
+        intent.decision_committed_digest,
+    ):
+        raise _Skip(SkipReason.SUPERSEDED_DECISION)
 
 
 def _commitment_ref(value: SuccessorPolicyInputV2) -> PolicyRef:
