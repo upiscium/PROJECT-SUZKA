@@ -64,7 +64,7 @@ from suzka.r18.outcome_owner import (
     R18OutcomeReason,
     _OutcomeResult,
 )
-from suzka.r18.sweep import SweepGate, rotate_if_needed
+from suzka.r18.sweep import ForeignTarget, SweepGate, foreign_target_reason, rotate_if_needed
 from suzka.r18.target import (
     TargetBindingError,
     TargetCapacityError,
@@ -490,11 +490,24 @@ class R18Executor:
             self._sweep_queued = False
         try:
             store = self._open_store()
-            rotated = rotate_if_needed(store, self._id)
-            self._sweep_log("S1", f"rotated={'yes' if rotated else 'already'}")
+            # S0 (HD-F15-11 (a)): nothing is written to a target before it is
+            # proven this subject's, so the records are read first and the
+            # check is read-only. A foreign target never gets S1 / S3.
             records = self._read_records()
             if records.blocked is not None:
                 raise _SweepRetry("history")
+            reason = foreign_target_reason(
+                store,
+                (
+                    item.record
+                    for item in records.records
+                    if item.record_kind is RecordKind.ACTION_INTENT and type(item.record) is ActionIntentV1
+                ),
+            )
+            if reason is not None:
+                raise ForeignTarget(f"foreign target ({reason})")
+            rotated = rotate_if_needed(store, self._id)
+            self._sweep_log("S1", f"rotated={'yes' if rotated else 'already'}")
             claims = [
                 claim
                 for claim in pending_forward_claims(records.records)
@@ -577,7 +590,9 @@ class R18Executor:
             else:
                 delay = PROBE_STEADY_SECONDS
             self._next_probe = now + delay
-            blocked = elapsed >= BLOCKED_AFTER_SECONDS
+            # A foreign target is not transient: it closes the gate at once and
+            # then rides the same probe cadence as any BLOCKED_TARGET.
+            blocked = elapsed >= BLOCKED_AFTER_SECONDS or isinstance(error, ForeignTarget)
         if blocked:
             self._gate.blocked()
         else:
@@ -704,6 +719,9 @@ class R18Executor:
 
         try:
             store = self._open_store()
+            reason = foreign_target_reason(store, (intent,), scan_ledger=False)
+            if reason is not None:
+                raise ForeignTarget(f"foreign target ({reason})")
             row = store.fence(intent.obligation_group_key, Direction.FORWARD)
         except (TargetError, OSError) as error:
             self._reopen()
