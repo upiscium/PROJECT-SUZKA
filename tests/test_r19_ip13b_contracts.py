@@ -85,12 +85,14 @@ CAUSE_REF = {
     WakeCause.COMMITMENT_ADMITTED: PolicyRef("commitment-admission", "commitment-1", 1, H),
     WakeCause.FEEDBACK_ADMITTED: PolicyRef("r17-feedback", "feedback-1", 1, H),
     WakeCause.OUTCOME_VERIFIED_NO_FEEDBACK: PolicyRef("r17-assessment", "assessment-1", 1, H),
+    WakeCause.APPROVAL_CLOSED: PolicyRef("r18-intent", "r18-intent-1", 1, H),
 }
 ORIGIN_REFS = {
     WakeCause.GOAL_ADMITTED: (),
     WakeCause.COMMITMENT_ADMITTED: (COMMITMENT,),
     WakeCause.FEEDBACK_ADMITTED: (COMMITMENT, OUTCOME),
     WakeCause.OUTCOME_VERIFIED_NO_FEEDBACK: (COMMITMENT, OUTCOME),
+    WakeCause.APPROVAL_CLOSED: (COMMITMENT,),
 }
 
 
