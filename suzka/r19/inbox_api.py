@@ -293,7 +293,11 @@ def build_router(limits: InboxLimits) -> APIRouter:
         if owner is None:
             return _unavailable()
         # The read-only pre-check: only a WRITE submits an event (D1 §5-4).
-        pre = await run_in_threadpool(owner.check_ack, message_id, context_id, status,
+        pre = await run_in_threadpool(
+            owner.check_ack,
+            message_id,
+            context_id,
+            status,
             session if type(session) is str else None,
         )
         if pre.check is None:

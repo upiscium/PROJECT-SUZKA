@@ -10,6 +10,7 @@ of ``r19_wake_fixtures``; the ACK owner's live clock is set to it as well.
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import json
 import logging
@@ -1113,22 +1114,110 @@ def test_slot_release_is_once_only() -> None:
     lock.release()
 
 
-def test_a_cancelled_or_failed_dispatch_frees_the_slot(world) -> None:  # type: ignore[no-untyped-def]
+def _fail_only_the_dispatch(world, error: BaseException):  # type: ignore[no-untyped-def]
+    """Replace ``run_in_threadpool`` so that only the ``_submit`` dispatch fails
+    (the pre-check still runs); returns the captured dispatch and an abandon log."""
+
+    real = inbox_api.run_in_threadpool
+    seen: dict[str, object] = {"abandons": 0}
+
+    async def dispatch(func, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if func is inbox_api._submit:
+            seen["call"] = (func, args)
+            raise error
+        return await real(func, *args, **kwargs)
+
+    real_abandon = inbox_api._Slot.abandon
+
+    def abandon(self):  # type: ignore[no-untyped-def]
+        seen["abandons"] = int(seen["abandons"]) + 1  # type: ignore[call-overload]
+        return real_abandon(self)
+
+    world.monkeypatch.setattr(inbox_api, "run_in_threadpool", dispatch)
+    world.monkeypatch.setattr(inbox_api._Slot, "abandon", abandon)
+    return seen
+
+
+@pytest.mark.parametrize("error", [RuntimeError("no thread"), asyncio.CancelledError()])
+def test_a_cancelled_or_failed_dispatch_frees_the_slot(world, error) -> None:  # type: ignore[no-untyped-def]
+    state = world.state
+    message = _message(world)
+    submits = _AckSubmits(state, world.monkeypatch)
+    seen = _fail_only_the_dispatch(world, error)
+    try:
+        _ack(world, message)
+    except BaseException:  # noqa: BLE001 - the failure surfaces through the client
+        pass
+    # The dispatch was reached, the coroutine freed the slot, nothing was submitted.
+    assert "call" in seen and seen["abandons"] == 1
+    assert submits.count == 0 and not _acks(state)
+    assert state.inbox_limits.event_lock.acquire(blocking=False)
+    state.inbox_limits.event_lock.release()
+    # A worker that starts late runs nothing (the token was released).
+    func, args = seen["call"]  # type: ignore[misc]
+    late = func(*args)
+    assert late.status_code == 503 and submits.count == 0 and not _acks(state)
+    assert state.inbox_limits.event_lock.acquire(blocking=False)  # still exactly one release
+    state.inbox_limits.event_lock.release()
+    # A later ACK is served normally.
+    world.monkeypatch.undo()
+    state.inbox_ack_owner._clock = world.time.live
+    assert _ack(world, message).status_code == 201
+
+
+def test_abandon_and_the_worker_race_never_double_release() -> None:
+    import threading
+
+    for _ in range(200):
+        lock = threading.Lock()
+        assert lock.acquire(blocking=False)
+        slot = inbox_api._Slot(lock)
+        ran: list[bool] = []
+
+        def worker() -> None:
+            if slot.start():
+                ran.append(True)
+                slot.release()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        slot.abandon()
+        thread.join()
+        slot.release()
+        assert lock.acquire(blocking=False)  # released exactly once, never raised
+        lock.release()
+        # Either the worker ran (and released) or it was refused; never both free and run.
+        assert ran in ([True], [])
+
+
+def test_the_ack_event_cap_is_thirty_and_a_hit_frees_the_slot(world) -> None:  # type: ignore[no-untyped-def]
+    assert inbox_api.MAX_ACK_EVENTS_PER_MINUTE == 30
+    window = inbox_api._Window(inbox_api.MAX_ACK_EVENTS_PER_MINUTE)
+    assert [window.allow() for _ in range(31)].count(True) == 30
+    state = world.state
+    first = _message(world)
+    second = _message(world, another=True)
+    world.monkeypatch.setattr(state.inbox_limits, "ack_events", inbox_api._Window(1))
+    assert _ack(world, first).status_code == 201
+    capped = _ack(world, second)
+    assert (capped.status_code, capped.json()) == (429, {"status": "RATE_LIMITED"})
+    assert len(_acks(state)) == 1
+    assert state.inbox_limits.event_lock.acquire(blocking=False)
+    state.inbox_limits.event_lock.release()
+
+
+def test_a_registry_failure_in_the_precheck_is_a_503_with_no_event(world) -> None:  # type: ignore[no-untyped-def]
     state = world.state
     message = _message(world)
     submits = _AckSubmits(state, world.monkeypatch)
 
-    async def never_starts(*_a, **_k):  # type: ignore[no-untyped-def]
-        raise RuntimeError("no thread")
+    def broken():  # type: ignore[no-untyped-def]
+        raise RuntimeError("registry exploded")
 
-    world.monkeypatch.setattr(inbox_api, "run_in_threadpool", never_starts)
-    with pytest.raises(RuntimeError):
-        _ack(world, message)
+    world.monkeypatch.setattr(state.inbox_ack_owner, "_registry", broken)
+    response = _ack(world, message)
+    assert (response.status_code, response.json()) == (503, {"status": "HISTORY_UNAVAILABLE"})
     assert submits.count == 0 and not _acks(state)
-    # The slot is free: with the dispatcher restored the next ACK is served.
-    world.monkeypatch.undo()
-    state.inbox_ack_owner._clock = world.time.live
-    assert _ack(world, message).status_code == 201
 
 
 # ----------------------------- 21b emitter and 21c ACK coexist (integration)
