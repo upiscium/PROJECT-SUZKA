@@ -4,6 +4,7 @@ import ipaddress
 import logging
 from pathlib import Path
 import math
+import re
 from urllib.parse import urlsplit
 
 from typing import Literal
@@ -69,6 +70,23 @@ def approval_host_header(origin: str) -> str:
     shown = f"[{host}]" if ":" in host else host
     default = 443 if scheme == "https" else 80
     return shown if port == default else f"{shown}:{port}"
+
+
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def validate_allowed_host(host: str) -> str:
+    """A bare lowercase DNS name (no port, wildcard, userinfo or trailing dot)."""
+
+    labels = host.split(".") if type(host) is str and host.isascii() else []
+    if (
+        not labels
+        or len(host) > 253
+        or host != host.lower()
+        or not all(_DNS_LABEL.fullmatch(label) for label in labels)
+    ):
+        raise ValueError("an allowed host is a bare lowercase DNS name")
+    return host
 
 
 def _is_loopback_ip(host: str) -> bool:
@@ -244,6 +262,25 @@ class ApiSettings(StrictBaseModel):
     # is still accepted so existing config files keep loading.
     admin_token_env: str | None = Field(default=None, exclude=True)
     cors_origins: list[str]
+    # Origin/Host guard for /api/* outside the R18 approval API (see
+    # ``suzka/api/origin_guard.py``).  Both are optional: IP literals,
+    # ``localhost`` and the cors origins are accepted without any entry.
+    allowed_hosts: list[str] = Field(default_factory=list)
+    allowed_origins: list[str] = Field(default_factory=list)
+
+    @field_validator("allowed_hosts")
+    @classmethod
+    def _validate_allowed_hosts(cls, value: list[str]) -> list[str]:
+        for item in value:
+            validate_allowed_host(item)
+        return value
+
+    @field_validator("allowed_origins")
+    @classmethod
+    def _validate_allowed_origins(cls, value: list[str]) -> list[str]:
+        for item in value:
+            parse_approval_origin(item)
+        return value
 
     @model_validator(mode="after")
     def _warn_ignored_admin_token_env(self) -> "ApiSettings":
