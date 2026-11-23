@@ -171,9 +171,17 @@ class InboxAckOwnerV1(_WakeOwnerBase):
         return InboxRead(view=view)
 
     def check_ack(
-        self, message_id: str, context_id: str, status: AckStatus
+        self,
+        message_id: str,
+        context_id: str,
+        status: AckStatus,
+        client_session_id: str | None = None,
     ) -> AckPrecheck:
-        """The route's read-only pre-check (D1 §5-4 steps 3-5); never an event."""
+        """The route's read-only pre-check (D1 §5-4 steps 3-5); never an event.
+        It also reads the Context (``registry.get`` is locked and read-only), so
+        an ACK that the handler would refuse for an inactive Context or another
+        session writes no event at all; the handler's own check stays the
+        authority."""
 
         if not self._enabled:
             return AckPrecheck(hold=AckHold.R19_DISABLED)
@@ -194,9 +202,18 @@ class InboxAckOwnerV1(_WakeOwnerBase):
                 ack_key_live=live,
                 clock_floor=None if floor is None else utc_timestamp(floor),
             )
+            if check.eligibility is AckEligibility.WRITE:
+                refused = self._context_check(context_id, client_session_id)
+                if refused is not None:
+                    check = (
+                        AckCheck(AckEligibility.NOT_FOUND)
+                        if refused.result is AckResult.NOT_FOUND
+                        else AckCheck(AckEligibility.HOLD, refused.hold)
+                    )
         except _Hold as hold:
             return AckPrecheck(hold=_HOLD_MAP.get(hold.reason, AckHold.HISTORY_UNAVAILABLE))
-        except (HistoryStoreError, AgentStateLoadError, TypeError, ValueError):
+        except Exception:
+            # A read-only check: any failure is a closed 503, never an event.
             LOGGER.warning("R19 inbox ack pre-check failed", exc_info=True)
             return AckPrecheck(hold=AckHold.HISTORY_UNAVAILABLE)
         return AckPrecheck(check=check)
@@ -270,6 +287,9 @@ class InboxAckOwnerV1(_WakeOwnerBase):
             self._pending = None
             return self._held(_HOLD_MAP.get(hold.reason, AckHold.HISTORY_UNAVAILABLE))
         except Exception:
+            # Deliberately broad (unlike claim_owner's list): this event is
+            # bookkeeping and the registry callable is injected, so any failure
+            # before PREPARE must be a typed HOLD, never a runtime failure.
             # Everything before PREPARE is a typed outcome (IP-14b §2-6): a
             # failed read, a record the builders refuse, an unreadable
             # registry.  Never an exception into the runtime for a bookkeeping

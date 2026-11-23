@@ -71,6 +71,8 @@ LOGGER = logging.getLogger(__name__)
 API_PREFIX: Final = "/api/r19/inbox"
 MAX_BODY_BYTES: Final = 4 * 1024
 MAX_REQUESTS_PER_MINUTE: Final = 120
+# ACK events that reach submission (a write is expected): far below the request cap.
+MAX_ACK_EVENTS_PER_MINUTE: Final = 30
 _RATE_WINDOW_S: Final = 60.0
 _GET_QUERY: Final = frozenset({"context_id", "limit"})
 _POST_KEYS: Final = frozenset({"context_id", "status", "client_session_id"})
@@ -106,6 +108,42 @@ class InboxLimits:
     )
     # At most one ``R19_INBOX_ACK`` event in flight in the process.
     event_lock: threading.Lock = field(default_factory=threading.Lock)
+    # A separate small cap on the ACK events that reach submission.
+    ack_events: _Window = field(default_factory=lambda: _Window(MAX_ACK_EVENTS_PER_MINUTE))
+
+
+class _Slot:
+    """A once-only release token for the single-flight lock.  The worker thread
+    is the normal releaser; the coroutine frees the slot only if its await
+    failed (cancelled, no thread) **before** the worker started, and then the
+    worker, should it ever run, refuses to submit.  Releasing twice is a no-op."""
+
+    def __init__(self, lock: threading.Lock) -> None:
+        self._lock = lock
+        self._mutex = threading.Lock()
+        self._started = False
+        self._released = False
+
+    def start(self) -> bool:
+        with self._mutex:
+            if self._released:
+                return False
+            self._started = True
+            return True
+
+    def release(self) -> None:
+        with self._mutex:
+            if not self._released:
+                self._released = True
+                self._lock.release()
+
+    def abandon(self) -> None:
+        """The coroutine's release: only while the worker has not started."""
+
+        with self._mutex:
+            if not self._started and not self._released:
+                self._released = True
+                self._lock.release()
 
 
 def _reply(body: dict[str, object], status: int = 200) -> JSONResponse:
@@ -255,7 +293,9 @@ def build_router(limits: InboxLimits) -> APIRouter:
         if owner is None:
             return _unavailable()
         # The read-only pre-check: only a WRITE submits an event (D1 §5-4).
-        pre = await run_in_threadpool(owner.check_ack, message_id, context_id, status)
+        pre = await run_in_threadpool(owner.check_ack, message_id, context_id, status,
+            session if type(session) is str else None,
+        )
         if pre.check is None:
             assert pre.hold is not None
             return _hold_response(pre.hold)
@@ -274,8 +314,12 @@ def build_router(limits: InboxLimits) -> APIRouter:
         # One ACK event in flight in the process: a further one is a 429.
         if not limits.event_lock.acquire(blocking=False):
             return _rate()
-        # The slot is released by the worker thread when the event is done, never
-        # by the coroutine: a cancelled request must not free it early.
+        slot = _Slot(limits.event_lock)
+        if not limits.ack_events.allow():
+            slot.release()
+            return _rate()
+        # The worker thread releases the slot when the event is done; the
+        # coroutine frees it only if the worker never started (once-only token).
         try:
             handler = owner.ack_handler(
                 message_id,
@@ -284,9 +328,13 @@ def build_router(limits: InboxLimits) -> APIRouter:
                 session if type(session) is str else None,
             )
         except BaseException:
-            limits.event_lock.release()
+            slot.release()
             raise
-        outcome = await run_in_threadpool(_submit, request, handler, limits.event_lock)
+        try:
+            outcome = await run_in_threadpool(_submit, request, handler, slot)
+        except BaseException:
+            slot.abandon()
+            raise
         if isinstance(outcome, JSONResponse):
             return outcome
         return _outcome_response(outcome.result, outcome.hold, status)
@@ -294,10 +342,13 @@ def build_router(limits: InboxLimits) -> APIRouter:
     return router
 
 
-def _submit(request: Request, handler: Any, slot: threading.Lock) -> Any:
+def _submit(request: Request, handler: Any, slot: _Slot) -> Any:
     """Submit the one ACK event; a runtime refusal is a closed 503, never an
     exception text (a full Journal never blocks chat; it only refuses this)."""
 
+    if not slot.start():
+        # The request was abandoned before this worker began: submit nothing.
+        return _unavailable("RUNTIME_UNAVAILABLE")
     try:
         return _run_event(request, handler)
     finally:
@@ -307,6 +358,8 @@ def _submit(request: Request, handler: Any, slot: threading.Lock) -> Any:
 def _run_event(request: Request, handler: Any) -> Any:
     runtime = request.app.state.agent_runtime
     try:
+        # ``.result()`` inside has no timeout by design: the runtime always
+        # settles an admitted event, and the slot must stay held until it does.
         event = execute_with_event(
             runtime,
             AgentEventType.R19_INBOX_ACK,

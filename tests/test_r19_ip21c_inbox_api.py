@@ -484,7 +484,8 @@ def test_a_closed_context_is_refused_by_the_handler_and_a_missing_registry_skips
     submits = _AckSubmits(state, world.monkeypatch)
     refused = _ack(world, message)
     assert (refused.status_code, refused.json()) == (404, {"status": "NOT_FOUND"})
-    assert submits.count == 1 and not _acks(state)  # the handler, not the route, refused
+    # The route's pre-check reads the Context too: no event for a refused ACK.
+    assert submits.count == 0 and not _acks(state)
     registry.resume(message.context_id)
     registry.close(message.context_id)
     assert _ack(world, message).status_code == 404
@@ -1048,3 +1049,83 @@ def test_neither_module_schedules_anything() -> None:
         source = _src(module)
         for name in ("Timer(", "Thread(", "sleep("):
             assert name not in source
+
+
+# ------------------------------------- refused ACKs write no event (P2-1)
+
+
+def test_repeated_refused_acks_create_no_journal_event(world) -> None:  # type: ignore[no-untyped-def]
+    state = world.state
+    message = _message(world)
+    submits = _AckSubmits(state, world.monkeypatch)
+    # Wrong session id (the default Context has none).
+    before = _journal_len(state)
+    for _ in range(25):
+        r = _ack(world, message, client_session_id="wrong-session")
+        assert (r.status_code, r.json()) == (409, {"status": "CONTEXT_CONFLICT"})
+    # Closed Context.
+    state.main_loop.context_registry.close(message.context_id)
+    for _ in range(25):
+        assert _ack(world, message).status_code == 404
+    assert submits.count == 0 and _journal_len(state) == before and not _acks(state)
+
+
+def test_ack_events_that_reach_submission_have_their_own_cap(world) -> None:  # type: ignore[no-untyped-def]
+    state = world.state
+    message = _message(world)
+    world.monkeypatch.setattr(state.inbox_limits, "ack_events", inbox_api._Window(0))
+    response = _ack(world, message)
+    assert (response.status_code, response.json()) == (429, {"status": "RATE_LIMITED"})
+    assert not _acks(state)
+    assert state.inbox_limits.event_lock.acquire(blocking=False)  # slot was freed
+    state.inbox_limits.event_lock.release()
+
+
+# ------------------------------------ the once-only slot token (P2-2)
+
+
+def test_slot_release_is_once_only() -> None:
+    import threading
+
+    lock = threading.Lock()
+    assert lock.acquire(blocking=False)
+    slot = inbox_api._Slot(lock)
+    slot.release()
+    slot.release()  # no second release, no RuntimeError
+    assert lock.acquire(blocking=False)  # still exactly one release happened
+    lock.release()
+    # After the worker started, the coroutine's abandon frees nothing.
+    assert lock.acquire(blocking=False)
+    started = inbox_api._Slot(lock)
+    assert started.start()
+    started.abandon()
+    assert not lock.acquire(blocking=False)
+    started.release()
+    assert lock.acquire(blocking=False)
+    lock.release()
+    # An abandoned slot refuses a late worker.
+    assert lock.acquire(blocking=False)
+    gone = inbox_api._Slot(lock)
+    gone.abandon()
+    assert not gone.start()
+    gone.release()
+    assert lock.acquire(blocking=False)
+    lock.release()
+
+
+def test_a_cancelled_or_failed_dispatch_frees_the_slot(world) -> None:  # type: ignore[no-untyped-def]
+    state = world.state
+    message = _message(world)
+    submits = _AckSubmits(state, world.monkeypatch)
+
+    async def never_starts(*_a, **_k):  # type: ignore[no-untyped-def]
+        raise RuntimeError("no thread")
+
+    world.monkeypatch.setattr(inbox_api, "run_in_threadpool", never_starts)
+    with pytest.raises(RuntimeError):
+        _ack(world, message)
+    assert submits.count == 0 and not _acks(state)
+    # The slot is free: with the dispatcher restored the next ACK is served.
+    world.monkeypatch.undo()
+    state.inbox_ack_owner._clock = world.time.live
+    assert _ack(world, message).status_code == 201
