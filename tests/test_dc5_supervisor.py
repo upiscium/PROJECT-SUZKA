@@ -43,7 +43,6 @@ from suzka.api.supervisor import (
     SubjectPhaseMiddleware,
     SubjectSupervisor,
     ReadyReport,
-    THREAD_SOURCE_KEYS,
     failed_to_serving_bound_s,
     phase_detail,
 )
@@ -966,11 +965,9 @@ def test_every_thread_creating_site_has_a_threads_alive_owner() -> None:
     # of the proof (and the control thread is the one doing the proving)
     sites.pop("suzka/api/supervisor.py")
     assert set(sites) == set(owners), (
-        "a new Thread/Timer site needs a threads_alive() owner in "
-        "THREAD_SOURCE_KEYS and the termination proof"
+        "a new Thread/Timer site needs an owner with threads_alive() that "
+        "lives in app.state (the termination proof finds owners by that method)"
     )
-    assert set(owners.values()) <= set(THREAD_SOURCE_KEYS)
-    assert "hard_band_watcher" in THREAD_SOURCE_KEYS  # DC-6 registers here
 
 
 # ====================================================== real app: helpers

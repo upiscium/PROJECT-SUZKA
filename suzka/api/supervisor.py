@@ -82,7 +82,6 @@ __all__ = [
     "SubjectPhaseMiddleware",
     "SubjectSupervisor",
     "Timebase",
-    "THREAD_SOURCE_KEYS",
     "failed_to_serving_bound_s",
     "hard_exit",
     "phase_detail",
@@ -95,18 +94,6 @@ EXIT_CODE_THREADS_NOT_STOPPED = 70
 
 CYCLE_THREAD_NAME = "suzka-dc-cycle"
 SUPERVISOR_THREAD_NAME = "suzka-dc-supervisor"
-
-#: ``app.state`` keys whose objects own threads (D1 sec. 5.3 item 6 (b)); the
-#: ``HardBandWatcher`` (DC-6) registers under the last key.
-THREAD_SOURCE_KEYS: tuple[str, ...] = (
-    "agent_runtime",
-    "emotion_timer",
-    "r16_driver",
-    "wake_scheduler",
-    "approval_owner",
-    "r18_executor",
-    "hard_band_watcher",
-)
 
 #: The bounded joins one after another (D1 sec. 3): Scheduler, approval owner,
 #: executor worker, executor reconciler, R16 driver (30 s each).
@@ -739,10 +726,16 @@ class SubjectSupervisor:
     # ----------------------------------------------- termination proof (sec. 5.3)
 
     def _collect_sources(self) -> list[tuple[str, object]]:
+        """Every object in ``app.state`` that has a ``threads_alive()`` (the
+        Runtime, the emotion timer, the R16 driver, the R19 Scheduler, the
+        approval owner, the R18 executor, DC-6's watcher...).  Found by the
+        method, not by a key list, so a new owner is covered without an edit;
+        ``tests/test_dc5_supervisor.py`` pins that every Thread / Timer site in
+        ``suzka/`` belongs to such an owner."""
+
         found: list[tuple[str, object]] = []
-        for key in THREAD_SOURCE_KEYS:
-            owner = getattr(self._state, key, None)
-            if owner is not None:
+        for key, owner in list(self._state._state.items()):
+            if owner is not None and callable(getattr(owner, "threads_alive", None)):
                 found.append((key, owner))
         if self._extra_sources is not None:
             found.extend(self._extra_sources(self._app))
