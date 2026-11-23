@@ -27,6 +27,7 @@ from suzka.api.routes import (
     sleep,
     values,
 )
+from suzka.api.origin_guard import ApiOriginGuard, OriginGuardConfig
 from suzka.api.context_read_model import (
     CommittedContextReadModel,
     PublishedContextView,
@@ -1429,6 +1430,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+    )
+    # Origin/Host guard for /api outside /api/r18 (CSRF / DNS rebinding now
+    # that the token layer is gone).  Added after CORS, so it is OUTSIDE it:
+    # a refusal carries no CORS headers.  The R18 guard (mounted below) is
+    # outside this one and owns /api/r18/*.
+    app.add_middleware(
+        ApiOriginGuard, config=OriginGuardConfig.from_settings(app_settings.api)
     )
 
     @app.get("/health")
