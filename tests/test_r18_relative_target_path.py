@@ -88,7 +88,7 @@ def test_with_r18_off_a_relative_path_is_inert(tmp_path: Path, monkeypatch: pyte
 def test_the_cached_get_settings_object_is_not_mutated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from suzka.api import server
 
-    base = ip16a2._settings(tmp_path / "settings", r18=False, init=False)
+    base = ip16a2._settings(tmp_path / "settings", r18=True, init=False)
     cached = base.model_copy(
         update={"r18": base.r18.model_copy(update={"target_path": Path("rel/target.sqlite3")})}
     )
@@ -97,3 +97,49 @@ def test_the_cached_get_settings_object_is_not_mutated(tmp_path: Path, monkeypat
     app = server.create_app()
     assert cached.r18.target_path == Path("rel/target.sqlite3")
     assert app.state.settings.r18.target_path == tmp_path / "rel" / "target.sqlite3"
+
+
+def _deleted_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+
+
+def test_r18_off_relative_path_and_a_deleted_cwd_still_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = ip16a2._settings(tmp_path / "settings", r18=False, init=False)
+    settings = base.model_copy(
+        update={"r18": base.r18.model_copy(update={"target_path": Path("rel/target.sqlite3")})}
+    )
+    _deleted_cwd(tmp_path, monkeypatch)
+    app = _app(settings, executor=True)
+    assert app.state.settings is settings
+    assert settings.r18.target_path == Path("rel/target.sqlite3")
+
+
+def test_r18_on_relative_path_and_a_deleted_cwd_is_a_typed_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from suzka.r18.target import TargetCorrupt
+
+    settings = _relative_settings(tmp_path / "settings", Path("rel/target.sqlite3"))
+    _deleted_cwd(tmp_path, monkeypatch)
+    with pytest.raises(TargetCorrupt, match="current directory is unavailable"):
+        _app(settings, executor=True)
+    assert settings.r18.target_path == Path("rel/target.sqlite3")
+
+
+def test_target_init_resolves_a_relative_path_against_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from suzka.r18.target_init import main
+
+    work = tmp_path / "work"
+    (work / "t").mkdir(parents=True, mode=0o700)
+    os.chmod(work / "t", 0o700)
+    monkeypatch.chdir(work)
+    assert main(["t/target.sqlite3"]) == 0
+    assert (work / "t" / "target.sqlite3").is_file()
+    assert "created target" in capsys.readouterr().out
