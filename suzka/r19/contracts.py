@@ -128,9 +128,11 @@ class WakeCause(str, Enum):
     # IP-21d (#411 IP-21 D1 r3 §7): an unclaimed forward Intent closed by a
     # DENY, the third challenge expiry or the end of its approval window.  The
     # cause event is the Intent's admitting event (no DDL, no new event type).
-    # A store that holds an APPROVAL_CLOSED Wake is not readable by pre-IP-21d
-    # code (``parse_enum`` rejects the value); see the compatibility test in
-    # ``tests/test_r19_ip21d_approval_closed.py`` for what that does.
+    # A store that holds an APPROVAL_CLOSED Wake is not decodable by pre-IP-21d
+    # code (``parse_enum`` rejects the value): the reader then marks the
+    # incarnation DIVERGED (tested for ``adopted_records()`` only).  No older
+    # build with R19 rows is deployed; the effect on the other owners (R16 / R17
+    # / R18 may HOLD) and on startup is NOT verified.
     APPROVAL_CLOSED = "APPROVAL_CLOSED"
 
 

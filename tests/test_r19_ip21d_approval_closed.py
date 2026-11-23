@@ -170,8 +170,9 @@ def test_the_wake_is_timed_like_feedback_from_its_creation(world) -> None:  # ty
     assert abs((due - (world.time.now() + timedelta(seconds=60))).total_seconds()) < 10
 
 
-def test_an_open_claimed_or_inverse_intent_makes_no_wake(world) -> None:  # type: ignore[no-untyped-def]
-    """INTENT_ISSUED (open) and CLAIMED (a claimed Intent is an Outcome-cause
+def test_an_open_or_claimed_intent_makes_no_wake(world) -> None:  # type: ignore[no-untyped-def]
+    """(No inverse case: inverse Intents are excluded by type and not tested.)
+    INTENT_ISSUED (open) and CLAIMED (a claimed Intent is an Outcome-cause
     Intent) are not closed unclaimed states."""
 
     state = world.state
@@ -359,6 +360,19 @@ def test_a_third_expiry_closure_older_than_the_bound_is_out_of_scope(world) -> N
     _three_expiries(world)
     state.wake_materializer._max_age = timedelta(seconds=600)
     clock.advance(700)
+    assert _skips(_scan(state)) == [(WakeCause.APPROVAL_CLOSED, SkipReason.OUT_OF_SCOPE)]
+
+
+def test_a_closure_with_the_window_ended_and_a_third_expiry_uses_the_earlier(world) -> None:  # type: ignore[no-untyped-def]
+    """approval_window_end (an hour out) vs the third expiry's Journal time
+    (now): the earlier, the expiry, is the closure instant, so with the window
+    5 s past and a 600 s bound the closure is an hour old: OUT_OF_SCOPE."""
+
+    state = world.state
+    _only_approval(state)
+    _three_expiries(world)
+    _past_window(world)
+    state.wake_materializer._max_age = timedelta(seconds=600)
     assert _skips(_scan(state)) == [(WakeCause.APPROVAL_CLOSED, SkipReason.OUT_OF_SCOPE)]
 
 
@@ -604,8 +618,9 @@ def test_an_older_reader_blocks_the_incarnation_instead_of_failing(world) -> Non
     a pre-IP-21d build cannot decode it.  Simulated by an enum that does not
     know the value: the reader maps the decode error to a ``DIVERGED`` block of
     the whole incarnation (``classify`` catches ``ValueError``), never an
-    exception, so the owners HOLD (HISTORY_CONFLICT / HISTORY_UNAVAILABLE) and
-    the runtime starts.  Not verified here: an actual older binary."""
+    exception.  This marks the whole incarnation's SubjectHistory DIVERGED (not
+    only R19).  NOT verified here: an owner HOLD (R16 / R17 / R18), startup of
+    an older build, or an actual older binary."""
 
     state = world.state
     wake = _closure_wake(world, _deny)

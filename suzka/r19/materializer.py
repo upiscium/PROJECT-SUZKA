@@ -726,8 +726,13 @@ class WakeMaterializerV1:
             # admission (up to the approval window, at most 86400 s, earlier).
             # ``cause_utc`` stays the admission time (``wake_window`` reads it
             # only for "a Wake is created at or after its cause").
-            # Computed here, after CAUSE_ALREADY_WOKEN, so an old closed Intent
-            # costs no Journal lookup and a failure stays a per-candidate skip.
+            # Computed here, after CAUSE_ALREADY_WOKEN, so a failure stays a
+            # per-candidate skip.  The admission lookup above runs first; a
+            # closed Intent without a Wake pays one closure lookup per scan (and
+            # ends SUPERSEDED_DECISION each time once its Decision was replaced):
+            # bounded by retention and max_age, not zero.  An archived third
+            # expiry event makes the closure instant slightly late (the age
+            # bound slightly loose; the window is <= 1 day, retention 30 d).
             assert candidate.intent is not None and candidate.closed_state is not None
             closed_at = _closure_instant(scan, candidate.intent, candidate.closed_state)
             if closed_at is None:
