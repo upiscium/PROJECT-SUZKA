@@ -179,10 +179,12 @@ def _utc_now() -> datetime:
 
 
 def _reason(error: BaseException) -> str:
-    """The failure's message on one bounded line (target errors carry fixed text)."""
+    """The failure's fixed text for a TargetError only; any other exception
+    (OSError, sqlite3, ...) can carry a path or payload, so it gets ``-``."""
 
-    text = " ".join(str(error).split())[:200]
-    return repr(text) if text else "-"
+    if not isinstance(error, TargetError):
+        return "-"
+    return repr(" ".join(str(error).split())[:200] or "-")
 
 
 def _stamp(moment: datetime) -> str:
