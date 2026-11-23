@@ -159,16 +159,21 @@ class ForeignTarget(TargetError):
 
 
 def foreign_target_reason(
-    store: TargetStore, intents: Iterable[ActionIntentV1], *, scan_ledger: bool = True
+    store: TargetStore,
+    intents: Iterable[ActionIntentV1],
+    *,
+    scan_ledger: bool = True,
 ) -> str | None:
     """A public-safe reason code when the target is provably not ours, else
     None. Read-only: it never repairs, rotates or fences anything.
 
-    ``namespace``: not the review-artifact target. ``identity``: an adopted
-    Intent of this subject is bound to another ``target_instance_id``.
-    ``ledger_key``: a ledger row whose operation key is not the key of its own
-    group and direction (a row this code never wrote). With no Intent there
-    is nothing to compare an identity with: a fresh target is adoptable.
+    ``namespace``: not the review-artifact target. ``identity``: an Intent in
+    ``intents`` (the caller passes the LATEST adopted one, so an old target
+    that was legitimately replaced cannot block forever) is bound to another
+    ``target_instance_id``. ``ledger_key``: a ledger row whose operation key
+    is not the key of its own group and direction. With no
+    Intent there is nothing to compare an identity with (a target that holds
+    rows of a group no Claim names is a valid "fact", not a foreign one).
     A missing or corrupt target raises its own ``TargetError`` (unchanged)."""
 
     meta = store.meta()
@@ -176,11 +181,10 @@ def foreign_target_reason(
         return "namespace"
     if any(intent.target_instance_id != meta.target_instance_id for intent in intents):
         return "identity"
-    if scan_ledger and any(
-        row.operation_key != operation_key(row.obligation_group_key, row.direction)
-        for row in store.ledger()
-    ):
-        return "ledger_key"
+    if scan_ledger:
+        rows = store.ledger()
+        if any(row.operation_key != operation_key(row.obligation_group_key, row.direction) for row in rows):
+            return "ledger_key"
     return None
 
 

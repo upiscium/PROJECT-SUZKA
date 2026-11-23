@@ -496,18 +496,17 @@ class R18Executor:
             records = self._read_records()
             if records.blocked is not None:
                 raise _SweepRetry("history")
-            reason = foreign_target_reason(
-                store,
-                (
-                    item.record
-                    for item in records.records
-                    if item.record_kind is RecordKind.ACTION_INTENT and type(item.record) is ActionIntentV1
-                ),
-            )
+            reason = self._foreign_reason(store, records)
             if reason is not None:
                 raise ForeignTarget(f"foreign target ({reason})")
             rotated = rotate_if_needed(store, self._id)
             self._sweep_log("S1", f"rotated={'yes' if rotated else 'already'}")
+            # The scan is read AFTER the rotation (#380 D2 addendum 2): a late
+            # CAS of an older process cannot land behind the records we act on.
+            records = self._read_records()
+            if records.blocked is not None:
+                raise _SweepRetry("history")
+            claim_keys = None if self._read_claim_keys is None else self._read_claim_keys()
             claims = [
                 claim
                 for claim in pending_forward_claims(records.records)
@@ -524,7 +523,6 @@ class R18Executor:
                 row = store.fence(chain[0].obligation_group_key, Direction.FORWARD)
                 self._log_exec(claim, _Stage.SETTLE, row.kind.value, "CLAIMED")
                 settled.append(claim)
-            claim_keys = None if self._read_claim_keys is None else self._read_claim_keys()
             fenced_prior = 0
             if claim_keys is not None:
                 done = {claim.operation_key for claim in settled}
@@ -568,6 +566,18 @@ class R18Executor:
         for claim in settled:
             self._register_settled(claim)
             self._outcome_attempt(claim.claim_id)
+
+    @staticmethod
+    def _foreign_reason(store: TargetStore, records: AdoptedRecords) -> str | None:
+        """S0, read-only: the identity is compared with the latest adopted
+        Intent (by processing sequence), so a long-gone target cannot block."""
+
+        latest = [
+            item
+            for item in sorted(records.records, key=lambda item: item.processing_sequence)
+            if item.record_kind is RecordKind.ACTION_INTENT and type(item.record) is ActionIntentV1
+        ][-1:]
+        return foreign_target_reason(store, [item.record for item in latest])  # type: ignore[misc]
 
     @staticmethod
     def _sweep_log(step: str, detail: str) -> None:

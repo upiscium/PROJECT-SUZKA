@@ -220,3 +220,12 @@ def test_chat_and_cognition_are_unaffected_by_a_blocked_foreign_target(tmp_path:
         _chat(state)  # the subject keeps talking and thinking
         assert state.r18_gate.state is GateState.BLOCKED_TARGET
     assert _digest(path) == before
+
+
+def test_an_old_intent_of_a_replaced_target_does_not_block_the_genuine_one(world: _World) -> None:
+    from dataclasses import replace
+
+    old = replace(world.intent, target_instance_id=new_runtime_instance_id())
+    first = replace(world.records[0], record=old)
+    world.records.insert(0, first)  # the old target's Intent is older than the current one
+    _opened(world)
