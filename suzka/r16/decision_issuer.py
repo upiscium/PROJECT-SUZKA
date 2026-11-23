@@ -65,8 +65,10 @@ a qualified PLAN_PREVIEW_REVIEW seals one ``R16_PLAN_HOLD`` receipt per
 (switch, active store, unchanged sources, free ``plan-hold:`` key, headroom)
 runs immediately before the ``CoordinatedResult`` is returned and, when one
 fails, the unchanged HOLD is returned with no transaction and
-``PLAN_HOLD_RECEIPT_SKIPPED`` is logged: PREPARE can then not raise.  Past that
-point a failure is a restartable runtime fail-stop, as for a Decision.
+``PLAN_HOLD_RECEIPT_SKIPPED`` is logged.  The pre-checks mirror every refusal
+PREPARE has; only a race after them (SQLite busy, I/O, capacity) remains, and
+that, like any later failure, is a restartable runtime fail-stop as for a
+Decision.
 
 Known limits: any other HOLD is not persisted (R19,
 #376 v2 §2); the R15 interpretation is sealed as its closed enum only; the

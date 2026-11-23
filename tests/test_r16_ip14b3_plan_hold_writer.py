@@ -132,13 +132,13 @@ def world(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
 # ------------------------------------------------------ flag off: unchanged
 
 
-def test_flag_off_the_hold_path_is_unchanged_and_writes_nothing(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_flag_off_the_hold_path_is_unchanged_and_writes_nothing(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     with TestClient(_app(_settings(tmp_path / "off", holds=False))) as client:
         state = client.app.state
         assert state.subject_history_store.plan_hold_receipts_enabled is False
         _x, gid = _qualified_goal(state)
         _contradictory(state)
-        prepares = _Prepares(pytest.MonkeyPatch())
+        prepares = _Prepares(monkeypatch)
         before = len(state.event_journal.inspect().completed_transactions)
         held = _issue(state, gid)
         assert (held.status, held.row) == (DecisionIssueStatus.HOLD, SuccessorRow.ROW_2B)
