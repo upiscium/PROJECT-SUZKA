@@ -83,3 +83,17 @@ def test_with_r18_off_a_relative_path_is_inert(tmp_path: Path, monkeypatch: pyte
         assert client.app.state.r18_executor is None
         assert client.app.state.r18_gate.state is GateState.DISABLED
     assert not (root / "none").exists()
+
+
+def test_the_cached_get_settings_object_is_not_mutated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from suzka.api import server
+
+    base = ip16a2._settings(tmp_path / "settings", r18=False, init=False)
+    cached = base.model_copy(
+        update={"r18": base.r18.model_copy(update={"target_path": Path("rel/target.sqlite3")})}
+    )
+    monkeypatch.setattr(server, "get_settings", lambda: cached)
+    monkeypatch.chdir(tmp_path)
+    app = server.create_app()
+    assert cached.r18.target_path == Path("rel/target.sqlite3")
+    assert app.state.settings.r18.target_path == tmp_path / "rel" / "target.sqlite3"
