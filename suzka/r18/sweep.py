@@ -14,14 +14,16 @@ never touch another thread's state.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from enum import Enum
 import logging
 from threading import Lock
 import time
 from typing import Final
 
-from suzka.r18.target import TargetStore
+from suzka.r18.contracts import ActionIntentV1, operation_key
+from suzka.r18.obligation import TARGET_NAMESPACE
+from suzka.r18.target import TargetError, TargetStore
 
 LOGGER = logging.getLogger(__name__)
 
@@ -150,6 +152,42 @@ class SweepGate:
         return f"SweepGate({self._state.value})"
 
 
+class ForeignTarget(TargetError):
+    """The target file is not this subject's (HD-F15-11 (a)). Raised before
+    anything is written to it; the executor treats it as a target failure that
+    closes the gate at once (BLOCKED_TARGET), and the probe re-evaluates it."""
+
+
+def foreign_target_reason(
+    store: TargetStore,
+    intents: Iterable[ActionIntentV1],
+    *,
+    scan_ledger: bool = True,
+) -> str | None:
+    """A public-safe reason code when the target is provably not ours, else
+    None. Read-only: it never repairs, rotates or fences anything.
+
+    ``namespace``: not the review-artifact target. ``identity``: an Intent in
+    ``intents`` (the caller passes the LATEST adopted one, so an old target
+    that was legitimately replaced cannot block forever) is bound to another
+    ``target_instance_id``. ``ledger_key``: a ledger row whose operation key
+    is not the key of its own group and direction. With no
+    Intent there is nothing to compare an identity with (a target that holds
+    rows of a group no Claim names is a valid "fact", not a foreign one).
+    A missing or corrupt target raises its own ``TargetError`` (unchanged)."""
+
+    meta = store.meta()
+    if meta.target_namespace != TARGET_NAMESPACE:
+        return "namespace"
+    if any(intent.target_instance_id != meta.target_instance_id for intent in intents):
+        return "identity"
+    if scan_ledger:
+        rows = store.ledger()
+        if any(row.operation_key != operation_key(row.obligation_group_key, row.direction) for row in rows):
+            return "ledger_key"
+    return None
+
+
 def rotate_if_needed(store: TargetStore, runtime_instance_id: str) -> bool:
     """S1, idempotent: ``meta`` first; "already this process's id" is done.
 
@@ -163,4 +201,4 @@ def rotate_if_needed(store: TargetStore, runtime_instance_id: str) -> bool:
     return True
 
 
-__all__ = ["GateState", "SweepGate", "rotate_if_needed"]
+__all__ = ["ForeignTarget", "GateState", "SweepGate", "foreign_target_reason", "rotate_if_needed"]

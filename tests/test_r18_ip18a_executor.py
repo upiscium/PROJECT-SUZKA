@@ -711,8 +711,11 @@ def test_the_sweep_rotates_before_it_scans_and_the_gate_opens_only_at_the_end(wo
         _opened(world)
     finally:
         executor_module.rotate_if_needed = real_rotate  # type: ignore[assignment]
-    assert order[0] == "rotate gate_open=False"
-    assert order[1] == "scan rotated_to_me=True gate_open=False"
+    # HD-F15-11 (a): a read-only S0 look (target not yet written) comes first;
+    # the scan the sweep acts on still comes after the rotation.
+    assert order[0] == "scan rotated_to_me=False gate_open=False"
+    assert order[1] == "rotate gate_open=False"
+    assert order[2] == "scan rotated_to_me=True gate_open=False"
     assert world.store.meta().runtime_instance_id == ME
 
 
