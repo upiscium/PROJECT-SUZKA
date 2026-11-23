@@ -7,7 +7,7 @@ import math
 import re
 from urllib.parse import urlsplit
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import (
     BaseModel,
@@ -333,6 +333,84 @@ class EventJournalSettings(StrictBaseModel):
         elif self.soft_band_bytes >= self.max_total_bytes:
             raise ValueError("soft_band_bytes must be below max_total_bytes")
         return self
+
+
+_DcSeconds = Annotated[float, Field(gt=0, le=604_800, allow_inf_nan=False)]
+_DcLadderStep = Annotated[StrictInt, Field(ge=0, le=36_500)]
+
+
+class DegradedContinuationSettings(StrictBaseModel):
+    """F15 degraded continuation (#411, F15 slice D1 sec. 5.1, DC-1).
+
+    Inert until the later units (supervisor, participant quarantine, HARD-band
+    ladder) read it.  Every default keeps an existing production config valid:
+    no key is required, and a ladder step that does not apply to the configured
+    ``event_journal.retention_days`` is dropped at run time
+    (``effective_hard_ladder``), never refused.
+    """
+
+    # "refuse" is the exact legacy behaviour: no supervisor, no quarantine, no
+    # ladder.
+    mode: Literal["continue", "refuse"] = "continue"
+    # Manifests and the HARD-band log only; ``None`` -> ``<journal dir>/quarantine``.
+    quarantine_dir: Path | None = None
+    # T_retry: one shared deadline per start attempt.
+    t_retry_s: _DcSeconds = 60.0
+    # T_hash: shared hashing budget per quarantine action.
+    t_hash_s: _DcSeconds = 30.0
+    # T_boot_max (HD-new-3): first cycle build to ACCEPTING, teardown excluded.
+    t_boot_max_s: _DcSeconds = 240.0
+    # T_teardown_max: one cycle teardown (bounded joins plus two unbounded ones).
+    t_teardown_max_s: _DcSeconds = 240.0
+    # T_hard: continuous HARD band before the ladder runs.
+    t_hard_s: _DcSeconds = 600.0
+    # T_stable: ACCEPTING for this long resets the restart counter.
+    t_stable_s: _DcSeconds = 600.0
+    # T_shutdown_join: SIGTERM while a cycle is starting, stopping or backing off.
+    t_shutdown_join_s: _DcSeconds = 60.0
+    restart_limit: int = Field(default=3, ge=1, le=1_000)
+    restart_window_s: _DcSeconds = 600.0
+    reeval_max_backoff_s: _DcSeconds = 300.0
+    cycle_restart_cap: int = Field(default=3, ge=1, le=1_000)
+    # HD-F15S-2 (e): only the terminal ``threads_not_stopped`` state exits.
+    exit_on_threads_not_stopped: bool = False
+    # HD-new-2: quarantine on ``Unavailable`` too?  "never" is the recommendation.
+    quarantine_unavailable: Literal["never", "after_t_retry", "after_s"] = "never"
+    quarantine_unavailable_after_s: _DcSeconds = 86_400.0
+    # A-3 (#381 D2 amendment): lower the retention window stepwise after
+    # ``t_hard_s`` of continuous HARD.  ``false`` restores the old behaviour.
+    hard_band_auto_shrink: bool = True
+    hard_ladder_days: list[_DcLadderStep] = Field(
+        default_factory=lambda: [14, 7, 3, 1, 0]
+    )
+
+    @field_validator("hard_ladder_days")
+    @classmethod
+    def validate_ladder_descends(cls, value: list[int]) -> list[int]:
+        # A ladder lowers the window stepwise, so it must strictly descend.
+        # (A step that does not apply to ``retention_days`` is NOT an error:
+        # see ``effective_hard_ladder``.)
+        if any(later >= earlier for earlier, later in zip(value, value[1:])):
+            raise ValueError("hard_ladder_days must be strictly descending")
+        return value
+
+    def effective_hard_ladder(self, retention_days: int) -> tuple[int, ...]:
+        """The rungs that apply to ``retention_days``: steps strictly below it,
+        in configured order.  Filter-style: a step that is not below the window
+        is dropped, never refused (a window of 0 or less has no rung), and
+        switching the shrink off leaves no rung."""
+
+        if not self.hard_band_auto_shrink:
+            return ()
+        return tuple(step for step in self.hard_ladder_days if step < retention_days)
+
+    def resolved_quarantine_dir(self, journal_path: Path) -> Path:
+        """``quarantine_dir``, or ``<journal dir>/quarantine`` (the Journal's
+        artifact scan ignores that name, #411 F15 D1 sec. 9)."""
+
+        if self.quarantine_dir is not None:
+            return self.quarantine_dir
+        return journal_path.parent / "quarantine"
 
 
 class SelfGoalSettings(StrictBaseModel):
@@ -662,6 +740,9 @@ class Settings(StrictBaseModel):
     working_memory: WorkingMemorySettings = Field(default_factory=WorkingMemorySettings)
     agent_state: AgentStateSettings = Field(default_factory=AgentStateSettings)
     event_journal: EventJournalSettings = Field(default_factory=EventJournalSettings)
+    degraded_continuation: DegradedContinuationSettings = Field(
+        default_factory=DegradedContinuationSettings
+    )
     state_wal: StateWALSettings = Field(default_factory=StateWALSettings)
     chat_log: ChatLogSettings = Field(default_factory=ChatLogSettings)
     conversation_trace: ConversationTraceSettings = Field(

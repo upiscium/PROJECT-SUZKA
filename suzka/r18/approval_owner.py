@@ -104,6 +104,7 @@ from suzka.runtime.agent_runtime import (
 )
 from suzka.runtime.agent_state import AgentStateLoadError
 from suzka.runtime.event_journal import TransactionKind
+from suzka.runtime.thread_liveness import ThreadLedger
 from suzka.runtime.transaction_coordinator import (
     CoordinatedResult,
     TransactionCoordinator,
@@ -455,6 +456,7 @@ class ApprovalChallengeOwnerV1:
         self._stop_event = threading.Event()
         self._stopped = False
         self._scan_thread: threading.Thread | None = None
+        self._thread_ledger = ThreadLedger()
 
     @property
     def enabled(self) -> bool:
@@ -1692,6 +1694,8 @@ class ApprovalChallengeOwnerV1:
         if old is not None:
             old.cancel()
         timer.start()
+        if isinstance(timer, threading.Thread):  # a test factory may not be one
+            self._thread_ledger.register(timer)
 
     def start(self) -> None:
         """§8 startup (r18.enabled only): the BOOT_CHANGED scan, once.  A store
@@ -1713,6 +1717,7 @@ class ApprovalChallengeOwnerV1:
         )
         self._scan_thread = thread
         thread.start()
+        self._thread_ledger.register(thread)
 
     def _startup_scan(self) -> None:
         """Chain the scan over every dead challenge.  A transient HOLD that
@@ -1743,6 +1748,12 @@ class ApprovalChallengeOwnerV1:
                 retried = True
                 continue
             after = result.challenge_digest
+
+    def threads_alive(self) -> tuple[str, ...]:
+        """Names of this owner's threads that are still alive (read-only;
+        remembers a thread that ``stop()`` timed out on and abandoned)."""
+
+        return self._thread_ledger.alive()
 
     def stop(self) -> None:
         """Cancel the timers and join the startup scan (before the runtime stops)."""

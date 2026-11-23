@@ -7,6 +7,7 @@ import math
 from threading import Event, Lock, Thread, current_thread
 from typing import Callable
 
+from suzka.runtime.thread_liveness import ThreadLedger
 from suzka.runtime.agent_runtime import (
     AgentEventOutcome,
     AgentEventSource,
@@ -49,6 +50,7 @@ class EmotionTimer:
         self._stop_event = Event()
         self._lock = Lock()
         self._thread: Thread | None = None
+        self._thread_ledger = ThreadLedger()
         self._outstanding = False
 
     @property
@@ -73,6 +75,13 @@ class EmotionTimer:
             except BaseException:
                 self._thread = None
                 raise
+            self._thread_ledger.register(self._thread)
+
+    def threads_alive(self) -> tuple[str, ...]:
+        """Names of this owner's threads that are still alive (read-only;
+        remembers a thread that ``stop()`` timed out on and abandoned)."""
+
+        return self._thread_ledger.alive()
 
     def stop(self) -> None:
         """Stop and join the producer without cancelling accepted runtime work."""

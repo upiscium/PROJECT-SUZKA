@@ -79,6 +79,7 @@ from suzka.runtime.agent_runtime import (
     AgentRuntimeQueueFull,
     AgentRuntimeStopped,
 )
+from suzka.runtime.thread_liveness import ThreadLedger
 
 LOGGER = logging.getLogger(__name__)
 
@@ -312,6 +313,7 @@ class R18Executor:
         self._started = False
         self._worker: threading.Thread | None = None
         self._reconciler: threading.Thread | None = None
+        self._thread_ledger = ThreadLedger()
         self._lifecycle = threading.Lock()
         # Worker-thread state.
         self._store: TargetStore | None = None
@@ -352,11 +354,19 @@ class R18Executor:
                 )
                 self._reconciler = reconciler
                 reconciler.start()
+                self._thread_ledger.register(reconciler)
 
     def _start_worker(self) -> None:
         worker = threading.Thread(target=self._worker_loop, name="suzka-r18-executor", daemon=True)
         self._worker = worker
         worker.start()
+        self._thread_ledger.register(worker)
+
+    def threads_alive(self) -> tuple[str, ...]:
+        """Names of this owner's threads that are still alive (read-only;
+        remembers a thread that ``stop()`` timed out on and abandoned)."""
+
+        return self._thread_ledger.alive()
 
     def stop(self) -> None:
         """Set stop, join both threads (30 s each; a thread that does not

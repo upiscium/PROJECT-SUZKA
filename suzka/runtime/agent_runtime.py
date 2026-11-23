@@ -12,6 +12,7 @@ from typing import Any, Callable, Generic, TypeVar, cast
 from uuid import uuid4
 
 from suzka.limits import MAX_PERSISTED_EVENT_SEQUENCE
+from suzka.runtime.thread_liveness import ThreadLedger
 
 
 class AgentEventType(str, Enum):
@@ -257,6 +258,7 @@ class AgentRuntime:
         self._pending: deque[_PendingEvent] = deque()
         self._status = AgentRuntimeStatus.CREATED
         self._worker: Thread | None = None
+        self._thread_ledger = ThreadLedger()
         self._sequence = initial_sequence
         self._last_admitted_at: datetime | None = None
         self._admission_in_progress = False
@@ -348,6 +350,13 @@ class AgentRuntime:
                 self._worker = None
                 self._status = AgentRuntimeStatus.CREATED
                 raise
+            self._thread_ledger.register(worker)
+
+    def threads_alive(self) -> tuple[str, ...]:
+        """Names of this runtime's threads that are still alive (read-only;
+        remembers a worker that ``shutdown()`` or a failure has forgotten)."""
+
+        return self._thread_ledger.alive()
 
     def configure_durability(
         self,
