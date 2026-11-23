@@ -102,6 +102,7 @@ from suzka.r19.scheduler import WakeScheduler
 from suzka.r18.approval_api import mount_approval_api
 from suzka.r18.approval_owner import ApprovalChallengeOwnerV1
 from suzka.r18.executor import ClaimKeys, R18Executor
+from suzka.r18.target import TargetCorrupt
 from suzka.r18.facts import FactsHolder
 from suzka.r18.outcome_owner import OutcomeOwnerV1
 from suzka.r18.policy_owner import ReviewArtifactPolicyV1
@@ -141,6 +142,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     """Create the API application from typed settings."""
 
     app_settings = settings or get_settings()
+    # With R18 on, a relative r18.target_path resolves against the process cwd,
+    # once, here, before any consumer (executor, owners, issuers, approval) reads
+    # it, so all of them see the same absolute path. An absolute path is left
+    # untouched, and with R18 off nothing is touched at all (no cwd lookup).
+    # In place for a passed Settings, so ``app.state.settings is settings`` still
+    # holds; the process-wide cached ``get_settings()`` object is copied first so
+    # one app's cwd is never frozen into it.
+    if app_settings.r18.enabled and not app_settings.r18.target_path.is_absolute():
+        try:
+            absolute_target = Path.cwd() / app_settings.r18.target_path
+        except OSError as error:
+            raise TargetCorrupt(
+                "r18.target_path is relative and the current directory is unavailable"
+            ) from error
+        if settings is None:
+            app_settings = app_settings.model_copy()
+            app_settings.r18 = app_settings.r18.model_copy()
+        app_settings.r18.target_path = absolute_target
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
