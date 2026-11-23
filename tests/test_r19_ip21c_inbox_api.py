@@ -1129,3 +1129,43 @@ def test_a_cancelled_or_failed_dispatch_frees_the_slot(world) -> None:  # type: 
     world.monkeypatch.undo()
     state.inbox_ack_owner._clock = world.time.live
     assert _ack(world, message).status_code == 201
+
+
+# ----------------------------- 21b emitter and 21c ACK coexist (integration)
+
+
+def test_an_emitted_decision_message_is_read_and_acked(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A message written by the real IP-21b owner from a real review closure
+    (DECISION template) is read through GET and acknowledged through POST."""
+
+    app = _app(fx.settings(tmp_path / "e2e"))
+    app.state.r19_scheduler_enabled = False
+    with TestClient(app) as client:
+        state = client.app.state
+        clock = fx.Time(state, monkeypatch)
+        state.wake_outbox_owner._clock = clock.live
+        state.inbox_ack_owner._clock = clock.live
+        _x, gid = _qualified_goal(state)
+        wake = fx.materialize(state, gid, clock)
+        claimed = fx.claim(state, wake)
+        fx.review(state, claimed.claim.claim_id)
+        emitted = state.wake_outbox_owner._submit_complete(wake.wakeup_id).result(timeout=30).value
+        (message,) = fx.adopted(state, OutboxMessageV1)
+        assert message.message_id == emitted.message_id
+        assert message.template.value == "DECISION_ISSUED"
+        context = message.context_id
+        got = client.get(f"{BASE}/messages?context_id={context}").json()["messages"]
+        assert [(m["message_id"], m["state"], m["template"]) for m in got] == [
+            (message.message_id, "PENDING", "DECISION_ISSUED")
+        ]
+        done = client.post(
+            f"{BASE}/messages/{message.message_id}/ack", json=_ack_body(context)
+        )
+        assert (done.status_code, done.json()["result"]) == (201, "COMMITTED")
+        (row,) = fx.adopted(state, InboxAckV1)
+        assert row.message_id == message.message_id
+        (item,) = client.get(f"{BASE}/messages?context_id={context}").json()["messages"]
+        assert item["state"] == "ACKNOWLEDGED"
+        assert not any(
+            r.lifecycle is EventLifecycle.FAILED for r in state.event_journal.inspect().records
+        )

@@ -91,6 +91,7 @@ from suzka.r17.expectation_issuer import ExpectationIssuerV1
 from suzka.r17.feedback_owner import FeedbackOwnerV1
 from suzka.r19.ack_owner import InboxAckOwnerV1
 from suzka.r19.claim_owner import WakeClaimOwnerV1
+from suzka.r19.outbox_owner import OutboxOwnerV1
 from suzka.r19.contracts import WakeTiming
 from suzka.r19.inbox_api import mount_inbox_api
 from suzka.r19.materializer import WakeMaterializerV1
@@ -582,6 +583,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise StateRecoveryError("R16 Wake review owner unavailable")
             return owner
 
+        def _r19_wake_outbox_owner_for_commit(
+            event: AgentEvent,
+        ) -> OutboxOwnerV1 | None:
+            owner = getattr(app.state, "wake_outbox_owner", None)
+            if owner is None and event.event_type is AgentEventType.R19_WAKE_COMPLETE:
+                raise StateRecoveryError("R19 Outbox owner unavailable")
+            return owner
+
         def _r19_wake_materializer_for_commit(
             event: AgentEvent,
         ) -> WakeMaterializerV1 | None:
@@ -655,6 +664,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             wake_review_owner = getattr(app.state, "wake_review_owner", None)
             if wake_review_owner is not None:
                 wake_review_owner._clear()
+            wake_outbox_owner = getattr(app.state, "wake_outbox_owner", None)
+            if wake_outbox_owner is not None:
+                wake_outbox_owner._clear()
             policy_owner = getattr(app.state, "policy_owner", None)
             if policy_owner is not None:
                 policy_owner._clear()
@@ -710,6 +722,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 wake_review_owner = _r19_wake_review_owner_for_commit(event)
                 if wake_review_owner is not None:
                     wake_review_owner._validate_commit(event)
+                wake_outbox_owner = _r19_wake_outbox_owner_for_commit(event)
+                if wake_outbox_owner is not None:
+                    wake_outbox_owner._validate_commit(event)
                 policy_owner = _r18_policy_owner_for_commit(event)
                 if policy_owner is not None:
                     policy_owner._validate_commit(event)
@@ -1014,6 +1029,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.feedback_owner = None
             app.state.wake_claim_owner = None
             app.state.wake_review_owner = None
+            app.state.wake_outbox_owner = None
             app.state.policy_owner = None
             app.state.approval_owner = None
             app.state.outcome_owner = None
@@ -1117,6 +1133,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         getattr(app.state, "main_loop", None), "context_registry", None
                     ),
                 )
+                # IP-21b: the Outbox owner (R19_WAKE_COMPLETE), built only with
+                # r19.enabled; without it no Scheduler exists to submit an event.
+                if app_settings.r19.enabled:
+                    app.state.wake_outbox_owner = OutboxOwnerV1(
+                        app.state.decision_issuer,
+                        app.state.agent_runtime,
+                        enabled=True,
+                        timing=_wake_timing,
+                        outbox_ttl_s=app_settings.r19.outbox_ttl_s,
+                    )
                 # IP-17a (#411 D1 r7 §1/§2): the R18 Policy owner, installed
                 # and gated exactly like the Intent issuer.
                 app.state.policy_owner = ReviewArtifactPolicyV1(
@@ -1240,6 +1266,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         app.state.wake_materializer,
                         app.state.wake_claim_owner,
                         app.state.wake_review_owner,
+                        outbox_owner=app.state.wake_outbox_owner,
                         timing=app.state.wake_claim_owner.timing,
                             rescan_s=app_settings.r19.rescan_s,
                         )
