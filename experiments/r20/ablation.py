@@ -90,15 +90,21 @@ class AblationResult:
 
 
 def ablate_feedback(payload: bytes) -> AblationResult:
-    """Evaluate a sealed input against its Feedback-ABSENT counterfactual."""
+    """Evaluate a sealed input against its Feedback-ABSENT counterfactual.
+
+    The caller must also run ``replay_defect`` on the factual side (rule 3).
+    A V3 sealed input is accepted as ``from_bytes`` accepts it.
+    """
 
     factual = SuccessorPolicyInputV2.from_bytes(payload)
     # Rule 1: the Feedback state AND its own reference (an ABSENT state that
     # keeps a ref is a row-0 conflict, successor_policy "absent_feedback_has_ref").
     hypo = replace(factual, feedback=FeedbackState.ABSENT, feedback_ref=None)
     differing = fields_differing(factual, hypo)
-    if not differing <= FEEDBACK_FIELDS:
-        raise ValueError("the ablation changed a field other than Feedback")
+    # D1 sec. 5 "require": exactly the Feedback state and its ref differ.  An input
+    # whose Feedback is already ABSENT / None is refused (no ablation happened).
+    if differing != FEEDBACK_FIELDS:
+        raise ValueError("the ablation must change exactly the Feedback state and its ref")
     if cross_reference_conflicts(hypo):
         raise ValueError("the ablated input is not a valid closed input")
     factual_result = evaluate(factual)

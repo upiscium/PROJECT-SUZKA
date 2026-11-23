@@ -279,16 +279,22 @@ def test_f1_preregistration_names_the_table_and_decisions() -> None:
 
 # ----------------------------------------------------- purity / determinism
 
-_ALLOWED_TOP = {
-    "dataclasses",
-    "enum",
-    "__future__",
-    "suzka.r16.successor_policy",
+_ALLOWED = {
+    "ablation": {"dataclasses", "enum", "__future__", "suzka.r16.successor_policy"},
+    "f1_table": {
+        "dataclasses",
+        "typing",
+        "__future__",
+        "experiments.r20.ablation",
+        "suzka.r16.successor_policy",
+    },
 }
 
 
-def test_module_imports_only_the_pure_policy_surface() -> None:
-    tree = ast.parse(Path(ablation.__file__).read_text())
+@pytest.mark.parametrize("name", sorted(_ALLOWED))
+def test_module_imports_only_the_pure_policy_surface(name: str) -> None:
+    module = {"ablation": ablation, "f1_table": f1_table}[name]
+    tree = ast.parse(Path(module.__file__).read_text())  # type: ignore[arg-type]
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -296,12 +302,18 @@ def test_module_imports_only_the_pure_policy_surface() -> None:
         elif isinstance(node, ast.ImportFrom):
             assert node.level == 0
             imported.add(node.module or "")
-    assert imported <= _ALLOWED_TOP
+    assert imported <= _ALLOWED[name]
+
+
+def test_already_absent_feedback_is_refused_not_ablated() -> None:
+    value = _s0(feedback=FeedbackState.ABSENT, feedback_ref=None, verified_outcome_ref=None)
+    with pytest.raises(ValueError):
+        ablate_feedback(value.canonical_bytes())
 
 
 def test_importing_the_module_loads_no_store_runtime_or_api() -> None:
     code = (
-        "import sys, experiments.r20.ablation;"
+        "import sys, experiments.r20.ablation, experiments.r20.f1_table;"
         "print('\\n'.join(sorted(m for m in sys.modules if m.startswith('suzka'))))"
     )
     root = Path(__file__).resolve().parent.parent
@@ -321,24 +333,39 @@ def test_importing_the_module_loads_no_store_runtime_or_api() -> None:
 
 
 def test_deterministic_and_stores_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    payload = _s0().canonical_bytes()
-    (tmp_path / "root").mkdir()
-    (tmp_path / "root" / "f").write_bytes(b"x")
+    import builtins
+    import os
+    import socket
+    import sqlite3
 
-    def snapshot() -> dict[str, bytes]:
-        return {str(p): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    payload = _s0().canonical_bytes()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "f").write_bytes(b"x")
+    monkeypatch.chdir(root)
+
+    def snapshot() -> dict[str, tuple[bytes, int]]:
+        return {
+            str(p): (p.read_bytes(), p.stat().st_mtime_ns)
+            for p in tmp_path.rglob("*")
+            if p.is_file()
+        }
 
     before = snapshot()
 
     def refuse(*args: object, **kwargs: object) -> None:
-        raise AssertionError("the evaluator must not open files")
+        raise AssertionError("the evaluator must not touch storage or network")
 
-    monkeypatch.setattr("builtins.open", refuse)
+    for target, attr in (
+        (sqlite3, "connect"),
+        (os, "open"),
+        (socket, "socket"),
+        (builtins, "open"),
+    ):
+        monkeypatch.setattr(target, attr, refuse)
     first = ablate_feedback(payload)
     second = ablate_feedback(payload)
     monkeypatch.undo()
     assert first == second
-    assert first.ablated_payload == second.ablated_payload
     assert snapshot() == before
-    # the factual input bytes are not modified (immutability of the caller's value)
     assert payload == _s0().canonical_bytes()
