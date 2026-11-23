@@ -28,7 +28,6 @@ from experiments.r20.factory import create_subject
 from experiments.r20.provider import ScriptedProvider
 from experiments.r20.tier1 import FakeClock, T1Runtime
 from r20_chain import adopted, drive_to_allowed, goal_id, operations
-from r20_fixtures import r20_base  # noqa: F401
 from suzka.r16.history_records import HistoryOperationKind as K
 from suzka.r16.successor_policy import SuccessorRow
 from suzka.r18.contracts import ExecutionClaimV1

@@ -39,7 +39,6 @@ from r20_chain import (
     wait_interest,
     X_TEXT,
 )
-from r20_fixtures import r20_base  # noqa: F401
 from suzka.r16.history_records import HistoryOperationKind as K
 from suzka.r16.successor_policy import SuccessorRow
 from suzka.r18.contracts import ActionIntentV1, ExecutionClaimV1

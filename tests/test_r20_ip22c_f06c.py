@@ -37,7 +37,6 @@ from experiments.r20.manifest import Manifest
 from experiments.r20.polling import poll_until, short_read
 from experiments.r20.supervisor import ChildProcess
 from r20_chain import X_TEXT
-from r20_fixtures import r20_base  # noqa: F401
 
 
 def _shim(client: BoundClient) -> Any:

@@ -33,6 +33,7 @@ import argparse
 import ast
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -582,13 +583,9 @@ def pytest_runner(node_ids: Sequence[str]) -> dict[str, str]:
     root = guards.repo_root()
     previous = Path.cwd()
     try:
-        import os
-
         os.chdir(root)
         pytest.main(["-q", "-p", "no:cacheprovider", *node_ids], plugins=[Collector()])
     finally:
-        import os
-
         os.chdir(previous)
     return outcomes
 

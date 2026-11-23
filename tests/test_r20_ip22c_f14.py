@@ -35,7 +35,6 @@ from experiments.r20.factory import create_subject
 from experiments.r20.manifest import Manifest
 from experiments.r20.provider import ScriptedProvider, r15_answer, r15_protocol_script
 from experiments.r20.tier1 import T1Runtime
-from r20_fixtures import r20_base  # noqa: F401
 from suzka.runtime.agent_runtime import (
     AgentEventSource,
     AgentEventType,

@@ -10,7 +10,6 @@ from collections.abc import Callable
 import time
 from typing import Any
 
-from fastapi.testclient import TestClient
 
 from suzka.r16.history_records import HistoryOperationKind
 from suzka.runtime.agent_runtime import AgentEventType

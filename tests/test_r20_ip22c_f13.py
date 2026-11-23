@@ -27,7 +27,6 @@ from experiments.r20.factory import create_subject
 from experiments.r20.provider import HIDDEN_THOUGHT_MARKER, ScriptedProvider
 from experiments.r20.tier1 import T1Runtime
 from r20_chain import FAST_R19, Wire, chat, run_full_chain
-from r20_fixtures import r20_base  # noqa: F401
 
 
 def _tree_text(root: Path) -> bytes:
