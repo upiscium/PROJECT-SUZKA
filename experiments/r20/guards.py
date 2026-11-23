@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel
 
@@ -202,7 +203,7 @@ def check_settings_network(settings: Any) -> int:
     check_loopback_host(settings.api.host)
     port = check_port(settings.api.port)
     for origin in settings.r18.approval_origins:
-        if origin.rsplit(":", 1)[-1].isdigit() and int(origin.rsplit(":", 1)[-1]) in FORBIDDEN_PORTS:
+        if urlsplit(origin).port in FORBIDDEN_PORTS:
             raise GuardRefusal("PORT_FORBIDDEN", f"approval origin {origin}")
     return port
 

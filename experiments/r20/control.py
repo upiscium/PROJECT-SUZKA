@@ -27,7 +27,7 @@ IO_TIMEOUT_S = 60.0
 Handler = Callable[[Mapping[str, Any]], dict[str, Any]]
 
 
-class ControlError(Exception):
+class ControlError(ValueError):
     pass
 
 

@@ -6,8 +6,9 @@ and counts only; no raw private text.  The key set is closed.
 
 ``plan_hold_receipts``: the receipt writer (IP-14b-3) is a separate unit.  A HOLD
 the harness observed is recorded ``HOLD_UNSEALED`` unless the caller names the
-id of a receipt READ FROM SubjectHistory; there is no way to seal an entry from
-a log or a manifest copy (IP-14b HD-3 (a)).
+id of a receipt READ FROM SubjectHistory.  The manifest cannot verify that id
+itself: the caller (22d) must read it from the store; a manifest copy of a log
+is never a receipt (IP-14b HD-3 (a)).
 """
 
 from __future__ import annotations

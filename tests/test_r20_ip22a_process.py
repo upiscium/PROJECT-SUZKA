@@ -399,3 +399,34 @@ def test_serve_refuses_to_start_without_the_marker_as_a_real_process(r20_base: P
     (subject.root / ".r20_throwaway").unlink()
     with pytest.raises(GuardRefusal):
         ChildProcess.spawn(subject)  # the parent refuses before spawning
+
+
+def test_a_child_that_has_not_bound_its_port_yet_gets_nothing(r20_base: Path) -> None:
+    subject = create_subject("NEG-plain", base=r20_base, tier=Tier.T2)
+    _record(subject)
+    server = ControlServer(
+        subject.control_socket,
+        {
+            "status": lambda _a: {
+                "port": subject.port, "pid": os.getpid(), "run_id": subject.run_id,
+                "journal_lineage_id": LINEAGE, "ready": False,
+            },
+            "r15_review": lambda _a: {},
+            "quit": lambda _a: {},
+        },
+    )
+    server.start()
+    listener = _Listener(subject.port)  # something else already holds the port
+    try:
+        with pytest.raises(DestinationMismatch):
+            _post(BoundClient(_destination(subject), subject.subject_json))
+        assert listener.connections == 0
+    finally:
+        listener.close()
+        server.stop()
+
+
+def test_a_run_id_must_be_plain_ascii_alphanumeric(r20_base: Path) -> None:
+    for bad in ("a/b", "²", "", "x" * 40, "a b"):
+        with pytest.raises(GuardRefusal):
+            create_subject("NEG-plain", base=r20_base, run_id=bad)

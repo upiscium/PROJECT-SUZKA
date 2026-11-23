@@ -24,6 +24,7 @@ from enum import Enum
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import socket
 import subprocess
@@ -284,7 +285,7 @@ def create_subject(
     guards.check_inherited_environment(env)
     resolved_base = guards.resolve_base(base, env)
     rid = run_id or uuid.uuid4().hex[:8]
-    if not rid.isalnum():
+    if not re.fullmatch(r"[A-Za-z0-9]{1,24}", rid):
         raise GuardRefusal("RUN_ID_INVALID", rid)
     run_dir = guards.check_root_location(resolved_base / rid, resolved_base)
     root = run_dir / "subject"

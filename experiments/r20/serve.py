@@ -106,9 +106,16 @@ def main(argv: list[str] | None = None) -> int:
         uvicorn.Config(app, host=settings.api.host, port=port, log_level="warning", lifespan="on")
     )
 
+    lineage_cache: list[str] = []
+
     def status(_arguments: Any) -> dict[str, Any]:
+        # The lineage never changes in a life: read it once (inspect() is heavy).
         journal = getattr(app.state, "event_journal", None)
-        lineage = None if journal is None else journal.inspect().journal_lineage_id
+        if not lineage_cache and journal is not None and server.started:
+            found = journal.inspect().journal_lineage_id
+            if found is not None:
+                lineage_cache.append(str(found))
+        lineage = lineage_cache[0] if lineage_cache else None
         return {
             "port": port,
             "pid": os.getpid(),

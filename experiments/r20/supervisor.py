@@ -153,14 +153,19 @@ class ChildProcess:
         raise GuardRefusal("CHILD_NOT_READY")
 
     def kill_group(self, sig: int = signal.SIGKILL) -> None:
-        try:
-            os.killpg(self.pgid, sig)
-        except ProcessLookupError:
-            pass
+        # Only while the child is not yet reaped: afterwards the pgid may belong
+        # to an unrelated process.
+        if self.process.poll() is None:
+            try:
+                os.killpg(self.pgid, sig)
+            except ProcessLookupError:
+                pass
         try:
             self.process.wait(timeout=15)
         except subprocess.TimeoutExpired:
             pass
+        if self.process.poll() is not None and self in ChildProcess._live:
+            ChildProcess._live.remove(self)
 
     def stop(self) -> None:
         """``quit`` over the control channel, then ``killpg`` in any case."""
@@ -173,8 +178,6 @@ class ChildProcess:
             pass
         finally:
             self.kill_group(signal.SIGKILL)
-            if self in ChildProcess._live:
-                ChildProcess._live.remove(self)
 
     def __enter__(self) -> ChildProcess:
         return self
@@ -186,6 +189,8 @@ class ChildProcess:
 @atexit.register
 def _kill_leftovers() -> None:  # pragma: no cover - interpreter exit
     for child in list(ChildProcess._live):
+        if child.process.poll() is not None:
+            continue
         try:
             os.killpg(child.pgid, signal.SIGKILL)
         except OSError:

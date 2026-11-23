@@ -89,6 +89,13 @@ def recompute(reply: dict[str, Any]) -> Recomputed:
     """Verify challenge <-> intent <-> forecast and recompute digests and code
     from the bytes the server returned (the page's ``verify``)."""
 
+    try:
+        return _recompute(reply)
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        raise GuardRefusal("APPROVAL_RECOMPUTE_MALFORMED", type(error).__name__) from error
+
+
+def _recompute(reply: dict[str, Any]) -> Recomputed:
     problems: list[str] = []
     challenge_text, intent_text = reply["challenge"], reply["intent"]
     challenge, intent = json.loads(challenge_text), json.loads(intent_text)

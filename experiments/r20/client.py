@@ -192,7 +192,9 @@ class BoundClient:
             raise self._refuse("control channel does not answer") from error
         if (
             reply.get("ok") is not True
+            or reply.get("ready") is not True  # the child has bound its port
             or reply.get("port") != dest.port
+            or reply.get("journal_lineage_id") is None
             or reply.get("journal_lineage_id") != record.get("journal_lineage_id")
             or reply.get("pid") != dest.pid
             or server_pid != dest.pid
