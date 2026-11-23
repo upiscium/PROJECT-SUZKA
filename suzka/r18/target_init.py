@@ -2,6 +2,9 @@
 
     python -m suzka.r18.target_init /abs/path/target.sqlite3
 
+A relative path resolves against the process's current directory, the same way
+the API resolves a relative ``r18.target_path`` at startup.
+
 Creates the fixed target (IP-15) and the obligation secret (§3a) in the
 target's private directory. Nothing creates them at startup, and neither is
 ever replaced: an existing target or secret is refused (#380 D2 addendum 3).
@@ -49,10 +52,10 @@ def initialize(path: Path) -> tuple[str, Path]:
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 1:
-        print("usage: python -m suzka.r18.target_init /abs/path/target.sqlite3", file=sys.stderr)
+        print("usage: python -m suzka.r18.target_init /path/target.sqlite3", file=sys.stderr)
         return 2
     try:
-        instance, secret = initialize(Path(args[0]))
+        instance, secret = initialize(Path.cwd() / Path(args[0]))
     except (TargetError, ObligationSecretError) as error:
         print(f"target creation refused: {error}", file=sys.stderr)
         return 1

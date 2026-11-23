@@ -178,6 +178,13 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _reason(error: BaseException) -> str:
+    """The failure's message on one bounded line (target errors carry fixed text)."""
+
+    text = " ".join(str(error).split())[:200]
+    return repr(text) if text else "-"
+
+
 def _stamp(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).strftime(_UTC_FORMAT)
 
@@ -608,7 +615,10 @@ class R18Executor:
         else:
             self._gate.sweeping()
         self._sweep_done = False
-        self._sweep_log("FAIL", f"error={type(error).__name__} blocked={'yes' if blocked else 'no'}")
+        self._sweep_log(
+            "FAIL",
+            f"error={type(error).__name__} reason={_reason(error)} blocked={'yes' if blocked else 'no'}",
+        )
 
     def _target_ok(self) -> None:
         # Damping (review P3-d): the probe index is NOT reset here, only when a
