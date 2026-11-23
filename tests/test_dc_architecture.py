@@ -71,6 +71,20 @@ FORBIDDEN_CALL_SUFFIXES = (
     "setxattr",
     "sendfile",
     "copy_file_range",
+    "renames",
+    "makedirs",
+    "mkfifo",
+    "mknod",
+    "fdopen",
+    "mkstemp",
+    "mkdtemp",
+    "popen",
+    "system",
+    "spawn",
+    "exec",
+    "run",
+    "check_call",
+    "check_output",
 )
 
 
@@ -84,7 +98,46 @@ def test_the_primitive_module_never_deletes_repairs_or_copies() -> None:
     } | {
         node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
     }
-    assert "shutil" not in imported and "tempfile" not in imported
+    banned = {
+        "shutil",
+        "tempfile",
+        "subprocess",
+        "ctypes",
+        "importlib",
+        "io",
+        "builtins",
+    }
+    assert not banned & {name.split(".")[0] for name in imported}, imported
+    # every rename / replace / open / mkdir is one of the named primitives
+    # (Path.rename, Path.open, io.open... are not among them)
+    owners = _enclosing_functions(tree)
+    primitive = {
+        "os.rename": "_rename_directory",
+        "os.replace": "_publish_file",
+        "os.mkdir": "_create_manifest_dir",
+        "manifest_dir.parent.mkdir": "_create_manifest_dir",
+    }
+    for name, call in _calls(tree):
+        suffix = name.rsplit(".", 1)[-1]
+        if suffix in {"rename", "replace", "mkdir", "open"} and name not in {
+            "os.open",
+            "replace",  # dataclasses.replace, imported by that bare name
+        }:
+            assert name in primitive and owners.get(call) == primitive[name], (
+                name,
+                call.lineno,
+            )
+    # __import__ / getattr(os, ...) indirection is not used
+    for name, call in _calls(tree):
+        assert name not in {"__import__", "exec", "eval"}, (name, call.lineno)
+        if name == "getattr":
+            assert "os" not in ast.unparse(call.args[0]) or ast.unparse(
+                call.args[1]
+            ) in {
+                "'O_NOFOLLOW'",
+                "'O_NONBLOCK'",
+                "'O_NOCTTY'",
+            }, call.lineno
     for name, call in _calls(tree):
         suffix = name.rsplit(".", 1)[-1]
         assert suffix not in FORBIDDEN_CALL_SUFFIXES, (name, call.lineno)

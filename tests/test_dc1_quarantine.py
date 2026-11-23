@@ -304,7 +304,9 @@ def world(tmp_path: Path) -> tuple[Path, Path, QuarantineWriter]:
         memory,
         qdir,
         QuarantineWriter(
-            qdir, wall_clock=lambda: datetime(2026, 11, 24, tzinfo=timezone.utc)
+            qdir,
+            has_exclusive_authority=lambda: True,
+            wall_clock=lambda: datetime(2026, 11, 24, tzinfo=timezone.utc),
         ),
     )
 
@@ -474,10 +476,17 @@ def test_hash_budget_exhaustion_records_unhashed_and_still_renames(world) -> Non
     before = tree_snapshot(root)
     ticks = iter(range(10_000))
     # every clock read advances 10 s: the 30 s budget ends inside the first pass
-    writer = QuarantineWriter(qdir, t_hash_s=30, clock=lambda: next(ticks) * 10.0)
+    writer = QuarantineWriter(
+        qdir,
+        has_exclusive_authority=lambda: True,
+        t_hash_s=30,
+        clock=lambda: next(ticks) * 10.0,
+    )
     manifest = _quarantine(writer, root)
     (artifact,) = manifest.artifacts
     assert artifact.unhashed  # recorded, not silently dropped
+    # the post-move check was partial, and the manifest must not claim more
+    assert artifact.verified is None
     assert all(
         entry[3] is None for entry in artifact.entries if entry[0] in artifact.unhashed
     )
@@ -523,7 +532,8 @@ def test_a_changed_tree_after_the_move_is_not_marked_moved(  # type: ignore[no-u
 
     def rename_then_damage(source: Path, target: Path) -> None:
         real(source, target)
-        (target / "records" / "a.json").write_bytes(b"changed!")  # same size class
+        # same size, different bytes: only the sha256 compare can see it
+        (target / "records" / "a.json").write_bytes(b'{"id": "Z"}\n')
 
     monkeypatch.setattr(dc, "_rename_directory", rename_then_damage)
     with pytest.raises(QuarantineError):
@@ -544,7 +554,9 @@ def test_the_writer_never_writes_under_a_quarantined_path(tmp_path: Path) -> Non
     memory = tmp_path / "memory"
     memory.mkdir()
     root = _make_store(memory)
-    writer = QuarantineWriter(tmp_path / "q.quarantine-z")
+    writer = QuarantineWriter(
+        tmp_path / "q.quarantine-z", has_exclusive_authority=lambda: True
+    )
     with pytest.raises(QuarantineRefused):
         _quarantine(writer, root)
     assert root.is_dir() and not (tmp_path / "q.quarantine-z").exists()
@@ -576,7 +588,7 @@ def _crash_before_manifest_write(monkeypatch: pytest.MonkeyPatch, number: int) -
 def _reborn(writer: QuarantineWriter) -> QuarantineWriter:
     """A new process: a new writer over the same directory."""
 
-    return QuarantineWriter(writer._dir)
+    return QuarantineWriter(writer._dir, has_exclusive_authority=lambda: True)
 
 
 def test_crash_before_the_pending_manifest_moves_nothing(  # type: ignore[no-untyped-def]
@@ -711,6 +723,68 @@ def test_a_torn_manifest_write_leaves_the_old_manifest_and_deletes_nothing(  # t
     assert len(leftovers) == 1  # the stray temporary stays: nothing is deleted
     # the next write works and does not collide with the leftover
     assert writer.mark_journaled("e1").state is ManifestState.JOURNALED
+
+
+def test_no_exclusive_authority_no_quarantine(world) -> None:  # type: ignore[no-untyped-def]
+    memory, qdir, _ = world
+    root = _make_store(memory)
+    before = tree_snapshot(root)
+    held = [False]
+    writer = QuarantineWriter(qdir, has_exclusive_authority=lambda: held[0])
+    with pytest.raises(QuarantineRefused):
+        _quarantine(writer, root)
+    assert_trees_equal(before, tree_snapshot(root))
+    assert not qdir.exists()
+    held[0] = True
+    assert _quarantine(writer, root).state is ManifestState.MOVED
+
+
+def test_redo_rehashes_a_root_that_changed_after_the_pending_write(  # type: ignore[no-untyped-def]
+    world, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    memory, _, writer = world
+    root = _make_store(memory)
+
+    def die(source: Path, target: Path) -> None:
+        raise _Crash
+
+    monkeypatch.setattr(dc, "_rename_directory", die)
+    with pytest.raises(_Crash):
+        _quarantine(writer, root)
+    monkeypatch.undo()
+    (root / "records" / "new.json").write_bytes(b"written after the crash")
+    changed = tree_snapshot(root)
+    plan = _reborn(writer).resume("e1", root)
+    assert plan.action is ResumeAction.CONTINUE_JOURNAL
+    moved = _reborn(writer).read_manifest("e1")
+    assert moved.state is ManifestState.MOVED
+    assert any(e[0] == "records/new.json" for e in moved.artifacts[0].entries)
+    assert_trees_equal(changed, tree_snapshot(memory / "experience.quarantine-e1"))
+
+
+def test_redo_refuses_a_manifest_that_does_not_match_the_root(
+    world, monkeypatch: pytest.MonkeyPatch
+) -> None:  # type: ignore[no-untyped-def]
+    memory, _, writer = world
+    root = _make_store(memory)
+
+    def die(source: Path, target: Path) -> None:
+        raise _Crash
+
+    monkeypatch.setattr(dc, "_rename_directory", die)
+    with pytest.raises(_Crash):
+        _quarantine(writer, root)
+    monkeypatch.undo()
+    other = _make_store(memory, "semantic")
+    before = tree_snapshot(other)
+    with pytest.raises(QuarantineRefused):  # the manifest names "experience"
+        _reborn(writer).resume("e1", other)
+    assert_trees_equal(before, tree_snapshot(other))
+    assert root.is_dir()
+    link = memory / "experience-link"
+    link.symlink_to(root)
+    with pytest.raises(QuarantineRefused):
+        _reborn(writer).resume("e1", link)
 
 
 @pytest.mark.parametrize(

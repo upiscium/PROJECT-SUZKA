@@ -18,6 +18,22 @@ DC-6).  The module offers:
 * ``Deadline``, the probe / back-off schedules and the status record behind
   the ``dc_*`` health fields.
 
+Known limits (stated, not hidden):
+
+* ``T_hash`` bounds hashing between syscalls.  One ``open`` / ``read`` /
+  ``scandir`` / ``rename`` / ``fsync`` on a hung filesystem is not
+  interruptible, so the bound is not a hard wall-clock guarantee there.
+* ``os.rename`` of a directory replaces an EMPTY directory that appears at the
+  target between the existence check and the rename (no ``RENAME_NOREPLACE``
+  in the standard library).  No artifact data can be lost that way.
+* A busy lease and any other ``OSError`` of ``EventJournalLease`` share one
+  exception class and message, so both are labelled ``event_journal_lease_busy``
+  (TRANSIENT); only the label is affected, nothing is quarantined on it.
+* A post-move check after the hash budget ran out compares paths, kinds and
+  sizes only; the manifest then records ``verified: null``, not ``true``.
+* DC-4 must create the empty root together with its marker atomically (temp
+  directory, then rename): a root without the marker is ``BLOCKED`` here.
+
 Prohibitions kept here (D1 sec. 10): no ``unlink`` / ``rmtree`` / truncate /
 copy anywhere in this module, writes only create NEW files (``O_EXCL``), no
 path under a ``*.quarantine-*`` component is ever written, and no quarantined
@@ -292,8 +308,9 @@ class Deadline:
 
 def probe_schedule(total_s: float) -> tuple[float, ...]:
     """Doubling probe delays 1, 2, 4... whose SUM is exactly ``total_s``
-    (60 s -> 1, 2, 4, 8, 16, 29), so a retry loop that sleeps them in turn
-    ends at the shared deadline and no later."""
+    (60 s -> 1, 2, 4, 8, 16, 29).  The SLEEPS add up to ``total_s``; the time
+    an attempt itself takes is not in it, so a caller that wants a hard end
+    must also check a ``Deadline`` after each attempt."""
 
     if not total_s > 0:
         return ()
@@ -658,8 +675,12 @@ class _TreeScan:
 
 def _hash_file(path: Path, deadline: Deadline) -> tuple[str | None, str | None]:
     """sha256 of a regular file, or ``(None, reason)``.  Opens read-only,
-    without following a symlink, without blocking on a special file."""
+    without following a symlink, without blocking on a special file.  The budget is checked BEFORE the file
+    is opened and between chunks; a single ``open`` / ``read`` on a hung
+    filesystem is not interruptible and is not bounded by it."""
 
+    if deadline.expired():
+        return None, "unhashed"
     try:
         descriptor = os.open(
             path,
@@ -736,6 +757,21 @@ def _scan_tree(
     return scan
 
 
+def _fully_compared(
+    before: Iterable[tuple[str, str, int, str | None]],
+    after: Iterable[tuple[str, str, int, str | None]],
+) -> bool:
+    """Every file that had a sha256 before the move has one after it, so the
+    comparison covered all hashed content (``verified=True`` needs this)."""
+
+    new = {entry[0]: entry for entry in after}
+    return all(
+        new[entry[0]][3] is not None
+        for entry in before
+        if entry[1] == "file" and entry[3] is not None
+    )
+
+
 def _tree_digest(entries: Iterable[tuple[str, str, int, str | None]]) -> str:
     payload = json.dumps(
         sorted(list(entry) for entry in entries), separators=(",", ":"), sort_keys=True
@@ -780,6 +816,7 @@ class QuarantineWriter:
         self,
         quarantine_dir: Path,
         *,
+        has_exclusive_authority: Callable[[], bool],
         t_hash_s: float = 30.0,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], datetime] | None = None,
@@ -788,6 +825,9 @@ class QuarantineWriter:
         ),
     ) -> None:
         self._dir = Path(quarantine_dir)
+        # Prohibition 8: no DC action without the Journal lease.  Asked before
+        # every move (the caller passes e.g. ``journal.has_exclusive_authority``).
+        self._authority = has_exclusive_authority
         self._t_hash_s = t_hash_s
         self._clock = clock
         self._wall_clock = wall_clock or (lambda: datetime.now(timezone.utc))
@@ -833,6 +873,7 @@ class QuarantineWriter:
         moved back, copied or deleted."""
 
         self._check_epoch_id(epoch_id)
+        self._require_authority()
         if participant_id not in QUARANTINABLE_PARTICIPANTS:
             raise QuarantineRefused("participant is not quarantinable")
         if verdict not in self._verdicts:
@@ -872,6 +913,10 @@ class QuarantineWriter:
         # Step 2, MOVED.
         return self._move_and_verify(manifest, root, deadline)
 
+    def _require_authority(self) -> None:
+        if not self._authority():
+            raise QuarantineRefused("no exclusive Journal authority; nothing was done")
+
     def _refuse_unsafe(self, root: Path, target: Path, manifest_dir: Path) -> None:
         try:
             status = os.lstat(root)
@@ -902,7 +947,8 @@ class QuarantineWriter:
             _fsync_directory(root.parent)
         except OSError as error:
             raise QuarantineError(
-                "quarantine rename failed; nothing was deleted"
+                "quarantine rename or parent fsync failed (the tree may or may "
+                "not have moved; nothing was deleted)"
             ) from error
         hashed = frozenset(
             entry[0]
@@ -910,14 +956,23 @@ class QuarantineWriter:
             if entry[1] == "file" and entry[3] is not None
         )
         after = _scan_tree(target, deadline, only_hash=hashed)
-        if not _entries_match(artifact.entries, after.entries):
+        unreadable = {item[0] for item in after.read_errors} & hashed
+        if unreadable or not _entries_match(artifact.entries, after.entries):
             raise QuarantineError(
                 "moved tree differs from the recorded one; manifest stays PENDING"
             )
+        # True only when every previously hashed file was hashed again and
+        # equal; when the budget ran out the check was partial (paths, kinds,
+        # sizes) and the manifest says so with None.
+        complete = (
+            not artifact.unhashed
+            and not artifact.read_errors
+            and _fully_compared(artifact.entries, after.entries)
+        )
         moved = replace(
             manifest,
             state=ManifestState.MOVED,
-            artifacts=(replace(artifact, verified=True),),
+            artifacts=(replace(artifact, verified=True if complete else None),),
         )
         self._write_manifest(moved)
         return moved
@@ -1045,9 +1100,42 @@ class QuarantineWriter:
         manifest = self.read_manifest(epoch_id)
         plan = plan_resume(manifest, self.observe(manifest, Path(root)))
         if plan.action is ResumeAction.REDO_MOVE:
-            moved = self._move_and_verify(
-                manifest, Path(root), Deadline(self._t_hash_s, self._clock)
+            self._require_authority()
+            root = Path(root)
+            (artifact,) = manifest.artifacts
+            target = self.quarantine_path_for(root, epoch_id)
+            # The manifest never steers the rename: the destination is
+            # recomputed and must equal what it recorded.
+            if artifact.origin_path != str(root) or artifact.quarantine_path != str(
+                target
+            ):
+                raise QuarantineRefused("manifest does not match this root and epoch")
+            status = os.lstat(root)
+            if stat.S_ISLNK(status.st_mode) or not stat.S_ISDIR(status.st_mode):
+                raise QuarantineRefused("root is not a real directory")
+            if os.stat(root.parent).st_uid != os.geteuid():
+                raise QuarantineRefused("parent is not owned by this process")
+            if QUARANTINE_NAME_INFIX in root.name:
+                raise QuarantineRefused("root is itself a quarantined name")
+            # The original may have changed since the PENDING hashes were
+            # taken (a live writer, the crash window): hash it again and
+            # record that before moving.
+            deadline = Deadline(self._t_hash_s, self._clock)
+            scan = _scan_tree(root, deadline)
+            manifest = replace(
+                manifest,
+                artifacts=(
+                    replace(
+                        artifact,
+                        tree_sha256=_tree_digest(scan.entries),
+                        entries=tuple(scan.entries),
+                        read_errors=tuple(scan.read_errors),
+                        unhashed=tuple(scan.unhashed),
+                    ),
+                ),
             )
+            self._write_manifest(manifest)
+            moved = self._move_and_verify(manifest, root, deadline)
             return ResumePlan(ResumeAction.CONTINUE_JOURNAL, "moved again", moved.state)
         if plan.action is ResumeAction.MARK_MOVED:
             moved = self.advance(epoch_id, ManifestState.MOVED)
