@@ -233,3 +233,18 @@ def test_each_row_is_consistent(case: str) -> None:
         assert row.counted and not row.transitional and not row.pending_reason
     if row.status == PENDING:
         assert row.pending_reason and not row.new
+
+
+def test_parametrized_results_aggregate_and_the_real_pytest_runner_reports_them() -> None:
+    node = "tests/test_x.py::test_p"
+    assert f_matrix.aggregate_outcome({f"{node}[a]": "passed", f"{node}[b]": "passed"}, node) == "passed"
+    assert f_matrix.aggregate_outcome({f"{node}[a]": "passed", f"{node}[b]": "failed"}, node) == "failed"
+    assert f_matrix.aggregate_outcome({f"{node}[a]": "passed", f"{node}[b]": "skipped"}, node) == "skipped"
+    assert f_matrix.aggregate_outcome({"tests/test_x.py::test_pq": "passed"}, node) == f_matrix.NOT_RUN
+    # the real runner on a small parametrized test of this file
+    cited = "tests/test_r20_ip22c_matrix.py::test_each_row_is_consistent"
+    outcomes = f_matrix.pytest_runner([cited])
+    assert len([key for key in outcomes if key.startswith(cited + "[")]) == 15
+    assert f_matrix.aggregate_outcome(outcomes, cited) == "passed"
+    # every parametrized test the table cites is therefore not NOT_RUN: check the two known ones
+    assert any(ref.name == "test_f05_w_the_stand_in_is_a_guarded_client_with_and_without_fetch_metadata" for ref in case_for("F05").new)

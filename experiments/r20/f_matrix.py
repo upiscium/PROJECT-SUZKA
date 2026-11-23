@@ -590,6 +590,19 @@ def pytest_runner(node_ids: Sequence[str]) -> dict[str, str]:
     return outcomes
 
 
+def aggregate_outcome(outcomes: Mapping[str, str], node_id: str) -> str:
+    """The outcome of one cited test.  A parametrized test reports one node id
+    per parameter (``id[...]``): all of them must have passed; any other state
+    wins; nothing reported is ``NOT_RUN``."""
+
+    found = [state for key, state in outcomes.items() if key == node_id or key.startswith(node_id + "[")]
+    if not found:
+        return NOT_RUN
+    if all(state == "passed" for state in found):
+        return "passed"
+    return next(state for state in found if state != "passed")
+
+
 def run_matrix(
     runner: Runner,
     evidence_dir: Path,
@@ -617,7 +630,7 @@ def run_matrix(
     outcomes = dict(runner(list(dict.fromkeys(wanted)))) if wanted else {}
 
     def outcome(ref: TestRef) -> str:
-        return outcomes.get(ref.node_id, NOT_RUN)
+        return aggregate_outcome(outcomes, ref.node_id)
 
     manifest = Manifest(evidence_dir, run_id)
     manifest.set("profile", "F-MATRIX")

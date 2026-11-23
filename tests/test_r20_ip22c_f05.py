@@ -74,7 +74,8 @@ def test_f05_w_an_unapproved_intent_closes_as_row_2c_with_no_claim_and_the_subje
 
         # a late approval is refused: still no claim, no effect
         late = operator.approve(intent.intent_id)
-        assert late.status != 200 and late.json().get("status") != "claimed"
+        assert late.status in (404, 409), late.text  # the window closed: a hold, not a claim
+        assert late.json().get("status") in ("hold", "refused", "not_found"), late.text
         assert _claims(state) == 0
         assert _target_digest(state) == target_before
         assert operations(state, K.R18_OUTCOME_COMMIT) == []
@@ -132,3 +133,8 @@ def test_f05_w_the_stand_in_is_a_guarded_client_with_and_without_fetch_metadata(
         refused = operator.confirm(ids["intent"].intent_id, checked.nonce, checked.code, Origin="http://evil.example")
         assert refused.status in (400, 403, 409, 421)
         assert _claims(state) == 0
+        # CONTROL: the same request with the right Origin (and, in the second
+        # variant, Sec-Fetch-Site: same-origin) is the one that claims
+        accepted = operator.confirm(ids["intent"].intent_id, checked.nonce, checked.code)
+        assert accepted.status == 200 and accepted.json()["status"] == "claimed"
+        assert _claims(state) == 2

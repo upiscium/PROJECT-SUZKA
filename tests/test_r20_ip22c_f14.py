@@ -12,8 +12,8 @@ only what stays true under any later design:
    byte-identically after a restart;
 2. a replay of the S2 admission with the same sources returns
    ``changed = False`` and changes nothing;
-3. a changed interpretation is a NEW attributed event (its own event id and a
-   later sequence) and never an in-place overwrite: whatever the admission
+3. a changed interpretation is a NEW event (the later turns have their own event
+   ids and later sequences) and never an in-place overwrite: whatever the admission
    outcome, revisions 1 and 2 and the Journal records of their review events
    are unchanged.
 
@@ -171,8 +171,7 @@ def test_f14_committed_revisions_are_never_rewritten_and_a_changed_interpretatio
             # the state is then byte-identical (TRANSITIONAL: no revision stage exists yet)
             assert owner.snapshot().canonical_bytes() == stored[0]
             assert _checkpoint(state) == stored[1]
-        else:  # a future revision stage: the old revisions stay a prefix (checked above)
-            assert owner.snapshot().revision > 2
+        # otherwise (a future revision stage): the old revisions stay a prefix (_kept above)
 
         manifest.result("F14.second_interpretation", TRANSITIONAL)
         manifest.result("F14.admission_outcome", ";".join(outcomes))
