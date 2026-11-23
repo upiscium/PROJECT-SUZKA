@@ -4,7 +4,7 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from suzka.api.dependencies import get_memory_system, require_admin
+from suzka.api.dependencies import get_memory_system
 from suzka.api.schemas.memory import (
     EpisodeMemoryResponse,
     MemorySearchResponse,
@@ -20,7 +20,7 @@ from suzka.memory import (
 
 
 router = APIRouter(
-    prefix="/api/memory", tags=["memory"], dependencies=[Depends(require_admin)]
+    prefix="/api/memory", tags=["memory"]
 )
 
 

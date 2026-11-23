@@ -36,14 +36,7 @@ from suzka.runtime.main_loop import ChatResult
 from test_r16_ip4c_past_retention import app  # noqa: F401
 from test_r16_u2a_source_owner import _app
 
-TOKEN = "ip6b-admin-token"
-ADMIN = {"X-SUZKA-Admin-Token": TOKEN}
 EXP = "experience-00000000-0000-4000-8000-000000000001"
-
-
-@pytest.fixture(autouse=True)
-def _admin_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", TOKEN)
 
 
 def _until(predicate, timeout: float = 30.0):  # type: ignore[no-untyped-def]
@@ -73,7 +66,7 @@ def _settled(client: TestClient, ticket_id: str) -> dict[str, Any]:
 
 
 def _activate(client: TestClient) -> None:
-    assert client.post("/api/r16/driver/activate", headers=ADMIN).status_code == 200
+    assert client.post("/api/r16/driver/activate").status_code == 200
 
 
 def _interest(client: TestClient, experience_id: str) -> None:

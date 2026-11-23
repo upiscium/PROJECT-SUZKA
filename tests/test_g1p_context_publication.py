@@ -17,7 +17,7 @@ from suzka.api.context_read_model import (
     PublishedContextView,
 )
 from suzka.runtime import ContextRegistry, ContextType
-from test_fastapi_backend import ThinkingProvider, _client, admin_headers
+from test_fastapi_backend import ThinkingProvider, _client
 
 
 def _empty_state() -> PublishedContextView:
@@ -36,7 +36,7 @@ def _send_chat(client, session: str) -> object:
 
 
 def _public(client):
-    return client.get("/api/contexts", headers=admin_headers())
+    return client.get("/api/contexts")
 
 
 def test_private_model_admitted_get_linearizes_before_pending() -> None:
@@ -117,7 +117,7 @@ def test_context_get_never_reads_uncommitted_registry_directly(tmp_path: Path) -
         assert listed.json() == old.json()
         assert listed.headers["x-context-terminal-sequence"] == "0"
         detail = client.get(
-            "/api/contexts/speculative-only", headers=admin_headers()
+            "/api/contexts/speculative-only"
         )
         assert detail.status_code == 404
         assert detail.json() == {"detail": "Context not found"}
@@ -158,7 +158,6 @@ def test_inflight_model_get_sees_only_prior_terminal(
                 assert _public(client).json() == initial.json()
                 assert client.get(
                     f"/api/contexts/{live.frames[0].context_id}",
-                    headers=admin_headers(),
                 ).status_code == 404
             finally:
                 provider.release.set()
@@ -233,7 +232,6 @@ def test_terminal_pending_denies_new_get_until_atomic_swap(
                 assert live.frames
                 detail = client.get(
                     f"/api/contexts/{live.frames[0].context_id}",
-                    headers=admin_headers(),
                 )
                 assert detail.status_code == 503
                 assert "g1p-pending" not in detail.text
@@ -264,7 +262,7 @@ def test_uncertain_terminal_failure_keeps_get_degraded(
         )
         assert _public(client).status_code == 503
         assert client.get(
-            "/api/contexts/conversation.default", headers=admin_headers()
+            "/api/contexts/conversation.default"
         ).status_code == 503
 
 
@@ -425,7 +423,7 @@ def test_api_context_mutation_reply_and_public_generation_match(tmp_path: Path) 
         cid = before.json()["current_context_id"]
         assert cid is not None
         result = client.post(
-            f"/api/contexts/{cid}/suspend", headers=admin_headers()
+            f"/api/contexts/{cid}/suspend"
         )
         assert result.status_code == 200
         assert result.json()["status"] == "suspended"
@@ -434,7 +432,7 @@ def test_api_context_mutation_reply_and_public_generation_match(tmp_path: Path) 
         after = _public(client)
         assert after.headers["x-context-terminal-sequence"] == "2"
         assert after.json()["current_context_id"] is None
-        detail = client.get(f"/api/contexts/{cid}", headers=admin_headers())
+        detail = client.get(f"/api/contexts/{cid}")
         assert detail.status_code == 200
         assert detail.headers["x-context-terminal-sequence"] == (
             after.headers["x-context-terminal-sequence"]

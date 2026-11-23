@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { isAllowed, safeBackendPath } from "@/lib/admin-proxy-path";
 
 const BACKEND_URL = process.env.SUZKA_BACKEND_URL ?? "http://127.0.0.1:8000";
-const ADMIN_TOKEN = process.env.SUZKA_ADMIN_TOKEN;
 
 type RouteContext = { params: Promise<{ path: string[] }> };
 
@@ -15,10 +14,6 @@ export async function POST(request: NextRequest, context: RouteContext) {
 }
 
 async function proxyAdminRequest(request: NextRequest, context: RouteContext): Promise<NextResponse> {
-  if (!ADMIN_TOKEN) {
-    return NextResponse.json({ detail: "SUZKA_ADMIN_TOKEN is not configured" }, { status: 503 });
-  }
-
   const { path } = await context.params;
   const backendPath = safeBackendPath(path, request.nextUrl.pathname);
   if (backendPath === null || !isAllowed(request.method, backendPath)) {
@@ -32,7 +27,6 @@ async function proxyAdminRequest(request: NextRequest, context: RouteContext): P
     method: request.method,
     headers: {
       "Content-Type": request.headers.get("Content-Type") ?? "application/json",
-      "X-SUZKA-Admin-Token": ADMIN_TOKEN,
     },
     body,
     redirect: "manual",

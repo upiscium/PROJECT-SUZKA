@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -107,9 +106,6 @@ def settings_in(root: Path):
                     "eval_sets": [],
                 }
             ),
-            "api": settings.api.model_copy(
-                update={"admin_token_env": "SUZKA_P1B_TEST_TOKEN"}
-            ),
             "agent_state": settings.agent_state.model_copy(
                 update={"path": root / "agent_state.json"}
             ),
@@ -139,7 +135,6 @@ def scenario(tmp_path: Path, *, no_reveal: bool = False):
         manifest,
     )
     provider = SequencedProvider(no_reveal=no_reveal)
-    os.environ["SUZKA_P1B_TEST_TOKEN"] = "not-real"
     app = create_app(settings)
     app.state.model_provider = provider
     app.state.memory_system = DualMemorySystem(settings)

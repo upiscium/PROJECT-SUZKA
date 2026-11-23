@@ -83,15 +83,16 @@ G2 source authority; no semantic lifecycle or G2 authority-preserving source pro
 The Memory search uses the **actual pending CHAT message** as its query
 rather than an unrelated probe string; source-owned retrieval may legitimately
 show existing text without attesting the same event's Context generation.
-During each CP1–CP4 probe, Context GETs with **missing and forged** admin tokens
-must both return 401, even when authorized callers see generic 503. A generic
-503 is an availability/timing signal to an already-authorized caller, not a
+During each CP1–CP4 probe, Context GETs carrying a stray legacy
+`X-SUZKA-Admin-Token` header must behave exactly like those without it (the
+admin token layer was removed; the header is ignored). A generic 503 is an
+availability/timing signal to any caller of the private listener, not a
 promise that a pending transaction's existence is itself secret.
 
 - **CP1** frozen model generation: R09 has created a provisional Context, but
   list/detail give prior terminal state/404. Every registered public/admin
-  HTTP GET is probed, including positive old Memory details; missing and forged
-  admin tokens are both rejected.
+  HTTP GET is probed, including positive old Memory details; a stray legacy
+  admin token header changes nothing.
   Private committed R14 read view remains the previous generation here.
 - **CP2** frozen R07 external finalization after internal commit: Context GET
   remains prior terminal/404 and other API readers do not disclose a newly

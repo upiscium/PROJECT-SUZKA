@@ -1,6 +1,5 @@
 import json
 import math
-import os
 from collections.abc import Callable
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
@@ -90,7 +89,6 @@ from suzka.runtime import (
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
-ADMIN_TOKEN = "test-admin-token"
 PRIVATE_SENTINEL = "PRIVATE-SENTINEL-R02"
 
 
@@ -279,7 +277,6 @@ def test_retention_exhaustion_blocks_mutation_but_keeps_read_only_health(
         assert str(settings.event_journal.path) not in health.text
         read_only = client.get(
             "/api/memory/search",
-            headers=admin_headers(),
             params={"query": "fill"},
         )
         assert read_only.status_code == 200
@@ -299,7 +296,6 @@ def test_retention_exhaustion_blocks_mutation_but_keeps_read_only_health(
         )
         assert restarted.get(
             "/api/memory/search",
-            headers=admin_headers(),
             params={"query": "fill"},
         ).status_code == 200
         assert restarted.post(
@@ -340,7 +336,6 @@ def test_journal_soft_band_keeps_cognition_and_refuses_debug_chat(
         before_records = journal.records
         refused = client.post(
             "/api/chat/debug",
-            headers=admin_headers(),
             json={"message": PRIVATE_SENTINEL, "attachments": [], "debug": True},
         )
         assert refused.status_code == 503
@@ -546,7 +541,7 @@ def test_repeated_real_memory_and_experience_reads_do_not_mutate_authority(
             "real stored semantic response",
             emotion_arousal=0.9,
         )
-        sleep_response = client.post("/api/sleep/run", headers=admin_headers())
+        sleep_response = client.post("/api/sleep/run")
         assert sleep_response.status_code == 200
         semantic_id = sleep_response.json()["semantic_memory_ids"][0]
         assert memory.semantic_store.load_current(semantic_id) is not None
@@ -975,7 +970,6 @@ def test_unrelated_validation_keeps_pre_u4_fastapi_error_shape(
     with _client(tmp_path) as client:
         response = client.post(
             "/api/adapters/missing/evaluate",
-            headers=admin_headers(),
             json={"deterministic_score": "PRIVATE-ADAPTER-INPUT"},
         )
 
@@ -1351,7 +1345,7 @@ def test_context_lifecycle_and_relation_are_durable_across_restart(
                   "client_session_id": "lifecycle-b"},
         )
         assert first.status_code == second.status_code == 200
-        contexts = client.get("/api/contexts", headers=admin_headers()).json()[
+        contexts = client.get("/api/contexts").json()[
             "contexts"
         ]
         context_a = next(
@@ -1363,26 +1357,25 @@ def test_context_lifecycle_and_relation_are_durable_across_restart(
         context_a_id, context_b_id = context_a["context_id"], context_b["context_id"]
 
         suspended = client.post(
-            f"/api/contexts/{context_a_id}/suspend", headers=admin_headers()
+            f"/api/contexts/{context_a_id}/suspend"
         )
         assert suspended.status_code == 200
         assert suspended.json()["status"] == "suspended"
         assert suspended.json()["is_current"] is False
         resumed = client.post(
-            f"/api/contexts/{context_a_id}/resume", headers=admin_headers()
+            f"/api/contexts/{context_a_id}/resume"
         )
         assert resumed.status_code == 200
         assert resumed.json()["status"] == "active"
         assert resumed.json()["is_current"] is False
         related = client.post(
             f"/api/contexts/{context_a_id}/relations",
-            headers=admin_headers(),
             json={"related_context_id": context_b_id},
         )
         assert related.status_code == 200
         assert context_b_id in related.json()["contexts"][0]["related_context_ids"]
         closed = client.post(
-            f"/api/contexts/{context_a_id}/close", headers=admin_headers()
+            f"/api/contexts/{context_a_id}/close"
         )
         assert closed.status_code == 200
         assert closed.json()["status"] == "closed"
@@ -1395,7 +1388,7 @@ def test_context_lifecycle_and_relation_are_durable_across_restart(
         assert rejected.status_code == 409
 
     with _client(tmp_path, settings=settings) as restarted:
-        restored = restarted.get("/api/contexts", headers=admin_headers())
+        restored = restarted.get("/api/contexts")
         assert restored.status_code == 200
         by_id = {item["context_id"]: item for item in restored.json()["contexts"]}
         assert by_id[context_a_id]["status"] == "closed"
@@ -1447,7 +1440,6 @@ def test_api_chat_debug_requires_explicit_opt_in(tmp_path: Path) -> None:
     with _client(tmp_path) as client:
         response = client.post(
             "/api/chat/debug",
-            headers=admin_headers(),
             json={"message": "hello", "attachments": [], "debug": False},
         )
         assert response.status_code == 400
@@ -1459,7 +1451,6 @@ def test_api_chat_debug_is_ephemeral_and_not_persisted(tmp_path: Path) -> None:
     with _client(tmp_path, settings=settings) as client:
         response = client.post(
             "/api/chat/debug",
-            headers=admin_headers(),
             json={"message": "hello", "attachments": [], "debug": True},
         )
         assert response.status_code == 200
@@ -1524,7 +1515,6 @@ def test_api_chat_debug_invalid_loss_is_nullable_and_not_persisted_as_zero(
     ) as client:
         response = client.post(
             "/api/chat/debug",
-            headers=admin_headers(),
             json={"message": "invalid loss", "attachments": [], "debug": True},
         )
 
@@ -1569,27 +1559,26 @@ def test_adapter_endpoints_enforce_lifecycle_transitions(tmp_path: Path) -> None
             dataset_hash="hash",
         )
         invalid = client.post(
-            "/api/adapters/adapter-api/activate", headers=admin_headers()
+            "/api/adapters/adapter-api/activate"
         )
         assert invalid.status_code == 400
         evaluated = client.post(
             "/api/adapters/adapter-api/evaluate",
-            headers=admin_headers(),
             json={"deterministic_score": 0.9},
         )
         assert evaluated.status_code == 200
         assert evaluated.json()["status"] == "trial_active"
         approved = client.post(
-            "/api/adapters/adapter-api/approve", headers=admin_headers()
+            "/api/adapters/adapter-api/approve"
         )
         assert approved.status_code == 200
         assert approved.json()["status"] == "approved"
         active = client.post(
-            "/api/adapters/adapter-api/activate", headers=admin_headers()
+            "/api/adapters/adapter-api/activate"
         )
         assert active.status_code == 200
         assert active.json()["status"] == "active"
-        listed = client.get("/api/adapters", headers=admin_headers())
+        listed = client.get("/api/adapters")
         assert listed.status_code == 200
         assert listed.json()["adapters"][0]["status"] == "active"
 
@@ -1603,7 +1592,7 @@ def test_sleep_endpoint_returns_dry_run_result(tmp_path: Path) -> None:
             emotion_arousal=0.9,
         )
 
-        response = client.post("/api/sleep/run", headers=admin_headers())
+        response = client.post("/api/sleep/run")
 
         assert response.status_code == 200
         data = response.json()
@@ -1632,7 +1621,7 @@ def test_sleep_handler_failure_before_internal_commit_leaves_no_semantic_authori
         )
 
         with pytest.raises(ValueError, match=PRIVATE_SENTINEL):
-            client.post("/api/sleep/run", headers=admin_headers())
+            client.post("/api/sleep/run")
 
         store = client.app.state.memory_system.semantic_store
         assert not tuple(store.records_root.rglob("*.json"))
@@ -1657,10 +1646,10 @@ def test_memory_api_does_not_expose_private_fields(tmp_path: Path) -> None:
         episode_id = memory.save_episodic("memory input", "memory output")
 
         search = client.get(
-            "/api/memory/search", headers=admin_headers(), params={"query": "memory"}
+            "/api/memory/search", params={"query": "memory"}
         )
         detail = client.get(
-            f"/api/memory/episodes/{episode_id}", headers=admin_headers()
+            f"/api/memory/episodes/{episode_id}"
         )
         assert search.status_code == 200
         assert detail.status_code == 200
@@ -1681,7 +1670,7 @@ def test_memory_episode_api_fails_closed_for_invalid_committed_record(
             invalid_record,
         )
         response = client.get(
-            "/api/memory/episodes/episode-invalid", headers=admin_headers()
+            "/api/memory/episodes/episode-invalid"
         )
 
         assert response.status_code == 500
@@ -1691,29 +1680,51 @@ def test_memory_episode_api_fails_closed_for_invalid_committed_record(
         assert "PRIVATE" not in response.text
 
 
-def test_sensitive_api_requires_admin_token(tmp_path: Path) -> None:
+STRAY_ADMIN_HEADER = {"X-SUZKA-Admin-Token": "stray-ignored-token"}
+
+
+def test_formerly_admin_routes_work_without_a_token_and_ignore_a_stray_header(
+    tmp_path: Path,
+) -> None:
     with _client(tmp_path) as client:
+        for headers in ({}, STRAY_ADMIN_HEADER):
+            assert (
+                client.post(
+                    "/api/chat/debug",
+                    headers=headers,
+                    json={"message": "hello", "attachments": [], "debug": True},
+                ).status_code
+                == 200
+            )
+            assert (
+                client.get(
+                    "/api/memory/search", params={"query": "hello"}, headers=headers
+                ).status_code
+                == 200
+            )
+            assert client.post("/api/sleep/run", headers=headers).status_code == 200
+            assert client.get("/api/adapters", headers=headers).status_code == 200
+            assert client.get("/api/values", headers=headers).status_code == 200
+            assert client.get("/api/contexts", headers=headers).status_code == 200
+
+
+def test_formerly_admin_mutations_ignore_a_stray_token_header(tmp_path: Path) -> None:
+    with _client(tmp_path) as client:
+        plain = client.post("/api/r16/driver/activate")
+        assert plain.status_code == 200, plain.text
+        # the same call with a stray header behaves like the plain repeat (409), not 401
+        stray = client.post("/api/r16/driver/activate", headers=STRAY_ADMIN_HEADER)
+        assert stray.status_code == 409
         assert (
-            client.post(
-                "/api/chat",
-                json={"message": "hello", "attachments": [], "debug": False},
-            ).status_code
-            == 200
+            client.post("/api/contexts/missing/suspend", headers=STRAY_ADMIN_HEADER).status_code
+            == client.post("/api/contexts/missing/suspend").status_code
+            != 401
         )
         assert (
-            client.post(
-                "/api/chat/debug",
-                json={"message": "hello", "attachments": [], "debug": True},
-            ).status_code
-            == 401
+            client.post("/api/adapters/missing/approve", headers=STRAY_ADMIN_HEADER).status_code
+            == client.post("/api/adapters/missing/approve").status_code
+            != 401
         )
-        assert (
-            client.get("/api/memory/search", params={"query": "hello"}).status_code
-            == 401
-        )
-        assert client.post("/api/sleep/run").status_code == 401
-        assert client.get("/api/adapters").status_code == 401
-        assert client.get("/api/values").status_code == 401
 
 
 def test_values_api_reads_are_pure_and_governance_is_runtime_bound(
@@ -1741,13 +1752,13 @@ def test_values_api_reads_are_pure_and_governance_is_runtime_bound(
         assert client.app.state.main_loop.value_system.snapshot() == before_foreign
         before_records = len(journal.records)
 
-        values = client.get("/api/values", headers=admin_headers())
-        value = client.get("/api/values/care", headers=admin_headers())
+        values = client.get("/api/values")
+        value = client.get("/api/values/care")
         revisions = client.get(
-            "/api/values/care/revisions", headers=admin_headers()
+            "/api/values/care/revisions"
         )
         seeds = client.get(
-            "/api/values/config-seeds", headers=admin_headers()
+            "/api/values/config-seeds"
         )
 
         assert values.status_code == 200
@@ -1769,7 +1780,7 @@ def test_values_api_reads_are_pure_and_governance_is_runtime_bound(
         assert len(journal.records) == before_records
 
         frozen = client.post(
-            "/api/values/care/freeze", headers=admin_headers()
+            "/api/values/care/freeze"
         )
         assert frozen.status_code == 200
         assert frozen.json()["status"] == "applied"
@@ -1789,13 +1800,12 @@ def test_values_api_reads_are_pure_and_governance_is_runtime_bound(
         assert len(event_ids) == 1
 
         unfreezed = client.post(
-            "/api/values/care/unfreeze", headers=admin_headers()
+            "/api/values/care/unfreeze"
         )
         assert unfreezed.status_code == 200
         assert unfreezed.json()["revision"] == 2
         rollback = client.post(
             "/api/values/care/rollback",
-            headers=admin_headers(),
             json={"target_revision": 1},
         )
         assert rollback.status_code == 200
@@ -1803,7 +1813,7 @@ def test_values_api_reads_are_pure_and_governance_is_runtime_bound(
         assert rollback.json()["frozen"] is True
 
         revisions = client.get(
-            "/api/values/care/revisions", headers=admin_headers()
+            "/api/values/care/revisions"
         )
         assert revisions.status_code == 200
         revision_items = revisions.json()["revisions"]
@@ -1817,27 +1827,25 @@ def test_values_api_reads_are_pure_and_governance_is_runtime_bound(
 
         invalid = client.post(
             "/api/values/care/rollback",
-            headers=admin_headers(),
             json={"target_revision": 1, "PRIVATE-SENTINEL": PRIVATE_SENTINEL},
         )
         assert invalid.status_code == 422
         assert PRIVATE_SENTINEL not in invalid.text
 
         assert client.get(
-            "/api/values/missing", headers=admin_headers()
+            "/api/values/missing"
         ).status_code == 404
         assert client.post(
-            "/api/values/missing/freeze", headers=admin_headers()
+            "/api/values/missing/freeze"
         ).status_code == 404
         invalid_target = client.post(
             "/api/values/care/rollback",
-            headers=admin_headers(),
             json={"target_revision": 999},
         )
         assert invalid_target.status_code == 409
 
     with _client(tmp_path, settings=settings) as restarted:
-        restored = restarted.get("/api/values/care", headers=admin_headers())
+        restored = restarted.get("/api/values/care")
         assert restored.status_code == 200
         assert restored.json()["revision"] == 3
         assert restored.json()["frozen"] is True
@@ -1849,7 +1857,7 @@ def test_values_api_origin_review_and_seed_adoption_are_narrow(
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
         seed = client.post(
-            "/api/values/config-seeds/care/adopt", headers=admin_headers()
+            "/api/values/config-seeds/care/adopt"
         )
         assert seed.status_code == 200
         assert seed.json()["status"] == "idempotent"
@@ -1857,7 +1865,6 @@ def test_values_api_origin_review_and_seed_adoption_are_narrow(
 
         invalid_decision = client.post(
             "/api/values/care/origin-review",
-            headers=admin_headers(),
             json={"decision": "self_endorse"},
         )
         assert invalid_decision.status_code == 422
@@ -1865,7 +1872,6 @@ def test_values_api_origin_review_and_seed_adoption_are_narrow(
 
         invalid_fields = client.post(
             "/api/values/care/freeze",
-            headers=admin_headers(),
             json={"event_id": PRIVATE_SENTINEL},
         )
         assert invalid_fields.status_code == 422
@@ -1873,14 +1879,13 @@ def test_values_api_origin_review_and_seed_adoption_are_narrow(
 
         direct_value_fields = client.post(
             "/api/values/care/freeze",
-            headers=admin_headers(),
             json={"strength": 0.1, "polarity": -1},
         )
         assert direct_value_fields.status_code == 422
         assert PRIVATE_SENTINEL not in direct_value_fields.text
 
         missing_seed = client.post(
-            "/api/values/config-seeds/missing/adopt", headers=admin_headers()
+            "/api/values/config-seeds/missing/adopt"
         )
         assert missing_seed.status_code == 404
 
@@ -1888,7 +1893,7 @@ def test_values_api_origin_review_and_seed_adoption_are_narrow(
 def test_values_api_explicitly_adopts_a_new_config_seed(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     with _client(tmp_path, settings=settings) as client:
-        assert client.get("/api/values/new-seed", headers=admin_headers()).status_code == 404
+        assert client.get("/api/values/new-seed").status_code == 404
 
     new_seed = settings.values.seeds[0].model_copy(
         update={"value_id": "new-seed", "name": "new-seed"}
@@ -1901,25 +1906,25 @@ def test_values_api_explicitly_adopts_a_new_config_seed(tmp_path: Path) -> None:
         }
     )
     with _client(tmp_path, settings=expanded) as client:
-        listed = client.get("/api/values/config-seeds", headers=admin_headers())
+        listed = client.get("/api/values/config-seeds")
         assert listed.status_code == 200
         new_seed_projection = next(
             item for item in listed.json()["seeds"] if item["value_id"] == "new-seed"
         )
         assert new_seed_projection["adopted"] is False
-        assert client.get("/api/values/new-seed", headers=admin_headers()).status_code == 404
+        assert client.get("/api/values/new-seed").status_code == 404
 
         adopted = client.post(
-            "/api/values/config-seeds/new-seed/adopt", headers=admin_headers()
+            "/api/values/config-seeds/new-seed/adopt"
         )
         assert adopted.status_code == 200
         assert adopted.json()["status"] == "applied"
         assert adopted.json()["revision"] == 0
         assert client.get(
-            "/api/values/new-seed", headers=admin_headers()
+            "/api/values/new-seed"
         ).json()["origin_actor"] == "system"
         revisions = client.get(
-            "/api/values/new-seed/revisions", headers=admin_headers()
+            "/api/values/new-seed/revisions"
         )
         assert [item["operation"] for item in revisions.json()["revisions"]] == [
             "admission"
@@ -1950,7 +1955,7 @@ def test_value_governance_failure_restores_the_last_committed_view(
 
         monkeypatch.setattr(main_loop._value_system, "freeze", mutate_then_fail)
         with pytest.raises(RuntimeError, match="PRIVATE-SENTINEL governance failure"):
-            client.post("/api/values/care/freeze", headers=admin_headers())
+            client.post("/api/values/care/freeze")
 
         assert main_loop.value_system.snapshot() == before
         assert client.app.state.agent_runtime.status is AgentRuntimeStatus.ACCEPTING
@@ -1990,19 +1995,8 @@ def test_unbound_value_mutation_cannot_be_published_by_a_later_event(
 
     with _client(tmp_path, settings=settings) as restarted:
         assert restarted.get(
-            "/api/values/care", headers=admin_headers()
+            "/api/values/care"
         ).json()["revision"] == 0
-
-
-def test_sensitive_api_reports_missing_admin_token_config(tmp_path: Path) -> None:
-    with _client(tmp_path, configure_admin_token=False) as client:
-        response = client.post(
-            "/api/chat/debug",
-            headers=admin_headers(),
-            json={"message": "hello", "attachments": [], "debug": True},
-        )
-        assert response.status_code == 503
-        assert "SUZKA_TEST_ADMIN_TOKEN" in response.json()["detail"]
 
 
 def test_lifespan_owns_and_drains_one_runtime(tmp_path: Path) -> None:
@@ -2182,42 +2176,40 @@ def test_mutating_routes_submit_events_without_private_metadata(tmp_path: Path) 
         assert (
             client.post(
                 "/api/chat/debug",
-                headers=admin_headers(),
                 json={"message": PRIVATE_SENTINEL, "attachments": [], "debug": True},
             ).status_code
             == 200
         )
-        assert client.post("/api/sleep/run", headers=admin_headers()).status_code == 200
+        assert client.post("/api/sleep/run").status_code == 200
         assert (
             client.post(
                 "/api/adapters/recorded/evaluate",
-                headers=admin_headers(),
                 json={"deterministic_score": 0.9},
             ).status_code
             == 200
         )
         assert (
             client.post(
-                "/api/adapters/recorded/approve", headers=admin_headers()
+                "/api/adapters/recorded/approve"
             ).status_code
             == 200
         )
         assert (
             client.post(
-                "/api/adapters/recorded/activate", headers=admin_headers()
+                "/api/adapters/recorded/activate"
             ).status_code
             == 200
         )
         # Invalid transitions still admit an ADAPTER_UPDATE event before the domain 400.
         assert (
             client.post(
-                "/api/adapters/missing/trial", headers=admin_headers()
+                "/api/adapters/missing/trial"
             ).status_code
             == 400
         )
         assert (
             client.post(
-                "/api/adapters/missing/reject", headers=admin_headers()
+                "/api/adapters/missing/reject"
             ).status_code
             == 400
         )
@@ -2251,10 +2243,10 @@ def test_runtime_admission_failures_are_bounded_503(tmp_path: Path) -> None:
 def test_read_only_routes_do_not_submit_events(tmp_path: Path) -> None:
     runtime = RecordingRuntime()
     with _client(tmp_path, runtime=runtime) as client:
-        assert client.get("/api/adapters", headers=admin_headers()).status_code == 200
+        assert client.get("/api/adapters").status_code == 200
         assert (
             client.get(
-                "/api/memory/search", headers=admin_headers(), params={"query": "none"}
+                "/api/memory/search", params={"query": "none"}
             ).status_code
             == 200
         )
@@ -3516,7 +3508,7 @@ def test_value_governance_commit_is_published_before_finalization_failure(
         runtime=FinalizationFailingRuntime(),
     ) as client:
         response = client.post(
-            "/api/values/care/freeze", headers=admin_headers()
+            "/api/values/care/freeze"
         )
         assert response.status_code == 500
         assert response.json() == {
@@ -3525,7 +3517,7 @@ def test_value_governance_commit_is_published_before_finalization_failure(
         assert client.app.state.agent_runtime.status is AgentRuntimeStatus.FAILED
         assert client.app.state.agent_state_store.load().last_processed_event_sequence == 1
 
-        visible = client.get("/api/values/care", headers=admin_headers())
+        visible = client.get("/api/values/care")
         assert visible.status_code == 200
         assert visible.json()["revision"] == 1
         assert visible.json()["frozen"] is True
@@ -3535,7 +3527,7 @@ def test_value_governance_commit_is_published_before_finalization_failure(
         assert committed.value_state.values[0].frozen is True
 
     with _client(tmp_path, settings=settings) as restarted:
-        restored = restarted.get("/api/values/care", headers=admin_headers())
+        restored = restarted.get("/api/values/care")
         assert restored.status_code == 200
         assert restored.json()["revision"] == 1
         assert restored.json()["frozen"] is True
@@ -3780,7 +3772,6 @@ def test_debug_projection_can_use_resolved_body_without_durable_leak(
         client.app.state.memory_system.save_legacy_semantic(resolved_body)
         response = client.post(
             "/api/chat/debug",
-            headers=admin_headers(),
             json={"message": resolved_body, "attachments": [], "debug": True},
         )
 
@@ -3870,7 +3861,6 @@ def test_finalized_episode_is_retrieved_and_admitted_on_later_turn(
 
         second = client.post(
             "/api/chat/debug",
-            headers=admin_headers(),
             json={
                 "message": "U4 later-turn retrieval marker",
                 "attachments": [],
@@ -3963,7 +3953,6 @@ def test_startup_does_not_resolve_noneligible_working_memory_refs(
         assert view.decisions[0].reason is expected_reason
         response = restarted.post(
             "/api/chat/debug",
-            headers=admin_headers(),
             json={"message": "later decision", "attachments": [], "debug": True},
         )
         assert response.status_code == 200
@@ -3980,17 +3969,12 @@ def _client(
     tmp_path: Path,
     *,
     settings: Settings | None = None,
-    configure_admin_token: bool = True,
     runtime: AgentRuntime | AdmissionRuntime | None = None,
     provider: DummyProvider | None = None,
     timer: RecordingTimer | None = None,
     main_loop: SuzkaMainLoop | None = None,
     experience_store: ExperienceStore | None = None,
 ) -> TestClient:
-    if configure_admin_token:
-        os.environ["SUZKA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
-    else:
-        os.environ.pop("SUZKA_TEST_ADMIN_TOKEN", None)
     app_settings = settings or _settings(tmp_path)
     app = create_app(app_settings)
     app.state.model_provider = provider or ThinkingProvider()
@@ -4035,9 +4019,6 @@ def _settings(tmp_path: Path) -> Settings:
                     "eval_sets": [],
                 }
             ),
-            "api": settings.api.model_copy(
-                update={"admin_token_env": "SUZKA_TEST_ADMIN_TOKEN"}
-            ),
             "agent_state": settings.agent_state.model_copy(
                 update={"path": tmp_path / "agent_state.json"}
             ),
@@ -4050,6 +4031,3 @@ def _settings(tmp_path: Path) -> Settings:
         }
     )
 
-
-def admin_headers() -> dict[str, str]:
-    return {"X-SUZKA-Admin-Token": ADMIN_TOKEN}

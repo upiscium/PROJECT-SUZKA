@@ -457,8 +457,6 @@ def test_n8_a_closed_admission_gate_holds_the_claim(app) -> None:  # type: ignor
 
 def test_drift_after_the_challenge_holds_the_claim_and_closes_at_the_window(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     from suzka.r16.review_value import REVIEW_VALUE_ID
-
-    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", ip16a2.TOKEN)
     with TestClient(app) as client:
         state = client.app.state
         owner = state.approval_owner
@@ -466,7 +464,7 @@ def test_drift_after_the_challenge_holds_the_claim_and_closes_at_the_window(app,
         gid, intent, _forecast = _allowed(state)
         challenge = _issued(state, intent.intent_id)
         for action in ("freeze", "unfreeze"):
-            assert client.post(f"/api/values/{REVIEW_VALUE_ID}/{action}", headers=ip16a2.ADMIN).status_code == 200
+            assert client.post(f"/api/values/{REVIEW_VALUE_ID}/{action}").status_code == 200
         held = owner.confirm(intent.intent_id, challenge.nonce, challenge.confirmation_code)
         assert (held.status, held.reason) == (ApprovalStatus.HOLD, R18ApprovalReason.SOURCE_NOT_CURRENT)
         assert _claim_rows(state) == [] and _consumptions(state) == []

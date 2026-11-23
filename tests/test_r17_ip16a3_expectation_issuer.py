@@ -42,7 +42,6 @@ import test_r16_ip10_decision_issuer as ip10
 import test_r18_ip16a2_intent_issuer as ip16a2
 from test_r16_u2a_source_owner import _app
 
-ADMIN = ip16a2.ADMIN
 _settings = ip16a2._settings
 _row4 = ip16a2._row4
 _intent = ip16a2._intent
@@ -53,11 +52,6 @@ _no_failed_events = ip16a2._no_failed_events
 @pytest.fixture
 def app(tmp_path):  # type: ignore[no-untyped-def]
     return _app(_settings(tmp_path / "ip16a3"))
-
-
-@pytest.fixture
-def _admin_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", ip16a2.TOKEN)
 
 
 def _forecast(state, intent_id):  # type: ignore[no-untyped-def]
@@ -413,7 +407,7 @@ def test_the_soft_band_refuses_the_forecast_event() -> None:
 # ------------------------------------------------------------- restart scan
 
 
-def test_crash_between_intent_and_forecast_is_completed_by_the_restart_scan(tmp_path, _admin_token) -> None:  # type: ignore[no-untyped-def]
+def test_crash_between_intent_and_forecast_is_completed_by_the_restart_scan(tmp_path) -> None:  # type: ignore[no-untyped-def]
     settings = _settings(tmp_path / "restart-scan")
     with TestClient(_app(settings)) as client:
         state = client.app.state
@@ -421,7 +415,7 @@ def test_crash_between_intent_and_forecast_is_completed_by_the_restart_scan(tmp_
         # the process ended right after the Intent's event.
         state.r16_driver._expectation = None
         _gid, _decision, intent = _issued_intent(state)
-        assert client.post("/api/r16/driver/activate", headers=ADMIN).status_code == 200
+        assert client.post("/api/r16/driver/activate").status_code == 200
         time.sleep(0.5)
         assert _forecast_rows(state) == []
         assert _forecast_events(state) == 0
@@ -443,7 +437,7 @@ def test_crash_between_intent_and_forecast_is_completed_by_the_restart_scan(tmp_
         _no_failed_events(state)
 
 
-def test_driver_chain_ends_in_one_forecast_only_when_enabled(tmp_path, _admin_token) -> None:  # type: ignore[no-untyped-def]
+def test_driver_chain_ends_in_one_forecast_only_when_enabled(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from test_r16_ip6b_driver import _interest, _settled
 
     for enabled in (True, False):
@@ -461,7 +455,7 @@ def test_driver_chain_ends_in_one_forecast_only_when_enabled(tmp_path, _admin_to
                     return future
 
                 issuer._submit_expectation = spy  # type: ignore[method-assign]
-            assert client.post("/api/r16/driver/activate", headers=ADMIN).status_code == 200
+            assert client.post("/api/r16/driver/activate").status_code == 200
             x = ip16a2._chat(client, "something wonderful happened today")
             _interest(client, x["experience_id"])
             review = ip16a2._chat(client, f"REVIEW_EXPERIENCE:{x['experience_id']}")

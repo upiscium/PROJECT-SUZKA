@@ -101,7 +101,6 @@ def test_debug_never_issues_live_stance(tmp_path: Path) -> None:
             with patch.object(provider, "generate", return_value="debug answer") as generate:
                 response = client.post(
                     "/api/chat/debug",
-                    headers={"X-SUZKA-Admin-Token": "not-real"},
                     json={"message": "debug", "attachments": [], "debug": True,
                           "client_session_id": "debug-session"},
                 )
@@ -142,7 +141,6 @@ def test_closed_collision_refuses_inherited_member(tmp_path: Path) -> None:
                 second = owner.main_loop.context_registry.current_context_id
                 closed = client.post(
                     f"/api/contexts/{second}/close",
-                    headers={"X-SUZKA-Admin-Token": "not-real"},
                 )
                 assert closed.status_code == 200
                 assert owner.main_loop.context_registry.get(second).status is ContextStatus.CLOSED

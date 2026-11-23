@@ -1,5 +1,4 @@
 from pathlib import Path
-import os
 
 from fastapi.testclient import TestClient
 
@@ -19,7 +18,6 @@ from suzka.tools import (
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
-ADMIN_TOKEN = "test-admin-token"
 
 
 def test_chat_request_accepts_empty_attachments(tmp_path: Path) -> None:
@@ -52,7 +50,6 @@ def test_debug_chat_rejects_non_empty_attachments_with_clear_v1_message(tmp_path
     with _client(tmp_path) as client:
         response = client.post(
             "/api/chat/debug",
-            headers={"X-SUZKA-Admin-Token": ADMIN_TOKEN},
             json={
                 "message": "hello",
                 "attachments": [{"type": "image", "url": "file:///tmp/image.png"}],
@@ -115,7 +112,6 @@ def test_tool_registry_rejects_unapproved_generated_registration() -> None:
 
 def _client(tmp_path: Path) -> TestClient:
     settings = _settings(tmp_path)
-    os.environ["SUZKA_TEST_ADMIN_TOKEN"] = ADMIN_TOKEN
     app = create_app(settings)
     app.state.model_provider = DummyProvider()
     app.state.memory_system = DualMemorySystem(settings)
@@ -150,6 +146,5 @@ def _settings(tmp_path: Path) -> Settings:
             "state_wal": settings.state_wal.model_copy(
                 update={"directory": tmp_path / "private" / "state_wal"}
             ),
-            "api": settings.api.model_copy(update={"admin_token_env": "SUZKA_TEST_ADMIN_TOKEN"}),
         }
     )

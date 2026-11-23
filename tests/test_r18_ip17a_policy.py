@@ -94,7 +94,6 @@ _intent = ip16a2._intent
 _no_failed_events = ip16a2._no_failed_events
 _forward = ip16b._forward
 UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
-ADMIN = ip16a2.ADMIN
 V2 = PolicyKind.SUCCESSOR_POLICY_V2
 V3 = PolicyKind.SUCCESSOR_POLICY_V3
 _R18_EVENTS = frozenset(
@@ -109,11 +108,6 @@ _R18_EVENTS = frozenset(
 @pytest.fixture
 def app(tmp_path):  # type: ignore[no-untyped-def]
     return _app(_settings(tmp_path / "ip17a"))
-
-
-@pytest.fixture
-def _admin_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", ip16a2.TOKEN)
 
 
 def _policy(state, intent_id):  # type: ignore[no-untyped-def]
@@ -543,7 +537,7 @@ def test_the_intent_issuer_asks_the_admission_gate(app, monkeypatch) -> None:  #
         assert ip16a2._intent_rows(state) == []
 
 
-def test_source_drift_is_deny_then_row_2c_then_a_new_request_is_2c(app, _admin_token, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_source_drift_is_deny_then_row_2c_then_a_new_request_is_2c(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """§2-5 DENY SOURCE_NOT_CURRENT; §8a DENY -> 2c; a second identical
     request on the closed group is 2c, not row 0 (§12-2)."""
 
@@ -554,7 +548,7 @@ def test_source_drift_is_deny_then_row_2c_then_a_new_request_is_2c(app, _admin_t
         seen = ip16b._Seen(monkeypatch)
         gid, _decision, intent, _forecast = _forward(state)
         for action in ("freeze", "unfreeze"):
-            response = client.post(f"/api/values/{REVIEW_VALUE_ID}/{action}", headers=ADMIN)
+            response = client.post(f"/api/values/{REVIEW_VALUE_ID}/{action}")
             assert response.status_code == 200, response.text
         denied = _policy(state, intent.intent_id)
         assert (denied.status, denied.verdict.verdict, denied.verdict.deny_reason) == (
@@ -747,7 +741,7 @@ def test_three_expiries_close_to_row_2c_inside_the_window(app, monkeypatch) -> N
         _no_failed_events(state)
 
 
-def test_drift_after_allow_closes_at_the_window_end(app, _admin_token, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_drift_after_allow_closes_at_the_window_end(app, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     from suzka.r16.review_value import REVIEW_VALUE_ID
 
     with TestClient(app) as client:
@@ -755,7 +749,7 @@ def test_drift_after_allow_closes_at_the_window_end(app, _admin_token, monkeypat
         gid, _decision, intent, _forecast = _forward(state)
         assert _policy(state, intent.intent_id).status is PolicyCommitStatus.ALLOWED
         for action in ("freeze", "unfreeze"):
-            assert client.post(f"/api/values/{REVIEW_VALUE_ID}/{action}", headers=ADMIN).status_code == 200
+            assert client.post(f"/api/values/{REVIEW_VALUE_ID}/{action}").status_code == 200
         assert ip16b._preview(state, gid).row is SuccessorRow.ROW_2
         _assert_row_2c(_closed_preview(state, gid, intent, monkeypatch))
 
@@ -914,13 +908,13 @@ def test_driver_posts_the_policy_scan_once_and_only_when_enabled() -> None:
     assert disabled._queue.qsize() == 0
 
 
-def test_crash_between_forecast_and_policy_is_completed_by_the_restart_scan(tmp_path, _admin_token) -> None:  # type: ignore[no-untyped-def]
+def test_crash_between_forecast_and_policy_is_completed_by_the_restart_scan(tmp_path) -> None:  # type: ignore[no-untyped-def]
     settings = _settings(tmp_path / "restart-scan")
     with TestClient(_app(settings)) as client:
         state = client.app.state
         state.r16_driver._policy = None
         _gid, _decision, intent, _forecast = _forward(state)
-        assert client.post("/api/r16/driver/activate", headers=ADMIN).status_code == 200
+        assert client.post("/api/r16/driver/activate").status_code == 200
         time.sleep(0.5)
         assert _verdict_rows(state) == []
     with TestClient(_app(settings)) as client:

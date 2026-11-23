@@ -7,7 +7,6 @@ const fetchMock = vi.fn();
 
 async function load() {
   vi.resetModules();
-  vi.stubEnv("SUZKA_ADMIN_TOKEN", "tok");
   vi.stubEnv("SUZKA_BACKEND_URL", "http://127.0.0.1:8000");
   return import("./[...path]/route");
 }
@@ -29,7 +28,7 @@ afterEach(() => {
 });
 
 describe("admin proxy request shape (allowed routes unchanged)", () => {
-  it("GET state/emotion relays only Content-Type and the admin token", async () => {
+  it("GET state/emotion relays only Content-Type (no token)", async () => {
     const mod = await load();
     const res = await call(mod, "GET", "/state/emotion", ["state", "emotion"], {
       headers: { Origin: "http://evil", "X-SUZKA-R18": "1", "X-Forwarded-For": "10.0.0.9", Host: "x", Cookie: "a=b" },
@@ -39,7 +38,17 @@ describe("admin proxy request shape (allowed routes unchanged)", () => {
     expect(String(url)).toBe("http://127.0.0.1:8000/api/state/emotion");
     expect(init.method).toBe("GET");
     expect(init.body).toBeUndefined();
-    expect(init.headers).toEqual({ "Content-Type": "application/json", "X-SUZKA-Admin-Token": "tok" });
+    expect(init.headers).toEqual({ "Content-Type": "application/json" });
+  });
+
+  it("works with no token configured and never relays a client-supplied token header", async () => {
+    const mod = await load();
+    const res = await call(mod, "GET", "/state/emotion", ["state", "emotion"], {
+      headers: { "X-SUZKA-Admin-Token": "client-supplied" },
+    });
+    expect(res.status).toBe(200);
+    const [, init] = fetchMock.mock.calls[0];
+    expect(Object.keys(init.headers).map((k) => k.toLowerCase())).not.toContain("x-suzka-admin-token");
   });
 
   it("POST adapters/x/approve forwards body, query and content type", async () => {
@@ -51,7 +60,7 @@ describe("admin proxy request shape (allowed routes unchanged)", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(String(url)).toBe("http://127.0.0.1:8000/api/adapters/ad1/approve?a=1");
     expect(init.body).toBe('{"k":1}');
-    expect(init.headers).toEqual({ "Content-Type": "text/plain", "X-SUZKA-Admin-Token": "tok" });
+    expect(init.headers).toEqual({ "Content-Type": "text/plain" });
     expect(Object.keys(init.headers).map((k) => k.toLowerCase())).not.toContain("origin");
   });
 

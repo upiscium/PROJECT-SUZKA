@@ -1,6 +1,7 @@
 """Typed configuration schema for PROJECT-SUZKA."""
 
 import ipaddress
+import logging
 from pathlib import Path
 import math
 from urllib.parse import urlsplit
@@ -239,8 +240,19 @@ class AdapterRegistrySettings(StrictBaseModel):
 class ApiSettings(StrictBaseModel):
     host: str = Field(min_length=1)
     port: int = Field(gt=0, le=65535)
-    admin_token_env: str = Field(min_length=1)
+    # Deprecated and ignored: the WebUI/Admin token layer was removed. The key
+    # is still accepted so existing config files keep loading.
+    admin_token_env: str | None = Field(default=None, exclude=True)
     cors_origins: list[str]
+
+    @model_validator(mode="after")
+    def _warn_ignored_admin_token_env(self) -> "ApiSettings":
+        if self.admin_token_env is not None:
+            logging.getLogger(__name__).warning(
+                "api.admin_token_env is deprecated and ignored: the admin token "
+                "check was removed. Remove the key from the config file."
+            )
+        return self
 
 
 class FrontendSettings(StrictBaseModel):

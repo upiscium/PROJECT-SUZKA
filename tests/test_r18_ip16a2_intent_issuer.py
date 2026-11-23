@@ -59,8 +59,6 @@ from test_r16_u2a_source_owner import _app
 from test_r16_u3a_plan_preview import _qualified_commitment, _qualified_goal
 
 X_TEXT = "source experience; fixture"  # the text _qualified_goal sends as X
-TOKEN = "ip16a2-admin-token"
-ADMIN = {"X-SUZKA-Admin-Token": TOKEN}
 
 
 def _target_path(root: Path) -> Path:
@@ -341,7 +339,7 @@ def test_deadline_is_checked_again_after_the_slow_reads(app, monkeypatch) -> Non
         _no_failed_events(state)
 
 
-def test_a_real_value_revision_move_is_source_drift(app, _admin_token) -> None:  # type: ignore[no-untyped-def]
+def test_a_real_value_revision_move_is_source_drift(app) -> None:  # type: ignore[no-untyped-def]
     """Review P3: no patched digest; the review Value really moves (freeze
     then unfreeze) after the row-4 Decision, so its sealed ref no longer
     matches the requalified source."""
@@ -355,7 +353,7 @@ def test_a_real_value_revision_move_is_source_drift(app, _admin_token) -> None: 
             ref for ref in decision.decision.source_refs if ref.kind == "value"
         ][0].revision
         for action in ("freeze", "unfreeze"):
-            response = client.post(f"/api/values/{REVIEW_VALUE_ID}/{action}", headers=ADMIN)
+            response = client.post(f"/api/values/{REVIEW_VALUE_ID}/{action}")
             assert response.status_code == 200, response.text
         assert response.json()["revision"] != before
         held = _intent(state, decision.lineage_scope)
@@ -364,7 +362,7 @@ def test_a_real_value_revision_move_is_source_drift(app, _admin_token) -> None: 
         _no_failed_events(state)
 
 
-def test_a_suspended_and_resumed_context_is_unavailable(app, _admin_token) -> None:  # type: ignore[no-untyped-def]
+def test_a_suspended_and_resumed_context_is_unavailable(app) -> None:  # type: ignore[no-untyped-def]
     """A real Context transition after the Decision: requalification through
     the preview owner fails, so the real path is SOURCE_UNAVAILABLE (the
     drift comparison is never reached)."""
@@ -374,7 +372,7 @@ def test_a_suspended_and_resumed_context_is_unavailable(app, _admin_token) -> No
         _x, _gid, decision = _row4(state)
         context_id = state.main_loop.context_registry.state.current_context_id
         for action in ("suspend", "resume"):
-            response = client.post(f"/api/contexts/{context_id}/{action}", headers=ADMIN)
+            response = client.post(f"/api/contexts/{context_id}/{action}")
             assert response.status_code == 200, response.text
         held = _intent(state, decision.lineage_scope)
         assert (held.status, held.reason) == (
@@ -759,11 +757,6 @@ def test_driver_without_an_enabled_issuer_submits_nothing(intent) -> None:  # ty
     assert driver.counters["submitted"] == 1  # the preview only
 
 
-@pytest.fixture
-def _admin_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SUZKA_P1B_TEST_TOKEN", TOKEN)
-
-
 def _chat(client: TestClient, text: str) -> dict[str, Any]:
     response = client.post("/api/chat", json={"message": text, "attachments": []})
     assert response.status_code == 200, response.text
@@ -780,12 +773,12 @@ def _intent_events(state) -> int:  # type: ignore[no-untyped-def]
 
 
 @pytest.mark.parametrize("enabled", (True, False))
-def test_driver_chain_ends_in_one_intent_only_when_enabled(tmp_path, _admin_token, enabled) -> None:  # type: ignore[no-untyped-def]
+def test_driver_chain_ends_in_one_intent_only_when_enabled(tmp_path, enabled) -> None:  # type: ignore[no-untyped-def]
     from test_r16_ip6b_driver import _interest, _settled
 
     with TestClient(_app(_settings(tmp_path / "chain", r18=enabled))) as client:
         state = client.app.state
-        assert client.post("/api/r16/driver/activate", headers=ADMIN).status_code == 200
+        assert client.post("/api/r16/driver/activate").status_code == 200
         x = _chat(client, "something wonderful happened today")
         _interest(client, x["experience_id"])
         review = _chat(client, f"REVIEW_EXPERIENCE:{x['experience_id']}")

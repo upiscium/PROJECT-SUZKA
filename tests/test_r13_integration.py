@@ -29,7 +29,7 @@ from suzka.runtime import (
     AgentStateSnapshotV9,
     AgentStateStore, SuzkaMainLoop,
 )
-from test_fastapi_backend import _client, _settings, ThinkingProvider, admin_headers
+from test_fastapi_backend import _client, _settings, ThinkingProvider
 from r14_attention_fixtures import coherent_r13_systems
 
 
@@ -88,7 +88,7 @@ def test_production_ports_upgrade_retained_v7_on_first_commit_without_feedback(t
             assert loop.r13_view() == R13PromptView()
             assert isinstance(store.load(), AgentStateSnapshotV9)
         debug = client.post(
-            "/api/chat/debug", headers=admin_headers(),
+            "/api/chat/debug",
             json={"message": "model thinks it wants more", "attachments": [], "debug": True},
         )
         assert debug.status_code == 200
@@ -130,7 +130,7 @@ def test_standard_prompt_renders_only_minimal_current_r13_authority(tmp_path: Pa
     expected, expected_view = _seed_v8(settings)
     with _client(tmp_path, settings=settings) as client:
         response = client.post(
-            "/api/chat/debug", headers=admin_headers(),
+            "/api/chat/debug",
             json={"message": "describe current state", "attachments": [], "debug": True},
         )
         assert response.status_code == 200

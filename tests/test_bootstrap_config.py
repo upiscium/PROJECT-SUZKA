@@ -286,10 +286,43 @@ def test_api_settings_come_from_config() -> None:
 
     assert settings.api.host == raw_config["api"]["host"]
     assert settings.api.port == raw_config["api"]["port"]
-    assert settings.api.admin_token_env == raw_config["api"]["admin_token_env"]
     assert settings.api.cors_origins == raw_config["api"]["cors_origins"]
 
 
 def test_fastapi_app_is_importable() -> None:
     settings = load_settings(CONFIG_PATH)
     assert create_app(settings).title == settings.project.name
+
+
+def test_legacy_admin_token_env_key_is_accepted_ignored_and_warned(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    raw = read_raw_config()
+    assert "admin_token_env" not in raw["api"]
+    raw["api"]["admin_token_env"] = "SUZKA_ADMIN_TOKEN"
+
+    with caplog.at_level("WARNING", logger="suzka.config.schema"):
+        settings = Settings.model_validate(raw)
+
+    warnings = [r for r in caplog.records if "admin_token_env" in r.getMessage()]
+    assert len(warnings) == 1
+    assert settings.api.host == raw["api"]["host"]
+    assert "admin_token_env" not in settings.api.model_dump()
+
+
+def test_config_without_admin_token_env_loads_without_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="suzka.config.schema"):
+        load_settings(CONFIG_PATH)
+
+    assert not [r for r in caplog.records if "admin_token_env" in r.getMessage()]
+
+
+def test_legacy_admin_token_env_config_file_still_loads(tmp_path: Path) -> None:
+    raw = read_raw_config()
+    raw["api"]["admin_token_env"] = "SUZKA_ADMIN_TOKEN"
+    legacy = tmp_path / "legacy.yaml"
+    legacy.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    assert load_settings(legacy).api.port == raw["api"]["port"]

@@ -14,9 +14,10 @@
 ## Admin Access
 
 - Normal chat remains public at `POST /api/chat`.
-- Debug, memory inspection, sleep, and adapter endpoints require `X-SUZKA-Admin-Token`.
-- The expected token is read from the env var named by `api.admin_token_env`; the default is `SUZKA_ADMIN_TOKEN`.
-- Frontend admin pages call the Next.js `/admin-proxy/*` route, which injects `SUZKA_ADMIN_TOKEN` server-side; the token is not included in browser bundles.
+- There is no application-level authentication layer. Debug, memory inspection, sleep, adapter, Context, Value, and R16 endpoints are open to whoever can reach the listener; deploy on a private LAN/VPN or behind your own access boundary (state-changing routes have no Origin/Host check outside `/api/r18/*`, so do not browse untrusted pages from a machine that can reach the listener).
+- The R18 approval API (`/api/r18/*`) keeps its own localhost/trusted-network, Host/Origin/header, JSON, rate-limit, and typed-code guards.
+- Frontend admin pages call the Next.js `/admin-proxy/*` route, which forwards an allowlisted set of paths to the backend without credentials and never reaches `/api/r18/*`.
+- A legacy `api.admin_token_env` key in an existing config file is still accepted but ignored (one deprecation warning at startup); a stray `X-SUZKA-Admin-Token` header is ignored.
 
 ## Model Provider
 
@@ -69,11 +70,11 @@ sudo chmod 600 /etc/project-suzka/*.env
 sudo chown suzka:suzka /etc/project-suzka/*.env
 ```
 
-Edit both env files and set the same long random `SUZKA_ADMIN_TOKEN`. Set `NEXT_PUBLIC_API_BASE_URL` to the browser-visible private origin and keep `SUZKA_BACKEND_URL` pointed at the private FastAPI listener.
+Edit both env files. Set `NEXT_PUBLIC_API_BASE_URL` to the browser-visible private origin and keep `SUZKA_BACKEND_URL` pointed at the private FastAPI listener.
 
 For SSH-tunnel access, run `ssh -L 18080:127.0.0.1:8080 user@host`, set `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:18080`, rebuild the frontend, and open `http://127.0.0.1:18080` locally.
 
-Admin warning: the frontend no longer exposes the admin token to browser bundles, but admin pages still do not have user login/session handling. Keep this listener bound to loopback, or put it behind VPN, SSO, basic auth, or another access-control layer.
+Admin warning: neither the backend nor the admin pages have authentication or user login/session handling. Keep this listener bound to loopback, or put it behind VPN, SSO, basic auth, or another access-control layer.
 
 Build the frontend after the env file is configured because `NEXT_PUBLIC_API_BASE_URL` is embedded at build time:
 
@@ -147,9 +148,9 @@ For Caddy, copy `deploy/caddy/Caddyfile` into your Caddy config path. The provid
 ### 6. Verify Deployment
 
 ```bash
-SUZKA_ADMIN_TOKEN=replace-with-long-random-token scripts/smoke-private-deploy.sh http://127.0.0.1:8080
+scripts/smoke-private-deploy.sh http://127.0.0.1:8080
 ```
 
-The smoke script verifies `/health`, public `/api/chat`, direct admin API rejection without a token, direct admin API success with `X-SUZKA-Admin-Token`, and `/admin-proxy/*` forwarding through the frontend. Set `CHECK_ADMIN_PROXY=0` if you are checking only the FastAPI reverse proxy without the frontend service.
+The smoke script verifies `/health`, public `/api/chat`, direct admin API access without any credential, and `/admin-proxy/*` forwarding through the frontend. Set `CHECK_ADMIN_PROXY=0` if you are checking only the FastAPI reverse proxy without the frontend service.
 
-Normal chat is unauthenticated on the private listener at `POST /api/chat`; direct debug, memory, sleep, and adapter APIs require the admin token header. Frontend admin pages use `/admin-proxy/*` and should remain behind your private access boundary.
+Normal chat is unauthenticated on the private listener at `POST /api/chat`; direct debug, memory, sleep, and adapter APIs are likewise unauthenticated. Keep the listener behind your private access boundary (LAN/VPN/SSH tunnel).
