@@ -23,15 +23,28 @@ from experiments.r20 import guards
 from experiments.r20.control import send
 from experiments.r20.factory import GenesisSubject, Tier
 from experiments.r20.guards import GuardRefusal
-from experiments.r20.provider import ApprovalActor, ProviderMode
+from experiments.r20.provider import ApprovalActor, ProviderMode, check_modes
 
 READY_TIMEOUT_S = 90.0
-_PASSTHROUGH = ("PATH", "LANG", "LC_ALL", "HOME", "HF_HOME")
+_PASSTHROUGH = ("PATH", "LANG", "LC_ALL")
 
 
-def child_environment(subject: GenesisSubject, parent: dict[str, str] | None = None) -> dict[str, str]:
+def child_home(subject: GenesisSubject) -> Path:
+    """A disposable HOME under the run directory (never the operator's)."""
+
+    return subject.run_dir / "home"
+
+
+def child_environment(
+    subject: GenesisSubject,
+    parent: dict[str, str] | None = None,
+    *,
+    hf_home: Path | None = None,
+) -> dict[str, str]:
     """An allow-list environment: the parent's ``SUZKA_*`` variables are not
-    inherited (as the lab script's ``env -i``)."""
+    inherited (as the lab script's ``env -i``).  HOME and the XDG directories
+    are disposable and under the run directory; ``HF_HOME`` is set only when a
+    real-model run names it explicitly."""
 
     source = dict(os.environ) if parent is None else parent
     env = {key: source[key] for key in _PASSTHROUGH if key in source}
@@ -41,9 +54,27 @@ def child_environment(subject: GenesisSubject, parent: dict[str, str] | None = N
             "SUZKA_CONFIG_PATH": str(subject.config_path),
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
+            "HOME": str(child_home(subject)),
+            "XDG_CONFIG_HOME": str(child_home(subject) / ".config"),
+            "XDG_CACHE_HOME": str(child_home(subject) / ".cache"),
+            "XDG_DATA_HOME": str(child_home(subject) / ".local" / "share"),
+            "XDG_STATE_HOME": str(child_home(subject) / ".local" / "state"),
         }
     )
+    if hf_home is not None:
+        env["HF_HOME"] = str(hf_home)
     return env
+
+
+def _die_with_parent() -> None:  # pragma: no cover - runs in the forked child
+    """Linux: SIGKILL this child when its parent dies (PR_SET_PDEATHSIG)."""
+
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)
+    except (OSError, AttributeError):
+        pass
 
 
 def process_start_ticks(pid: int) -> int | None:
@@ -98,6 +129,7 @@ class ChildProcess:
         provider_config: dict[str, Any] | None = None,
         log_path: Path | None = None,
     ) -> ChildProcess:
+        check_modes(provider, actor, human_launch=False)  # before any child exists
         if subject.tier is not Tier.T2:
             raise GuardRefusal("NOT_A_T2_SUBJECT", subject.run_id)
         guards.check_marker(subject.root, subject.run_id)
@@ -110,6 +142,7 @@ class ChildProcess:
             subject.provider_config.write_text(json.dumps(provider_config), encoding="utf-8")
             os.chmod(subject.provider_config, 0o600)
             command += ["--provider-config", str(subject.provider_config)]
+        child_home(subject).mkdir(mode=0o700, exist_ok=True)
         log = open(log_path or subject.run_dir / "serve.log", "ab")
         try:
             process = subprocess.Popen(
@@ -120,6 +153,7 @@ class ChildProcess:
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                preexec_fn=_die_with_parent if sys.platform.startswith("linux") else None,
             )
         finally:
             log.close()

@@ -67,6 +67,10 @@ def check_production_prefix(path: Path, *, repo: Path | None = None) -> Path:
     checkout = Path(os.path.realpath((repo or repo_root()) / ".suzka"))
     if _is_inside(resolved, checkout):
         raise GuardRefusal("REPOSITORY_STATE_PATH", str(checkout))
+    # The operator's own state directory, even when no journal exists there.
+    for home_state in {Path.home() / ".suzka", Path(os.path.realpath(Path.home() / ".suzka"))}:
+        if _is_inside(resolved, home_state):
+            raise GuardRefusal("HOME_STATE_PATH", str(home_state))
     return resolved
 
 
@@ -203,7 +207,11 @@ def check_settings_network(settings: Any) -> int:
     check_loopback_host(settings.api.host)
     port = check_port(settings.api.port)
     for origin in settings.r18.approval_origins:
-        if urlsplit(origin).port in FORBIDDEN_PORTS:
+        try:
+            origin_port = urlsplit(origin).port
+        except ValueError as error:
+            raise GuardRefusal("PORT_INVALID", f"approval origin {origin}") from error
+        if origin_port in FORBIDDEN_PORTS:
             raise GuardRefusal("PORT_FORBIDDEN", f"approval origin {origin}")
     return port
 

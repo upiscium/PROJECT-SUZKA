@@ -320,3 +320,17 @@ def test_the_harness_never_calls_the_approval_owner_and_stays_outside_suzka_stat
         ), path
     # the stand-in imports no R18 contract: its recomputation is independent
     assert not any(name.startswith("suzka.r18") for name in _imports(ROOT / "experiments" / "r20" / "approval.py"))
+
+
+def test_the_operators_own_state_directory_is_refused_even_without_a_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert refusal_code(guards.check_production_prefix, tmp_path / ".suzka" / "lab") == "HOME_STATE_PATH"
+    assert refusal_code(guards.resolve_base, tmp_path / ".suzka" / "base") == "HOME_STATE_PATH"
+    assert not (tmp_path / ".suzka").exists()
+
+
+def test_an_unparsable_approval_origin_port_is_a_guard_refusal(r20_base: Path) -> None:
+    subject = create_subject("NEG-plain", base=r20_base)
+    settings = subject.settings()
+    bad = settings.model_copy(update={"r18": settings.r18.model_copy(update={"approval_origins": ["http://localhost:99999"]})})
+    assert refusal_code(guards.check_settings_network, bad) == "PORT_INVALID"

@@ -21,6 +21,7 @@ from experiments.r20.client import (
     BoundClient,
     Destination,
     DestinationMismatch,
+    DestinationNoAnswer,
     Recorder,
 )
 from experiments.r20.control import COMMANDS, ControlError, ControlServer, send, validate_request
@@ -418,9 +419,10 @@ def test_a_child_that_has_not_bound_its_port_yet_gets_nothing(r20_base: Path) ->
     server.start()
     listener = _Listener(subject.port)  # something else already holds the port
     try:
-        with pytest.raises(DestinationMismatch):
-            _post(BoundClient(_destination(subject), subject.subject_json))
-        assert listener.connections == 0
+        client = BoundClient(_destination(subject), subject.subject_json)
+        with pytest.raises(DestinationNoAnswer):
+            _post(client)
+        assert listener.connections == 0 and client.label is None  # retryable, not marked
     finally:
         listener.close()
         server.stop()
@@ -430,3 +432,59 @@ def test_a_run_id_must_be_plain_ascii_alphanumeric(r20_base: Path) -> None:
     for bad in ("a/b", "²", "x" * 40, "a b"):
         with pytest.raises(GuardRefusal):
             create_subject("NEG-plain", base=r20_base, run_id=bad)
+
+
+def test_a_slow_status_is_no_answer_not_a_permanent_mismatch(r20_base: Path) -> None:
+    subject = create_subject("NEG-plain", base=r20_base, tier=Tier.T2)
+    _record(subject)
+    release = threading.Event()
+
+    def status(_a: Any) -> dict[str, Any]:
+        if not release.is_set():
+            time.sleep(0.3)  # a heavy inspect() or a long r15_review
+        return {"port": subject.port, "pid": os.getpid(), "run_id": subject.run_id,
+                "journal_lineage_id": LINEAGE, "ready": True}
+
+    server = ControlServer(subject.control_socket, {"status": status, "r15_review": lambda _a: {}, "quit": lambda _a: {}})
+    server.start()
+    child = _Listener(subject.port)
+    try:
+        client = BoundClient(_destination(subject), subject.subject_json)
+        import experiments.r20.client as client_module
+
+        real = client_module.control_send
+        client_module.control_send = lambda path, request, timeout_s=5: real(path, request, timeout_s=0.05)
+        try:
+            with pytest.raises(DestinationNoAnswer):
+                _post(client)
+        finally:
+            client_module.control_send = real
+        assert child.connections == 0 and client.label is None
+        release.set()
+        time.sleep(0.4)  # let the slow handler finish
+        assert _post(client).status == 200 and child.connections == 1
+    finally:
+        child.close()
+        server.stop()
+
+
+def test_the_child_environment_has_a_disposable_home_and_no_hf_home(r20_base: Path) -> None:
+    subject = create_subject("NEG-plain", base=r20_base, tier=Tier.T2)
+    parent = {"PATH": "/bin", "HOME": "/home/operator", "HF_HOME": "/home/operator/hf", "XDG_CACHE_HOME": "/home/operator/.cache"}
+    env = child_environment(subject, parent)
+    assert Path(env["HOME"]).is_relative_to(subject.run_dir) and "HF_HOME" not in env
+    for name in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"):
+        assert Path(env[name]).is_relative_to(subject.run_dir)
+    assert "/home/operator" not in " ".join(env.values())
+    assert child_environment(subject, parent, hf_home=Path("/models/hf"))["HF_HOME"] == "/models/hf"
+
+
+def test_spawn_refuses_a_real_provider_misuse_before_any_child(r20_base: Path) -> None:
+    from experiments.r20.provider import ApprovalActor, ProviderMode
+
+    subject = create_subject("NEG-plain", base=r20_base, tier=Tier.T2)
+    before = len(ChildProcess._live)
+    for provider, actor in ((ProviderMode.REAL, ApprovalActor.SCRIPTED), (ProviderMode.REAL, ApprovalActor.HUMAN)):
+        with pytest.raises(GuardRefusal):
+            ChildProcess.spawn(subject, provider=provider, actor=actor)
+    assert len(ChildProcess._live) == before and not (subject.run_dir / "serve.log").exists()

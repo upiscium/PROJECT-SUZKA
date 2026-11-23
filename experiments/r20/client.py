@@ -151,6 +151,14 @@ class DestinationMismatch(GuardRefusal):
         super().__init__("DESTINATION_MISMATCH", detail)
 
 
+class DestinationNoAnswer(GuardRefusal):
+    """The child did not answer in time or is not ready yet: retryable, the
+    client stays usable, and nothing was sent meanwhile."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__("DESTINATION_NO_ANSWER", detail)
+
+
 class BoundClient:
     """The only HTTP client the harness uses against a T2 child."""
 
@@ -188,8 +196,12 @@ class BoundClient:
             raise self._refuse("port or run differs from the factory record")
         try:
             reply, server_pid = control_send(dest.control_socket, {"cmd": "status"}, timeout_s=5)
+        except TimeoutError as error:  # slow status: retryable, still sends nothing
+            raise DestinationNoAnswer("status timed out") from error
         except (OSError, ValueError, GuardRefusal) as error:
             raise self._refuse("control channel does not answer") from error
+        if reply.get("ok") is True and reply.get("ready") is False:
+            raise DestinationNoAnswer("the child is not ready yet")
         if (
             reply.get("ok") is not True
             or reply.get("ready") is not True  # the child has bound its port
@@ -282,6 +294,7 @@ __all__ = [
     "BoundClient",
     "Destination",
     "DestinationMismatch",
+    "DestinationNoAnswer",
     "HttpClient",
     "HttpResult",
     "Recorder",
