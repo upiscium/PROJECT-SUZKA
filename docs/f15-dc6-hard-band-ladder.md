@@ -61,3 +61,11 @@ running) or `HARD_STUCK` (see `dc_hard_reason`: a compaction reason,
 `ladder_empty`, `ladder_exhausted`, `run_at_idle_timeout`) with
 `dc_reason = journal_hard_limit`, while the subject is SERVING or RECONCILING.
 Chat stays refused (503) for new events until the band is cleared.
+
+## Bounds
+
+The per-step 60 s bounds the wait for the Runtime to become idle, not the
+compaction itself (an in-flight compaction cannot be interrupted). A cycle
+teardown waits for the watcher thread; one that does not end is reported by the
+stop proof (`threads_not_stopped`). `hard_band.jsonl` is append-only and is not
+rotated.

@@ -184,8 +184,8 @@ class HardBandWatcher:
             try:
                 self.tick()
             except Exception as error:  # the watcher never dies silently
+                # Not provable: log only; never show HARD_STUCK for it.
                 LOGGER.warning("HARD-band watcher tick failed: %s", type(error).__name__)
-                self._stuck(f"watcher_error:{type(error).__name__}")
             if self._stop.wait(self._poll_s):
                 return
 
@@ -231,9 +231,16 @@ class HardBandWatcher:
             started = self._runtime_started()
             before = self._live_bytes()
             reason, performed = self._attempt(days, started)
+            if reason == "stopped":
+                return  # a teardown asked us to end: no audit line, no state
             self._log_attempt(days, reason, performed, before, started)
             if performed:
                 self._status.note_hard_window(days)
+                LOGGER.warning(
+                    "HARD-band ladder archived under a %d-day retention window; "
+                    "the window does not return by itself",
+                    days,
+                )
                 if not self._still_hard():
                     self._cleared(started)
                     return
