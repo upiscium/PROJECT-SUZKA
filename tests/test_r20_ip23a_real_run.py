@@ -238,8 +238,8 @@ def test_the_fixed_launch_stops_when_the_stop_file_appears_and_records_the_reaso
     assert launch(lab, "G1") == 1
     assert time.monotonic() - started < 15
     result = json.loads(next(lab["base"].glob("results-G1-*.json")).read_text())
-    assert result["stop_reason"] == "interrupted"
-    assert [row["reason"] for row in Ledger(lab["base"]).rows() if row["kind"] == "end"] == ["interrupted"]
+    assert result["stop_reason"] == "STOP_FILE"
+    assert [row["reason"] for row in Ledger(lab["base"]).rows() if row["kind"] == "end"] == ["STOP_FILE"]
     assert signal.getsignal(signal.SIGINT) is signal.default_int_handler  # the handlers were restored
 
 
