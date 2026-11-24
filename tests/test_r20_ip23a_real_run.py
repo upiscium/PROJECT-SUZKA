@@ -237,13 +237,14 @@ def test_the_fixed_launch_stops_when_the_stop_file_appears_and_records_the_reaso
         return {}
 
     monkeypatch.setattr(real_run, "dispatch", dispatch)
+    before_handler = signal.getsignal(signal.SIGINT)
     started = time.monotonic()
     assert launch(lab, "G1") == 1
     assert time.monotonic() - started < 15
     result = json.loads(next(lab["base"].glob("results-G1-*.json")).read_text())
     assert result["stop_reason"] == "STOP_FILE"
     assert [row["reason"] for row in Ledger(lab["base"]).rows() if row["kind"] == "end"] == ["STOP_FILE"]
-    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler  # the handlers were restored
+    assert signal.getsignal(signal.SIGINT) is before_handler  # the handlers were restored
 
 
 def test_a_refusal_inside_a_stage_is_recorded_as_its_reason(lab: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
