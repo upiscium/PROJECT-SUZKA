@@ -303,7 +303,7 @@ def _run_stage(args: argparse.Namespace, *, attest: Attest, gpu_runner: Any, loc
             reason = stopper.reason or "interrupted"
         except GuardRefusal as refusal:
             reason = refusal.code
-            payload = {"refused": refusal.code}
+            payload = {"refused": refusal.code, **({"detail": refusal.detail} if refusal.detail else {})}
         except BaseException as error:  # an unexpected failure is recorded, and the results are still written
             reason = f"crashed:{type(error).__name__}"
             payload = {"exception": type(error).__name__}

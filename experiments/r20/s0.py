@@ -22,12 +22,13 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any
 
 from experiments.r15_p0.pilot import Case, seal_case
-from experiments.r15_p1.protocol import run_trial
+from experiments.r15_p1.protocol import TrialRefused, run_trial
 from experiments.r20 import factory
 from experiments.r20.approval import ApprovalOperator
 from experiments.r20 import artifacts
@@ -511,11 +512,23 @@ class S0Session:
                 reviews["S1"] = self.review("S1")
             data = self.chat(message)
             self.experience_ids.append(str(data["experience_id"]))
-            return {"episode_id": str(data["episode_id"]), "response": str(data["response"])}
+            reply = {"episode_id": str(data["episode_id"]), "response": str(data["response"])}
+            if self.real:  # model text stays in the private directory, one line per turn, as it arrives
+                self._keep_turn(len(self.experience_ids), message, reply["response"])
+            return reply
 
-        run_trial(seal, capture, transport)
+        try:
+            run_trial(seal, capture, transport)
+        except TrialRefused as refusal:  # the reason is coarse by contract (no transcript, path or id)
+            raise GuardRefusal("P1_PROTOCOL_REFUSED", f"{refusal}; turns_answered={len(self.experience_ids)}") from refusal
         reviews["S2"] = self.review("S2")
         return reviews
+
+    def _keep_turn(self, ordinal: int, request: str, response: str) -> None:
+        path = self.capture_dir / "p1.turns.jsonl"
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"ordinal": ordinal, "request": request, "response": response}, ensure_ascii=False) + "\n")
 
     def review(self, stage: str) -> dict[str, Any]:
         started = time.monotonic()
