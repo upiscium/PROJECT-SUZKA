@@ -280,6 +280,17 @@ def test_a_refusal_inside_a_stage_is_recorded_as_its_reason(lab: dict[str, Any],
     assert result["stop_reason"] == "TURN_CAP_EXCEEDED" and result["refused"] == "TURN_CAP_EXCEEDED"
 
 
+def test_the_results_file_records_the_protocol_refusal_and_its_detail_without_transcript_text(lab: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    def dispatch(ctx: drivers.RunContext, stage: str, content: dict[str, Any]) -> dict[str, Any]:
+        raise GuardRefusal("P1_PROTOCOL_REFUSED", "S1 reply is not canonical JSON; turns_answered=3")
+
+    monkeypatch.setattr(real_run, "dispatch", dispatch)
+    assert launch(lab, "S0") == 1
+    result = json.loads(next(lab["base"].glob("results-S0-*.json")).read_text())
+    assert result["stop_reason"] == "P1_PROTOCOL_REFUSED" and result["refused"] == "P1_PROTOCOL_REFUSED"
+    assert result["detail"] == "S1 reply is not canonical JSON; turns_answered=3"
+
+
 def test_the_stop_command_writes_the_stop_file(lab: dict[str, Any]) -> None:
     assert real_run.main(["stop", "--base", str(lab["base"])]) == 0
     assert (lab["base"] / real_run.STOP_FILE).exists()

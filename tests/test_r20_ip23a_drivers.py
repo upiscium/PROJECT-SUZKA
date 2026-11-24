@@ -344,3 +344,47 @@ def test_f1_subject_creation_for_a_real_model_goes_through_the_one_choke_point(r
     assert refusal_code(ctx.new_session, "F1", stage="F1") == "STAGE_B_NOT_RELEASED"
     assert refusal_code(drivers.run_f1_member, ctx, 1, "NEUTRAL", None) == "STAGE_B_NOT_RELEASED"
     assert [p for p in r20_base.iterdir()] == [] and not ctx.sessions
+
+
+# ------------------------------------------- the protocol refusal is diagnosable
+
+
+def _answering(session: S0Session, replies: list[str]) -> None:
+    """Replace the chat route with fixed replies (no child, no model)."""
+
+    answers = iter(replies)
+
+    def chat(text: str) -> dict[str, Any]:
+        n = len(session.experience_ids) + 1
+        return {"experience_id": f"x{n}", "episode_id": f"e{n}", "response": next(answers)}
+
+    session.chat = chat  # type: ignore[method-assign]
+
+
+def test_a_non_json_s1_reply_is_a_protocol_refusal_with_a_coarse_reason_and_the_turn_count(r20_base: Path) -> None:
+    session = real_context(r20_base, gpu_check=lambda: None).new_session("S0", stage="G1")
+    _answering(session, ["SECRET-A", "SECRET-B", "not json SECRET-C"])
+    with pytest.raises(GuardRefusal) as refused:
+        session.run_r15_protocol()
+    assert refused.value.code == "P1_PROTOCOL_REFUSED"
+    assert refused.value.detail == "malformed JSON record; turns_answered=3"
+    assert "SECRET" not in refused.value.detail
+
+
+def test_a_real_session_keeps_each_turn_in_a_private_0600_file_and_a_scripted_one_writes_none(r20_base: Path) -> None:
+    session = real_context(r20_base, gpu_check=lambda: None).new_session("S0", stage="G1")
+    _answering(session, ["SECRET-A", "SECRET-B", "not json SECRET-C"])
+    with pytest.raises(GuardRefusal):
+        session.run_r15_protocol()
+    turns = session.capture_dir / "p1.turns.jsonl"
+    assert session.capture_dir == session.subject.run_dir / "private" and stat.S_IMODE(turns.stat().st_mode) == 0o600
+    rows = [json.loads(line) for line in turns.read_text().splitlines()]
+    assert [row["ordinal"] for row in rows] == [1, 2, 3]
+    assert [row["response"] for row in rows] == ["SECRET-A", "SECRET-B", "not json SECRET-C"]
+    assert not list(session.subject.evidence_dir.glob("*turns*"))
+
+    plain = scripted(r20_base).new_session("S0", stage="G1")
+    _answering(plain, ["A", "B", "not json"])
+    with pytest.raises(GuardRefusal):
+        plain.run_r15_protocol()
+    assert not list(plain.subject.run_dir.rglob("p1.turns.jsonl"))
