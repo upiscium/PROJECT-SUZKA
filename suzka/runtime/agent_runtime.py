@@ -316,6 +316,41 @@ class AgentRuntime:
                 and not self._admission_in_progress
             )
 
+    def run_at_idle(self, fn: Callable[[], object], timeout_s: float) -> bool:
+        """Run ``fn`` while the runtime is idle and nothing can be admitted.
+
+        F15 DC-6 (D1 sec. 5.4): the HARD band admits no event, so no terminal
+        completion ever reaches the compaction that runs there; maintenance
+        has to run when the worker is idle.  Waits up to ``timeout_s`` for
+        "accepting, nothing pending, nothing active, no admission in progress",
+        then runs ``fn`` UNDER the runtime's condition lock: ``submit`` blocks
+        for the duration, so no event interleaves with ``fn``.  Lock order is
+        the same as ``submit`` (runtime condition, then Journal lock).
+
+        Returns False without running ``fn`` on a timeout or when the runtime
+        is not accepting (never started, draining, stopped or failed).  An
+        exception ``fn`` raises propagates (the lock is released).  Must not
+        be called from the worker thread or from an admission collaborator
+        (it would wait for itself)."""
+
+        with self._condition:
+            if current_thread() is self._worker:
+                raise RuntimeError("run_at_idle cannot run on the runtime worker")
+
+            def idle_or_gone() -> bool:
+                return self._status is not AgentRuntimeStatus.ACCEPTING or (
+                    not self._pending
+                    and self._active is None
+                    and not self._admission_in_progress
+                )
+
+            if not self._condition.wait_for(idle_or_gone, max(0.0, timeout_s)):
+                return False
+            if self._status is not AgentRuntimeStatus.ACCEPTING:
+                return False
+            fn()
+            return True
+
     def current_event(self) -> AgentEvent | None:
         """Return the event only while its handler runs on the worker thread."""
 
