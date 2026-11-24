@@ -39,6 +39,17 @@ Bounds and what is NOT bounded (stated, not hidden):
 * The teardown proof waits ``T_teardown_max + T_term_grace`` from the stop
   request; one non-interruptible syscall inside the teardown is not bounded by
   this code.
+* Known violations, stated: a build that never returns stays at
+  ``REFUSED_RUNNING(boot_timeout)`` (opt-in ``exit_on_boot_timeout`` ends the
+  process non-zero, default off; the legacy start hangs too).  A request in
+  flight across a cycle's ``app.state`` reset may get a 500.  While the subject
+  is not SERVING an OPTIONS preflight gets the plain 503 without CORS headers
+  (the phase middleware is outermost).  In ``continue`` mode shutdown is capped
+  at ``T_shutdown_join`` (the legacy lifespan waited without a bound).
+* The model provider is reused only across cycles that never SERVED (no route
+  or Runtime could have attached an adapter; ``attach_adapter`` wraps the model
+  on every call, it is not idempotent); a provider that served is ``release()``d
+  and rebuilt.  Not measured: model load time, GPU memory release.
 * ``T_failed_to_serving_max`` (400 s) holds only without a stuck thread and
   with a build that stays inside ``T_boot_max``; with a stuck thread the state
   is terminal instead.
@@ -77,12 +88,14 @@ from suzka.runtime.degraded_continuation import (
 )
 
 __all__ = [
+    "EXIT_CODE_BOOT_TIMEOUT",
     "EXIT_CODE_THREADS_NOT_STOPPED",
     "ReadyReport",
     "SubjectPhaseMiddleware",
     "SubjectSupervisor",
     "Timebase",
     "failed_to_serving_bound_s",
+    "normal_failed_to_serving_s",
     "hard_exit",
     "phase_detail",
 ]
@@ -91,6 +104,8 @@ LOGGER = logging.getLogger(__name__)
 
 #: ``EX_SOFTWARE``: the process ends because it cannot recover in-process.
 EXIT_CODE_THREADS_NOT_STOPPED = 70
+#: ``exit_on_boot_timeout``: a build that never finished within ``T_boot_max``.
+EXIT_CODE_BOOT_TIMEOUT = 71
 
 CYCLE_THREAD_NAME = "suzka-dc-cycle"
 SUPERVISOR_THREAD_NAME = "suzka-dc-supervisor"
@@ -104,9 +119,23 @@ _JOIN_SLACK_S = 0.5
 
 
 def failed_to_serving_bound_s(settings: DegradedContinuationSettings) -> float:
-    """``T_failed_to_serving_max`` (D1 sec. 3): the worst normal teardown (the
-    bounded joins, 150 s) + the first restart back-off (1 s) + ``T_boot_max``.
-    With the defaults 391 s, inside the stated 400 s."""
+    """Worst case from a Runtime FAILED observation to the next SERVING with a
+    slow-but-exiting teardown: ``T_teardown_max`` + ``T_term_grace`` (the proof
+    window, 270 s) + the first restart back-off (1 s) + ``T_boot_max`` (240 s)
+    = 511 s with the defaults.  The D1's 400 s (``T_failed_to_serving_max``) is
+    the NORMAL case: a teardown that takes the bounded joins' 150 s
+    (``normal_failed_to_serving_s``, 391 s)."""
+
+    return (
+        float(settings.t_teardown_max_s)
+        + T_TERM_GRACE_SECONDS
+        + restart_delay(0)
+        + float(settings.t_boot_max_s)
+    )
+
+
+def normal_failed_to_serving_s(settings: DegradedContinuationSettings) -> float:
+    """The D1's 400 s bound: the bounded joins (150 s) + back-off + build."""
 
     return _BOUNDED_JOINS_S + restart_delay(0) + float(settings.t_boot_max_s)
 
@@ -189,6 +218,9 @@ class _Cycle:
         self.restart_reason: str | None = None
         self.shutdown_signal = False
         self.exit_label: str | None = None
+        #: True once the supervisor published SERVING for this cycle: from then
+        #: on routes and the Runtime may have changed the provider (adapters).
+        self.served = False
         self.teardown_label: str | None = None
 
 
@@ -504,6 +536,7 @@ class SubjectSupervisor:
                 failed_at=failed_at,
             )
         self._publish(DcState.SERVING)
+        handle.served = True
         serving_since = self._tb.now()
         reeval_n = 0
         if failed_at is not None:
@@ -591,6 +624,10 @@ class SubjectSupervisor:
             )
             self._publish(DcState.REFUSED_RUNNING, "boot_timeout")
             with self._cv:
+                stopping = self._stopping
+            if self._settings.exit_on_boot_timeout and not stopping:
+                self._exit_fn(EXIT_CODE_BOOT_TIMEOUT)
+            with self._cv:
                 self._tb.wait_for(self._cv, settled, None)
         with self._cv:
             if self._stopping:
@@ -656,7 +693,14 @@ class SubjectSupervisor:
             target=self._cycle_thread, args=(handle,), name=CYCLE_THREAD_NAME, daemon=True
         )
         handle.thread = thread
-        thread.start()
+        try:
+            thread.start()
+        except Exception as error:  # thread exhaustion: a refusal, not a 270 s wait
+            failure = classify_cycle_exception(error)
+            with self._cv:
+                handle.failure = failure
+                handle.done = True
+                self._cv.notify_all()
         return handle
 
     def _reset_app_state(self) -> None:
@@ -665,8 +709,30 @@ class SubjectSupervisor:
         Called only after the previous cycle is proven stopped."""
 
         values = self._state._state
+        keep: dict[str, object] = {}
+        provider = values.get("model_provider")
+        previous = self._handle
+        if provider is not None and "model_provider" not in self._baseline:
+            if previous is not None and not previous.served:
+                # A cycle that never SERVED cannot have changed the provider:
+                # every route was a 503 and the Runtime never started, so no
+                # adapter was attached.  Reuse it: a RECONCILING / refused
+                # re-evaluation must not reload a multi-GB model every tick.
+                keep["model_provider"] = provider
+            else:
+                # It may carry an attached adapter that a fresh start would not
+                # have (``attach_adapter`` wraps the model each time, it is not
+                # idempotent): release it explicitly and build a new one.
+                releaser = getattr(provider, "release", None)
+                if callable(releaser):
+                    try:
+                        releaser()
+                    except Exception:
+                        LOGGER.warning("the model provider did not release cleanly")
         for key in [key for key in values if key not in self._baseline]:
             values.pop(key, None)
+        values.update(keep)
+        del provider
         gc.collect()
 
     def _abandon_cycle(self) -> None:

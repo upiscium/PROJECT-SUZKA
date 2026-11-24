@@ -131,6 +131,38 @@ from suzka.runtime.semantic_receipt_retention import (
 )
 
 
+def _stop_leftover_owners(app: FastAPI) -> None:
+    """A supervised cycle's teardown is a plain sequence: one ``stop()`` that
+    raises skips every later one.  Here, on the same (cycle) thread and before
+    the Journal is closed, every owner that still has a live thread gets one
+    more idempotent ``stop()`` / ``shutdown()``, each in its own try / except,
+    producers first and the Runtime last.  A no-op after a clean teardown (no
+    owner has a live thread).  A thread that really is stuck stays alive and
+    is then reported by the supervisor's stop proof."""
+
+    log = logging.getLogger(__name__)
+    owners: list[object] = []
+    for owner in list(app.state._state.values()):
+        accessor = getattr(owner, "threads_alive", None)
+        if not callable(accessor):
+            continue
+        try:
+            alive = accessor()
+        except Exception:
+            alive = ("unknown",)
+        if alive:
+            owners.append(owner)
+    owners.sort(key=lambda owner: "runtime" in type(owner).__name__.lower())
+    for owner in owners:
+        stopper = getattr(owner, "stop", None) or getattr(owner, "shutdown", None)
+        if not callable(stopper):
+            continue
+        try:
+            stopper()
+        except Exception:
+            log.warning("leftover stop of %s failed", type(owner).__name__)
+
+
 def _release_cycle_resources(app: FastAPI) -> None:
     """Idempotent failure-path cleanup of a supervised cycle (D1 sec. 5.3
     item 8): close the SubjectHistory store (the cycle body closes it only on
@@ -1486,6 +1518,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             async with _subject_cycle(app):
                 yield
         finally:
+            _stop_leftover_owners(app)
             _release_cycle_resources(app)
 
     def _ready_report(app: FastAPI) -> ReadyReport:

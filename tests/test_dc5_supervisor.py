@@ -43,7 +43,9 @@ from suzka.api.supervisor import (
     SubjectPhaseMiddleware,
     SubjectSupervisor,
     ReadyReport,
+    EXIT_CODE_BOOT_TIMEOUT,
     failed_to_serving_bound_s,
+    normal_failed_to_serving_s,
     phase_detail,
 )
 from suzka.config import Settings, load_settings
@@ -641,7 +643,7 @@ def test_a_teardown_of_140_virtual_seconds_is_not_threads_not_stopped() -> None:
         assert elapsed is not None
         # FAILED observed -> teardown (140) + back-off (1) + build (90), all
         # inside T_failed_to_serving_max, measured from the FAILED observation.
-        assert 140 + 1 + 90 <= elapsed <= 400
+        assert 140 + 1 + 90 <= elapsed <= 400  # a 140 s teardown is still "normal"
         assert elapsed <= failed_to_serving_bound_s(sup._settings) + 1.0
     finally:
         sup.shutdown(timeout=2.0)
@@ -649,7 +651,10 @@ def test_a_teardown_of_140_virtual_seconds_is_not_threads_not_stopped() -> None:
 
 def test_the_stated_bounds_add_up() -> None:
     settings = DegradedContinuationSettings()
-    assert failed_to_serving_bound_s(settings) == 391.0 <= 400.0
+    # D1's 400 s is the NORMAL case (the bounded joins, 150 s); a slow-but-exiting
+    # teardown may use the whole proof window: 240 + 30 + 1 + 240.
+    assert normal_failed_to_serving_s(settings) == 391.0 <= 400.0
+    assert failed_to_serving_bound_s(settings) == 511.0
     assert settings.t_teardown_max_s >= 150 + 90  # joins, then the two unbounded
     assert settings.t_boot_max_s == 240
 
@@ -944,7 +949,10 @@ def test_the_supervisor_module_never_opens_a_subject_history_store() -> None:
 
 def test_every_thread_creating_site_has_a_threads_alive_owner() -> None:
     sites: dict[str, int] = {}
-    pattern = re.compile(r"(?<![A-Za-z_])(?:threading\.)?(Thread|Timer)\(")
+    pattern = re.compile(
+        r"(?<![A-Za-z_])(?:threading\.)?(Thread|Timer)\(|ThreadPoolExecutor|"
+        r"to_thread\(|run_in_executor\(|multiprocessing|subprocess\."
+    )
     for path in sorted((ROOT / "suzka").rglob("*.py")):
         count = 0
         for line in path.read_text().splitlines():
@@ -953,21 +961,234 @@ def test_every_thread_creating_site_has_a_threads_alive_owner() -> None:
                 count += 1
         if count:
             sites[path.relative_to(ROOT).as_posix()] = count
-    owners = {
-        "suzka/runtime/agent_runtime.py": "agent_runtime",
-        "suzka/runtime/emotion_timer.py": "emotion_timer",
-        "suzka/r16/driver.py": "r16_driver",
-        "suzka/r19/scheduler.py": "wake_scheduler",
-        "suzka/r18/approval_owner.py": "approval_owner",
-        "suzka/r18/executor.py": "r18_executor",
-    }
-    # the supervisor's own two threads are covered by the cycle-thread check
-    # of the proof (and the control thread is the one doing the proving)
-    sites.pop("suzka/api/supervisor.py")
-    assert set(sites) == set(owners), (
-        "a new Thread/Timer site needs an owner with threads_alive() that "
-        "lives in app.state (the termination proof finds owners by that method)"
+    # The supervisor's own control / cycle threads are proven by the cycle-thread
+    # check of the proof; server.py's single run_in_executor is the supervised
+    # lifespan's shutdown call (it runs supervisor.shutdown, no owned thread).
+    assert sites.pop("suzka/api/supervisor.py") == 2
+    assert sites.pop("suzka/api/server.py") == 1
+    # Pinned per file WITH counts: a new site (or a new kind of site) in an
+    # owner fails here until it is registered in that owner's ThreadLedger.
+    assert sites == {
+        "suzka/runtime/agent_runtime.py": 1,
+        "suzka/runtime/emotion_timer.py": 1,
+        "suzka/r16/driver.py": 1,
+        "suzka/r19/scheduler.py": 1,
+        "suzka/r18/approval_owner.py": 2,
+        "suzka/r18/executor.py": 2,
+    }, (
+        "a new thread site needs an owner with threads_alive() that lives in "
+        "app.state (the termination proof finds owners by that method)"
     )
+
+
+# --------------------------------------------- provider reuse / boot / launch
+
+
+class _Provider:
+    def __init__(self) -> None:
+        self.released = False
+
+    def release(self) -> None:
+        self.released = True
+
+
+def _provider_step(made: list[_Provider], *, serving: bool = True) -> Step:
+    def build(app: Any, cycles: ScriptedCycles, n: int) -> None:
+        provider = getattr(app.state, "model_provider", None)
+        if provider is None:
+            provider = _Provider()
+            made.append(provider)
+            app.state.model_provider = provider
+
+    return Step(build=build, serving=serving)
+
+
+def test_a_provider_of_a_cycle_that_never_served_is_reused_by_the_re_evaluation(
+    supervisors: Any,
+) -> None:
+    made: list[_Provider] = []
+    sup, cycles, _status, _app = make(
+        [_provider_step(made, serving=False), _provider_step(made, serving=False), _provider_step(made)]
+    )
+    supervisors(sup).start()
+    wait_until(phase_is(sup, SERVING))
+    assert cycles.launches == 3
+    assert len(made) == 1  # one model load for three cycles
+    assert not made[0].released
+
+
+def test_a_provider_that_served_is_released_and_rebuilt() -> None:
+    made: list[_Provider] = []
+    sup, cycles, _status, app = make([_provider_step(made)])
+    sup.start()
+    try:
+        wait_until(phase_is(sup, SERVING))
+        app.state.agent_runtime.fail()
+        wait_until(lambda: cycles.launches == 2 and sup.phase is SERVING)
+        assert len(made) == 2 and made[0].released and not made[1].released
+        assert app.state.model_provider is made[1]
+    finally:
+        sup.shutdown(timeout=2.0)
+
+
+def test_a_refused_start_keeps_the_provider_a_later_cycle_needs_not_rebuilt(
+    supervisors: Any,
+) -> None:
+    made: list[_Provider] = []
+    refuse_after = _provider_step(made)
+    refusing = Step(
+        build=lambda app, c, n: (
+            refuse_after.build(app, c, n),  # type: ignore[misc]
+            (_ for _ in ()).throw(RuntimeError("after the model load")),
+        )
+    )
+    sup, cycles, _status, _app = make([refusing, refusing, _provider_step(made)])
+    supervisors(sup).start()
+    wait_until(phase_is(sup, SERVING))
+    assert len(made) == 1  # not reloaded on each re-evaluation
+
+
+def test_exit_on_boot_timeout_is_opt_in(supervisors: Any) -> None:
+    for enabled in (False, True):
+        release = threading.Event()
+        exits: list[int] = []
+        sup, _cycles, _status, _app = make(
+            [Step(build=lambda a, c, n, r=release: r.wait(30))],
+            t_boot_max_s=0.2,
+            exit_on_boot_timeout=enabled,
+            exit_fn=exits.append,
+        )
+        sup.start()
+        try:
+            wait_until(phase_is(sup, DcState.REFUSED_RUNNING))
+            time.sleep(0.1)
+            assert exits == ([EXIT_CODE_BOOT_TIMEOUT] if enabled else [])
+        finally:
+            release.set()
+            sup.shutdown(timeout=2.0)
+
+
+def test_thread_exhaustion_at_launch_is_a_refusal_not_a_long_wait(
+    supervisors: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_start = threading.Thread.start
+    state = {"failed": False}
+
+    def start(self: threading.Thread) -> None:
+        if self.name == "suzka-dc-cycle" and not state["failed"]:
+            state["failed"] = True
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    sup, cycles, status, _app = make([ok()], reeval_delay=0.3, t_teardown_max_s=30.0)
+    supervisors(sup).start()
+    wait_until(phase_is(sup, DcState.REFUSED_RUNNING), timeout=3)
+    assert status.snapshot()["dc_reason"] == "builtins.RuntimeError"
+    assert not sup.terminal
+    wait_until(phase_is(sup, SERVING), timeout=5)
+
+
+# ------------------------------------------ real R18 executor: fencing, zombie
+
+
+def _real_target(tmp_path: Path) -> Any:
+    from test_r18_ip15_target_verifier import RUNTIME, _forward, _store
+
+    store = _store(tmp_path)
+    intent, challenge, claim = _forward(store)
+    return store, intent, challenge, claim, RUNTIME
+
+
+def test_dc5_zombie_executor_cannot_write_after_rotation(tmp_path: Path) -> None:
+    from dataclasses import replace as _replace
+
+    from suzka.r18.contracts import ExecutorResult
+    from suzka.r18.target import TargetStore, new_runtime_instance_id
+
+    store, intent, challenge, claim, _old = _real_target(tmp_path)
+    successor = TargetStore.open(store.path)
+    new_id = new_runtime_instance_id()
+    successor.rotate_runtime_instance(new_id)  # the new cycle's S1, first
+    now = lambda: __import__("datetime").datetime(2026, 11, 16, 0, 6, tzinfo=__import__("datetime").timezone.utc)  # noqa: E731
+    # the old cycle's executor wakes up late with its in-flight claim
+    late = store.forward_write(intent, challenge, claim, now=now)
+    assert late.executor_result is ExecutorResult.CAS_REJECTED
+    assert store.status(intent.obligation_group_key).artifact is None  # no effect
+    # the new cycle writes it once under its own id
+    fresh = _replace(claim, runtime_instance_id=new_id)
+    assert successor.forward_write(intent, challenge, fresh, now=now).executor_result is (
+        ExecutorResult.APPLIED
+    )
+    # and the zombie still cannot add a second one
+    again = store.forward_write(intent, challenge, claim, now=now)
+    assert again.executor_result is ExecutorResult.CAS_REJECTED
+    active = successor.status(intent.obligation_group_key).artifact
+    assert active is not None and active.revision == 1
+    successor.close()
+    store.close()
+
+
+def test_dc5_stuck_thread_ends_refused_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A REAL threaded R18 executor whose worker is blocked inside a job: the
+    legacy teardown abandons it after its join timeout, the thread proof sees
+    it, the state is terminal and no second cycle (no second executor) starts."""
+
+    from suzka.r18 import executor as executor_module
+    from suzka.r18.executor import R18Executor
+    from test_r18_ip18a_executor import ME, _World
+    from suzka.r16.history_reader import AdoptedRecords
+
+    monkeypatch.setattr(executor_module, "JOIN_TIMEOUT_SECONDS", 0.2)
+    world = _World(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_submit(claim_id: str) -> Any:
+        entered.set()
+        release.wait(60)
+        raise RuntimeError("released")
+
+    world.outcome._submit_outcome = blocked_submit  # type: ignore[method-assign]
+    executors: list[R18Executor] = []
+
+    def build(app: Any, cycles: ScriptedCycles, n: int) -> None:
+        executor = R18Executor(
+            target_path=world.path,
+            runtime_instance_id=ME,
+            gate=world.gate,
+            outcome_owner=world.outcome,
+            read_records=lambda: AdoptedRecords(world.blocked, tuple(world.records)),
+            has_exclusive_authority=lambda: True,
+        )
+        executors.append(executor)
+        app.state.r18_executor = executor
+        app.state.r18_gate = world.gate
+        executor.start()
+        executor.enqueue(world.claim)
+
+    def teardown(app: Any, cycles: ScriptedCycles, n: int) -> None:
+        app.state.r18_executor.stop()  # what the legacy teardown does
+
+    sup, cycles, status, app = make(
+        [Step(build=build, teardown=teardown), ok()], t_teardown_max_s=1.0
+    )
+    sup.start()
+    try:
+        wait_until(phase_is(sup, SERVING))
+        assert entered.wait(20), "the worker never entered the blocked job"
+        app.state.agent_runtime.fail()
+        wait_until(lambda: sup.terminal, timeout=20, what="terminal")
+        assert "suzka-r18-executor" in status.snapshot()["dc_reason"]
+        assert world.gate.state is not GateState.OPEN  # R18 closed
+        time.sleep(0.3)
+        assert cycles.launches == 1 and len(executors) == 1  # no second executor
+    finally:
+        release.set()
+        sup.shutdown(timeout=3.0)
+        world.close()
 
 
 # ====================================================== real app: helpers
@@ -1173,6 +1394,10 @@ def test_real_app_corrupt_journal_refuses_and_keeps_answering(
     with TestClient(app) as client:
         wait_until(phase_is(supervisor, DcState.REFUSED_RUNNING), timeout=60)
         wait_until(lambda: supervisor.cycles_launched >= 3, timeout=60)
+        # the Journal constructor failed: its lease is free between attempts
+        wait_until(phase_is(supervisor, DcState.REFUSED_RUNNING), timeout=60)
+        probe = EventJournalLease(settings.event_journal.path)
+        probe.close()
         assert client.get("/health").status_code == 200
         assert client.get("/health/dc").json()["dc_state"] in (
             "REFUSED_RUNNING",
@@ -1235,6 +1460,19 @@ def test_the_baseline_includes_what_the_mounted_apis_set_at_create_app(
     assert {"settings", "dc_status", "dc_supervisor", "inbox_limits"} <= (
         supervisor._baseline
     )
+
+
+def test_the_baseline_includes_the_approval_api_and_guard_keys(
+    tmp_path: Path, provider: SimpleNamespace
+) -> None:
+    base = _settings(tmp_path, mode="continue")
+    app = server.create_app(
+        base.model_copy(update={"r18": base.r18.model_copy(update={"enabled": True})})
+    )
+    supervisor: SubjectSupervisor = app.state.dc_supervisor
+    set_by_mounts = {"approval_guard_config", "approval_limits"}
+    assert set_by_mounts <= set(app.state._state)
+    assert set_by_mounts <= supervisor._baseline  # captured LAST, after the mounts
 
 
 def test_real_app_state_is_rebuilt_not_reused_across_a_restart(
@@ -1341,3 +1579,84 @@ def test_a_runtime_without_the_observer_behaves_as_before() -> None:
         failing._fail_stop_locked(phase=AgentRuntimeDurabilityPhase.ADMISSION)
     with pytest.raises(RuntimeError, match="cannot be restarted"):
         failing.start()
+
+
+# ======================================== real routes on the SERVER loop (P2-1)
+
+
+def _chat_and_reads(client: TestClient) -> None:
+    chat = client.post("/api/chat", json={"message": "hello", "attachments": []})
+    assert chat.status_code == 200, chat.text
+    assert client.get("/api/memory/search", params={"query": "hello"}).status_code == 200  # memory_system
+    assert client.get("/api/contexts").status_code == 200  # main_loop registry
+    assert client.get("/health").json()["status"] == "ok"
+
+
+def test_real_routes_work_on_the_server_loop_while_serving_and_after_a_restart(
+    tmp_path: Path, provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = server.create_app(_settings(tmp_path, mode="continue"))
+    supervisor = _fast(app)
+    with TestClient(app) as client:
+        assert supervisor.wait_serving(120)
+        _chat_and_reads(client)  # objects built on the cycle thread's loop
+        runtime = app.state.agent_runtime
+        monkeypatch.setattr(
+            app.state.event_journal,
+            "append_started",
+            lambda *a, **k: (_ for _ in ()).throw(OSError(5, "EIO")),
+        )
+        with pytest.raises(Exception):
+            runtime.submit(
+                AgentEventType.CHAT, AgentEventSource.API_CHAT, lambda: None
+            ).result(10)
+        wait_until(
+            lambda: supervisor.cycles_launched == 2 and supervisor.phase is SERVING,
+            timeout=120,
+        )
+        _chat_and_reads(client)  # and after the first loop was closed
+
+
+def test_a_teardown_step_that_raises_does_not_skip_the_later_stops(
+    tmp_path: Path, provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The legacy teardown is a plain sequence: the emotion timer's stop() is
+    before ``agent_runtime.shutdown()``.  A raise there used to leave the
+    Runtime worker alive and the supervisor in a permanent
+    REFUSED_RUNNING(threads_not_stopped); now the later owner is still stopped
+    and the next cycle starts."""
+
+    app = server.create_app(_settings(tmp_path, mode="continue"))
+    supervisor = _fast(app)
+    with TestClient(app):
+        assert supervisor.wait_serving(120)
+        first_runtime = app.state.agent_runtime
+        assert first_runtime.threads_alive() != ()
+
+        def boom() -> None:
+            raise RuntimeError("timer stop failed")
+
+        monkeypatch.setattr(app.state.emotion_timer, "stop", boom)
+        # a failure observation with the Runtime still ACCEPTING: the
+        # teardown runs the legacy sequence, which raises midway
+        with supervisor._cv:
+            supervisor._failed = True
+            supervisor._cv.notify_all()
+        wait_until(
+            lambda: supervisor.cycles_launched == 2 and supervisor.phase is SERVING,
+            timeout=120,
+            what="the next cycle after a raising teardown",
+        )
+        assert not supervisor.terminal
+        assert first_runtime.threads_alive() == ()
+        assert first_runtime.status is AgentRuntimeStatus.STOPPED
+
+
+def test_transformers_provider_release_drops_model_and_processor() -> None:
+    from suzka.models.transformers_provider import TransformersProvider
+
+    provider = object.__new__(TransformersProvider)
+    provider.model = object()  # type: ignore[assignment]
+    provider.processor = object()  # type: ignore[assignment]
+    provider.release()
+    assert provider.model is None and provider.processor is None
