@@ -216,6 +216,9 @@ class _Cycle:
         self.done = False
         self.failure: CycleFailure | None = None
         self.restart_reason: str | None = None
+        #: DC-6: a request from INSIDE a ready cycle (the HARD-band watcher) to
+        #: end it and start a new one at once; consumed by ``_after_ready``.
+        self.restart_request: str | None = None
         self.shutdown_signal = False
         self.exit_label: str | None = None
         #: True once the supervisor published SERVING for this cycle: from then
@@ -283,6 +286,11 @@ class SubjectSupervisor:
         self._last_reason: str | None = None
         self._exit_code: int | None = None
         self._failed_at: float | None = None
+        #: DC-6 (D1 P1-6): the instant HARD was first seen, in this supervisor's
+        #: time base.  Owned HERE, not by a cycle: a rebuilt cycle (a
+        #: RECONCILING re-evaluation, a Runtime restart) must not restart the
+        #: ``T_hard`` count.  Cleared only by an observation of a non-HARD band.
+        self._hard_since: float | None = None
         #: Seconds from the instant a Runtime FAILED was observed to the next
         #: SERVING, teardown included (the F15 bound ``T_failed_to_serving_max``).
         self.last_failed_to_serving_s: float | None = None
@@ -304,6 +312,43 @@ class SubjectSupervisor:
     @property
     def status(self) -> DegradedContinuationStatus:
         return self._status
+
+    @property
+    def hard_since(self) -> float | None:
+        with self._cv:
+            return self._hard_since
+
+    def now(self) -> float:
+        """The supervisor's clock (the watcher measures ``T_hard`` with it)."""
+
+        return self._tb.now()
+
+    def observe_hard_band(self, hard: bool) -> float | None:
+        """One observation of the Journal band from a cycle's watcher.  HARD
+        sets the origin if there is none; a non-HARD band clears it.  Returns
+        the origin (``None`` when not HARD)."""
+
+        with self._cv:
+            if not hard:
+                self._hard_since = None
+            elif self._hard_since is None:
+                self._hard_since = self._tb.now()
+            return self._hard_since
+
+    def request_cycle_restart(self, reason: str) -> bool:
+        """Ask for the live cycle to end and a new one to start at once (the
+        HARD ladder cleared the band while the Runtime was never started).
+        Not a failure; capped like ``CycleRestart``.  Returns False when no
+        cycle is live or a shutdown is under way."""
+
+        with self._cv:
+            handle = self._handle
+            if handle is None or handle.done or self._stopping:
+                return False
+            if handle.restart_request is None:
+                handle.restart_request = reason
+            self._cv.notify_all()
+            return True
 
     def capture_baseline(self) -> None:
         """Call once, at the very END of ``create_app`` (after every router
@@ -525,9 +570,33 @@ class SubjectSupervisor:
             self._publish(
                 DcState.RECONCILING, report.reason or "external_reconciliation_required"
             )
-            if self._sleep(self._reeval_delay(reeval_n)):
+            woken = self._sleep_or_restart_request(
+                handle, self._reeval_delay(reeval_n)
+            )
+            if woken == "stop":
                 self._end_for_shutdown(handle)
                 return _Outcome(finished=True)
+            if woken == "restart":
+                # DC-6: the ladder cleared the band; a new cycle starts the
+                # Runtime.  Counted against ``cycle_restart_cap`` like a
+                # ``CycleRestart``, and not a refusal.
+                restart_run += 1
+                if restart_run > int(self._settings.cycle_restart_cap):
+                    self._publish(DcState.RECONCILING, "cycle_restart_loop")
+                    return self._tear_down_then(
+                        handle,
+                        delay=self._reeval_delay(reeval_n),
+                        reeval_n=reeval_n + 1,
+                        restart_run=0,
+                        failed_at=failed_at,
+                    )
+                return self._tear_down_then(
+                    handle,
+                    delay=0.0,
+                    reeval_n=reeval_n,
+                    restart_run=restart_run,
+                    failed_at=failed_at,
+                )
             return self._tear_down_then(
                 handle,
                 delay=0.0,
@@ -608,6 +677,21 @@ class SubjectSupervisor:
 
         with self._cv:
             return self._tb.wait_for(self._cv, lambda: self._stopping, seconds)
+
+    def _sleep_or_restart_request(self, handle: _Cycle, seconds: float) -> str:
+        """The RECONCILING wait.  ``"stop"`` on a shutdown, ``"restart"`` when
+        this cycle's watcher asked for a new cycle, else ``"tick"`` after
+        ``seconds``."""
+
+        with self._cv:
+            self._tb.wait_for(
+                self._cv,
+                lambda: self._stopping or handle.restart_request is not None,
+                seconds,
+            )
+            if self._stopping:
+                return "stop"
+            return "restart" if handle.restart_request is not None else "tick"
 
     def _await_build(self, handle: _Cycle) -> str:
         def settled() -> bool:

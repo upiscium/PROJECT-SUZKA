@@ -65,7 +65,22 @@ class JournalCompactionCoordinator:
         self.consecutive_unperformed = 0
 
     def maybe_compact(self) -> EventJournalCompactionOutcome:
-        outcome = self._attempt()
+        return self._record(self._attempt(self.policy.retention_days))
+
+    def compact_with_window(self, retention_days: int) -> EventJournalCompactionOutcome:
+        """One attempt with ``retention_days`` instead of the policy's window
+        (F15 DC-6, the HARD-band ladder).  Same checks as ``maybe_compact``
+        (the Journal archives only whole rotated segments at a clean boundary,
+        the Semantic guard and the SubjectHistory attestation still apply); the
+        frozen policy is not changed, so the next ordinary compaction uses the
+        configured window again, and the segments this attempt archived stay
+        archived."""
+
+        return self._record(self._attempt(retention_days))
+
+    def _record(
+        self, outcome: EventJournalCompactionOutcome
+    ) -> EventJournalCompactionOutcome:
         self.last_outcome = outcome
         if outcome.performed or outcome.reason == "nothing_due":
             self.consecutive_unperformed = 0
@@ -78,18 +93,16 @@ class JournalCompactionCoordinator:
             )
         return outcome
 
-    def _attempt(self) -> EventJournalCompactionOutcome:
+    def _attempt(self, retention_days: int) -> EventJournalCompactionOutcome:
         try:
-            if not self.journal.compaction_due(
-                retention_days=self.policy.retention_days
-            ):
+            if not self.journal.compaction_due(retention_days=retention_days):
                 return EventJournalCompactionOutcome(False, "nothing_due")
             semantic = self.semantic
             # Lock order: Journal -> Semantic store. The guard prunes Semantic
             # receipts while the Journal lock is held; safe because the runtime
             # worker is serial and Semantic never takes the Journal lock first.
             return self.journal.compact(
-                retention_days=self.policy.retention_days,
+                retention_days=retention_days,
                 carried_tail=None if semantic is None else semantic.carried_tail(),
                 guard=None if semantic is None else semantic.compaction_blocked,
                 history_attestation=self.history_attestation,

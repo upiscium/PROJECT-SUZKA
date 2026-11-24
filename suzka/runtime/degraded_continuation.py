@@ -383,6 +383,17 @@ class DcState(str, Enum):
     HARD_STUCK = "HARD_STUCK"
 
 
+HARD_STATES = frozenset({DcState.HARD_WAIT, DcState.HARD_LADDER, DcState.HARD_STUCK})
+_HARD_VISIBLE = frozenset({DcState.SERVING, DcState.RECONCILING})
+#: ``dc_reason`` of a HARD-band overlay on a plain SERVING subject (the
+#: legacy ``/health`` ``reason`` is the same string).
+HARD_BAND_REASON = "journal_hard_limit"
+#: ``dc_hard_window_note``: what the Human must know once a rung archived.
+HARD_WINDOW_NOTE = (
+    "retention window shortened by the HARD ladder; it does not return by itself; "
+    "R15/R16 narrative sources older than it are no longer retained in the Journal"
+)
+
 _DC_REASON_MAX = 200
 #: ``dc_reason`` of a SERVING subject whose memory domain was quarantined (DC-4).
 DOMAIN_QUARANTINED_REASON = "domain_quarantined"
@@ -416,6 +427,36 @@ class DegradedContinuationStatus:
         # cannot hide it (prohibition 9: a degraded state must not hide).
         self._domains: tuple[str, ...] = ()
         self._domain_epoch: str | None = None
+        # DC-6: the HARD-band overlay.  ``_hard_state`` replaces ``dc_state``
+        # while the subject is SERVING or RECONCILING (the two phases a HARD
+        # band can be seen in); ``_hard_window_days`` is the smallest retention
+        # window a ladder rung applied in this process and is NEVER cleared
+        # (the window does not come back by itself, D1 A-3 consequence 4).
+        self._hard_state: DcState | None = None
+        self._hard_detail: str | None = None
+        self._hard_changed_at: datetime | None = None
+        self._hard_window_days: int | None = None
+
+    def note_hard_band(self, state: DcState | None, detail: str | None = None) -> None:
+        """Set the HARD-band overlay (``HARD_WAIT`` / ``HARD_LADDER`` /
+        ``HARD_STUCK``) with the last reason that stopped the ladder; ``None``
+        clears it (the band is not HARD).  The applied window is kept."""
+
+        if state is not None and state not in HARD_STATES:
+            raise ValueError("not a HARD-band state")
+        with self._lock:
+            detail = None if detail is None else _bounded(detail)
+            if (state, detail) != (self._hard_state, self._hard_detail):
+                self._hard_changed_at = self._clock()
+            self._hard_state = state
+            self._hard_detail = detail if state is not None else None
+
+    def note_hard_window(self, retention_days: int) -> None:
+        """A ladder rung archived under ``retention_days``: keep the smallest."""
+
+        with self._lock:
+            if self._hard_window_days is None or retention_days < self._hard_window_days:
+                self._hard_window_days = retention_days
 
     def note_domain_quarantine(
         self, participants: Iterable[str], epoch_id: str | None
@@ -448,13 +489,24 @@ class DegradedContinuationStatus:
         """Every field, for ``GET /health/dc``.  ``dc_state`` is always there."""
 
         with self._lock:
-            fields = {"dc_state": self._state.value}
+            hard = self._hard_state if self._state in _HARD_VISIBLE else None
+            fields = {"dc_state": (hard or self._state).value}
+            since = self._since
             if self._reason:
                 fields["dc_reason"] = self._reason
+            elif hard is not None:
+                fields["dc_reason"] = HARD_BAND_REASON
             elif self._domains:
                 fields["dc_reason"] = DOMAIN_QUARANTINED_REASON
-            if self._since is not None:
-                fields["dc_since"] = self._since.isoformat()
+            if hard is not None and self._hard_changed_at is not None:
+                since = self._hard_changed_at
+                if self._hard_detail:
+                    fields["dc_hard_reason"] = self._hard_detail
+            if self._hard_window_days is not None:
+                fields["dc_hard_window_days"] = str(self._hard_window_days)
+                fields["dc_hard_window_note"] = HARD_WINDOW_NOTE
+            if since is not None:
+                fields["dc_since"] = since.isoformat()
             participants = tuple(sorted({*self._participants, *self._domains}))
             if participants:
                 fields["dc_participants"] = ",".join(participants)
@@ -471,7 +523,11 @@ class DegradedContinuationStatus:
 
         with self._lock:
             quiet = self._state in (DcState.INACTIVE, DcState.SERVING) and not (
-                self._reason or self._participants or self._domains
+                self._reason
+                or self._participants
+                or self._domains
+                or self._hard_state is not None
+                or self._hard_window_days is not None
             )
         return {} if quiet else self.snapshot()
 

@@ -16,11 +16,13 @@ MODULE = PACKAGE / "runtime" / "degraded_continuation.py"
 
 # Modules that import the primitives.  DC-5: the server and the supervisor.  DC-4
 # adds the two modules of the participant quarantine: ``domain_quarantine`` (the
-# policy) and ``startup_reconciliation`` (it raises ``CycleRestart``).
+# policy) and ``startup_reconciliation`` (it raises ``CycleRestart``).  DC-6 adds
+# ``hard_band_watcher`` (the HARD-band ladder).
 IMPORTERS_OF_PRIMITIVES = {
     "suzka/api/server.py",
     "suzka/api/supervisor.py",
     "suzka/runtime/domain_quarantine.py",
+    "suzka/runtime/hard_band_watcher.py",
     "suzka/runtime/startup_reconciliation.py",
 }
 # Modules that read ``settings.degraded_continuation``: create_app (DC-5: it
@@ -276,6 +278,7 @@ def test_every_thread_site_is_covered_by_the_termination_proof() -> None:
         "suzka/r18/approval_owner.py",
         "suzka/r18/executor.py",
         "suzka/r19/scheduler.py",
+        "suzka/runtime/hard_band_watcher.py",
     }, "a new thread owner must be added to the termination proof (and here)"
     for rel, count in sites.items():
         text = (ROOT / rel).read_text()
@@ -394,3 +397,42 @@ def test_the_empty_root_is_created_before_any_store_object_and_before_reconcilia
         "resolve_open_wal_rollover()",
     ):
         assert source.index(later) > start, later
+
+
+# ------------------------------------------------------------------ DC-6
+
+WATCHER_MODULE = PACKAGE / "runtime" / "hard_band_watcher.py"
+
+
+def test_the_hard_band_watcher_deletes_nothing_and_only_appends_its_log() -> None:
+    # The ladder archives only through ``compact_with_window`` (the Journal's
+    # own, verified compaction): this module has no way to delete, move, copy
+    # or rewrite anything.
+    for name, _call in _calls(_tree(WATCHER_MODULE)):
+        assert name.rsplit(".", 1)[-1] not in FORBIDDEN_CALL_SUFFIXES, name
+    text = WATCHER_MODULE.read_text()
+    assert "os.O_APPEND" in text and "os.O_TRUNC" not in text
+    assert "open(" not in text.replace("os.open(", "")
+
+
+def test_the_server_builds_the_watcher_only_in_continue_mode_with_the_switch_on() -> None:
+    source = (PACKAGE / "api" / "server.py").read_text()
+    assert source.count("HardBandWatcher(") == 1
+    tree = _tree(PACKAGE / "api" / "server.py")
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_start_hard_band_watcher"
+    )
+    guard = next(node for node in function.body if isinstance(node, ast.If))
+    text = ast.unparse(guard.test)
+    assert "mode" in text and "hard_band_auto_shrink" in text
+    assert isinstance(guard.body[0], ast.Return)
+    # and the supervisor is the only owner of the origin of the HARD band
+    # (P1-6): the watcher holds no origin attribute of its own.
+    names = {
+        node.attr
+        for node in ast.walk(_tree(WATCHER_MODULE))
+        if isinstance(node, ast.Attribute)
+    }
+    assert not {name for name in names if "hard_since" in name}

@@ -975,6 +975,8 @@ def test_every_thread_creating_site_has_a_threads_alive_owner() -> None:
         "suzka/r19/scheduler.py": 1,
         "suzka/r18/approval_owner.py": 2,
         "suzka/r18/executor.py": 2,
+        # DC-6: the HARD-band watcher (found in app.state by threads_alive()).
+        "suzka/runtime/hard_band_watcher.py": 1,
     }, (
         "a new thread site needs an owner with threads_alive() that lives in "
         "app.state (the termination proof finds owners by that method)"

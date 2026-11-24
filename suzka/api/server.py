@@ -94,6 +94,7 @@ from suzka.api.supervisor import (
 from suzka.runtime.degraded_continuation import DcState, DegradedContinuationStatus
 from suzka.runtime.domain_quarantine import DomainQuarantinePolicy
 from suzka.runtime.event_journal import EventJournalAdmissionBand
+from suzka.runtime.hard_band_watcher import HARD_BAND_LOG_NAME, HardBandWatcher
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
 from suzka.r16.decision_issuer import _DecisionIssuer
 from suzka.r18.intent_issuer import ReviewArtifactIntentIssuerV1
@@ -130,6 +131,11 @@ from suzka.runtime.wal_rollover import (
 from suzka.runtime.semantic_receipt_retention import (
     SemanticReceiptRetentionCoordinator,
 )
+
+
+#: D1 sec. 5.4: the HARD-band watcher polls ``admission_status()`` every 5 s
+#: (a module constant so that a test can speed it up).
+HARD_BAND_POLL_S = 5.0
 
 
 def _stop_leftover_owners(app: FastAPI) -> None:
@@ -223,6 +229,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app_settings = app_settings.model_copy()
             app_settings.r18 = app_settings.r18.model_copy()
         app_settings.r18.target_path = absolute_target
+
+    def _start_hard_band_watcher(app: FastAPI) -> None:
+        hard_config = app_settings.degraded_continuation
+        supervisor = getattr(app.state, "dc_supervisor", None)
+        if (
+            hard_config.mode != "continue"
+            or not hard_config.hard_band_auto_shrink
+            or supervisor is None
+        ):
+            return
+        try:
+            # A new cycle starts with no HARD overlay: a stale one from the
+            # previous cycle must not show up in this cycle's SERVING.
+            app.state.dc_status.note_hard_band(None)
+            compaction = app.state.journal_compaction
+            watcher = HardBandWatcher(
+                journal=app.state.event_journal,
+                compaction=compaction,
+                runtime=app.state.agent_runtime,
+                status=app.state.dc_status,
+                port=supervisor,
+                ladder=hard_config.effective_hard_ladder(
+                    compaction.policy.retention_days
+                ),
+                configured_days=compaction.policy.retention_days,
+                t_hard_s=float(hard_config.t_hard_s),
+                log_path=(
+                    hard_config.resolved_quarantine_dir(app_settings.event_journal.path)
+                    / HARD_BAND_LOG_NAME
+                ),
+                reeval_max_backoff_s=float(hard_config.reeval_max_backoff_s),
+                poll_s=HARD_BAND_POLL_S,
+                # The join is part of ``T_teardown_max``; normally instant, it
+                # takes long only for an in-flight compaction.
+                stop_join_s=min(30.0, float(hard_config.t_teardown_max_s) / 8),
+            )
+            watcher.start()
+        except Exception:
+            # No watcher: the HARD band stays as it is today.  The subject must
+            # not be torn down for a maintenance thread that could not start.
+            logging.getLogger(__name__).warning(
+                "HARD-band watcher could not start; the ladder is off in this cycle",
+                exc_info=True,
+            )
+            return
+        app.state.hard_band_watcher = watcher
 
     @asynccontextmanager
     async def _subject_cycle(app: FastAPI) -> AsyncIterator[None]:
@@ -1511,9 +1563,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.agent_runtime.shutdown()
                 app.state.event_journal.close()
                 raise
+        # F15 DC-6: the HARD-band ladder's watcher.  Only with mode "continue"
+        # AND hard_band_auto_shrink; otherwise no thread and no key exist and
+        # the HARD band behaves as before.  Stopped FIRST in the teardown: it
+        # uses the Runtime and the Journal.
+        _start_hard_band_watcher(app)
         try:
             yield
         finally:
+            hard_band_watcher = getattr(app.state, "hard_band_watcher", None)
+            if hard_band_watcher is not None:
+                hard_band_watcher.stop()
             # IP-20d: the Scheduler submits Runtime events, so it stops first.
             if getattr(app.state, "wake_scheduler", None) is not None:
                 app.state.wake_scheduler.stop()
