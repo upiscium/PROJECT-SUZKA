@@ -373,6 +373,8 @@ def test_a_transient_participant_fault_is_never_quarantined(
     monkeypatch.setattr(ExperienceStore, "load_pending", unavailable)
     result = cycle(rig)
     assert result == (False, LEGACY_REASON)
+    # it was PROBED inside one T_retry (60 s of sleeps, never more) and then left
+    assert sum(rig.clock.slept) == pytest.approx(60.0)
     assert rig.policy().writer.list_epochs() == ()  # no manifest at all
     assert_trees_equal(before, tree_snapshot(root))  # nothing moved
     assert not any("quarantined" in row for row in records_of(rig, prepared.transaction_id))
@@ -1441,3 +1443,63 @@ def test_a_quarantined_outcome_is_never_read_as_the_data_exists(tmp_path: Path) 
         False,
         "semantic_terminal_proof_unavailable",
     )
+
+
+# ===================================================== 20. T_retry probes (TRANSIENT)
+
+
+def test_a_transient_fault_that_clears_inside_t_retry_finalizes_in_the_same_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from suzka.memory.experience_store import ExperienceStoreUnavailable
+
+    rig = Rig(tmp_path)
+    prepared = rig.prepare("clears", 1, experience=True)
+    real = ExperienceStore.load_pending
+    state = {"calls": 0}
+
+    def flaky(self: ExperienceStore, transaction_id: str) -> Any:
+        state["calls"] += 1
+        if state["calls"] <= 3:
+            raise ExperienceStoreUnavailable("EIO for a moment")
+        return real(self, transaction_id)
+
+    monkeypatch.setattr(ExperienceStore, "load_pending", flaky)
+    assert cycle(rig) == (True, None)  # NO restart, NO quarantine
+    assert rig.policy().writer.list_epochs() == ()
+    assert terminal_of(rig, prepared.transaction_id) == "completed"
+    assert ("participant_finalized", EXPERIENCE, "finalized") in records_of(
+        rig, prepared.transaction_id
+    )
+    assert rig.clock.slept[:3] == [1.0, 2.0, 4.0]  # the schedule 1, 2, 4, 8, 16, 29
+
+
+def test_the_probes_share_one_deadline_and_a_disabled_participant_is_not_probed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from suzka.memory.experience_store import ExperienceStoreUnavailable
+    from suzka.memory.semantic_store import SemanticStoreUnavailable
+
+    rig = Rig(tmp_path)
+    rig.prepare("shared", 1, experience=True)
+
+    def unavailable(*_args: object, **_kwargs: object) -> None:
+        raise ExperienceStoreUnavailable("down")
+
+    monkeypatch.setattr(ExperienceStore, "load_pending", unavailable)
+    policy = rig.policy(t_retry_s=10.0)
+    policy.start_cycle()
+    coordinator = rig.coordinator(policy)
+    assert coordinator.reconcile_open_transactions() == (False, LEGACY_REASON)
+    assert sum(rig.clock.slept) == pytest.approx(10.0)
+    # the deadline is spent: a second pass in the same attempt does NOT probe again
+    slept = len(rig.clock.slept)
+    assert coordinator.reconcile_open_transactions() == (False, LEGACY_REASON)
+    assert len(rig.clock.slept) == slept
+    # a participant the policy does not cover (Semantic, off by default) is not probed
+    default = rig.policy(participants=None)
+    assert not default.wants_retry(SEMANTIC, ParticipantUnavailableError("x"))
+    assert default.wants_retry(EXPERIENCE, ParticipantUnavailableError("x"))
+    assert not default.wants_retry(EXPERIENCE, ParticipantDivergedError("x"))
+    assert not default.wants_retry("subject.history", ParticipantUnavailableError("x"))
+    assert SemanticStoreUnavailable  # imported for the class-name classification

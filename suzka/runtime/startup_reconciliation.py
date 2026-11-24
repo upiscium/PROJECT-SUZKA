@@ -267,6 +267,11 @@ class StartupReconciliationCoordinator:
                     UnsupportedParticipantReconciliationError,
                 ) as error:
                     participant_id = getattr(error, "dc_participant_id", None)
+                    if policy.wants_retry(participant_id, error):
+                        # a TRANSIENT fault: probe again inside the shared T_retry
+                        policy.wait_probe()
+                        current = self._open_transaction(current.transaction_id)
+                        continue
                     if participant_id is not None and participant_id not in confirmed:
                         if policy.wants_confirmation(participant_id, error):
                             # one confirming re-read of a DIVERGED verdict
@@ -537,6 +542,9 @@ class StartupReconciliationCoordinator:
                         UnsupportedParticipantReconciliationError,
                     ) as error:
                         policy = self.resolution_policy
+                        if policy.wants_retry(requirement.participant_id, error):
+                            policy.wait_probe()
+                            continue
                         if not confirmed and policy.wants_confirmation(
                             requirement.participant_id, error
                         ):

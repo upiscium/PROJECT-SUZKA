@@ -58,6 +58,7 @@ from uuid import uuid4
 from suzka.runtime.degraded_continuation import (
     DOMAIN_STORE_REPLACED_REASON,
     EPOCH_MARKER_NAME,
+    Deadline,
     DegradedContinuationStatus,
     ManifestError,
     ManifestState,
@@ -67,6 +68,7 @@ from suzka.runtime.degraded_continuation import (
     ResumeAction,
     classify_participant_error,
     is_quarantinable,
+    probe_schedule,
     IntegrityVerdict,
 )
 from suzka.runtime.event_journal import (
@@ -134,6 +136,16 @@ class ParticipantResolutionPolicy:
 
     def confirm_delay(self) -> None:
         """Wait before the one confirming re-read of a DIVERGED verdict."""
+
+    def wants_retry(self, participant_id: str | None, error: BaseException) -> bool:
+        """True when ``error`` is a TRANSIENT fault of a participant this policy
+        covers and the shared ``T_retry`` budget has a probe left (D1 sec. 3:
+        probes 1, 2, 4, 8, 16, 29 s inside ONE deadline per start attempt)."""
+
+        return False
+
+    def wait_probe(self) -> None:
+        """Sleep for the next probe delay (never past the shared deadline)."""
 
     def should_restart(self) -> bool:
         """True when a quarantine happened in this cycle: the store objects of
@@ -358,6 +370,8 @@ class DomainQuarantinePolicy(ParticipantResolutionPolicy):
         mismatch_bound_s: float | None = None,
         wall_clock: Callable[[], datetime] | None = None,
         participants: frozenset[str] | None = None,
+        t_retry_s: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         enabled = DEFAULT_QUARANTINE_PARTICIPANTS if participants is None else participants
         if not enabled <= frozenset(STORE_DIRECTORY_NAMES):
@@ -365,6 +379,10 @@ class DomainQuarantinePolicy(ParticipantResolutionPolicy):
         #: What this policy ACTS on.  Existing manifests of any participant are
         #: still resumed (a crashed quarantine must always be finished).
         self.enabled_participants = frozenset(enabled)
+        self._t_retry_s = t_retry_s
+        self._clock = clock
+        self._deadline = Deadline(t_retry_s, clock)
+        self._probes = list(probe_schedule(t_retry_s))
         self._memory_root = Path(memory_root)
         self._status = status
         self._confirm_delay_s = confirm_delay_s
@@ -402,6 +420,10 @@ class DomainQuarantinePolicy(ParticipantResolutionPolicy):
         deleted or guessed."""
 
         self.start_block = None
+        # ONE shared T_retry per start attempt (here, the cycle) across all
+        # participants, however many probes they draw.
+        self._deadline = Deadline(self._t_retry_s, self._clock)
+        self._probes = list(probe_schedule(self._t_retry_s))
         try:
             epochs = self._load_epochs()
             if epochs.unreadable:
@@ -504,6 +526,21 @@ class DomainQuarantinePolicy(ParticipantResolutionPolicy):
     def confirm_delay(self) -> None:
         if self._confirm_delay_s > 0:
             self._sleep(self._confirm_delay_s)
+
+    def wants_retry(self, participant_id: str | None, error: BaseException) -> bool:
+        return (
+            participant_id is not None
+            and participant_id in self.enabled_participants
+            and classify_participant_error(participant_id, error)
+            is IntegrityVerdict.TRANSIENT
+            and bool(self._probes)
+            and not self._deadline.expired()
+        )
+
+    def wait_probe(self) -> None:
+        delay = min(self._probes.pop(0), self._deadline.remaining())
+        if delay > 0:
+            self._sleep(delay)
 
     def should_restart(self) -> bool:
         return bool(self.quarantined_this_cycle)

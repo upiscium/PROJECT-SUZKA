@@ -274,6 +274,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     ),
                     status=getattr(app.state, "dc_status", None),
                     t_hash_s=float(dc_config.t_hash_s),
+                    t_retry_s=float(dc_config.t_retry_s),
                 )
                 domain_policy.start_cycle()
 

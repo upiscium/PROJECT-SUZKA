@@ -91,6 +91,21 @@ def snapshot(sequence: int) -> AgentStateSnapshotV2:
     )
 
 
+class FakeClock:
+    """A monotonic clock that only moves when the code under test sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.slept: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+
 @dataclass
 class Prepared:
     """One prepared transaction: the event, its participants and their bindings."""
@@ -155,6 +170,7 @@ class Rig:
         self.semantic_store = SemanticStore.from_memory_root(
             self.settings.memory.persist_directory
         )
+        self.clock = FakeClock()
         self.qdir = (
             self.settings.degraded_continuation.resolved_quarantine_dir(
                 self.settings.event_journal.path
@@ -176,6 +192,8 @@ class Rig:
             "has_exclusive_authority": lambda: self.journal.has_exclusive_authority,
             "status": self.status,
             "confirm_delay_s": 0.0,
+            "sleep": self.clock.sleep,
+            "clock": self.clock,
             # both domains: Semantic is OFF by default (S0-c), tests enable it
             "participants": frozenset({"memory.experience", "memory.semantic"}),
         }
