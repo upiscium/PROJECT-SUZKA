@@ -420,6 +420,7 @@ class DomainQuarantinePolicy(ParticipantResolutionPolicy):
         deleted or guessed."""
 
         self.start_block = None
+        self.quarantined_this_cycle = []
         # ONE shared T_retry per start attempt (here, the cycle) across all
         # participants, however many probes they draw.
         self._deadline = Deadline(self._t_retry_s, self._clock)
@@ -461,6 +462,7 @@ class DomainQuarantinePolicy(ParticipantResolutionPolicy):
             self.start_block = self.start_block or "domain_quarantine_resume_failed"
             return
         if plan.action is ResumeAction.CREATE_EMPTY_ROOT:
+            self.writer.require_authority()  # prohibition 8: no action without the lease
             create_empty_root(
                 root,
                 epoch_id=manifest.epoch_id,
@@ -473,7 +475,9 @@ class DomainQuarantinePolicy(ParticipantResolutionPolicy):
         elif plan.action is ResumeAction.CONTINUE_JOURNAL:
             return  # PENDING became MOVED: step 3 follows in ``begin``
         else:  # BLOCKED
-            if manifest.state is ManifestState.JOURNALED:
+            if plan.reason == "quarantined tree is missing":
+                self.start_block = self.start_block or "domain_quarantine_tree_missing"
+            elif manifest.state is ManifestState.JOURNALED:
                 self.start_block = self.start_block or DOMAIN_STORE_REPLACED_REASON
             else:
                 self.start_block = self.start_block or "domain_quarantine_blocked"
@@ -597,6 +601,8 @@ class DomainQuarantinePolicy(ParticipantResolutionPolicy):
             journal = coordinator.journal
             if journal.inspect().schema_version != 4:
                 return False  # a v3 Journal is migrated first; never quarantined
+            if participant_id in self.quarantined_this_cycle:
+                return False  # already done this cycle: never a second epoch
             existing = next(
                 (
                     item

@@ -1035,6 +1035,9 @@ class QuarantineWriter:
         # Step 2, MOVED.
         return self._move_and_verify(manifest, root, deadline)
 
+    def require_authority(self) -> None:
+        self._require_authority()
+
     def _require_authority(self) -> None:
         if not self._authority():
             raise QuarantineRefused("no exclusive Journal authority; nothing was done")
@@ -1287,6 +1290,7 @@ class QuarantineWriter:
         continues with an empty store; the Human can read the manifest to see
         exactly which paths differ."""
 
+        self._require_authority()
         (artifact,) = manifest.artifacts
         target = Path(artifact.quarantine_path)
         hashed = frozenset(

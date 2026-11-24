@@ -1503,3 +1503,43 @@ def test_the_probes_share_one_deadline_and_a_disabled_participant_is_not_probed(
     assert not default.wants_retry(EXPERIENCE, ParticipantDivergedError("x"))
     assert not default.wants_retry("subject.history", ParticipantUnavailableError("x"))
     assert SemanticStoreUnavailable  # imported for the class-name classification
+
+
+# ============================================ 21. review fixes
+
+
+def test_a_journaled_manifest_is_not_acted_on_without_the_lease(tmp_path: Path) -> None:
+    rig = Rig(tmp_path)
+    prepared = rig.prepare("lease2", 1, experience=True)
+    damage_experience(rig, prepared)
+    with pytest.raises(CycleRestart):
+        cycle(rig)
+    policy = rig.policy(has_exclusive_authority=lambda: False)
+    policy.start_cycle()
+    assert policy.start_block == "domain_quarantine_resume_failed"
+    assert not rig.experience_store.root.exists()  # no empty root without the lease
+    assert only_manifest(rig).state is ManifestState.JOURNALED
+
+
+def test_a_missing_quarantined_tree_has_its_own_reason(tmp_path: Path) -> None:
+    rig = Rig(tmp_path)
+    prepared = rig.prepare("gone-tree", 1, experience=True)
+    damage_experience(rig, prepared)
+    with pytest.raises(CycleRestart):
+        cycle(rig)
+    root = rig.experience_store.root
+    root.with_name(root.name + ".quarantine-" + only_manifest(rig).epoch_id).rename(
+        tmp_path / "moved-by-hand"
+    )
+    policy = rig.policy()
+    policy.start_cycle()
+    assert policy.start_block == "domain_quarantine_tree_missing"
+    assert not root.exists()  # nothing created, nothing guessed
+
+
+def test_start_cycle_resets_the_per_cycle_quarantine_record(tmp_path: Path) -> None:
+    rig = Rig(tmp_path)
+    policy = rig.policy()
+    policy.quarantined_this_cycle.append(EXPERIENCE)
+    policy.start_cycle()
+    assert policy.quarantined_this_cycle == [] and not policy.should_restart()
