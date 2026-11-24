@@ -97,6 +97,23 @@ export class ApiError extends Error {
   }
 }
 
+// The API's guard refusal is {"status":"refused","reason":...,"hint":...}; show the
+// hint in plain words when present, otherwise keep the generic text.
+export function describeApiError(status: number, statusText: string, detail: string): string {
+  try {
+    const body: unknown = JSON.parse(detail);
+    if (body !== null && typeof body === "object") {
+      const { status: kind, hint } = body as { status?: unknown; hint?: unknown };
+      if (kind === "refused" && typeof hint === "string" && hint !== "") {
+        return `${status} The API refused this request. To fix: ${hint}.`;
+      }
+    }
+  } catch {
+    // not JSON: fall through to the generic text
+  }
+  return `${status} ${statusText}: ${detail}`;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return requestUrl<T>(`${API_BASE_URL}${path}`, init);
 }
@@ -112,7 +129,7 @@ async function requestUrl<T>(url: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) {
     const detail = await response.text();
-    throw new ApiError(response.status, `${response.status} ${response.statusText}: ${detail}`);
+    throw new ApiError(response.status, describeApiError(response.status, response.statusText, detail));
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;

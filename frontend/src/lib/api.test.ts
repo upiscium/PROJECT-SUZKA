@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { api } from "./api";
+import { api, ApiError, describeApiError } from "./api";
 
 const fetchMock = vi.fn();
 
@@ -54,5 +54,24 @@ describe("api client", () => {
     await api.sleepRun();
 
     expect(fetchMock).toHaveBeenCalledWith("/admin-proxy/sleep/run", expect.objectContaining({ method: "POST" }));
+  });
+});
+
+describe("API error text", () => {
+  it("shows the hint of a guard refusal in plain words", async () => {
+    const detail = '{"status":"refused","reason":"api_host_not_accepted","hint":"add this host name to api.allowed_hosts"}';
+    fetchMock.mockReturnValue(Promise.resolve({ ok: false, status: 403, statusText: "Forbidden", text: () => Promise.resolve(detail) }));
+
+    const error = await api.chatSessions().catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).message).toBe("403 The API refused this request. To fix: add this host name to api.allowed_hosts.");
+  });
+
+  it("keeps the existing text for other errors", () => {
+    expect(describeApiError(500, "Server Error", "boom")).toBe("500 Server Error: boom");
+    expect(describeApiError(403, "Forbidden", '{"status":"refused","reason":"x"}')).toBe('403 Forbidden: {"status":"refused","reason":"x"}');
+    expect(describeApiError(400, "Bad", '{"hint":"h"}')).toBe('400 Bad: {"hint":"h"}');
+    expect(describeApiError(400, "Bad", "null")).toBe("400 Bad: null");
   });
 });

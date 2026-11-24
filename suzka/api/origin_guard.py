@@ -30,7 +30,7 @@ neither grant nor deny anything):
 The guard sits OUTSIDE the app-wide ``CORSMiddleware`` so a refused request
 gets no CORS headers; nothing here adds a permissive CORS header, so a GET
 response is never readable cross-origin unless the origin is already in
-``api.cors_origins``.  A refusal is a closed 403 body (no request content is
+``api.cors_origins``.  A refusal is a closed 403 body (a fixed hint per reason; no request content is
 echoed), logged at most once per refusal class per minute.  The check is total:
 an unexpected error refuses the request (fails closed) and never reaches a route.
 """
@@ -81,6 +81,32 @@ class Refusal(str, Enum):
     HOST = "api_host_not_accepted"
     ORIGIN = "api_origin_not_accepted"
     FETCH_SITE = "api_cross_site_request_refused"
+
+
+# One fixed hint per reason; it never contains a request value.
+HINTS: Final = {
+    Refusal.HOST: "add this host name to api.allowed_hosts",
+    Refusal.ORIGIN: (
+        "same-origin requests only; to allow another origin add it to api.allowed_origins"
+    ),
+    Refusal.FETCH_SITE: "same-origin requests only; cross-site requests are not accepted",
+}
+_LOG_VALUE_MAX: Final = 64
+_LOG_UNSAFE: Final = "\\\"'`"
+
+
+def sanitize_for_log(value: str | None) -> str:
+    """A header value made safe for one log line: at most 64 characters, ASCII
+    printable only, quotes / backslashes / everything else replaced by ``?``,
+    then double-quoted (it cannot forge a line or a field)."""
+
+    if value is None:
+        return '"-"'
+    out = "".join(
+        ch if " " <= ch <= "~" and ch not in _LOG_UNSAFE else "?"
+        for ch in value[:_LOG_VALUE_MAX]
+    )
+    return f'"{out}"'
 
 
 def is_guarded_path(path: str, exempt: str) -> bool:
@@ -171,6 +197,19 @@ def check_request(
     return None
 
 
+def _first(raw: Iterable[tuple[bytes, bytes]], name: str) -> str | None:
+    values = _headers(raw).get(name)
+    return values[0] if values else None
+
+
+def _log_detail(refusal: Refusal, raw_headers: Iterable[tuple[bytes, bytes]]) -> str:
+    raw = tuple(raw_headers)
+    detail = f" host={sanitize_for_log(_first(raw, 'host'))}"
+    if refusal is Refusal.ORIGIN:
+        detail += f" origin={sanitize_for_log(_first(raw, 'origin'))}"
+    return detail
+
+
 class _RefusalLog:
     """At most one log line per refusal class per interval."""
 
@@ -179,14 +218,14 @@ class _RefusalLog:
         self._last: dict[Refusal, float] = {}
         self._lock = threading.Lock()
 
-    def note(self, refusal: Refusal) -> None:
+    def note(self, refusal: Refusal, detail: str = "") -> None:
         now = self._clock()
         with self._lock:
             last = self._last.get(refusal)
             if last is not None and now - last < LOG_INTERVAL_SECONDS:
                 return
             self._last[refusal] = now
-        LOGGER.warning("api request refused: %s", refusal.value)
+        LOGGER.warning("api request refused: %s%s", refusal.value, detail)
 
 
 Scope = MutableMapping[str, Any]
@@ -242,7 +281,7 @@ class ApiOriginGuard:
             refusal = Refusal.HOST
         if refusal is not None:
             try:
-                self._log.note(refusal)
+                self._log.note(refusal, _log_detail(refusal, scope.get("headers", ())))
             except Exception:  # noqa: BLE001 - logging must not break a refusal
                 pass
             if kind == "websocket":
@@ -250,7 +289,7 @@ class ApiOriginGuard:
                 await send({"type": "websocket.close", "code": 1008})
                 return
             response = JSONResponse(
-                {"status": "refused", "reason": refusal.value},
+                {"status": "refused", "reason": refusal.value, "hint": HINTS[refusal]},
                 status_code=403,
                 headers={"Cache-Control": "no-store"},
             )
