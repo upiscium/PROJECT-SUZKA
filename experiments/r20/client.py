@@ -202,6 +202,11 @@ class BoundClient:
             raise self._refuse("control channel does not answer") from error
         if reply.get("ok") is True and reply.get("ready") is False:
             raise DestinationNoAnswer("the child is not ready yet")
+        if reply.get("ok") is True and reply.get("pid") == dest.pid and reply.get("journal_lineage_id") is None:
+            # A supervised child (``degraded_continuation.mode = continue``) binds its
+            # port before its first cycle has built the Journal: the lineage is not
+            # known YET.  Retryable; nothing is sent meanwhile.
+            raise DestinationNoAnswer("the child has not built its Journal yet")
         if (
             reply.get("ok") is not True
             or reply.get("ready") is not True  # the child has bound its port

@@ -237,6 +237,7 @@ def build_config(
     r19: bool,
     run_id: str,
     r19_overrides: dict[str, int] | None = None,
+    degraded_continuation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The raw config dict of one subject (the repository config, overridden)."""
 
@@ -257,6 +258,9 @@ def build_config(
     r19_section: dict[str, Any] = {"enabled": r19}
     r19_section.update(r19_overrides or {})
     raw["r19"] = r19_section
+    if degraded_continuation is not None:
+        # F15 (IP-22d): the supervised ``mode = "continue"`` and its bounds.
+        raw["degraded_continuation"] = dict(degraded_continuation)
     return raw
 
 
@@ -273,6 +277,7 @@ def create_subject(
     r18: bool | None = None,
     r19: bool | None = None,
     r19_overrides: dict[str, int] | None = None,
+    degraded_continuation: dict[str, Any] | None = None,
     environ: dict[str, str] | None = None,
 ) -> GenesisSubject:
     """Create one new genesis subject.  Refuses (``GuardRefusal``) a root that
@@ -306,6 +311,7 @@ def create_subject(
     raw = build_config(
         chosen, root, port, tier,
         deterministic=deterministic, r18=use_r18, r19=use_r19, run_id=rid, r19_overrides=r19_overrides,
+        degraded_continuation=degraded_continuation,
     )
     (root / "config.yaml").write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     os.chmod(root / "config.yaml", 0o600)

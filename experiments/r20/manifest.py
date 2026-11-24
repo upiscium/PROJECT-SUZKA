@@ -23,16 +23,17 @@ from experiments.r20.guards import GuardRefusal
 ADMISSION_PATH = "HARNESS_BRIDGE"
 HOLD_UNSEALED = "HOLD_UNSEALED"
 HOLD_SEALED = "SEALED"
+STEP_LABELS = ("DONE", "NOT_DONE", "PENDING")
 KEYS = (
     "run_id", "profile", "tier", "code_head", "config_sha256", "provider", "identity",
     "approval_actor", "admission_path", "fixture_only", "timeline", "policy_inputs",
     "plan_hold_receipts", "logical_cycle_resolutions", "ablation", "kill_points",
-    "restarts", "journal", "results", "recorder", "destination",
+    "restarts", "journal", "results", "recorder", "destination", "steps",
 )
 _LISTS = frozenset(
     {
         "timeline", "policy_inputs", "plan_hold_receipts", "logical_cycle_resolutions",
-        "ablation", "kill_points", "restarts", "recorder",
+        "ablation", "kill_points", "restarts", "recorder", "steps",
     }
 )
 
@@ -69,6 +70,19 @@ class Manifest:
     def result(self, check: str, label: str) -> None:
         self._data["results"][check] = label
 
+    def step(
+        self, number: int, name: str, label: str, evidence: dict[str, Any] | None = None, note: str | None = None
+    ) -> dict[str, Any]:
+        """One S0 dry-run checklist item (D1 sec. 7): ``DONE`` / ``NOT_DONE`` /
+        ``PENDING`` with the evidence ids it rests on (identifiers, digests,
+        counts only).  A step never carries a label it has no evidence for."""
+
+        if label not in STEP_LABELS:
+            raise ValueError(label)
+        entry = {"step": number, "name": name, "label": label, "evidence": dict(evidence or {}), "note": note}
+        self.append("steps", entry)
+        return entry
+
     def record_hold(self, row: str, *, receipt_id: str | None = None) -> dict[str, Any]:
         """A HOLD the harness observed.  Sealed only by a store receipt id."""
 
@@ -95,4 +109,4 @@ class Manifest:
         return self.path
 
 
-__all__ = ["ADMISSION_PATH", "HOLD_SEALED", "HOLD_UNSEALED", "KEYS", "Manifest"]
+__all__ = ["ADMISSION_PATH", "HOLD_SEALED", "HOLD_UNSEALED", "KEYS", "STEP_LABELS", "Manifest"]

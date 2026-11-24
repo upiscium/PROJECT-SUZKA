@@ -102,6 +102,13 @@ def main(argv: list[str] | None = None) -> int:
     app = create_app(settings)
     if provider is not None:
         app.state.model_provider = provider
+        # Mode "continue": the supervisor drops every ``app.state`` key added after
+        # ``create_app`` before a new cycle.  The injected scripted provider is the
+        # harness's, not the cycle's: part of the baseline, so a restart cycle in
+        # this process keeps it (a model provider the CYCLE builds is still rebuilt).
+        supervisor = getattr(app.state, "dc_supervisor", None)
+        if supervisor is not None:
+            supervisor.capture_baseline()
     server = uvicorn.Server(
         uvicorn.Config(app, host=settings.api.host, port=port, log_level="warning", lifespan="on")
     )

@@ -181,6 +181,13 @@ class ChildProcess:
                 reply = self.status()
             except (OSError, ValueError):
                 reply = {}
+            except GuardRefusal as refusal:
+                # a socket still answered by another process (e.g. the killed predecessor's
+                # last moments): not ready yet; nothing is sent on this path, and the
+                # destination-bound client re-checks the peer before every state change
+                if refusal.code != "CONTROL_PEER_MISMATCH":
+                    raise
+                reply = {}
             if reply.get("ready"):
                 return reply
             time.sleep(0.1)

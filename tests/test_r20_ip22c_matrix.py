@@ -120,20 +120,27 @@ def test_only_t1_results_count_as_covered() -> None:
     assert "F06" in covered_cases()  # covered by its merged T1 tests, not by the smoke
 
 
-def test_the_new_ip22c_tests_are_registered_and_the_f15_row_is_pending_with_none() -> None:
+def test_the_new_tests_are_registered_and_the_f15_row_is_bound_to_the_slice_acceptance() -> None:
     expected_new = {
-        "F01": 1, "F02": 2, "F05": 3, "F12": 1, "F13": 1, "F14": 1,
+        "F01": 1, "F02": 2, "F05": 3, "F06": 2, "F12": 1, "F13": 1, "F14": 1,
     }
     for case in CASES:
         assert len(case.new) == expected_new.get(case.case, 0), case.case
         for ref in case.new:
-            assert ref.file.startswith("test_r20_ip22c_"), ref.node_id
-    assert [case.case for case in CASES if case.smoke] == ["F06"]
-    # F15: a clearly marked PENDING row; nothing is claimed and nothing new exists
+            assert ref.file.startswith(("test_r20_ip22c_", "test_r20_ip22d_")), ref.node_id
+    assert [case.case for case in CASES if case.smoke] == ["F06", "F15"]
+    # F15: no longer PENDING; its smoke tests are the three rewritten F15-x tests, none counted
     f15 = case_for("F15")
-    assert f15.status == PENDING and f15.new == () and f15.smoke == ()
-    assert f15.pending_reason is not None and "7103463226" in f15.pending_reason
-    assert "F15" not in covered_cases()
+    assert f15.status == COVERED and f15.pending_reason is None and f15.new == ()
+    assert [ref.name.split("_")[1:5] for ref in f15.smoke] == [
+        ["f15", "x", "1", "a"], ["f15", "x", "2", "a"], ["f15", "x", "3", "an"],
+    ]
+    assert all(ref.file == "test_r20_ip22d_f15.py" for ref in f15.smoke)
+    assert not set(f15.smoke) & set(f15.counted)
+    assert "F15" in covered_cases()
+    # the counted F15 evidence is the deterministic T1 DC tests (no process tier)
+    assert f15.counted and all(ref.file.startswith("test_dc") for ref in f15.counted)
+    # the IP-22c files carry no F15 test: F15-x lives in IP-22d
     for path in sorted((ROOT / "tests").glob("test_r20_ip22c_*.py")):
         names = [n.name for n in ast.walk(ast.parse(path.read_text(encoding="utf-8"))) if isinstance(n, ast.FunctionDef)]
         assert not [name for name in names if name.startswith("test_f15")], path.name
@@ -165,25 +172,67 @@ def _fake(outcomes: dict[str, str]):  # type: ignore[no-untyped-def]
     return runner, calls
 
 
-def test_the_runner_writes_one_label_per_f_and_never_runs_or_passes_a_pending_row(tmp_path: Path) -> None:
+def test_the_runner_writes_one_label_per_f_and_the_known_violations_with_their_text(tmp_path: Path) -> None:
     runner, calls = _fake({})
     manifest, labels = run_matrix(runner, tmp_path)
     assert set(labels) == set(EXPECTED_CASES)
-    assert labels["F15"] == "PENDING"
     assert labels["F14"] == "PASS_TRANSITIONAL"
-    assert all(labels[name] == "PASS" for name in EXPECTED_CASES if name not in {"F14", "F15"})
+    assert all(labels[name] == "PASS" for name in EXPECTED_CASES if name != "F14")  # F15 included
     ran = {node_id for batch in calls for node_id in batch}
-    elsewhere = {ref.node_id for case in CASES if case.case != "F15" for ref in case.all_ids}
-    exclusive = {ref.node_id for ref in case_for("F15").all_ids} - elsewhere
-    assert exclusive and not exclusive & ran  # F15's own cited tests are not run as F15 evidence
-    assert not any(ref.node_id in ran for ref in case_for("F06").smoke)  # smoke only on request
+    f15 = case_for("F15")
+    assert {ref.node_id for ref in f15.counted} <= ran  # F15 is RUN, not just listed
+    assert {ref.node_id for ref in f15.boundary_ids} <= ran  # and so is every boundary test
+    assert not {ref.node_id for ref in f15.smoke} & ran  # the T2 smoke only on request
+    assert not any(ref.node_id in ran for ref in case_for("F06").smoke)
     path = manifest.write()
     written = json.loads(path.read_text(encoding="utf-8"))
-    assert written["results"]["F15"] == "PENDING" and written["results"]["table"] == "PASS"
-    assert written["results"]["F14.second_interpretation"] == "TRANSITIONAL"
+    results = written["results"]
+    assert results["F15"] == "PASS" and results["table"] == "PASS"
+    assert results["F14.second_interpretation"] == "TRANSITIONAL"
+    ids = [violation.id for violation in f15.known_violations]
+    assert len(ids) >= 13 and "KV-SEMANTIC-QUARANTINE-OFF" in ids and "KV-MODE-REFUSE" in ids
+    for violation_id in ids:
+        assert results[f"F15.known_violation.{violation_id}"] == "NOT_COVERED_KNOWN_VIOLATION", violation_id
+    # each one is also in the timeline with its D1 text and its source
+    entries = [e for e in written["timeline"] if e.get("kind") == "known_violation"]
+    assert [e["id"] for e in entries] == ids
+    assert all(len(e["text"].split()) >= 8 and e["source"] for e in entries)
+    assert all(results[f"F15.covered.{c.name}"] == "PASS" for c in f15.covered_classes)
     assert written["fixture_only"] is True and written["tier"] == "T1"
-    assert f_matrix.exit_code(labels, strict=False) == 0
-    assert f_matrix.exit_code(labels, strict=True) == 3  # pending is not a pass
+    assert f_matrix.exit_code(labels, strict=False, results=results) == 0
+
+
+def test_strict_passes_only_when_every_f_is_done_and_every_uncovered_class_is_a_named_known_violation() -> None:
+    done = {name: "PASS" for name in EXPECTED_CASES}
+    kv = {"F15.known_violation.KV-X": "NOT_COVERED_KNOWN_VIOLATION", "F15.covered.x": "PASS"}
+    assert f_matrix.exit_code(done, strict=True, results=kv) == 0
+    # a PENDING row, a transitional row, an unnamed / unproven violation or a weaker covered class is not DONE
+    assert f_matrix.exit_code({**done, "F15": "PENDING"}, strict=True, results=kv) == 3
+    assert f_matrix.exit_code({**done, "F14": "PASS_TRANSITIONAL"}, strict=True, results=kv) == 3
+    assert f_matrix.exit_code(done, strict=True, results={**kv, "F15.known_violation.KV-Y": "PASS"}) == 3
+    assert f_matrix.exit_code(done, strict=True, results={**kv, "F15.covered.y": "SMOKE_NOT_COUNTED"}) == 3
+    assert f_matrix.exit_code({**done, "F14": "PASS_TRANSITIONAL"}, strict=False, results=kv) == 0
+    # a failed or missing result is a failure in both modes
+    for strict in (False, True):
+        assert f_matrix.exit_code({**done, "F15": "FAIL"}, strict=strict, results=kv) == 1
+        assert f_matrix.exit_code(done, strict=strict, results={**kv, "F15.known_violation.KV-X": "FAIL"}) == 1
+        assert f_matrix.exit_code(done, strict=strict, results={**kv, "F15.known_violation.KV-X": "NOT_RUN"}) == 1
+
+
+def test_a_known_violation_whose_boundary_test_fails_is_not_reported_as_a_known_violation(tmp_path: Path) -> None:
+    f15 = case_for("F15")
+    victim = next(v for v in f15.known_violations if v.evidence)
+    runner, _ = _fake({victim.evidence[0].node_id: "failed"})
+    manifest, labels = run_matrix(runner, tmp_path, only=["F15"])
+    results = manifest.to_dict()["results"]
+    assert results[f"F15.known_violation.{victim.id}"] == "FAIL"  # the boundary moved: not "known", a failure
+    assert f_matrix.exit_code(labels, strict=False, results=results) == 1
+    silent, _ = _fake({})
+    quiet_runner = lambda ids: {k: v for k, v in silent(ids).items() if k != victim.evidence[0].node_id}  # noqa: E731
+    manifest, labels = run_matrix(quiet_runner, tmp_path, only=["F15"])
+    results = manifest.to_dict()["results"]
+    assert results[f"F15.known_violation.{victim.id}"] == "NOT_RUN"
+    assert f_matrix.exit_code(labels, strict=False, results=results) == 1
 
 
 def test_a_failed_skipped_or_missing_result_is_never_a_pass(tmp_path: Path) -> None:
@@ -233,6 +282,8 @@ def test_each_row_is_consistent(case: str) -> None:
         assert row.counted and not row.transitional and not row.pending_reason
     if row.status == PENDING:
         assert row.pending_reason and not row.new
+    if row.known_violations:
+        assert row.status == COVERED and row.acceptance and row.covered_classes
 
 
 def test_parametrized_results_aggregate_and_the_real_pytest_runner_reports_them() -> None:
@@ -248,3 +299,116 @@ def test_parametrized_results_aggregate_and_the_real_pytest_runner_reports_them(
     assert f_matrix.aggregate_outcome(outcomes, cited) == "passed"
     # every parametrized test the table cites is therefore not NOT_RUN: check the two known ones
     assert any(ref.name == "test_f05_w_the_stand_in_is_a_guarded_client_with_and_without_fetch_metadata" for ref in case_for("F05").new)
+
+
+# ------------------------------------------------------- the F15 binding (IP-22d)
+
+_NOT_COVERED_PHRASES = {
+    "KV-JOURNAL": "Journal damage (including a torn tail",
+    "KV-SUBJECT-HISTORY": "SubjectHistory loss / corruption / disablement / capacity",
+    "KV-AMBIGUOUS": "AMBIGUOUS commit evidence",
+    "KV-EPISODIC-AND-HISTORY-PARTICIPANTS": "memory.episodic and subject.history failures",
+    "KV-UNAVAILABLE": "merely Unavailable (not divergent)",
+    "KV-DB2-AND-RECEIPT-RETENTION": "DB2 projection and semantic_receipt_retention failures",
+    "KV-TRUE-ROLLBACK-GATE": "true-rollback gate refusals",
+    "KV-NO-OPEN-TRANSACTION": "a memory store damaged with no open transaction",
+    "KV-STALE-RESTORE": "a stale restore over a quarantined store",
+    "KV-HARD-STUCK": "HARD where compaction cannot free enough",
+    "KV-THREADS-NOT-STOPPED": "threads that do not stop",
+    "KV-PROCESS-DIES": "a process that dies",
+}
+
+
+def test_every_class_of_the_d1_not_covered_list_is_a_known_violation_with_its_text() -> None:
+    f15 = case_for("F15")
+    assert f15.acceptance is not None
+    # the acceptance carries the D1 wording: bounds, the four clauses and the stated rule
+    for phrase in (
+        "T_failed_to_serving_max 400 s", "T_boot_max 240 s", "T_hard (600 s) + at most 5 rungs of 60 s",
+        "(1) each damaged artifact is byte-preserved", "(2) no row or record copies content",
+        "(3) no Action is admitted", "(4) every stop in the run ends in a terminal or re-evaluable state",
+        "a known violation of 'a safety stop must never stop the subject', reported as such",
+    ):
+        assert phrase in f15.acceptance, phrase
+    by_id = {violation.id: violation for violation in f15.known_violations}
+    for violation_id, phrase in _NOT_COVERED_PHRASES.items():
+        assert phrase in f15.acceptance, phrase  # the D1 'Not covered' list names it
+        assert violation_id in by_id, violation_id
+        assert "F15 acceptance 'Not covered'" in by_id[violation_id].source
+        assert "F15 slice D1 r3 FINAL" in by_id[violation_id].source
+    # the other three are the setting / implementation boundaries, each with a cited D1 place
+    extra = set(by_id) - set(_NOT_COVERED_PHRASES)
+    assert extra == {"KV-SEMANTIC-QUARANTINE-OFF", "KV-HARD-SHRINK-OFF", "KV-MODE-REFUSE"}
+    assert all("F15 slice D1 r3 FINAL" in by_id[name].source for name in extra)
+    # a class with no deterministic boundary test says so by an empty evidence list (listed anyway)
+    assert [v.id for v in f15.known_violations if not v.evidence] == [
+        "KV-DB2-AND-RECEIPT-RETENTION", "KV-NO-OPEN-TRANSACTION", "KV-PROCESS-DIES",
+    ]
+
+
+def test_semantic_quarantine_is_off_by_default_and_the_default_mode_is_refuse() -> None:
+    """The claims the F15 row makes about settings, checked against the product."""
+
+    from suzka.config.schema import DegradedContinuationSettings
+    from suzka.runtime.domain_quarantine import DEFAULT_QUARANTINE_PARTICIPANTS
+
+    assert "memory.experience" in DEFAULT_QUARANTINE_PARTICIPANTS
+    assert "memory.semantic" not in DEFAULT_QUARANTINE_PARTICIPANTS  # Semantic quarantine is OFF by default
+    defaults = DegradedContinuationSettings()
+    assert defaults.mode == "refuse"  # F15 is NOT in force under the default config
+    assert defaults.hard_band_auto_shrink is True
+    caveat = case_for("F15").caveat or ""
+    assert "mode = continue" in caveat and "OFF by default" in caveat and "KV-MODE-REFUSE" in caveat
+    ids = {v.id for v in case_for("F15").known_violations}
+    assert {"KV-SEMANTIC-QUARANTINE-OFF", "KV-MODE-REFUSE"} <= ids
+    covered_names = " ".join(c.name for c in case_for("F15").covered_classes).lower()
+    assert "semantic" not in covered_names  # Semantic is not claimed as covered
+
+
+def _source(file: str, name: str) -> str:
+    tree = ast.parse((ROOT / "tests" / file).read_text(encoding="utf-8"))
+    (node,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name]
+    return ast.get_source_segment((ROOT / "tests" / file).read_text(encoding="utf-8"), node) or ""
+
+
+def test_the_hard_ladder_is_exercised_only_with_hard_band_auto_shrink() -> None:
+    f15 = case_for("F15")
+    (hard,) = [c for c in f15.covered_classes if c.name.startswith("Journal over its hard cap")]
+    assert "hard_band_auto_shrink = true" in hard.setting and "never with it off" in hard.setting
+    for ref in hard.evidence:
+        text = _source(ref.file, ref.name)
+        assert "hard_band_auto_shrink" not in text or "hard_band_auto_shrink=False" not in text.replace(" ", ""), ref.node_id
+        assert '"hard_band_auto_shrink": False' not in text, ref.node_id
+    # the same row owns the opposite: with the ladder off the band blocks as before (a known violation)
+    (off,) = [v for v in f15.known_violations if v.id == "KV-HARD-SHRINK-OFF"]
+    assert off.evidence
+    assert "hard_band_auto_shrink" in _source(off.evidence[0].file, off.evidence[0].name)
+
+
+def test_the_f15_binding_checks_catch_a_missing_text_a_t2_boundary_test_and_a_vacuous_class() -> None:
+    f15 = case_for("F15")
+    original = f_matrix.CASES
+
+    def with_(**changes: object) -> list[str]:
+        f_matrix.CASES = tuple(dataclasses.replace(f15, **changes) if c.case == "F15" else c for c in original)  # type: ignore[arg-type]
+        try:
+            return check_table()
+        finally:
+            f_matrix.CASES = original
+
+    textless = dataclasses.replace(f15.known_violations[0], text="too short")
+    assert any("no D1 text" in p for p in with_(known_violations=(textless, *f15.known_violations[1:])))
+    t2 = dataclasses.replace(
+        f15.known_violations[0], evidence=(f_matrix._t("test_r20_ip22d_f15.py", f15.smoke[0].name),)
+    )
+    assert any("a T2 test" in p for p in with_(known_violations=(t2, *f15.known_violations[1:])))
+    ghost = dataclasses.replace(f15.known_violations[0], evidence=(f_matrix._t("test_dc5_supervisor.py", "test_no_such"),))
+    assert any("does not exist" in p for p in with_(known_violations=(ghost, *f15.known_violations[1:])))
+    twice = (f15.known_violations[0], *f15.known_violations)
+    assert any("used twice" in p for p in with_(known_violations=twice))
+    assert any("without a known-violation list" in p for p in with_(known_violations=()))
+    assert any("without covered classes" in p for p in with_(covered_classes=()))
+    weak = dataclasses.replace(f15.covered_classes[0], evidence=(f_matrix._t("test_dc6_hard_band.py", "test_run_at_idle_runs_when_idle_and_returns_true"),))
+    assert any("not a counted test" in p for p in with_(covered_classes=(weak, *f15.covered_classes[1:])))
+    assert any("no acceptance wording" in p for p in with_(acceptance=None))
+    assert check_table() == []

@@ -8,8 +8,9 @@ through these names; nothing here runs a case.
 * 22c F-matrix: ``F_CASES`` maps ``"F01-m"`` ... to a callable taking the
   harness context; the matrix table / runner is 22c's.
 * 22d S0 dry run and the SIGKILL tier: ``KILL_POINTS`` names the coarse points
-  (D1 sec. 4-3); the poll that decides when to kill is 22d's, using
-  ``polling.short_read`` and ``supervisor.ChildProcess.kill_group``.
+  (D1 sec. 4-3); the poll that decides when to kill is ``kill.py`` (using
+  ``polling.short_read`` and ``supervisor.ChildProcess.kill_group``), the dry run is
+  ``dry_run.py`` and the process-tier chain driver is ``s0.py``.
 """
 
 from __future__ import annotations
