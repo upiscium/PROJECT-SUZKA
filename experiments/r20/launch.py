@@ -96,10 +96,33 @@ class RealTerminal:
             os.close(descriptor)
 
     def prompt(self, text: str) -> str:
-        with open("/dev/tty", "r+", encoding="utf-8") as terminal:
-            terminal.write(text + "\n> ")
-            terminal.flush()
-            return terminal.readline().rstrip("\n")
+        """Writes ``text`` to ``/dev/tty`` and returns the typed line (stripped).  The terminal is
+        opened ONCE for reading and ONCE for writing on separate descriptors: a ``"r+"`` text file
+        makes the wrapper call ``tell`` / ``seek``, which a tty does not support.  No controlling
+        terminal, an end of input (Ctrl-D) and an interrupt (Ctrl-C) are clean refusals."""
+
+        try:
+            read_fd = os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY)
+        except OSError as error:
+            raise GuardRefusal("NO_TTY", "no controlling terminal to ask at") from error
+        try:
+            write_fd = os.open("/dev/tty", os.O_WRONLY | os.O_NOCTTY)
+        except OSError as error:
+            os.close(read_fd)
+            raise GuardRefusal("NO_TTY", "no controlling terminal to ask at") from error
+        try:
+            with os.fdopen(write_fd, "w", encoding="utf-8", buffering=1) as out, \
+                    os.fdopen(read_fd, "r", encoding="utf-8") as source:
+                out.write(text + "\n> ")
+                out.flush()
+                line = source.readline()
+        except KeyboardInterrupt as error:
+            raise GuardRefusal("CONFIRMATION_INTERRUPTED", "interrupted at the prompt") from error
+        except (OSError, UnicodeError) as error:
+            raise GuardRefusal("TERMINAL_UNREADABLE", type(error).__name__) from error
+        if not line:
+            raise GuardRefusal("CONFIRMATION_EOF", "end of input at the prompt")
+        return line.strip()
 
 
 def agent_environment(environ: Mapping[str, str]) -> list[str]:
