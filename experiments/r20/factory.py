@@ -35,6 +35,7 @@ import yaml  # type: ignore[import-untyped]
 
 from experiments.r20 import guards
 from experiments.r20.guards import GuardRefusal
+from experiments.r20.model_config import ModelOverride
 from experiments.r20.polling import short_read
 
 from suzka.config.schema import Settings
@@ -238,8 +239,11 @@ def build_config(
     run_id: str,
     r19_overrides: dict[str, int] | None = None,
     degraded_continuation: dict[str, Any] | None = None,
+    model: ModelOverride | None = None,
 ) -> dict[str, Any]:
-    """The raw config dict of one subject (the repository config, overridden)."""
+    """The raw config dict of one subject (the repository config, overridden).
+    ``model`` (IP-23a) overrides the model / generation sections; ``None`` keeps
+    the repository's ``dummy`` provider."""
 
     raw = _raw_config(guards.repo_root() / "config.yaml")
     _relocate(raw, root, tier)
@@ -261,6 +265,8 @@ def build_config(
     if degraded_continuation is not None:
         # F15 (IP-22d): the supervised ``mode = "continue"`` and its bounds.
         raw["degraded_continuation"] = dict(degraded_continuation)
+    if model is not None:
+        model.apply(raw)
     return raw
 
 
@@ -279,6 +285,7 @@ def create_subject(
     r19_overrides: dict[str, int] | None = None,
     degraded_continuation: dict[str, Any] | None = None,
     environ: dict[str, str] | None = None,
+    model: ModelOverride | None = None,
 ) -> GenesisSubject:
     """Create one new genesis subject.  Refuses (``GuardRefusal``) a root that
     exists or is not strictly under the explicit base, production locations,
@@ -311,7 +318,7 @@ def create_subject(
     raw = build_config(
         chosen, root, port, tier,
         deterministic=deterministic, r18=use_r18, r19=use_r19, run_id=rid, r19_overrides=r19_overrides,
-        degraded_continuation=degraded_continuation,
+        degraded_continuation=degraded_continuation, model=model,
     )
     (root / "config.yaml").write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     os.chmod(root / "config.yaml", 0o600)

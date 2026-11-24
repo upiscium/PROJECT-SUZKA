@@ -18,7 +18,7 @@ R19's per-start scans only.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 import threading
@@ -174,27 +174,46 @@ def run_kill_point(base: Path, point: str, *, attempts: int = 3) -> tuple[KillRe
 
 
 def _once(session: S0Session, point: str) -> KillResult:
-    result = KillResult(point)
     session.start()
-    first = session.child
-    assert first is not None
-    evidence = session.evidence
     ids = session.drive_to_open_approval()
     intent_id = ids["approval"]["intent_id"]
 
-    # approve, then poll until the named condition first holds and kill the group
-    # at once; the poll races the server (the window is not controlled)
     def approve() -> None:
+        session.approve(intent_id)
+
+    return kill_phase(session, point, approve)
+
+
+def kill_phase(
+    session: S0Session,
+    point: str,
+    approve: Callable[[], object],
+    *,
+    kill_wait_s: float = KILL_WAIT_S,
+    converge_s: float = CONVERGE_S,
+    chat_after_restart: bool = True,
+) -> KillResult:
+    """From an open approval on: ``approve`` runs in a worker (the scripted
+    operator, or the Human's wait), the group is killed when ``point`` first holds, a
+    new child serves the same root, and the invariants are judged.  The poll races
+    the server (the window is not controlled)."""
+
+    result = KillResult(point)
+    first = session.child
+    assert first is not None
+    evidence = session.evidence
+
+    def approve_quietly() -> None:
         try:
-            session.approve(intent_id)
+            approve()
         except (OSError, ValueError, GuardRefusal):
             pass  # the child may be killed under the request: that is the point
 
-    worker = threading.Thread(target=approve, name="r20-approve", daemon=True)
+    worker = threading.Thread(target=approve_quietly, name="r20-approve", daemon=True)
     worker.start()
     hit = poll_until(
         lambda: _snapshot_if(point, evidence),
-        timeout_s=KILL_WAIT_S,
+        timeout_s=kill_wait_s,
         interval_s=POLL_INTERVAL_S,
     )
     session.kill()
@@ -216,10 +235,14 @@ def _once(session: S0Session, point: str) -> KillResult:
     result.pids = (first.pid, second.pid)
     result.serving_after_restart_s = session.serving_after_s
     # the restarted subject serves a new turn; it needs no R16 command
-    turn = session.request("POST", "/api/chat", {"message": "after the restart", "attachments": []})
-    result.checks["subject_answers_after_restart"] = turn.status == 200
+    # (a COUNTED run asks /health instead: a chat turn here could land between the Feedback and the Wake review)
+    if chat_after_restart:
+        turn = session.request("POST", "/api/chat", {"message": "after the restart", "attachments": []})
+        result.checks["subject_answers_after_restart"] = turn.status == 200
+    else:
+        result.checks["subject_answers_after_restart"] = session.request("GET", "/health", timeout_s=30).status == 200
 
-    session.wait_for(lambda: session.finished(), CONVERGE_S, 0.5)
+    session.wait_for(lambda: session.finished(), converge_s, 0.5)
     time.sleep(3)  # a duplicate or a stray further row would show now
     _judge(session, result, frozen)
     return result
@@ -291,5 +314,5 @@ def _judge(session: S0Session, result: KillResult, frozen: Mapping[tuple[str, st
 
 
 __all__ = [
-    "KILL_TABLE", "T2_POINTS", "KillResult", "logical_counts", "replay_all", "run_kill_point",
+    "KILL_TABLE", "T2_POINTS", "KillResult", "kill_phase", "logical_counts", "replay_all", "run_kill_point",
 ]

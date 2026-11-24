@@ -21,6 +21,8 @@ from typing import Any
 from experiments.r20 import bridge, guards
 from experiments.r20.control import ControlError, ControlServer
 from experiments.r20.guards import GuardRefusal
+from experiments.r20.launch import check_launch_record
+from experiments.r20.measure import GpuSampler
 from experiments.r20.provider import (
     DEFAULT_ANSWER,
     NON_NEUTRAL_LOSS,
@@ -57,6 +59,8 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--approval-actor", choices=[a.value for a in ApprovalActor], default="SCRIPTED")
     parser.add_argument("--provider-config")
     parser.add_argument("--human-launch", action="store_true")
+    parser.add_argument("--launch-nonce")
+    parser.add_argument("--turn-cap-s", type=float, default=float(bridge.TIMEOUT_S))
     return parser.parse_args(argv)
 
 
@@ -78,6 +82,9 @@ def prepare(args: argparse.Namespace) -> tuple[Path, Any, ProviderMode]:
         ApprovalActor(args.approval_actor),
         human_launch=bool(args.human_launch) and sys.stdin.isatty(),
     )
+    if mode is ProviderMode.REAL:
+        # The launcher (``real_run``) is this child's parent and holds the Human's attestation.
+        check_launch_record(root.parent / "control" / "launch.json", args.launch_nonce, os.getppid())
     return root, load_provider(mode, Path(args.provider_config) if args.provider_config else None), mode
 
 
@@ -91,6 +98,9 @@ def main(argv: list[str] | None = None) -> int:
         settings = load_settings(root / "config.yaml")
         guards.check_settings_paths(settings, root, relative=True)
         port = guards.check_settings_network(settings)
+        # A real model is loaded ONLY in a Human-launched real run, and a real run loads ONLY a real config.
+        if (mode is ProviderMode.REAL) != (settings.model.provider != "dummy"):
+            raise GuardRefusal("MODEL_CONFIG_MODE_MISMATCH", f"{mode.value} vs {settings.model.provider}")
     except GuardRefusal as refusal:
         print(f"serve refused: {refusal.code}", file=sys.stderr)
         return 2
@@ -99,6 +109,10 @@ def main(argv: list[str] | None = None) -> int:
 
     from suzka.api.server import create_app
 
+    sampler: GpuSampler | None = None
+    if mode is ProviderMode.REAL:
+        sampler = GpuSampler(root.parent / "evidence" / "gpu.jsonl")
+        sampler.start()  # numbers only: free / total / reserved, before the load and then every few seconds
     app = create_app(settings)
     if provider is not None:
         app.state.model_provider = provider
@@ -134,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def review(arguments: Any) -> dict[str, Any]:
         try:
-            return bridge.review(app.state, str(arguments["stage"]))
+            return bridge.review(app.state, str(arguments["stage"]), timeout_s=float(args.turn_cap_s))
         except bridge.BridgeRefused as refusal:
             raise ControlError(str(refusal)) from refusal
 
@@ -151,6 +165,8 @@ def main(argv: list[str] | None = None) -> int:
         server.run()
     finally:
         control.stop()
+        if sampler is not None:
+            sampler.stop()
     return 0
 
 

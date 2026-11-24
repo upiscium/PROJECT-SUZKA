@@ -49,7 +49,7 @@ def committed_chat_turns(state: Any) -> list[QualifiedTurnRef]:
     return [ref for _sequence, ref in sorted(refs, key=lambda item: item[0])]
 
 
-def review(state: Any, stage: str) -> dict[str, object]:
+def review(state: Any, stage: str, timeout_s: float = TIMEOUT_S) -> dict[str, object]:
     """Admit S1 (after exactly three committed turns) or S2 (after five)."""
 
     if stage not in STAGE_TURNS:
@@ -63,7 +63,7 @@ def review(state: Any, stage: str) -> dict[str, object]:
         AgentEventSource.RUNTIME_NARRATIVE_REVIEW,
         lambda: owner._review_committed_turns(tuple(refs)),
     )
-    result = future.result(timeout=TIMEOUT_S).value
+    result = future.result(timeout=timeout_s).value
     return {
         "stage": stage,
         "changed": bool(result.changed),
