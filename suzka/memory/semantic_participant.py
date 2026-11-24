@@ -45,9 +45,9 @@ from suzka.runtime.event_journal import (
 )
 from suzka.runtime.transaction_coordinator import (
     ParticipantDivergedError,
+    ParticipantEvidenceAbsentError,
     ParticipantUnavailableError,
     TransactionBinding,
-    UnsupportedParticipantReconciliationError,
     validate_transaction_binding,
 )
 from suzka.identifiers import validate_identifier
@@ -309,7 +309,7 @@ class MemorySemanticParticipant:
         payload = pending or receipt
         if payload is None:
             if event_id is None or processing_sequence is None:
-                raise UnsupportedParticipantReconciliationError(
+                raise ParticipantEvidenceAbsentError(
                     "Semantic operation evidence is absent"
                 )
             operation = cls.operation_from_authority(
@@ -357,7 +357,7 @@ class MemorySemanticParticipant:
             and entry.revision.event_sequence == processing_sequence
         )
         if not candidates:
-            raise UnsupportedParticipantReconciliationError(
+            raise ParticipantEvidenceAbsentError(
                 "Semantic operation evidence is absent"
             )
         reconstructed: list[SemanticBatchEntry] = []
@@ -375,7 +375,7 @@ class MemorySemanticParticipant:
                     None,
                 )
             if batch_index is None or batch_index in used_indices:
-                raise UnsupportedParticipantReconciliationError(
+                raise ParticipantEvidenceAbsentError(
                     "Semantic batch index evidence is absent"
                 )
             used_indices.add(batch_index)
@@ -414,7 +414,7 @@ class MemorySemanticParticipant:
                 tuple(sorted(reconstructed, key=lambda item: item.batch_index)),
             )
         except (TypeError, ValueError):
-            raise UnsupportedParticipantReconciliationError(
+            raise ParticipantEvidenceAbsentError(
                 "Semantic authority batch evidence is incomplete"
             ) from None
         if semantic_batch_operation_digest(operation) != operation_digest:
@@ -602,7 +602,7 @@ class MemorySemanticParticipant:
             )
             self._validate_receipt_targets()
         elif pending is None:
-            raise UnsupportedParticipantReconciliationError(
+            raise ParticipantEvidenceAbsentError(
                 "Semantic operation evidence is absent"
             )
         self._validate_sources()

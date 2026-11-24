@@ -49,6 +49,11 @@ from suzka.r16.history_participant import (
 )
 from suzka.r16.history_store import SubjectHistoryStore
 from suzka.runtime.agent_runtime import AgentEvent
+from suzka.runtime.degraded_continuation import CycleRestart
+from suzka.runtime.domain_quarantine import (
+    ParticipantResolutionPolicy,
+    participant_floor,
+)
 from suzka.runtime.event_journal import (
     EventJournal,
     EventJournalIntegrityError,
@@ -87,6 +92,27 @@ from suzka.runtime.transaction_coordinator import (
 
 
 _RECONCILIATION_NAMESPACE = UUID("0b941247-478c-5e32-9142-d82b165a330f")
+
+# F15 DC-4: a transaction can need both memory domains quarantined (Experience
+# and Semantic), never more.
+_MAX_QUARANTINES_PER_TRANSACTION = 2
+_QUARANTINE_RESTART_REASON = "participant_quarantined"
+#: The outcomes that mean "the participant's data exists" for a reader that asks
+#: that question.  ``QUARANTINED`` is NOT one of them (D1 S0-b: a quarantined
+#: outcome must never be read as evidence that a store holds the data).
+_DATA_PRESENT_OUTCOMES = frozenset(
+    {ParticipantOutcome.FINALIZED, ParticipantOutcome.ALREADY_CONSISTENT}
+)
+
+
+def _annotate(error: BaseException, participant_id: str) -> None:
+    """Remember which participant raised, for the resolution policy."""
+
+    if getattr(error, "dc_participant_id", None) is None:
+        try:
+            error.dc_participant_id = participant_id  # type: ignore[attr-defined]
+        except AttributeError:  # pragma: no cover - exceptions allow attributes
+            pass
 
 
 class StartupReconciliationError(StateRecoveryError, EventJournalIntegrityError):
@@ -144,7 +170,10 @@ class StartupReconciliationCoordinator:
         | None = None,
         history_store: SubjectHistoryStore | None = None,
         history_incarnation: Callable[[], str] | None = None,
+        resolution_policy: ParticipantResolutionPolicy | None = None,
     ) -> None:
+        # The default is the legacy behaviour: nothing is resolved (DC-4).
+        self.resolution_policy = resolution_policy or ParticipantResolutionPolicy()
         self.journal = journal
         self.state_recovery = state_recovery
         self.memory = memory
@@ -190,8 +219,19 @@ class StartupReconciliationCoordinator:
         self.history_incarnation = history_incarnation
 
     def reconcile_open_transactions(self) -> tuple[bool, str | None]:
-        """Resolve Path A without replaying an event handler or model call."""
+        """Resolve Path A without replaying an event handler or model call.
 
+        With a ``DomainQuarantinePolicy`` (``degraded_continuation.mode =
+        "continue"``) a DIVERGED / evidence-absent ``memory.experience`` or
+        ``memory.semantic`` fault is resolved by a quarantine and the cycle ends
+        with ``CycleRestart`` so the next one runs on the empty store; without
+        it every fault ends in ``external_participant_reconciliation_required``
+        exactly as before."""
+
+        policy = self.resolution_policy
+        reason = policy.begin(self)
+        if reason is not None:
+            return False, reason
         transactions = sorted(
             self.journal.inspect().open_transactions,
             key=lambda item: item.transaction_id,
@@ -202,24 +242,66 @@ class StartupReconciliationCoordinator:
                 "transaction processing sequence",
                 positive=True,
             )
+        result: tuple[bool, str | None] = (True, None)
         for transaction in transactions:
             proof = self.state_recovery.inspect_transaction_commit(transaction)
             if proof.classification is InternalCommitClassification.AMBIGUOUS:
                 raise StartupReconciliationError(
                     "Open transaction internal commit evidence is ambiguous"
                 )
-            try:
-                if proof.classification is InternalCommitClassification.PRE_INTERNAL:
-                    self._abort_transaction(transaction)
-                else:
-                    self._roll_forward_transaction(transaction)
-            except (
-                ParticipantDivergedError,
-                ParticipantUnavailableError,
-                UnsupportedParticipantReconciliationError,
-            ):
-                return False, "external_participant_reconciliation_required"
-        return True, None
+            current: EventJournalTransaction | None = transaction
+            confirmed: set[str] = set()
+            resolved = 0
+            while current is not None:
+                try:
+                    if (
+                        proof.classification
+                        is InternalCommitClassification.PRE_INTERNAL
+                    ):
+                        self._abort_transaction(current)
+                    else:
+                        self._roll_forward_transaction(current)
+                except (
+                    ParticipantDivergedError,
+                    ParticipantUnavailableError,
+                    UnsupportedParticipantReconciliationError,
+                ) as error:
+                    participant_id = getattr(error, "dc_participant_id", None)
+                    if participant_id is not None and participant_id not in confirmed:
+                        if policy.wants_confirmation(participant_id, error):
+                            # one confirming re-read of a DIVERGED verdict
+                            confirmed.add(participant_id)
+                            policy.confirm_delay()
+                            current = self._open_transaction(current.transaction_id)
+                            continue
+                    if (
+                        resolved < _MAX_QUARANTINES_PER_TRANSACTION
+                        and policy.resolve_transaction_fault(
+                            self, participant_id, error
+                        )
+                    ):
+                        resolved += 1
+                        current = self._open_transaction(current.transaction_id)
+                        continue
+                    result = (False, "external_participant_reconciliation_required")
+                break
+            if not result[0]:
+                break
+        if policy.should_restart():
+            # The domain store was moved: this cycle's store objects are stale.
+            # End the cycle; the supervisor rebuilds (D1 sec. 4.2 step 4).
+            raise CycleRestart(_QUARANTINE_RESTART_REASON)
+        return result
+
+    def _open_transaction(self, transaction_id: str) -> EventJournalTransaction | None:
+        return next(
+            (
+                item
+                for item in self.journal.inspect().open_transactions
+                if item.transaction_id == transaction_id
+            ),
+            None,
+        )
 
     def reconcile_terminal_semantic_projections(self) -> tuple[bool, str | None]:
         """Reconcile DB2 only from terminal, Journal-proven Semantic authority."""
@@ -254,7 +336,8 @@ class StartupReconciliationCoordinator:
                     continue
                 if not any(
                     participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID
-                    for participant_id, _outcome in transaction.participant_outcomes
+                    and outcome in _DATA_PRESENT_OUTCOMES
+                    for participant_id, outcome in transaction.participant_outcomes
                 ):
                     continue
                 matching.append(transaction)
@@ -441,9 +524,32 @@ class StartupReconciliationCoordinator:
             for requirement in requirements:
                 if requirement.participant_id in known:
                     continue
-                outcome = self._reconcile_aggregate_participant(
-                    requirement.participant_id, transactions
-                )
+                confirmed = False
+                while True:
+                    try:
+                        outcome = self._reconcile_aggregate_participant(
+                            requirement.participant_id, transactions
+                        )
+                        break
+                    except (
+                        ParticipantDivergedError,
+                        ParticipantUnavailableError,
+                        UnsupportedParticipantReconciliationError,
+                    ) as error:
+                        policy = self.resolution_policy
+                        if not confirmed and policy.wants_confirmation(
+                            requirement.participant_id, error
+                        ):
+                            confirmed = True
+                            policy.confirm_delay()
+                            continue
+                        if policy.resolve_aggregate_fault(
+                            self, requirement.participant_id, error, reconciliation
+                        ):
+                            # R stays open and is NOT recomputed: the next
+                            # cycle resumes the same reconciliation_id.
+                            raise CycleRestart(_QUARANTINE_RESTART_REASON) from None
+                        raise
                 self.journal.append_startup_participant_reconciled(
                     reconciliation.reconciliation_id,
                     reconciliation.recovery_id,
@@ -515,28 +621,38 @@ class StartupReconciliationCoordinator:
                 or ParticipantCapability.ABORT not in requirement.capabilities
             ):
                 continue
-            binding = self._binding(transaction, requirement)
-            if requirement.participant_id == MEMORY_EPISODIC_PARTICIPANT_ID:
-                outcome = MemoryEpisodicParticipant.abort_pending(self.memory, binding)
-            elif requirement.participant_id == MEMORY_EXPERIENCE_PARTICIPANT_ID:
-                outcome = MemoryExperienceParticipant.abort_pending(
-                    self.memory, self.experience_store, binding
-                )
-            elif requirement.participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID:
-                outcome = MemorySemanticParticipant.abort_pending(
-                    self.memory, self.semantic_store, binding
-                )
-            elif requirement.participant_id == SESSION_TURN_PARTICIPANT_ID:
-                outcome = AbortOutcome.ALREADY_ABSENT
-            elif requirement.participant_id == SUBJECT_HISTORY_PARTICIPANT_ID:
-                store, incarnation = self._history_authority()
-                outcome = SubjectHistoryParticipant.abort_pending(
-                    store, incarnation, binding
-                )
-            else:
-                raise UnsupportedParticipantReconciliationError(
-                    "Participant abort resolver is not registered"
-                )
+            try:
+                binding = self._binding(transaction, requirement)
+                if requirement.participant_id == MEMORY_EPISODIC_PARTICIPANT_ID:
+                    outcome = MemoryEpisodicParticipant.abort_pending(
+                        self.memory, binding
+                    )
+                elif requirement.participant_id == MEMORY_EXPERIENCE_PARTICIPANT_ID:
+                    outcome = MemoryExperienceParticipant.abort_pending(
+                        self.memory, self.experience_store, binding
+                    )
+                elif requirement.participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID:
+                    outcome = MemorySemanticParticipant.abort_pending(
+                        self.memory, self.semantic_store, binding
+                    )
+                elif requirement.participant_id == SESSION_TURN_PARTICIPANT_ID:
+                    outcome = AbortOutcome.ALREADY_ABSENT
+                elif requirement.participant_id == SUBJECT_HISTORY_PARTICIPANT_ID:
+                    store, incarnation = self._history_authority()
+                    outcome = SubjectHistoryParticipant.abort_pending(
+                        store, incarnation, binding
+                    )
+                else:
+                    raise UnsupportedParticipantReconciliationError(
+                        "Participant abort resolver is not registered"
+                    )
+            except (
+                ParticipantDivergedError,
+                ParticipantUnavailableError,
+                UnsupportedParticipantReconciliationError,
+            ) as error:
+                _annotate(error, requirement.participant_id)
+                raise
             self.journal.append_participant_aborted(
                 event,
                 transaction.transaction_id,
@@ -562,33 +678,41 @@ class StartupReconciliationCoordinator:
         for requirement in transaction.required_participants:
             if requirement.participant_id in known:
                 continue
-            if requirement.participant_id == MEMORY_EPISODIC_PARTICIPANT_ID:
-                outcome = self._memory_participant(
-                    transaction, requirement
-                ).finalize(self._binding(transaction, requirement))
-            elif requirement.participant_id == MEMORY_EXPERIENCE_PARTICIPANT_ID:
-                outcome = self._experience_participant(
-                    transaction, requirement
-                ).finalize(self._binding(transaction, requirement))
-            elif requirement.participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID:
-                outcome = self._semantic_participant(
-                    transaction, requirement
-                ).finalize(self._binding(transaction, requirement))
-            elif requirement.participant_id == SESSION_TURN_PARTICIPANT_ID:
-                inspect_reset_session_operation(
-                    transaction.transaction_id,
-                    requirement.participant_id,
-                    requirement.operation_digest,
-                )
-                outcome = ParticipantOutcome.ALREADY_CONSISTENT
-            elif requirement.participant_id == SUBJECT_HISTORY_PARTICIPANT_ID:
-                outcome = self._history_participant(
-                    transaction, requirement
-                ).finalize(self._binding(transaction, requirement))
-            else:
-                raise UnsupportedParticipantReconciliationError(
-                    "Participant resolver is not registered"
-                )
+            try:
+                if requirement.participant_id == MEMORY_EPISODIC_PARTICIPANT_ID:
+                    outcome = self._memory_participant(
+                        transaction, requirement
+                    ).finalize(self._binding(transaction, requirement))
+                elif requirement.participant_id == MEMORY_EXPERIENCE_PARTICIPANT_ID:
+                    outcome = self._experience_participant(
+                        transaction, requirement
+                    ).finalize(self._binding(transaction, requirement))
+                elif requirement.participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID:
+                    outcome = self._semantic_participant(
+                        transaction, requirement
+                    ).finalize(self._binding(transaction, requirement))
+                elif requirement.participant_id == SESSION_TURN_PARTICIPANT_ID:
+                    inspect_reset_session_operation(
+                        transaction.transaction_id,
+                        requirement.participant_id,
+                        requirement.operation_digest,
+                    )
+                    outcome = ParticipantOutcome.ALREADY_CONSISTENT
+                elif requirement.participant_id == SUBJECT_HISTORY_PARTICIPANT_ID:
+                    outcome = self._history_participant(
+                        transaction, requirement
+                    ).finalize(self._binding(transaction, requirement))
+                else:
+                    raise UnsupportedParticipantReconciliationError(
+                        "Participant resolver is not registered"
+                    )
+            except (
+                ParticipantDivergedError,
+                ParticipantUnavailableError,
+                UnsupportedParticipantReconciliationError,
+            ) as error:
+                _annotate(error, requirement.participant_id)
+                raise
             self.journal.append_participant_finalized(
                 event,
                 transaction.transaction_id,
@@ -711,6 +835,18 @@ class StartupReconciliationCoordinator:
                 transaction
                 for transaction in transactions
                 if not self.semantic_checkpoint_covers(transaction)
+            )
+        # F15 DC-4 participant floor: transactions a quarantine of THIS
+        # participant already covered were checked against a store that no
+        # longer exists.  Derived from Journal records only and applied ONLY
+        # here: never in the transaction list, the requirement digest or the
+        # reconciliation_id (D1 r3 P1-A).  No quarantine, no floor, no change.
+        floor = participant_floor(self.journal.inspect(), participant_id)
+        if floor:
+            transactions = tuple(
+                transaction
+                for transaction in transactions
+                if transaction.processing_sequence > floor
             )
         rolled_forward = False
         for transaction in transactions:

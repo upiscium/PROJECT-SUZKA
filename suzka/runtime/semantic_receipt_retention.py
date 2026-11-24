@@ -12,7 +12,7 @@ from suzka.memory.semantic_store import (
     SemanticStoreConflict,
     SemanticStoreError,
 )
-from suzka.runtime.event_journal import EventJournal
+from suzka.runtime.event_journal import EventJournal, ParticipantOutcome
 from suzka.runtime.transaction_coordinator import (
     ParticipantRequirement,
 )
@@ -117,9 +117,13 @@ class SemanticReceiptRetentionCoordinator:
         safe_horizon = max(horizons)
         proofs: dict[str, str] = {}
         for transaction in transactions:
+            # A QUARANTINED outcome (F15 DC-4) means the store was moved away:
+            # it is not a proof that a receipt for this transaction may retire.
             if not any(
                 participant_id == MEMORY_SEMANTIC_PARTICIPANT_ID
-                for participant_id, _outcome in transaction.participant_outcomes
+                and outcome
+                in (ParticipantOutcome.FINALIZED, ParticipantOutcome.ALREADY_CONSISTENT)
+                for participant_id, outcome in transaction.participant_outcomes
             ):
                 continue
             requirement = next(
