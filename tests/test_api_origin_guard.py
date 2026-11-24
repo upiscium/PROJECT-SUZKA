@@ -83,7 +83,11 @@ def _send(app, method: str, path: str, host: str, headers=None, body=None):  # t
 
 def _refused(response, code: Refusal) -> None:  # type: ignore[no-untyped-def]
     assert response.status_code == 403
-    assert response.json() == {"status": "refused", "reason": code.value}
+    assert response.json() == {
+        "status": "refused",
+        "reason": code.value,
+        "hint": origin_guard.HINTS[code],
+    }
     assert "access-control-allow-origin" not in response.headers
 
 
@@ -453,3 +457,55 @@ def test_scheme_and_port_edge_cases() -> None:
         ApiSettings(host="127.0.0.1", port=8000, cors_origins=["*"])
     )
     assert wild.origins == frozenset()
+
+
+def test_refusal_hint_is_fixed_per_reason_and_has_no_request_value(app) -> None:  # type: ignore[no-untyped-def]
+    canary = "canary-evil.example"
+    host = _send(app, "GET", "/api/health", canary)
+    assert host.json()["hint"] == "add this host name to api.allowed_hosts"
+    origin = _send(app, "POST", "/api/sleep/run", LAN_HOST, {"Origin": "https://" + canary})
+    cross = _send(app, "POST", "/api/sleep/run", LAN_HOST, {"Sec-Fetch-Site": "cross-site"})
+    for response in (host, origin, cross):
+        assert set(response.json()) == {"status", "reason", "hint"}
+        assert canary not in response.text and canary not in str(response.headers)
+        assert response.json()["hint"] == origin_guard.HINTS[Refusal(response.json()["reason"])]
+    assert "api.allowed_origins" in origin.json()["hint"]
+
+
+NASTY = [
+    "evil.example\r\nWARNING forged line",
+    "evil\x1b[31m.example",
+    "h\u00f6st.example\u202e",
+    'a"b\\c\'d`e',
+    "a" * 1000,
+]
+
+
+@pytest.mark.parametrize("value", NASTY)
+def test_logged_header_values_cannot_break_the_one_line_format(value: str) -> None:
+    text = origin_guard.sanitize_for_log(value)
+    assert text.isascii() and text.isprintable()
+    assert text[0] == text[-1] == '"' and len(text) <= 64 + 2
+    assert text[1:-1].count('"') == 0 and "\\" not in text and "'" not in text
+    assert origin_guard.sanitize_for_log(None) == '"-"'
+
+
+@pytest.mark.parametrize("value", NASTY)
+def test_refusal_log_line_names_host_and_origin_on_one_line(value: str, caplog: pytest.LogCaptureFixture) -> None:
+    raw = [(b"host", value.encode("utf-8"))]
+    detail = origin_guard._log_detail(Refusal.HOST, raw)
+    assert detail.startswith(" host=\"") and "origin=" not in detail
+    raw.append((b"origin", value.encode("utf-8")))
+    detail = origin_guard._log_detail(Refusal.ORIGIN, raw)
+    assert " origin=\"" in detail
+    with caplog.at_level("WARNING", logger=origin_guard.LOGGER.name):
+        origin_guard._RefusalLog().note(Refusal.ORIGIN, detail)
+    (line,) = [r.getMessage() for r in caplog.records]
+    assert "\n" not in line and "\r" not in line and "\x1b" not in line and line.isascii()
+    assert len(line) <= len("api request refused: api_origin_not_accepted host= origin=") + 2 * 66
+
+
+def test_server_logs_the_refused_host(app, caplog: pytest.LogCaptureFixture) -> None:  # type: ignore[no-untyped-def]
+    with caplog.at_level("WARNING", logger=origin_guard.LOGGER.name):
+        _send(app, "GET", "/api/health", "suzka.arc.example")
+    assert 'host="suzka.arc.example"' in caplog.text
