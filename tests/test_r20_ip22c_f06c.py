@@ -4,13 +4,12 @@ T2 results are NOT counted as covered: the provider is scripted but the poll
 races the server, so the exact crash window is not controlled; the exact
 windows are the merged T1 tests (crash matrix, IP-17c claim, IP-19, IP-20d).
 
-Scope (stated, not hidden): this smoke is at the R16 level.  The D1 points
-K2-K6 need the R18 / R19 chain on a T2 root, and that chain does NOT start on a
-T2 root today: with ``r18.enabled`` and the factory's T2 layout (relative paths,
-cwd = root, ``serve``) the app never builds the Decision / Intent issuer and the
-R18 gate stays SWEEPING, so no Intent follows the row-4 Decision (observed
-for 40 s; the same config in-process with absolute paths works).  The cause is
-not isolated; it is reported for IP-22d, which owns K2-K6 and F15-x.
+Scope (stated, not hidden): this smoke is at the R16 level.  K2-K6 on the R18 / R19
+chain of a T2 S0 root are IP-22d's (``test_r20_ip22d_kill.py``): the relative-path
+``r18.target_path`` bug that kept the R18 executor from starting under the T2 layout
+(relative paths, cwd = root, ``serve``) is fixed (#469), and the chain now runs
+there (checked by IP-22d: Intent, forecast, Policy, approval, claim, effect,
+Outcome, Feedback, Wake, cycle Decision, Outbox).
 
 What is asserted after a real SIGKILL of the process group at the first moment
 a Decision row is visible: the restart reaches readiness on the same root
