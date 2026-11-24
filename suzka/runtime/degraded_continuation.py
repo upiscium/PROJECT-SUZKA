@@ -65,8 +65,13 @@ __all__ = [
     "CycleRestart",
     "Deadline",
     "DegradedContinuationStatus",
+    "DOMAIN_QUARANTINED_REASON",
+    "DOMAIN_STORE_REPLACED_REASON",
     "DcState",
     "EPOCH_MARKER_NAME",
+    "HASH_MISMATCH_BOUND_S",
+    "HASH_MISMATCH_MAX_OBSERVATIONS",
+    "HashMismatch",
     "IntegrityVerdict",
     "MANIFEST_SCHEMA",
     "ManifestError",
@@ -379,6 +384,11 @@ class DcState(str, Enum):
 
 
 _DC_REASON_MAX = 200
+#: ``dc_reason`` of a SERVING subject whose memory domain was quarantined (DC-4).
+DOMAIN_QUARANTINED_REASON = "domain_quarantined"
+#: ``dc_reason`` of a start that found a memory root that is not the latest
+#: epoch's (a restored or hand-replaced directory, F-15).  Detection only.
+DOMAIN_STORE_REPLACED_REASON = "domain_store_replaced"
 
 
 def _bounded(value: str) -> str:
@@ -401,6 +411,20 @@ class DegradedContinuationStatus:
         self._since: datetime | None = None
         self._participants: tuple[str, ...] = ()
         self._epoch_id: str | None = None
+        # DC-4: memory domains that were quarantined and now run empty.  Kept
+        # apart from the published state so a later ``publish`` (SERVING...)
+        # cannot hide it (prohibition 9: a degraded state must not hide).
+        self._domains: tuple[str, ...] = ()
+        self._domain_epoch: str | None = None
+
+    def note_domain_quarantine(
+        self, participants: Iterable[str], epoch_id: str | None
+    ) -> None:
+        """Set (replace) the quarantined-domain overlay.  Empty clears it."""
+
+        with self._lock:
+            self._domains = tuple(sorted(set(participants)))
+            self._domain_epoch = epoch_id if self._domains else None
 
     def publish(
         self,
@@ -427,12 +451,16 @@ class DegradedContinuationStatus:
             fields = {"dc_state": self._state.value}
             if self._reason:
                 fields["dc_reason"] = self._reason
+            elif self._domains:
+                fields["dc_reason"] = DOMAIN_QUARANTINED_REASON
             if self._since is not None:
                 fields["dc_since"] = self._since.isoformat()
-            if self._participants:
-                fields["dc_participants"] = ",".join(self._participants)
-            if self._epoch_id:
-                fields["dc_epoch_id"] = self._epoch_id
+            participants = tuple(sorted({*self._participants, *self._domains}))
+            if participants:
+                fields["dc_participants"] = ",".join(participants)
+            epoch = self._epoch_id or self._domain_epoch
+            if epoch:
+                fields["dc_epoch_id"] = epoch
             return fields
 
     def health_fields(self) -> dict[str, str]:
@@ -443,7 +471,7 @@ class DegradedContinuationStatus:
 
         with self._lock:
             quiet = self._state in (DcState.INACTIVE, DcState.SERVING) and not (
-                self._reason or self._participants
+                self._reason or self._participants or self._domains
             )
         return {} if quiet else self.snapshot()
 
@@ -559,6 +587,52 @@ def _opt_bool(value: Any) -> bool | None:
     return value
 
 
+#: How long a moved tree that no longer matches its PENDING hashes keeps the
+#: manifest PENDING and BLOCKED before the Human-free exit is taken (DC-4).  Wall
+#: clock, because it must survive a restart; the observation count is the
+#: fallback for a clock that stands still or jumps back.
+HASH_MISMATCH_BOUND_S = 60.0
+HASH_MISMATCH_MAX_OBSERVATIONS = 6
+_MISMATCH_PATHS_MAX = 20
+
+
+@dataclass(frozen=True)
+class HashMismatch:
+    """A moved tree that differs from the hashes recorded before the move.
+
+    The tree is the damaged artifact and stays exactly where it is: this is a
+    RECORD of the difference, never a repair.  ``accepted_at`` is set once the
+    bound passed and the quarantine was treated as done with ``verified: null``
+    (the Human-free exit, D1 sec. 4.2 resume rule, DC-4 interpretation)."""
+
+    first_seen_at: str
+    last_seen_at: str
+    observations: int
+    differing: tuple[str, ...]
+    accepted_at: str | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "first_seen_at": self.first_seen_at,
+            "last_seen_at": self.last_seen_at,
+            "observations": self.observations,
+            "differing": list(self.differing),
+            "accepted_at": self.accepted_at,
+        }
+
+    @classmethod
+    def from_json(cls, raw: object) -> "HashMismatch":
+        if not isinstance(raw, dict):
+            raise TypeError("hash_mismatch must be an object")
+        return cls(
+            first_seen_at=_str(raw["first_seen_at"]),
+            last_seen_at=_str(raw["last_seen_at"]),
+            observations=_int(raw["observations"]),
+            differing=tuple(_str(item) for item in raw["differing"]),
+            accepted_at=_opt_str(raw["accepted_at"]),
+        )
+
+
 @dataclass(frozen=True)
 class QuarantineManifest:
     """Sidecar record of one epoch.  Never an authority: it never narrows what
@@ -576,6 +650,9 @@ class QuarantineManifest:
     artifacts: tuple[QuarantineArtifact, ...]
     transaction_ids: tuple[str, ...] = ()
     schema: str = MANIFEST_SCHEMA
+    # DC-4: set when the moved tree differs from the recorded hashes.  Absent
+    # from a manifest written before DC-4 (read as None); the schema stays v1.
+    hash_mismatch: HashMismatch | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -591,6 +668,9 @@ class QuarantineManifest:
             "runtime_instance_id": self.runtime_instance_id,
             "artifacts": [artifact.to_json() for artifact in self.artifacts],
             "transaction_ids": list(self.transaction_ids),
+            "hash_mismatch": (
+                None if self.hash_mismatch is None else self.hash_mismatch.to_json()
+            ),
         }
 
     @classmethod
@@ -615,6 +695,11 @@ class QuarantineManifest:
                     QuarantineArtifact.from_json(a) for a in raw["artifacts"]
                 ),
                 transaction_ids=tuple(_str(t) for t in raw["transaction_ids"]),
+                hash_mismatch=(
+                    None
+                    if raw.get("hash_mismatch") is None
+                    else HashMismatch.from_json(raw["hash_mismatch"])
+                ),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ManifestError("manifest is malformed") from error
@@ -812,6 +897,28 @@ def _entries_match(
     return True
 
 
+def _differing_paths(
+    before: Iterable[tuple[str, str, int, str | None]],
+    after: Iterable[tuple[str, str, int, str | None]],
+) -> tuple[str, ...]:
+    """Relative paths where the two scans disagree (bounded, sorted)."""
+
+    old = {entry[0]: entry for entry in before}
+    new = {entry[0]: entry for entry in after}
+    found: list[str] = []
+    for relpath in sorted(old.keys() | new.keys()):
+        a, b = old.get(relpath), new.get(relpath)
+        if a is None or b is None:
+            found.append(relpath)
+        elif (a[1], a[2]) != (b[1], b[2]) or (
+            a[3] is not None and b[3] is not None and a[3] != b[3]
+        ):
+            found.append(relpath)
+        if len(found) >= _MISMATCH_PATHS_MAX:
+            break
+    return tuple(found)
+
+
 # -- manifest store ---------------------------------------------------------
 
 
@@ -836,7 +943,9 @@ class QuarantineWriter:
         quarantinable_verdicts: frozenset[IntegrityVerdict] = frozenset(
             {IntegrityVerdict.DIVERGED}
         ),
+        mismatch_bound_s: float = HASH_MISMATCH_BOUND_S,
     ) -> None:
+        self._mismatch_bound_s = mismatch_bound_s
         self._dir = Path(quarantine_dir)
         # Prohibition 8: no DC action without the Journal lease.  Asked before
         # every move (the caller passes e.g. ``journal.has_exclusive_authority``).
@@ -926,6 +1035,9 @@ class QuarantineWriter:
         # Step 2, MOVED.
         return self._move_and_verify(manifest, root, deadline)
 
+    def require_authority(self) -> None:
+        self._require_authority()
+
     def _require_authority(self) -> None:
         if not self._authority():
             raise QuarantineRefused("no exclusive Journal authority; nothing was done")
@@ -971,6 +1083,9 @@ class QuarantineWriter:
         after = _scan_tree(target, deadline, only_hash=hashed)
         unreadable = {item[0] for item in after.read_errors} & hashed
         if unreadable or not _entries_match(artifact.entries, after.entries):
+            self._note_mismatch(
+                manifest, _differing_paths(artifact.entries, after.entries)
+            )
             raise QuarantineError(
                 "moved tree differs from the recorded one; manifest stays PENDING"
             )
@@ -1075,13 +1190,144 @@ class QuarantineWriter:
             return ()
         return tuple(name for name in names if _EPOCH_ID.match(name))
 
+    # -- a vanished root (evidence absent, nothing to move)
+
+    def record_absent_root(
+        self,
+        root: Path,
+        *,
+        reason: str,
+        participant_id: str,
+        epoch_id: str,
+        verdict: IntegrityVerdict = IntegrityVerdict.DIVERGED,
+        journal_lineage_id: str | None = None,
+        journal_last_record_hash: str | None = None,
+        runtime_instance_id: str | None = None,
+        transaction_ids: Iterable[str] = (),
+    ) -> QuarantineManifest:
+        """The store's directory is gone: there is no tree to move or hash.
+
+        Writes a MOVED manifest with NO artifact (state order is kept: the
+        move step is vacuously done).  Refuses (changing nothing) when the
+        participant / verdict is not quarantinable, when the authority is
+        missing, when ``root`` exists in ANY form (then it is a real artifact
+        and ``quarantine_directory`` is the only way), or when the epoch
+        already has a manifest."""
+
+        self._check_epoch_id(epoch_id)
+        self._require_authority()
+        if participant_id not in QUARANTINABLE_PARTICIPANTS:
+            raise QuarantineRefused("participant is not quarantinable")
+        if verdict not in self._verdicts:
+            raise QuarantineRefused("verdict is not quarantinable")
+        root = Path(root)
+        manifest_dir = self._dir / epoch_id
+        if os.path.lexists(root):
+            raise QuarantineRefused("root exists: it must be moved, not recorded")
+        if os.path.lexists(manifest_dir):
+            raise QuarantineRefused("epoch already has a manifest directory")
+        manifest = QuarantineManifest(
+            epoch_id=epoch_id,
+            state=ManifestState.MOVED,
+            created_at=self._wall_clock().isoformat(),
+            participant_id=participant_id,
+            verdict=verdict.value,
+            reason=_bounded(reason),
+            journal_lineage_id=journal_lineage_id,
+            journal_last_record_hash=journal_last_record_hash,
+            runtime_instance_id=runtime_instance_id,
+            artifacts=(),
+            transaction_ids=tuple(transaction_ids),
+        )
+        self._create_manifest_dir(manifest_dir)
+        self._write_manifest(manifest)
+        return manifest
+
+    # -- hash mismatch after the move (the Human-free exit)
+
+    def _note_mismatch(
+        self, manifest: QuarantineManifest, differing: tuple[str, ...]
+    ) -> QuarantineManifest:
+        """Record (best effort, never raising) that the moved tree does not
+        match.  The manifest stays PENDING; the first observation starts the
+        bound.  Nothing is repaired, moved back or deleted."""
+
+        now = self._wall_clock().isoformat()
+        previous = manifest.hash_mismatch
+        mismatch = HashMismatch(
+            first_seen_at=previous.first_seen_at if previous else now,
+            last_seen_at=now,
+            observations=(previous.observations if previous else 0) + 1,
+            differing=differing,
+            accepted_at=previous.accepted_at if previous else None,
+        )
+        noted = replace(manifest, hash_mismatch=mismatch)
+        try:
+            self._write_manifest(noted)
+        except (OSError, QuarantineError):
+            return manifest
+        return noted
+
+    def _mismatch_bound_passed(self, mismatch: HashMismatch) -> bool:
+        if mismatch.observations >= HASH_MISMATCH_MAX_OBSERVATIONS:
+            return True
+        try:
+            first = datetime.fromisoformat(mismatch.first_seen_at)
+            last = datetime.fromisoformat(mismatch.last_seen_at)
+        except ValueError:
+            return True  # an unreadable stamp must not keep the subject stopped
+        return (last - first).total_seconds() >= self._mismatch_bound_s
+
+    def _resume_mismatch(self, manifest: QuarantineManifest, root: Path) -> "ResumePlan":
+        """PENDING, the rename happened, and the moved tree differs from the
+        recorded hashes.
+
+        Within the bound: record this observation and stay BLOCKED (a writer
+        that still had the tree open may settle).  After the bound, or after
+        ``HASH_MISMATCH_MAX_OBSERVATIONS`` looks: record the mismatch as final,
+        keep the artifact byte-preserved where it is, and treat the quarantine
+        as done with ``verified: null`` (state MOVED).  The subject then
+        continues with an empty store; the Human can read the manifest to see
+        exactly which paths differ."""
+
+        self._require_authority()
+        (artifact,) = manifest.artifacts
+        target = Path(artifact.quarantine_path)
+        hashed = frozenset(
+            e[0] for e in artifact.entries if e[1] == "file" and e[3] is not None
+        )
+        after = _scan_tree(
+            target, Deadline(self._t_hash_s, self._clock), only_hash=hashed
+        )
+        differing = _differing_paths(artifact.entries, after.entries)
+        noted = self._note_mismatch(manifest, differing)
+        mismatch = noted.hash_mismatch
+        if mismatch is None or not self._mismatch_bound_passed(mismatch):
+            return ResumePlan(
+                ResumeAction.BLOCKED,
+                "moved tree differs; waiting out the bound before accepting it",
+                ManifestState.PENDING,
+            )
+        accepted = replace(
+            noted,
+            hash_mismatch=replace(
+                mismatch, accepted_at=self._wall_clock().isoformat()
+            ),
+            artifacts=(replace(artifact, verified=None),),
+        )
+        self._write_manifest(accepted)
+        moved = self.advance(accepted.epoch_id, ManifestState.MOVED)
+        return ResumePlan(
+            ResumeAction.CONTINUE_JOURNAL,
+            "hash mismatch recorded and accepted after the bound",
+            moved.state,
+        )
+
     # -- resume
 
     def observe(self, manifest: QuarantineManifest, root: Path) -> "ResumeFacts":
         """Read-only facts the resume planner needs."""
 
-        (artifact,) = manifest.artifacts
-        target = Path(artifact.quarantine_path)
         marker_epoch: str | None = None
         try:
             marker = json.loads((Path(root) / EPOCH_MARKER_NAME).read_bytes())
@@ -1089,7 +1335,28 @@ class QuarantineWriter:
                 marker_epoch = marker["epoch_id"]
         except (OSError, ValueError):
             marker_epoch = None
+        if not manifest.artifacts:
+            # A vanished root (``record_absent_root``): nothing was moved, so
+            # the "moved tree" facts hold vacuously.
+            return ResumeFacts(
+                original_present=os.path.lexists(root),
+                quarantined_present=True,
+                quarantined_hashes_equal=True,
+                root_marker_epoch_id=marker_epoch,
+            )
+        (artifact,) = manifest.artifacts
+        target = Path(artifact.quarantine_path)
         hashes_equal = False
+        if manifest.state is not ManifestState.PENDING:
+            # Only a PENDING manifest needs the moved tree's hashes (is the
+            # rename done and intact?).  Later states never re-read it: the
+            # live process does not open a quarantined path again (prohibition 5).
+            return ResumeFacts(
+                original_present=os.path.lexists(root),
+                quarantined_present=os.path.lexists(target),
+                quarantined_hashes_equal=True,
+                root_marker_epoch_id=marker_epoch,
+            )
         if os.path.lexists(target) and not os.path.islink(target):
             hashed = frozenset(
                 e[0] for e in artifact.entries if e[1] == "file" and e[3] is not None
@@ -1111,7 +1378,17 @@ class QuarantineWriter:
         remains (Journal outcomes, the empty root) is the caller's."""
 
         manifest = self.read_manifest(epoch_id)
-        plan = plan_resume(manifest, self.observe(manifest, Path(root)))
+        facts = self.observe(manifest, Path(root))
+        plan = plan_resume(manifest, facts)
+        if (
+            plan.action is ResumeAction.BLOCKED
+            and manifest.state is ManifestState.PENDING
+            and manifest.artifacts
+            and not facts.original_present
+            and facts.quarantined_present
+            and not facts.quarantined_hashes_equal
+        ):
+            return self._resume_mismatch(manifest, Path(root))
         if plan.action is ResumeAction.REDO_MOVE:
             self._require_authority()
             root = Path(root)

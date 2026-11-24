@@ -47,6 +47,7 @@ from suzka.runtime.event_journal import (
 )
 from suzka.runtime.transaction_coordinator import (
     ParticipantDivergedError,
+    ParticipantEvidenceAbsentError,
     ParticipantUnavailableError,
     TransactionBinding,
     UnsupportedParticipantReconciliationError,
@@ -341,7 +342,7 @@ class MemoryExperienceParticipant:
             participant._validate_committed_artifact()
             return participant
         if event_id is None or processing_sequence is None:
-            raise UnsupportedParticipantReconciliationError(
+            raise ParticipantEvidenceAbsentError(
                 "Experience operation evidence is absent"
             )
         experience_id = experience_id_for_event(event_id, processing_sequence)
@@ -352,13 +353,13 @@ class MemoryExperienceParticipant:
         except ExperienceStoreError as error:
             raise ParticipantUnavailableError(str(error)) from None
         if current is None:
-            raise UnsupportedParticipantReconciliationError(
+            raise ParticipantEvidenceAbsentError(
                 "Experience operation evidence is absent"
             )
         if current.operation_digest != operation_digest:
             raise ParticipantDivergedError("Committed Experience digest conflicts")
         if current.record.revision != 0:
-            raise UnsupportedParticipantReconciliationError(
+            raise ParticipantEvidenceAbsentError(
                 "Committed Experience revision cannot reconstruct a create"
             )
         operation = ExperienceCreateIntent(
@@ -749,7 +750,7 @@ class MemoryExperienceParticipant:
         if pending == self._artifact(binding):
             raise ParticipantUnavailableError("Experience roll-forward is required")
         if pending is None:
-            raise UnsupportedParticipantReconciliationError(
+            raise ParticipantEvidenceAbsentError(
                 "Experience operation evidence is absent"
             )
         raise ParticipantDivergedError("Experience pending artifact conflicts")
@@ -939,7 +940,7 @@ class MemoryExperienceParticipant:
         except ExperienceStoreError as error:
             raise ParticipantUnavailableError(str(error)) from None
         if entry is None:
-            raise UnsupportedParticipantReconciliationError(
+            raise ParticipantEvidenceAbsentError(
                 "Committed Experience revision artifact is absent"
             )
         if not self._operation_matches_entry(entry):

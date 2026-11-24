@@ -38,6 +38,8 @@
  "tests/test_dc1_settings_health.py": 2.0,
  "tests/test_dc1_threads_alive.py": 1.0,
  "tests/test_dc5_supervisor.py": 36.8,
+ "tests/test_dc4_participant_quarantine.py": 16.0,
+ "tests/test_dc4_real_app.py": 19.2,
  "tests/test_dc_architecture.py": 3.0,
  "tests/test_dual_memory_system.py": 1.0,
  "tests/test_emotion_engine.py": 1.0,

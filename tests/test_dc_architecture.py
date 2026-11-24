@@ -14,8 +14,15 @@ ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "suzka"
 MODULE = PACKAGE / "runtime" / "degraded_continuation.py"
 
-# Modules that import the primitives.  Inert in DC-1: only the health routes.
-IMPORTERS_OF_PRIMITIVES = {"suzka/api/server.py", "suzka/api/supervisor.py"}
+# Modules that import the primitives.  DC-5: the server and the supervisor.  DC-4
+# adds the two modules of the participant quarantine: ``domain_quarantine`` (the
+# policy) and ``startup_reconciliation`` (it raises ``CycleRestart``).
+IMPORTERS_OF_PRIMITIVES = {
+    "suzka/api/server.py",
+    "suzka/api/supervisor.py",
+    "suzka/runtime/domain_quarantine.py",
+    "suzka/runtime/startup_reconciliation.py",
+}
 # Modules that read ``settings.degraded_continuation``: create_app (DC-5: it
 # chooses the supervised lifespan with ``mode``).
 READERS_OF_SETTINGS: set[str] = {"suzka/api/server.py"}
@@ -276,3 +283,114 @@ def test_every_thread_site_is_covered_by_the_termination_proof() -> None:
         assert "ThreadLedger()" in text, rel
         # every started thread is registered after its start()
         assert text.count("_thread_ledger.register(") >= count, rel
+
+
+# ------------------------------------------------------------------ DC-4
+
+DOMAIN_MODULE = PACKAGE / "runtime" / "domain_quarantine.py"
+
+
+def test_the_domain_quarantine_module_never_deletes_repairs_or_copies() -> None:
+    tree = _tree(DOMAIN_MODULE)
+    imported = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+    }
+    assert not {"shutil", "tempfile", "subprocess", "ctypes", "importlib"} & {
+        name.split(".")[0] for name in imported
+    }
+    for name, call in _calls(tree):
+        suffix = name.rsplit(".", 1)[-1]
+        if name == "open":
+            raise AssertionError(f"builtin open() at line {call.lineno}")
+        # the ONLY filesystem effects: mkdir / chmod of the new temporary root,
+        # the marker write, one rename, fsync.  Nothing that removes or rewrites.
+        assert suffix not in set(FORBIDDEN_CALL_SUFFIXES) - {"chmod"}, (name, call.lineno)
+    owners = _enclosing_functions(tree)
+    allowed = {
+        "os.rename": {"_publish_root"},
+        "os.mkdir": {"_mkdir_private"},
+        "os.chmod": {"_mkdir_private"},
+        "os.write": {"_write_marker"},
+    }
+    for name, call in _calls(tree):
+        if name in allowed:
+            assert owners.get(call) in allowed[name], (name, call.lineno)
+    # one writer of the marker: exclusive create, never truncate or append
+    writer = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_write_marker"
+    )
+    assert "O_EXCL" in ast.unparse(writer) and "O_CREAT" in ast.unparse(writer)
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} | {
+        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    }
+    assert not names & {"O_TRUNC", "O_APPEND", "O_RDWR"}
+
+
+def test_the_domain_quarantine_module_never_creates_a_subject_history_store() -> None:
+    text = DOMAIN_MODULE.read_text()
+    assert "open_or_create_store" not in text
+    assert not any("history_store" in name for name in _imports(DOMAIN_MODULE))
+
+
+def test_only_the_two_memory_domains_can_ever_be_quarantined() -> None:
+    from suzka.runtime.domain_quarantine import (
+        DEFAULT_QUARANTINE_PARTICIPANTS,
+        STORE_DIRECTORY_NAMES,
+    )
+    from suzka.runtime.degraded_continuation import QUARANTINABLE_PARTICIPANTS
+
+    assert set(STORE_DIRECTORY_NAMES) == {"memory.experience", "memory.semantic"}
+    assert QUARANTINABLE_PARTICIPANTS == set(STORE_DIRECTORY_NAMES)
+    # Semantic is implemented but OFF by default (S0-c, D1 F-7)
+    assert DEFAULT_QUARANTINE_PARTICIPANTS == {"memory.experience"}
+
+
+def test_no_ordinary_module_reads_the_quarantine_policy_or_its_floor() -> None:
+    """The policy is built only by the server (mode "continue"); the floor only
+    by startup reconciliation."""
+
+    users: set[str] = set()
+    for path in sorted(PACKAGE.rglob("*.py")):
+        rel = path.relative_to(ROOT).as_posix()
+        if rel == "suzka/runtime/domain_quarantine.py":
+            continue
+        if any("domain_quarantine" in name for name in _imports(path)):
+            users.add(rel)
+    assert users == {"suzka/api/server.py", "suzka/runtime/startup_reconciliation.py"}
+
+
+def test_the_server_builds_the_policy_only_in_continue_mode() -> None:
+    tree = _tree(PACKAGE / "api" / "server.py")
+    source = (PACKAGE / "api" / "server.py").read_text()
+    assert source.count("DomainQuarantinePolicy(") == 1
+    # the construction sits under ``if dc_config.mode == "continue":``
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and "dc_config.mode" in ast.unparse(node.test):
+            assert "DomainQuarantinePolicy(" in ast.unparse(node)
+            break
+    else:  # pragma: no cover
+        raise AssertionError("no mode guard around the policy")
+
+
+def test_the_empty_root_is_created_before_any_store_object_and_before_reconciliation() -> None:
+    """D1 sec. 4.2 step 4: ``start_cycle`` (a JOURNALED manifest creates the empty
+    root + marker) runs BEFORE ``DualMemorySystem`` (which builds the Semantic
+    store), ``ExperienceStore.from_memory_root`` and any reconciliation."""
+
+    source = (PACKAGE / "api" / "server.py").read_text()
+    start = source.index("domain_policy.start_cycle()")
+    for later in (
+        "app.state.memory_system = getattr(",
+        "ExperienceStore.from_memory_root(",
+        "StartupReconciliationCoordinator(\n                app.state.event_journal",
+        "reconcile_open_transactions()",
+        "resolve_open_wal_rollover()",
+    ):
+        assert source.index(later) > start, later

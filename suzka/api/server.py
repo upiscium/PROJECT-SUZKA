@@ -92,6 +92,7 @@ from suzka.api.supervisor import (
     phase_detail,
 )
 from suzka.runtime.degraded_continuation import DcState, DegradedContinuationStatus
+from suzka.runtime.domain_quarantine import DomainQuarantinePolicy
 from suzka.runtime.event_journal import EventJournalAdmissionBand
 from suzka.runtime.startup_reconciliation import StartupReconciliationCoordinator
 from suzka.r16.decision_issuer import _DecisionIssuer
@@ -251,6 +252,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )
                 app.state.event_journal = existing_journal
 
+            # F15 DC-4 (``mode = "continue"`` only): finish a crashed or
+            # restarted domain quarantine FIRST THING, before any store object
+            # is constructed and before any reconciliation (empty root + marker).
+            dc_config = app_settings.degraded_continuation
+            domain_policy: DomainQuarantinePolicy | None = None
+            if dc_config.mode == "continue":
+                journal_for_policy = app.state.event_journal
+                injected_memory = getattr(app.state, "memory_system", None)
+                domain_policy = DomainQuarantinePolicy(
+                    memory_root=(
+                        injected_memory.settings.memory.persist_directory
+                        if injected_memory is not None
+                        else app_settings.memory.persist_directory
+                    ),
+                    quarantine_dir=dc_config.resolved_quarantine_dir(
+                        app_settings.event_journal.path
+                    ),
+                    has_exclusive_authority=lambda: (
+                        journal_for_policy.has_exclusive_authority
+                    ),
+                    status=getattr(app.state, "dc_status", None),
+                    t_hash_s=float(dc_config.t_hash_s),
+                    t_retry_s=float(dc_config.t_retry_s),
+                )
+                domain_policy.start_cycle()
+
             configured_value_seeds = tuple(
                 seed.to_declaration() for seed in app_settings.values.seeds
             )
@@ -364,6 +391,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     app.state.semantic_receipt_retention.checkpoint_covers
                 ),
                 history_store=app.state.subject_history_store,
+                resolution_policy=domain_policy,
             )
             app.state.startup_reconciliation.resume_prepared_gate_clear()
             participants_consistent = True

@@ -66,6 +66,9 @@ _STARTUP_AGGREGATE_DOMAIN = (
     b"PROJECT-SUZKA:R07:STARTUP-PARTICIPANT-AGGREGATE:V1\x00"
 )
 _PARTICIPANT_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:\.[a-z0-9]+)*$")
+# F15 DC-4: the only participants that may carry a QUARANTINED outcome.
+_QUARANTINABLE_PARTICIPANT_IDS = frozenset({"memory.experience", "memory.semantic"})
+_QUARANTINED = "quarantined"
 
 
 class EventLifecycle(str, Enum):
@@ -128,6 +131,12 @@ class TransactionKind(str, Enum):
 class ParticipantOutcome(str, Enum):
     FINALIZED = "finalized"
     ALREADY_CONSISTENT = "already_consistent"
+    # F15 DC-4 (one-way): the participant's store was moved aside byte for byte
+    # and the domain continues empty.  Only memory.experience / memory.semantic,
+    # only schema 4, only inside a reconciliation-required transaction (it can
+    # then end only as TRANSACTION_RECONCILED, never TRANSACTION_COMPLETED).  A
+    # binary older than this value cannot read a Journal that contains it.
+    QUARANTINED = "quarantined"
 
 
 class ParticipantCapability(str, Enum):
@@ -140,6 +149,7 @@ class ParticipantCapability(str, Enum):
 class AbortOutcome(str, Enum):
     ABORTED = "aborted"
     ALREADY_ABSENT = "already_absent"
+    QUARANTINED = "quarantined"  # F15 DC-4, one-way, see ParticipantOutcome
 
 
 class ReconciliationReason(str, Enum):
@@ -152,6 +162,7 @@ class ReconciliationReason(str, Enum):
 class StartupParticipantOutcome(str, Enum):
     VERIFIED_CONSISTENT = "verified_consistent"
     ROLLED_FORWARD = "rolled_forward"
+    QUARANTINED = "quarantined"  # F15 DC-4, one-way, see ParticipantOutcome
 
 
 class EventFailureCategory(str, Enum):
@@ -686,6 +697,16 @@ class EventJournalRecord(_JournalModel):
             or self.migration_previous_v2_hash is not None
         ):
             raise ValueError("v4 records cannot carry older migrations")
+        if _QUARANTINED in (
+            self.participant_outcome,
+            self.abort_outcome,
+            self.startup_participant_outcome,
+        ) and (
+            self.schema_version != 4
+            or self.participant_id not in _QUARANTINABLE_PARTICIPANT_IDS
+        ):
+            # F15 DC-4: only the two memory domains, only schema 4.
+            raise ValueError("quarantined outcome is not valid here")
         for value in (
             self.wal_record_hash,
             self.migration_previous_v1_hash,
@@ -5292,6 +5313,16 @@ class EventJournal:
                                 "participant finalization is invalid"
                             )
                         assert record.participant_outcome is not None
+                        if (
+                            record.participant_outcome is ParticipantOutcome.QUARANTINED
+                            and tx["reason"] is None
+                        ):
+                            # F15 DC-4: a quarantine always goes through
+                            # TRANSACTION_RECONCILIATION_REQUIRED, so the
+                            # transaction can only end RECONCILED, never COMPLETED.
+                            raise EventJournalIntegrityError(
+                                "quarantined outcome needs a reconciliation reason"
+                            )
                         tx["outcomes"][record.participant_id] = (
                             record.participant_outcome
                         )

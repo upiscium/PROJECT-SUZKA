@@ -134,6 +134,14 @@ class UnsupportedParticipantReconciliationError(Exception):
     """A participant cannot provide the required reconciliation capability."""
 
 
+class ParticipantEvidenceAbsentError(UnsupportedParticipantReconciliationError):
+    """A memory participant's own operation evidence is gone (F15 DC-4).
+
+    A subclass, so every existing `except UnsupportedParticipantReconciliationError`
+    keeps working.  Distinct from the plain class, which means "no resolver is
+    registered for this participant" (a code defect, never quarantinable)."""
+
+
 @dataclass(frozen=True, slots=True)
 class _LiveTransaction:
     event_id: str

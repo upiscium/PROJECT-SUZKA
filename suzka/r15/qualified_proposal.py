@@ -390,7 +390,16 @@ class QualifiedNarrativeSourceGate:
             experience_id = experience_id_for_event(
                 source.event_id, source.event_sequence
             )
-            entry = self._experience.load_committed_current(experience_id)
+            try:
+                entry = self._experience.load_committed_current(experience_id)
+            except ExperienceStoreError:
+                # F15 DC-4: after a quarantine the Experience store is empty (or
+                # gone).  A source the store no longer holds is a per-operation
+                # unavailability, exactly like the ARCHIVED branch below.
+                raise QualifiedProposalUnavailable(
+                    "Experience source is not available",
+                    reason=JournalSourceReason.SOURCE_MISSING,
+                ) from None
             record = entry.record
             if (
                 record.lifecycle is not ExperienceLifecycle.ACTIVE
