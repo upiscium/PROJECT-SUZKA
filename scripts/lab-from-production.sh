@@ -8,7 +8,7 @@
 # keep experiments short.
 #
 # Usage (on the deploy host, as a user with sudo):
-#   scripts/lab-from-production.sh [--port N] [--timeout SECONDS] [--keep] [--r18] -- CMD...
+#   scripts/lab-from-production.sh [--port N] [--timeout SECONDS] [--keep] [--r18] [--r19] -- CMD...
 #
 # --r18 (#411 D1 r7 §9-1, IP-17c) switches R18 on in the LAB only, for an
 # approval-relevant run started with the Human's own privileges (attended, HD-15):
@@ -18,6 +18,17 @@
 # pattern this script already uses. Approve through a tunnel:
 #   ssh -L PORT:127.0.0.1:PORT <host>   then   http://localhost:PORT/api/r18/approve
 # Without --r18 the lab is unchanged.
+#
+# --r19 rehearses R19 before it is enabled in production. R19 on in the LAB
+# only: the Scheduler thread runs, Wakes are materialized from the subject's
+# Goals, Outbox messages are written, the Inbox API is mounted on the lab port.
+# Works alone or with --r18 (R19 needs no R18 target). Look at, during the run:
+#   GET http://127.0.0.1:PORT/api/r19/inbox/messages?context_id=...
+#     (the route exists only when r19 is enabled)
+#   Journal event types R19_WAKE_MATERIALIZE, R19_WAKE_CLAIM, R16_WAKE_REVIEW,
+#     R19_WAKE_COMPLETE (in the lab's .suzka journal)
+# A lab keeps GPU memory like production (about 7.7 GB more). The production
+# config is only read. Without --r19 the lab is unchanged.
 #
 # CMD runs as the invoking user with SUZKA_LAB_URL (the lab API base URL) and
 # SUZKA_LAB_DIR set. It is killed after --timeout seconds (default 3600).
@@ -36,6 +47,7 @@ PORT=8101
 TIMEOUT=3600
 KEEP=0
 R18=0
+R19=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -43,12 +55,13 @@ while [[ $# -gt 0 ]]; do
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
     --r18) R18=1; shift ;;
+    --r19) R19=1; shift ;;
     --) shift; break ;;
     *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
 if [[ $# -eq 0 ]]; then
-  printf 'usage: %s [--port N] [--timeout S] [--keep] [--r18] -- CMD...\n' "$0" >&2
+  printf 'usage: %s [--port N] [--timeout S] [--keep] [--r18] [--r19] -- CMD...\n' "$0" >&2
   exit 2
 fi
 if ! [[ "${PORT}" =~ ^[1-9][0-9]{0,4}$ ]] || (( PORT > 65535 )); then
@@ -115,6 +128,9 @@ PYTHON="${PROD_ROOT}/.venv/bin/python"
 PREPARE_ARGS=("${LAB}/prod-config.yaml" "${LAB}" "${PORT}")
 if [[ "${R18}" == 1 ]]; then
   PREPARE_ARGS+=(--r18)
+fi
+if [[ "${R19}" == 1 ]]; then
+  PREPARE_ARGS+=(--r19)
 fi
 PREPARED="$(sudo -u "${SERVICE_USER}" env -i "${SERVICE_ENV[@]}" PYTHONPATH="${PROD_ROOT}" \
   "${PYTHON}" "${LAB}/lab_prepare.py" "${PREPARE_ARGS[@]}")"
