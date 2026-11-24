@@ -179,6 +179,15 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _reason(error: BaseException) -> str:
+    """The failure's fixed text for a TargetError only; any other exception
+    (OSError, sqlite3, ...) can carry a path or payload, so it gets ``-``."""
+
+    if not isinstance(error, TargetError):
+        return "-"
+    return repr(" ".join(str(error).split())[:200] or "-")
+
+
 def _stamp(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).strftime(_UTC_FORMAT)
 
@@ -618,7 +627,10 @@ class R18Executor:
         else:
             self._gate.sweeping()
         self._sweep_done = False
-        self._sweep_log("FAIL", f"error={type(error).__name__} blocked={'yes' if blocked else 'no'}")
+        self._sweep_log(
+            "FAIL",
+            f"error={type(error).__name__} reason={_reason(error)} blocked={'yes' if blocked else 'no'}",
+        )
 
     def _target_ok(self) -> None:
         # Damping (review P3-d): the probe index is NOT reset here, only when a
