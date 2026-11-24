@@ -392,7 +392,7 @@ def kill_run(base: Path, point: str) -> tuple[Step, dict[str, Any]]:
         return step, entry
     try:
         step.require("kill_window_hit", result.window_hit, {"point": point})
-        step.evidence["window_confirmed_on_the_frozen_store"] = result.window_confirmed
+        step.require("kill_window_confirmed_on_the_frozen_store", result.window_confirmed)
         step.evidence["pids"] = list(result.pids)
         for name, held in result.checks.items():
             step.require(name, held)

@@ -107,7 +107,7 @@ class KillResult:
 
     @property
     def ok(self) -> bool:
-        return self.window_hit and all(self.checks.values())
+        return self.window_hit and self.window_confirmed and all(self.checks.values())
 
     def manifest_entry(self) -> dict[str, Any]:
         return {
