@@ -95,6 +95,77 @@ def test_an_unknown_flag_is_a_usage_error(tmp_path, capsys) -> None:  # type: ig
     assert not (tmp_path / "lab" / "config.yaml").exists()
 
 
+# ================================================== lab_prepare with --r19
+
+
+def test_r19_alone_switches_only_r19_on_in_the_lab_and_never_writes_production(tmp_path, capsys) -> None:  # type: ignore[no-untyped-def]
+    prod = _prod_config(tmp_path, r19={"enabled": False})
+    before = prod.read_bytes()
+    lab = _lab(tmp_path)
+    code = _lab_prepare().main(str(prod), str(lab), "8101", "--r19")
+    out = capsys.readouterr().out
+    assert (code, out) == (0, "8000\n")
+    assert prod.read_bytes() == before
+    settings = load_settings(lab / "config.yaml")
+    assert settings.r19.enabled is True and settings.r18.enabled is False
+    assert "r18_target" not in out
+
+
+def test_r19_keeps_other_production_r19_settings(tmp_path, capsys) -> None:  # type: ignore[no-untyped-def]
+    prod_default = load_settings(_prod_config(tmp_path)).r19
+    other = next(
+        name for name, value in prod_default.model_dump().items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 1
+    )
+    value = getattr(prod_default, other) + 1
+    code, _out, _err, lab, _prod = _run(tmp_path, capsys, "--r19", r19={"enabled": False, other: value})
+    assert code == 0
+    settings = load_settings(lab / "config.yaml")
+    assert settings.r19.enabled is True and getattr(settings.r19, other) == value
+
+
+def test_r19_with_r18_sets_both(tmp_path, capsys) -> None:  # type: ignore[no-untyped-def]
+    code, out, _err, lab, _prod = _run(tmp_path, capsys, "--r18", "--r19")
+    assert code == 0 and "r18_target=" in out
+    settings = load_settings(lab / "config.yaml")
+    assert settings.r18.enabled is True and settings.r19.enabled is True
+
+
+def test_r19_refuses_the_production_port_and_a_lab_without_subject_history(tmp_path, capsys) -> None:  # type: ignore[no-untyped-def]
+    code, _out, err, _lab_dir, _prod = _run(tmp_path, capsys, "--r19", port="8000")
+    assert code == 1 and "is the production port" in err
+
+
+def test_r19_checks_flag_missing_history_and_non_loopback() -> None:
+    from types import SimpleNamespace
+
+    def fake(history: bool, host: str, enabled: bool = True) -> SimpleNamespace:
+        return SimpleNamespace(
+            r19=SimpleNamespace(enabled=enabled),
+            api=SimpleNamespace(host=host),
+            subject_history=SimpleNamespace(enabled=history),
+        )
+
+    check = _lab_prepare()._r19_problems
+    assert check(fake(True, "127.0.0.1")) == []
+    assert any("subject.history" in p for p in check(fake(False, "127.0.0.1")))
+    assert any("loopback" in p for p in check(fake(True, "0.0.0.0")))
+    assert any("r19.enabled" in p for p in check(fake(True, "127.0.0.1", enabled=False)))
+
+
+def test_the_lab_script_wires_r19_and_leaves_the_default_arguments_alone() -> None:
+    text = _script()
+    assert "--r19) R19=1; shift ;;" in text
+    assert 'if [[ "${R19}" == 1 ]]; then\n  PREPARE_ARGS+=(--r19)\nfi\n' in text
+    assert 'PREPARE_ARGS=("${LAB}/prod-config.yaml" "${LAB}" "${PORT}")' in text
+    assert "/api/r19/inbox/messages" in text and "R19_WAKE_MATERIALIZE" in text
+    done = subprocess.run(
+        ["bash", str(SCRIPTS / "lab-from-production.sh"), "--r19", "--port", "99999", "--", "true"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert done.returncode == 2 and "invalid port" in done.stderr
+
+
 # ================================================== lab_prepare with --r18
 
 

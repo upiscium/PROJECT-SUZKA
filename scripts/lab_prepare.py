@@ -1,7 +1,7 @@
 """Write and check the lab config for scripts/lab-from-production.sh.
 
 Run with the deployed interpreter, so the checks see the same Settings the
-lab server will load. Usage: lab_prepare.py PROD_CONFIG LAB_DIR PORT [--r18]
+lab server will load. Usage: lab_prepare.py PROD_CONFIG LAB_DIR PORT [--r18] [--r19]
 
 Refuses (exit 1) unless every Path in the parsed lab settings stays inside
 LAB_DIR and the lab port differs from the production port.
@@ -16,6 +16,12 @@ loopback, a production port among the approval origins, and a lab without
 subject.history.  A second output line, ``r18_target=<relative path>``, tells
 the shell where ``python -m suzka.r18.target_init`` creates the target.
 Without ``--r18`` the lab is exactly as before.
+
+``--r19`` (alone or with ``--r18``) switches R19 on in the LAB config only:
+``r19.enabled: true``, every other production r19 setting kept.  R19 needs no
+R18 target.  It refuses a lab that does not listen on loopback, a lab on the
+production port, and a lab without subject.history (R19 needs SubjectHistory).
+The production config file is only read, never written.
 """
 
 from __future__ import annotations
@@ -73,6 +79,30 @@ def _r18_overrides(raw: dict[str, Any], port: int) -> str:
     return str(target)
 
 
+def _r19_overrides(raw: dict[str, Any]) -> None:
+    """Switch R19 on in the raw lab dict, keeping the other r19 settings."""
+
+    section = raw.get("r19")
+    section = dict(section) if isinstance(section, dict) else {}
+    section["enabled"] = True
+    raw["r19"] = section
+
+
+def _r19_problems(settings: Any) -> list[str]:
+    """The ``--r19`` checks, over the parsed lab settings."""
+
+    from suzka.config.schema import is_loopback_host
+
+    problems = []
+    if not settings.r19.enabled:
+        problems.append("lab r19.enabled is not true")
+    if not is_loopback_host(settings.api.host):
+        problems.append(f"lab api.host {settings.api.host} is not loopback")
+    if not settings.subject_history.enabled:
+        problems.append("r19 needs subject.history in the lab config")
+    return problems
+
+
 def _r18_problems(settings: Any, lab: Path, port: int, prod_port: int) -> list[str]:
     """The ``--r18`` checks, over the parsed lab settings."""
 
@@ -124,10 +154,11 @@ def _refusal_reasons(error: ValueError) -> str:
 
 
 def main(prod_config: str, lab_dir: str, port_text: str, *flags: str) -> int:
-    if any(flag != "--r18" for flag in flags):
-        print("usage: lab_prepare.py PROD_CONFIG LAB_DIR PORT [--r18]", file=sys.stderr)
+    if any(flag not in ("--r18", "--r19") for flag in flags):
+        print("usage: lab_prepare.py PROD_CONFIG LAB_DIR PORT [--r18] [--r19]", file=sys.stderr)
         return 2
     r18 = "--r18" in flags
+    r19 = "--r19" in flags
     lab = Path(lab_dir).resolve()
     port = int(port_text)
     prod_port = load_settings(prod_config).api.port
@@ -136,12 +167,14 @@ def main(prod_config: str, lab_dir: str, port_text: str, *flags: str) -> int:
         raw = yaml.safe_load(handle) or {}
     raw.setdefault("api", {})["port"] = port
     r18_target = _r18_overrides(raw, port) if r18 else None
+    if r19:
+        _r19_overrides(raw)
     lab_config = lab / "config.yaml"
     lab_config.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     try:
         settings = load_settings(lab_config)
     except ValueError as error:
-        if not r18:
+        if not (r18 or r19):
             raise
         # e.g. r18.enabled with a non-loopback api.host (the settings refuse it).
         # Print where and why only, never the offending input values.
@@ -161,6 +194,8 @@ def main(prod_config: str, lab_dir: str, port_text: str, *flags: str) -> int:
             problems.append(f"{where} = {text} leaves the lab directory")
     if r18:
         problems.extend(_r18_problems(settings, lab, port, prod_port))
+    if r19:
+        problems.extend(_r19_problems(settings))
     registry = lab / settings.adapter_registry.path
     if registry.exists():
         for text in _strings(json.loads(registry.read_text(encoding="utf-8"))):
