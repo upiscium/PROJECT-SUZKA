@@ -134,8 +134,25 @@ def _reference_body(session: S0Session, steps: dict[str, Step]) -> tuple[S0Sessi
     chain = _try(steps["1"], "chain", session.drive_to_claim)
     if chain is None:
         return session, facts, steps
+    return check_reference(session, steps, chain, facts)
+
+
+def check_reference(
+    session: S0Session,
+    steps: dict[str, Step],
+    chain: dict[str, Any],
+    facts: dict[str, Any],
+    *,
+    finish_wait_s: float = 150,
+    approval_actor: ApprovalActor = ApprovalActor.SCRIPTED,
+) -> tuple[S0Session, dict[str, Any], dict[str, Step]]:
+    """Items 1-9, 11, 12 on a subject that has just been driven through the
+    approval and the claim.  ``chain`` holds ``r15``, ``approval`` and (scripted
+    approval only) ``confirm``; a HUMAN approval has no ``confirm`` (the
+    Human confirmed in the browser) and is read from the claim row."""
+
     facts["chain"] = chain
-    finished = bool(session.wait_for(session.finished, 150, 0.5))
+    finished = bool(session.wait_for(session.finished, finish_wait_s, 0.5))
     facts["finished"] = finished
     evidence = session.evidence
     decisions = evidence.decisions()
@@ -167,7 +184,7 @@ def _reference_body(session: S0Session, steps: dict[str, Step]) -> tuple[S0Sessi
     else:
         one.problems.append("no row-4 Decision")
     one.evidence["provider"] = factory.read_identity_record(session.subject.subject_json)["provider"]
-    one.evidence["provider_script_sha256"] = _script_digest(session)
+    one.evidence["provider_script_sha256"] = None if session.real else _script_digest(session)
 
     # ---- 2: order (the journal sequence of the second narrative review precedes the goal adoption)
     two = steps["2"]
@@ -227,9 +244,13 @@ def _reference_body(session: S0Session, steps: dict[str, Step]) -> tuple[S0Sessi
     verdicts = evidence.records("policy_verdicts")
     five.require("policy_allow", len(verdicts) == 1 and verdicts[0].get("verdict") == "ALLOW",
                  [v.get("verdict") for v in verdicts])
-    five.require("approval_over_http_by_the_scripted_operator", chain["confirm"]["status"] == 200
-                 and chain["confirm"]["body"].get("status") == "claimed", chain["confirm"]["body"].get("status"))
-    five.evidence["approval_actor"] = ApprovalActor.SCRIPTED.value
+    if "confirm" in chain:
+        five.require("approval_over_http_by_the_scripted_operator", chain["confirm"]["status"] == 200
+                     and chain["confirm"]["body"].get("status") == "claimed", chain["confirm"]["body"].get("status"))
+    else:
+        five.require("approval_by_the_human_through_the_approval_page", counters["R18_EXECUTION_CLAIM"] == 1,
+                     "the claim row exists; the confirmation was typed in the browser (nothing here sent it)")
+    five.evidence["approval_actor"] = approval_actor.value
     five.require("one_execution_claim", counters["R18_EXECUTION_CLAIM"] == 1, counters["R18_EXECUTION_CLAIM"])
     five.require("one_target_effect", evidence.target_effects() == 1, evidence.target_effects())
 
@@ -329,7 +350,7 @@ def _reference_body(session: S0Session, steps: dict[str, Step]) -> tuple[S0Sessi
     twelve.require("run_stays_below_the_soft_band", counts["live_bytes"] < soft_start,
                    {"live_bytes": counts["live_bytes"], "soft_band_start_bytes": soft_start})
     twelve.evidence["finding_if_crossed"] = "a run that crosses the soft band is a finding (HP-8)"
-    facts["identity"] = asdict(factory.verify_first_start(session.subject, provider={"mode": "scripted", "fixture_only": True}))
+    facts["identity"] = asdict(factory.verify_first_start(session.subject, provider=session.provider_identity()))
     facts["reference_counts"] = logical_counts(session)
     facts["replay_defects"] = replay_all(evidence)
     return session, facts, steps
@@ -522,6 +543,40 @@ def apply_labels(manifest: Any, steps: dict[str, Step]) -> dict[int, list[str]]:
     return problems
 
 
+def populate_reference_manifest(
+    session: S0Session, facts: dict[str, Any], *, approval_actor: ApprovalActor, provider: dict[str, Any]
+) -> None:
+    """The manifest fields of a reference subject: identifiers, digests, rows, counts."""
+
+    manifest = session.manifest
+    manifest.set("tier", "T2")
+    manifest.set("profile", session.subject.profile.name)
+    manifest.set("approval_actor", approval_actor.value)
+    manifest.set("provider", provider)
+    manifest.set("identity", facts.get("identity"))
+    if facts.get("identity"):
+        manifest.set("code_head", facts["identity"]["git_head"])
+        manifest.set("config_sha256", facts["identity"]["config_sha256"])
+    manifest.set("destination", {"port": session.subject.port, "bound_client": True})
+    manifest.set("journal", facts.get("journal", {}))
+    for row in facts.get("decisions", []):
+        sealed = _sealed(row.sealed_input)
+        manifest.append("policy_inputs", {
+            "decision_id": row.decision_id, "kind": row.operation_kind, "sequence": row.sequence, "row": row.row,
+            "sealed_input_digest": row.sealed_digest, "interpretation": sealed.interpretation.value,
+            "stage": sealed.interpretation_stage.value, "feedback": sealed.feedback.value,
+        })
+    if facts.get("ablation") is not None:
+        manifest.append("ablation", facts["ablation"])
+    for entry in session.evidence.records("logical_cycle_resolutions"):
+        manifest.append("logical_cycle_resolutions", {
+            "logical_cycle_id": entry.get("logical_cycle_id"), "result_kind": entry.get("result_kind"),
+            "decision_id": entry.get("decision_id"),
+        })
+    for timeline_event in session.evidence.journal_events():
+        manifest.append("timeline", timeline_event)
+
+
 def run_dry_run(base: Path, *, kill_point: str = "K4") -> tuple[dict[str, Any], int, Path]:
     """Run everything; returns the manifest dict, the exit code (0 = no
     attempted item failed; 1 = an attempted item failed) and the manifest path.
@@ -569,37 +624,13 @@ def run_dry_run(base: Path, *, kill_point: str = "K4") -> tuple[dict[str, Any], 
     steps["15"] = receipt_step
     problems = apply_labels(manifest, steps)
 
-    # the remaining manifest fields of the reference subject
-    manifest.set("tier", "T2")
-    manifest.set("profile", "S0")
-    manifest.set("approval_actor", ApprovalActor.SCRIPTED.value)
-    manifest.set("provider", {"mode": ProviderMode.SCRIPTED.value, "fixture_only": True,
-                              "script_sha256": _script_digest(session)})
-    manifest.set("identity", facts.get("identity"))
-    if facts.get("identity"):
-        manifest.set("code_head", facts["identity"]["git_head"])
-        manifest.set("config_sha256", facts["identity"]["config_sha256"])
-    manifest.set("destination", {"port": session.subject.port, "bound_client": True})
-    manifest.set("journal", facts.get("journal", {}))
-    for row in facts.get("decisions", []):
-        sealed = _sealed(row.sealed_input)
-        manifest.append("policy_inputs", {
-            "decision_id": row.decision_id, "kind": row.operation_kind, "sequence": row.sequence, "row": row.row,
-            "sealed_input_digest": row.sealed_digest, "interpretation": sealed.interpretation.value,
-            "stage": sealed.interpretation_stage.value, "feedback": sealed.feedback.value,
-        })
-    if facts.get("ablation") is not None:
-        manifest.append("ablation", facts["ablation"])
-    for entry in session.evidence.records("logical_cycle_resolutions"):
-        manifest.append("logical_cycle_resolutions", {
-            "logical_cycle_id": entry.get("logical_cycle_id"), "result_kind": entry.get("result_kind"),
-            "decision_id": entry.get("decision_id"),
-        })
+    populate_reference_manifest(
+        session, facts, approval_actor=ApprovalActor.SCRIPTED,
+        provider={"mode": ProviderMode.SCRIPTED.value, "fixture_only": True, "script_sha256": _script_digest(session)},
+    )
     receipt_id = receipt_facts.get("receipt_id")
     manifest.append("plan_hold_receipts", {"row": "2b", "outcome": HOLD_SEALED if receipt_id else HOLD_UNSEALED,
                                            "receipt_id": receipt_id, "subject": "D (F1, CONTRADICTORY)"})
-    for timeline_event in session.evidence.journal_events():
-        manifest.append("timeline", timeline_event)
     for number, label_ in sorted((entry["step"], entry["label"]) for entry in manifest.to_dict()["steps"]):
         manifest.result(f"step_{number:02d}", label_)
     manifest.result("limits", "provider deterministic; kill window non-deterministic; T2 is smoke and is not counted as covered")

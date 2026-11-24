@@ -63,13 +63,14 @@ class Transport(Protocol):
 class SocketTransport:
     """A plain HTTP connection to the loopback port, one per request."""
 
-    def __init__(self, port: int) -> None:
+    def __init__(self, port: int, timeout_s: float = TIMEOUT_S) -> None:
         self.port = guards.check_port(port)
+        self.timeout_s = timeout_s
 
     def send(
         self, method: str, path: str, headers: Mapping[str, str], body: bytes | None
     ) -> HttpResult:
-        connection = http.client.HTTPConnection(LOOPBACK, self.port, timeout=TIMEOUT_S)
+        connection = http.client.HTTPConnection(LOOPBACK, self.port, timeout=self.timeout_s)
         try:
             connection.request(method, path, body=body, headers=dict(headers))
             response = connection.getresponse()

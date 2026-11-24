@@ -23,10 +23,13 @@ from experiments.r20 import guards
 from experiments.r20.control import send
 from experiments.r20.factory import GenesisSubject, Tier
 from experiments.r20.guards import GuardRefusal
+from experiments.r20.launch import HumanLaunch, write_launch_record
 from experiments.r20.provider import ApprovalActor, ProviderMode, check_modes
 
 READY_TIMEOUT_S = 90.0
 _PASSTHROUGH = ("PATH", "LANG", "LC_ALL")
+# a real model needs the CUDA runtime's library path and device selection; no secret
+_GPU_PASSTHROUGH = ("LD_LIBRARY_PATH", "CUDA_VISIBLE_DEVICES")
 
 
 def child_home(subject: GenesisSubject) -> Path:
@@ -40,6 +43,7 @@ def child_environment(
     parent: dict[str, str] | None = None,
     *,
     hf_home: Path | None = None,
+    gpu: bool = False,
 ) -> dict[str, str]:
     """An allow-list environment: the parent's ``SUZKA_*`` variables are not
     inherited (as the lab script's ``env -i``).  HOME and the XDG directories
@@ -52,6 +56,7 @@ def child_environment(
         {
             "PYTHONPATH": str(guards.repo_root()),
             "SUZKA_CONFIG_PATH": str(subject.config_path),
+            "PYTHONDONTWRITEBYTECODE": "1",  # no new .pyc is written by (or planted for) a run
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
             "HOME": str(child_home(subject)),
@@ -61,6 +66,8 @@ def child_environment(
             "XDG_STATE_HOME": str(child_home(subject) / ".local" / "state"),
         }
     )
+    if gpu:
+        env.update({key: source[key] for key in _GPU_PASSTHROUGH if key in source})
     if hf_home is not None:
         env["HF_HOME"] = str(hf_home)
     return env
@@ -117,6 +124,7 @@ class ChildProcess:
         self.pid = process.pid
         self.ticks = process_start_ticks(process.pid)
         self.port = subject.port
+        self.real = False
         ChildProcess._live.append(self)
 
     @classmethod
@@ -158,6 +166,56 @@ class ChildProcess:
         finally:
             log.close()
         return cls(subject, process)
+
+    @classmethod
+    def spawn_real(
+        cls,
+        subject: GenesisSubject,
+        launch: HumanLaunch,
+        *,
+        hf_home: Path | None,
+        turn_cap_s: float,
+        log_path: Path | None = None,
+    ) -> ChildProcess:
+        """The ONLY way a real-model child starts: it needs the attestation of THIS
+        process's Human launch (``attest_human_launch``).  ``spawn`` still refuses a
+        real provider for every caller."""
+
+        if not isinstance(launch, HumanLaunch) or not launch.valid_here():
+            raise GuardRefusal("HUMAN_LAUNCH_REQUIRED")
+        check_modes(ProviderMode.REAL, ApprovalActor.HUMAN, human_launch=True)
+        if subject.tier is not Tier.T2:
+            raise GuardRefusal("NOT_A_T2_SUBJECT", subject.run_id)
+        # exactly ONE real model process at a time (the GPU has no room for two)
+        if any(other.real and other.alive() for other in cls._live):
+            raise GuardRefusal("SECOND_REAL_PROCESS")
+        guards.check_marker(subject.root, subject.run_id)
+        # once per subject: a restart (the planned SIGKILL) finds the record and must match its binding
+        write_launch_record(subject.control_dir / "launch.json", launch)
+        command = [
+            sys.executable, "-B", "-m", "experiments.r20.serve", str(subject.root),
+            "--run-id", subject.run_id, "--provider", ProviderMode.REAL.value,
+            "--approval-actor", ApprovalActor.HUMAN.value, "--human-launch",
+            "--launch-nonce", launch.nonce, "--turn-cap-s", str(turn_cap_s),
+        ]
+        child_home(subject).mkdir(mode=0o700, exist_ok=True)
+        log = open(log_path or subject.run_dir / "serve.log", "ab")
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=subject.root,
+                env=child_environment(subject, hf_home=hf_home, gpu=True),
+                stdin=None,  # the Human's terminal, inherited: the child checks it is a tty
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                preexec_fn=_die_with_parent if sys.platform.startswith("linux") else None,
+            )
+        finally:
+            log.close()
+        child = cls(subject, process)
+        child.real = True
+        return child
 
     @property
     def pgid(self) -> int:

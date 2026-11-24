@@ -30,14 +30,17 @@ from experiments.r15_p0.pilot import Case, seal_case
 from experiments.r15_p1.protocol import run_trial
 from experiments.r20 import factory
 from experiments.r20.approval import ApprovalOperator
-from experiments.r20.client import BoundClient, Destination, DestinationNoAnswer
+from experiments.r20 import artifacts
+from experiments.r20.client import BoundClient, Destination, DestinationNoAnswer, SocketTransport
 from experiments.r20.control import send
 from experiments.r20.factory import GenesisSubject, Tier, create_subject
 from experiments.r20.guards import GuardRefusal
+from experiments.r20.launch import HumanLaunch
 from experiments.r20.manifest import Manifest
+from experiments.r20.model_config import ModelOverride
 from experiments.r20.polling import poll_until, short_read
 from experiments.r20.provider import r15_protocol_script
-from experiments.r20.supervisor import ChildProcess
+from experiments.r20.supervisor import READY_TIMEOUT_S, ChildProcess
 
 # R19 timings of the T2 chain: the Feedback Wake is due at once, the tick and the
 # claim lease are short, Goal / Commitment Wakes stay a week away (they are not the
@@ -51,6 +54,11 @@ T2_R19: dict[str, int] = {
     "tick_s": 1,
     "claim_lease_s": 15,
 }
+# A REAL model answers in seconds, not milliseconds: the Feedback Wake review is up to 2 model calls, so
+# the claim lease takes its maximum (120 s, ``schema.py``) and the tick is 2 s.
+REAL_R19: dict[str, int] = {**T2_R19, "tick_s": 2, "claim_lease_s": 120}
+REAL_STEP_TIMEOUT_S = 300.0
+REAL_LOAD_TIMEOUT_S = 600.0  # model load time is unmeasured (assume 1-3 min); G1 measures it
 # F15: the supervised mode with its stated defaults (D1 sec. 3), spelled out.
 CONTINUE: dict[str, Any] = {"mode": "continue"}
 X_TEXT = "something wonderful happened today"
@@ -279,8 +287,23 @@ def _r15_script(contradictory: bool) -> tuple[str, ...]:
     return tuple(script)
 
 
+class TurnCapExceeded(GuardRefusal):
+    """A chat turn, command or review took longer than the turn cap (a stop
+    reason of a real run; the attempt counts)."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__("TURN_CAP_EXCEEDED", detail)
+
+
 class S0Session:
-    """One genesis subject on the process tier, driven through real routes."""
+    """One genesis subject on the process tier, driven through real routes.
+
+    ``model`` (a real ``ModelOverride``) switches the session to a REAL model: it
+    then needs the attestation of a Human launch (``launch``) and spawns its child
+    through ``ChildProcess.spawn_real``; the plain ``spawn`` still refuses a real
+    provider for every caller.  In a real session the R15 capture (real model text)
+    goes to the private directory, never to the closed-key evidence directory.
+    """
 
     def __init__(
         self,
@@ -292,19 +315,34 @@ class S0Session:
         r19: Mapping[str, int] | None = None,
         dc: Mapping[str, Any] | None = None,
         default_answer: str | None = None,
+        script: tuple[str, ...] | None = None,
+        model: ModelOverride | None = None,
+        launch: HumanLaunch | None = None,
+        turn_cap_s: float = 120.0,
     ) -> None:
+        self.real = model is not None and model.is_real
+        if self.real and (launch is None or not isinstance(launch, HumanLaunch) or not launch.valid_here()):
+            raise GuardRefusal("REAL_PROVIDER_WITHOUT_HUMAN_LAUNCH")
+        self.model = model
+        self.launch = launch
+        self.turn_cap_s = turn_cap_s
+        self.step_timeout_s = REAL_STEP_TIMEOUT_S if self.real else STEP_TIMEOUT_S
+        self.ticket_timeout_s = max(30.0, turn_cap_s) if self.real else 30.0
+        self.turn_seconds: list[float] = []
         self.subject = create_subject(
             profile,
             base=base,
             run_id=run_id,
             tier=Tier.T2,
-            r19_overrides=dict(T2_R19 if r19 is None else r19),
+            r19_overrides=dict(r19 if r19 is not None else (REAL_R19 if self.real else T2_R19)),
             degraded_continuation=None if dc is None else dict(dc),
+            model=model,
         )
         self.supervised = dc is not None and dc.get("mode") == "continue"
-        self.provider_config: dict[str, Any] = {"script": list(_r15_script(contradictory))}
+        self.provider_config: dict[str, Any] = {"script": list(script if script is not None else _r15_script(contradictory))}
         if default_answer is not None:
             self.provider_config["default"] = default_answer
+        self.capture_dir = artifacts.private_dir(self.subject.run_dir) if self.real else self.subject.evidence_dir
         self.manifest = Manifest(self.subject.evidence_dir, self.subject.run_id, subject_root=self.subject.root)
         self.evidence = Evidence(self.subject)
         self.child: ChildProcess | None = None
@@ -316,19 +354,38 @@ class S0Session:
         self._lives: list[ChildProcess] = []
 
     # -- process
-    def start(self, *, expect: str | tuple[str, ...] = "SERVING", timeout_s: float = STEP_TIMEOUT_S) -> ChildProcess:
+    def _spawn(self) -> ChildProcess:
+        if self.real:
+            assert self.launch is not None and self.model is not None
+            return ChildProcess.spawn_real(
+                self.subject, self.launch, hf_home=self.model.hf_home, turn_cap_s=self.turn_cap_s
+            )
+        return ChildProcess.spawn(self.subject, provider_config=self.provider_config)
+
+    def provider_identity(self) -> dict[str, object]:
+        if self.real:
+            assert self.model is not None
+            return self.model.record()
+        return {"mode": "scripted", "fixture_only": True}
+
+    def start(self, *, expect: str | tuple[str, ...] = "SERVING", timeout_s: float | None = None) -> ChildProcess:
         """Spawn a child and wait until it serves (in ``continue`` mode: until
         ``/health/dc`` says ``expect``, default ``SERVING``; ``/health`` and
         ``/health/dc`` are sampled meanwhile into ``self.observed``).  The first
         call also verifies the adoption and writes the identity record."""
 
         first = not self._lives
-        child = ChildProcess.spawn(self.subject, provider_config=self.provider_config)
+        timeout_s = self.step_timeout_s if timeout_s is None else timeout_s
+        child = self._spawn()
         self.child = child
         self._lives.append(child)
         self.started_at = time.monotonic()
-        child.wait_ready()
-        self.client = BoundClient(Destination.from_child(child), self.subject.subject_json)
+        child.wait_ready(REAL_LOAD_TIMEOUT_S if self.real else READY_TIMEOUT_S)
+        self.client = BoundClient(
+            Destination.from_child(child),
+            self.subject.subject_json,
+            transport_factory=(lambda port: SocketTransport(port, timeout_s=self.turn_cap_s)) if self.real else SocketTransport,
+        )
         self.observed = []
         if self.supervised:
             self.observed = self.observe_until(expect, timeout_s)
@@ -337,7 +394,7 @@ class S0Session:
                 raise GuardRefusal("NOT_" + "_OR_".join(wanted), str(self.observed[-3:]))
         self.serving_after_s = time.monotonic() - self.started_at
         if first:
-            record = factory.verify_first_start(self.subject, provider={"mode": "scripted", "fixture_only": True})
+            record = factory.verify_first_start(self.subject, provider=self.provider_identity())
             factory.write_identity_record(self.subject, record)
         return child
 
@@ -350,9 +407,9 @@ class S0Session:
             child.stop()
 
     # -- plain requests (a retryable "not yet" is retried, nothing is sent meanwhile)
-    def request(self, method: str, path: str, body: Any = None, *, timeout_s: float = STEP_TIMEOUT_S) -> Any:
+    def request(self, method: str, path: str, body: Any = None, *, timeout_s: float | None = None) -> Any:
         assert self.client is not None
-        deadline = time.monotonic() + timeout_s
+        deadline = time.monotonic() + (self.step_timeout_s if timeout_s is None else timeout_s)
         while True:
             try:
                 return self.client.request(method, path, body)
@@ -417,7 +474,17 @@ class S0Session:
         return bool(poll_until(reached, timeout_s=timeout_s, interval_s=0.25))
 
     def chat(self, text: str) -> dict[str, Any]:
-        reply = self.request("POST", "/api/chat", {"message": text, "attachments": []})
+        started = time.monotonic()
+        try:
+            reply = self.request("POST", "/api/chat", {"message": text, "attachments": []})
+        except TimeoutError as error:
+            if self.real:
+                raise TurnCapExceeded(f"no answer within {self.turn_cap_s:.0f} s") from error
+            raise
+        took = time.monotonic() - started
+        self.turn_seconds.append(round(took, 3))
+        if self.real and took > self.turn_cap_s:
+            raise TurnCapExceeded(f"{took:.0f} s > {self.turn_cap_s:.0f} s")
         assert reply.status == 200, reply.text
         data: dict[str, Any] = reply.json()
         return data
@@ -435,8 +502,8 @@ class S0Session:
         S2 after the fifth.  Returns the two reviews (revision, path label)."""
 
         reviews: dict[str, Any] = {}
-        seal = self.subject.evidence_dir / "p1.manifest.json"
-        capture = self.subject.evidence_dir / "p1.capture.json"
+        seal = self.subject.evidence_dir / "p1.manifest.json"  # the case parameters: no model text
+        capture = self.capture_dir / "p1.capture.json"  # real runs: the private directory
         seal_case(Case(f"r20-{self.subject.run_id}", "B", "forced", 0, "normal"), seal)
 
         def transport(message: str) -> dict[str, str]:
@@ -451,7 +518,16 @@ class S0Session:
         return reviews
 
     def review(self, stage: str) -> dict[str, Any]:
-        reply, _pid = send(self.subject.control_socket, {"cmd": "r15_review", "stage": stage})
+        started = time.monotonic()
+        try:
+            reply, _pid = send(
+                self.subject.control_socket,
+                {"cmd": "r15_review", "stage": stage},
+                timeout_s=self.turn_cap_s + 10 if self.real else 60.0,
+            )
+        except TimeoutError as error:
+            raise TurnCapExceeded(f"review {stage} did not answer") from error
+        self.turn_seconds.append(round(time.monotonic() - started, 3))
         if reply.get("ok") is not True:
             raise GuardRefusal("R15_REVIEW_REFUSED", str(reply.get("error")))
         return reply
@@ -468,7 +544,7 @@ class S0Session:
         reply = self.chat(text)
         return str(reply["command_ticket"]["ticket_id"])
 
-    def adopt_goal(self) -> dict[str, Any]:
+    def adopt_goal(self, max_s: float | None = None) -> dict[str, Any]:
         """U2a INTEREST to Goal adoption: ``REVIEW_EXPERIENCE`` is re-sent (each
         attempt is its own turn) until the INTEREST exists and the ticket is
         ``adopted``.  Returns the number of refused attempts and the last reason."""
@@ -485,12 +561,12 @@ class S0Session:
                 status = self.ticket_status(ticket)
                 return None if status == "pending" else status
 
-            status = poll_until(settled, timeout_s=30)
+            status = poll_until(settled, timeout_s=self.ticket_timeout_s)
             if status != "adopted":
                 reasons.append(str(status))
             return status == "adopted"
 
-        if not poll_until(once, timeout_s=STEP_TIMEOUT_S, interval_s=0.5):
+        if not poll_until(once, timeout_s=self.step_timeout_s if max_s is None else max_s, interval_s=0.5):
             raise GuardRefusal("GOAL_NOT_ADOPTED", ",".join(reasons))
         return {"attempts": count, "refused": reasons}
 
@@ -498,7 +574,9 @@ class S0Session:
         """U2c: ``COMMIT_REVIEW_EXPERIENCE:1:<X>``; returns the settled status."""
 
         ticket = self._command(f"COMMIT_REVIEW_EXPERIENCE:1:{self.x}")
-        status = poll_until(lambda: (lambda s: None if s == "pending" else s)(self.ticket_status(ticket)), timeout_s=30)
+        status = poll_until(
+            lambda: (lambda s: None if s == "pending" else s)(self.ticket_status(ticket)), timeout_s=self.ticket_timeout_s
+        )
         return str(status)
 
     # -- approval (item 5), through the real route with the stand-in operator
@@ -516,7 +594,7 @@ class S0Session:
             items = result.json().get("approvals", [])
             return dict(items[0]) if items else None
 
-        found = poll_until(listed, timeout_s=STEP_TIMEOUT_S, interval_s=0.3)
+        found = poll_until(listed, timeout_s=self.step_timeout_s, interval_s=0.3)
         if not found:
             raise GuardRefusal("NO_OPEN_APPROVAL")
         return dict(found)
@@ -528,8 +606,8 @@ class S0Session:
     def wait_for(self, predicate: Callable[[], Any], timeout_s: float, interval_s: float = 0.2) -> Any:
         return poll_until(predicate, timeout_s=timeout_s, interval_s=interval_s)
 
-    def wait_finalized(self, kind: str, timeout_s: float = STEP_TIMEOUT_S) -> bool:
-        return bool(self.wait_for(lambda: self.evidence.finalized(kind) >= 1, timeout_s))
+    def wait_finalized(self, kind: str, timeout_s: float | None = None) -> bool:
+        return bool(self.wait_for(lambda: self.evidence.finalized(kind) >= 1, timeout_s or self.step_timeout_s))
 
     def drive_to_open_approval(self) -> dict[str, Any]:
         """Items 1-3 and 5 up to the open approval: genesis (already started),
@@ -566,5 +644,5 @@ def new_session(base: Path, **options: Any) -> S0Session:
 
 __all__ = [
     "CONTINUE", "FINALIZED", "KINDS", "T2_R19", "X_TEXT", "DecisionRow", "Evidence", "KillPoint",
-    "S0Session", "new_session",
+    "REAL_R19", "S0Session", "TurnCapExceeded", "new_session",
 ]

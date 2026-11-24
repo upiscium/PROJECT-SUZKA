@@ -35,6 +35,7 @@ import yaml  # type: ignore[import-untyped]
 
 from experiments.r20 import guards
 from experiments.r20.guards import GuardRefusal
+from experiments.r20.model_config import ModelOverride
 from experiments.r20.polling import short_read
 
 from suzka.config.schema import Settings
@@ -212,6 +213,46 @@ def git_head() -> str:
     return done.stdout.strip() if done.returncode == 0 and done.stdout.strip() else "unknown"
 
 
+# Ignored paths that are DATA, not code under test: tool caches and the interpreter environment.  Any
+# other ignored file (a ``sitecustomize.py``, a stray module) is refused; a ``.pyc`` under ``__pycache__``
+# is allowed (the source is the truth; the child also runs ``python -B``).
+IGNORED_OK_PREFIXES = (".venv/", ".mypy_cache/", ".pytest_cache/", ".ruff_cache/")
+
+
+def _git(root: Path, *arguments: str) -> str | None:
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(root), *arguments], capture_output=True, text=True, timeout=60, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def git_dirty(root: Path | None = None) -> bool | None:
+    """``True`` when the working tree differs from its head in ANY way that could change what runs:
+    modified / untracked files (all of them, submodules included), ignored files other than data
+    caches and ``__pycache__/*.pyc``, and ``assume-unchanged`` / ``skip-worktree`` entries (which
+    hide a modification from ``git status``).  ``None`` when git cannot be read."""
+
+    where = root or guards.repo_root()
+    status = _git(where, "-c", "status.showUntrackedFiles=all", "status", "--porcelain", "--untracked-files=all",
+                  "--ignore-submodules=none")
+    ignored = _git(where, "ls-files", "--others", "--ignored", "--exclude-standard")
+    tagged = _git(where, "ls-files", "-v")
+    if status is None or ignored is None or tagged is None:
+        return None
+    if status.strip():
+        return True
+    for line in ignored.splitlines():
+        path = line.strip()
+        if path.startswith(IGNORED_OK_PREFIXES) or (path.endswith(".pyc") and "__pycache__/" in path):
+            continue
+        return True
+    # lowercase tag = assume-unchanged; ``S`` = skip-worktree: both hide edits from ``git status``
+    return any(line[:1].islower() or line[:1] == "S" for line in tagged.splitlines() if line)
+
+
 def _relocate(raw: dict[str, Any], root: Path, tier: Tier) -> None:
     for section, key in _PATH_KEYS:
         value = raw.setdefault(section, {}).get(key)
@@ -238,8 +279,11 @@ def build_config(
     run_id: str,
     r19_overrides: dict[str, int] | None = None,
     degraded_continuation: dict[str, Any] | None = None,
+    model: ModelOverride | None = None,
 ) -> dict[str, Any]:
-    """The raw config dict of one subject (the repository config, overridden)."""
+    """The raw config dict of one subject (the repository config, overridden).
+    ``model`` (IP-23a) overrides the model / generation sections; ``None`` keeps
+    the repository's ``dummy`` provider."""
 
     raw = _raw_config(guards.repo_root() / "config.yaml")
     _relocate(raw, root, tier)
@@ -261,6 +305,8 @@ def build_config(
     if degraded_continuation is not None:
         # F15 (IP-22d): the supervised ``mode = "continue"`` and its bounds.
         raw["degraded_continuation"] = dict(degraded_continuation)
+    if model is not None:
+        model.apply(raw)
     return raw
 
 
@@ -279,6 +325,7 @@ def create_subject(
     r19_overrides: dict[str, int] | None = None,
     degraded_continuation: dict[str, Any] | None = None,
     environ: dict[str, str] | None = None,
+    model: ModelOverride | None = None,
 ) -> GenesisSubject:
     """Create one new genesis subject.  Refuses (``GuardRefusal``) a root that
     exists or is not strictly under the explicit base, production locations,
@@ -311,7 +358,7 @@ def create_subject(
     raw = build_config(
         chosen, root, port, tier,
         deterministic=deterministic, r18=use_r18, r19=use_r19, run_id=rid, r19_overrides=r19_overrides,
-        degraded_continuation=degraded_continuation,
+        degraded_continuation=degraded_continuation, model=model,
     )
     (root / "config.yaml").write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     os.chmod(root / "config.yaml", 0o600)
