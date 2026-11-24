@@ -82,6 +82,8 @@ REASON_RUNTIME_NOT_ACCEPTING = "runtime_not_accepting"
 REASON_CLEARED_RESTART = "hard_band_cleared"
 #: Slice of the run-at-idle wait, so a stop request is honoured within it.
 _IDLE_SLICE_S = 1.0
+#: The audit log is capped here (bytes); see ``_log_attempt``.
+_LOG_MAX_BYTES = 256 * 1024
 _ENDING = frozenset(
     {
         AgentRuntimeStatus.FAILED,
@@ -126,6 +128,7 @@ class HardBandWatcher:
         port: HardBandPort,
         ladder: tuple[int, ...],
         t_hard_s: float,
+        configured_days: int | None = None,
         log_path: Path | None,
         poll_s: float = 5.0,
         rung_timeout_s: float = T_LADDER_RUNG_SECONDS,
@@ -139,6 +142,8 @@ class HardBandWatcher:
         self._status = status
         self._port = port
         self._ladder = tuple(ladder)
+        # "Rung 0": one compaction with the CONFIGURED window before any shrink.
+        self._configured_days = configured_days
         self._t_hard_s = float(t_hard_s)
         self._log_path = log_path
         self._poll_s = float(poll_s)
@@ -153,6 +158,10 @@ class HardBandWatcher:
         self._retry_at: float | None = None
         self._stuck_attempts = 0
         self._restart_requested = False
+        # Last logged outcome per rung (the audit log writes only a change).
+        self._last_outcome: dict[int, str] = {}
+        self._error_attempts = 0
+        self._error_until: float | None = None
 
     # ----------------------------------------------------------- lifecycle
 
@@ -181,11 +190,24 @@ class HardBandWatcher:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            try:
-                self.tick()
-            except Exception as error:  # the watcher never dies silently
-                # Not provable: log only; never show HARD_STUCK for it.
-                LOGGER.warning("HARD-band watcher tick failed: %s", type(error).__name__)
+            now = self._port.now()
+            if self._error_until is None or now >= self._error_until:
+                try:
+                    self.tick()
+                    self._error_attempts = 0
+                    self._error_until = None
+                except Exception as error:  # the watcher never dies silently
+                    # Not provable: log only (never HARD_STUCK for it), and back
+                    # off like a stuck ladder so a persistent error cannot spin.
+                    delay = reeval_delay(self._error_attempts, self._reeval_max_backoff_s)
+                    self._error_attempts += 1
+                    self._error_until = self._port.now() + delay
+                    LOGGER.warning(
+                        "HARD-band watcher tick failed: %s (next try in %.0f s)",
+                        type(error).__name__,
+                        delay,
+                        exc_info=True,
+                    )
             if self._stop.wait(self._poll_s):
                 return
 
@@ -205,6 +227,7 @@ class HardBandWatcher:
         if not hard or since is None:
             self._retry_at = None
             self._stuck_attempts = 0
+            self._last_outcome.clear()
             self._status.note_hard_band(None)
             return
         now = self._port.now()
@@ -221,11 +244,15 @@ class HardBandWatcher:
         return getattr(self._runtime, "status", None) is AgentRuntimeStatus.ACCEPTING
 
     def _walk_ladder(self) -> None:
-        if not self._ladder:
-            self._stuck(REASON_LADDER_EMPTY)
-            return
         self._status.note_hard_band(DcState.HARD_LADDER)
-        for days in self._ladder:
+        # Rung 0 is the CONFIGURED window: what the policy already allows to
+        # archive, so it is not a shrink (no ``dc_hard_window_days``).  Only a
+        # band that is still HARD after it takes a shrinking rung.
+        plan: list[tuple[int, bool]] = []
+        if self._configured_days is not None:
+            plan.append((self._configured_days, False))
+        plan.extend((days, True) for days in self._ladder)
+        for days, shrinks in plan:
             if self._stop.is_set():
                 return
             started = self._runtime_started()
@@ -233,14 +260,15 @@ class HardBandWatcher:
             reason, performed = self._attempt(days, started)
             if reason == "stopped":
                 return  # a teardown asked us to end: no audit line, no state
-            self._log_attempt(days, reason, performed, before, started)
+            self._log_attempt(days, reason, performed, before, started, shrinks)
             if performed:
-                self._status.note_hard_window(days)
-                LOGGER.warning(
-                    "HARD-band ladder archived under a %d-day retention window; "
-                    "the window does not return by itself",
-                    days,
-                )
+                if shrinks:
+                    self._status.note_hard_window(days)
+                    LOGGER.warning(
+                        "HARD-band ladder archived under a %d-day retention window; "
+                        "the window does not return by itself",
+                        days,
+                    )
                 if not self._still_hard():
                     self._cleared(started)
                     return
@@ -252,7 +280,8 @@ class HardBandWatcher:
         if not self._still_hard():
             self._cleared(self._runtime_started())
             return
-        self._stuck(REASON_LADDER_EXHAUSTED)
+        self._stuck(REASON_LADDER_EXHAUSTED if self._ladder else REASON_LADDER_EMPTY)
+
 
     def _attempt(self, days: int, started: bool) -> tuple[str, bool]:
         """One compaction attempt at ``days``.  Returns ``(reason, performed)``;
@@ -293,6 +322,7 @@ class HardBandWatcher:
     def _cleared(self, started: bool) -> None:
         self._retry_at = None
         self._stuck_attempts = 0
+        self._last_outcome.clear()
         self._port.observe_hard_band(False)
         self._status.note_hard_band(None)
         if not started and not self._restart_requested:
@@ -327,16 +357,25 @@ class HardBandWatcher:
         performed: bool,
         before: int | None,
         started: bool,
+        shrinks: bool = True,
     ) -> None:
-        """One line per attempt; a failure to write is logged, never raised
-        (the audit line must not stop the subject either)."""
+        """One line per ``performed`` attempt and per CHANGE of a rung's outcome
+        (a permanently stuck ladder repeats the same outcomes every few minutes
+        and must not grow the file).  The file is capped: past
+        ``_LOG_MAX_BYTES`` the oldest half of its lines is dropped (the newest
+        lines are kept; nothing else is ever deleted).  A failure to write is
+        logged, never raised (the audit line must not stop the subject either)."""
 
+        if not performed and self._last_outcome.get(days) == reason:
+            return
+        self._last_outcome[days] = reason
         if self._log_path is None:
             return
         line = json.dumps(
             {
                 "ts": self._wall_clock().isoformat(),
                 "rung_days": days,
+                "kind": "rung" if shrinks else "configured_window",
                 "outcome": reason,
                 "performed": performed,
                 "live_bytes_before": before,
@@ -347,6 +386,7 @@ class HardBandWatcher:
         )
         try:
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._truncate_log_if_needed()
             descriptor = os.open(
                 self._log_path,
                 os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
@@ -359,3 +399,26 @@ class HardBandWatcher:
                 os.close(descriptor)
         except OSError:
             LOGGER.warning("could not append to the HARD-band log")
+
+    def _truncate_log_if_needed(self) -> None:
+        path = self._log_path
+        assert path is not None
+        try:
+            if path.stat().st_size < _LOG_MAX_BYTES:
+                return
+        except FileNotFoundError:
+            return
+        lines = path.read_bytes().splitlines(keepends=True)
+        kept = lines[len(lines) // 2 :]
+        temporary = path.with_name(f"{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            os.write(descriptor, b"".join(kept))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, path)

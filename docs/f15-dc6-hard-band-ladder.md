@@ -69,3 +69,25 @@ compaction itself (an in-flight compaction cannot be interrupted). A cycle
 teardown waits for the watcher thread; one that does not end is reported by the
 stop proof (`threads_not_stopped`). `hard_band.jsonl` is append-only and is not
 rotated.
+
+## Order of attempts, log, disk
+
+- Before any shrinking step the ladder first tries ONE compaction with the
+  configured `retention_days` ("rung 0", logged as `configured_window`). That
+  is not a shrink: it archives only what the configured policy already allows
+  and shows no `dc_hard_window_days`. If it clears HARD, nothing is shortened.
+  This also applies when the filtered ladder is empty (`retention_days` at or
+  below the lowest step); only a band still HARD after it ends `HARD_STUCK`
+  (`ladder_empty` / `ladder_exhausted`).
+- `hard_band.jsonl` gets one line per applied compaction and per CHANGE of a
+  step's outcome (a permanently stuck ladder does not append every retry). It
+  is capped at 256 KiB: past that the oldest half of its lines is dropped, the
+  newest kept; nothing else is deleted.
+- Archiving moves rotated segments from the Journal into `archive_dir`. It does
+  NOT free disk space: HARD is about the Journal's live bytes (active plus
+  rotated segments), which archives do not count.
+- The watcher's stop join is `min(30 s, T_teardown_max / 8)` and is inside the
+  `T_teardown_max` budget; it is instant unless a compaction is in flight.
+- An unexpected error in the watcher is logged and retried on the same growing
+  delay; it is never shown as `HARD_STUCK`. A watcher that cannot start leaves
+  the cycle serving without a ladder (a missing ladder never drops the subject).

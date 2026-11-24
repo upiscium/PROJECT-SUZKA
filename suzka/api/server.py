@@ -239,8 +239,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             or supervisor is None
         ):
             return
-        compaction = app.state.journal_compaction
         try:
+            # A new cycle starts with no HARD overlay: a stale one from the
+            # previous cycle must not show up in this cycle's SERVING.
+            app.state.dc_status.note_hard_band(None)
+            compaction = app.state.journal_compaction
             watcher = HardBandWatcher(
                 journal=app.state.event_journal,
                 compaction=compaction,
@@ -250,6 +253,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ladder=hard_config.effective_hard_ladder(
                     compaction.policy.retention_days
                 ),
+                configured_days=compaction.policy.retention_days,
                 t_hard_s=float(hard_config.t_hard_s),
                 log_path=(
                     hard_config.resolved_quarantine_dir(app_settings.event_journal.path)
@@ -257,6 +261,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ),
                 reeval_max_backoff_s=float(hard_config.reeval_max_backoff_s),
                 poll_s=HARD_BAND_POLL_S,
+                # The join is part of ``T_teardown_max``; normally instant, it
+                # takes long only for an in-flight compaction.
+                stop_join_s=min(30.0, float(hard_config.t_teardown_max_s) / 8),
             )
             watcher.start()
         except Exception:

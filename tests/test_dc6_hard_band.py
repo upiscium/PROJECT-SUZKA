@@ -211,8 +211,13 @@ class FakeBandJournal:
         self.band = band
         self.live = 1000
         self.unreadable = False
+        self.error: Exception | None = None
+        self.status_calls = 0
 
     def admission_status(self) -> Any:
+        self.status_calls += 1
+        if self.error is not None:
+            raise self.error
         if self.unreadable:
             raise EventJournalLoadError("size cannot be inspected")
         return SimpleNamespace(band=self.band, live_bytes=self.live)
@@ -301,6 +306,7 @@ def make_rig(
     ladder: tuple[int, ...] = (14, 7, 3, 1, 0),
     runtime_status: AgentRuntimeStatus = AgentRuntimeStatus.ACCEPTING,
     rung_timeout_s: float = 0.1,
+    configured_days: int | None = None,
 ) -> Rig:
     journal = FakeBandJournal()
     compaction = FakeCompaction(journal, script)
@@ -316,6 +322,7 @@ def make_rig(
         status=status,
         port=port,
         ladder=ladder,
+        configured_days=configured_days,
         t_hard_s=T_HARD,
         log_path=log,
         rung_timeout_s=rung_timeout_s,
@@ -559,6 +566,8 @@ def test_a_tick_that_raises_is_shown_and_the_thread_survives(tmp_path: Path) -> 
     rig.watcher.tick = flaky  # type: ignore[method-assign]
     rig.watcher.start()
     try:
+        wait_until(lambda: calls["n"] >= 1, what="the failing poll")
+        rig.port.t += 1000.0  # past the back-off
         wait_until(lambda: calls["n"] >= 3, what="polls after the error")
         assert rig.watcher.threads_alive()
     finally:
@@ -1165,8 +1174,9 @@ def test_real_app_hard_at_startup_runs_the_ladder_then_starts_the_runtime(
         assert record is not None and record.retention_days == 0  # the rung that freed
         assert app.state.event_journal.admission_status().band is NORMAL
         lines = _log_lines(settings)
-        assert [x["rung_days"] for x in lines] == [7, 3, 1, 0]
-        assert [x["performed"] for x in lines] == [False, False, False, True]
+        assert [x["rung_days"] for x in lines] == [10, 7, 3, 1, 0]  # 10 = rung 0
+        assert [x["kind"] for x in lines][0] == "configured_window"
+        assert [x["performed"] for x in lines] == [False, False, False, False, True]
         assert lines[-1]["live_bytes_after"] < lines[-1]["live_bytes_before"]
         health = client.get("/health").json()
         assert health["dc_hard_window_days"] == "0"
@@ -1289,3 +1299,158 @@ def test_flag_off_auto_shrink_disabled_the_hard_band_behaves_as_before(
         assert "dc_hard_window_days" not in dc and "dc_hard_reason" not in dc
         assert [p.name for p in _segments_of(settings)] == segments
     assert _log_lines(settings) == []
+
+
+# ======================================== rung 0: the configured window
+
+
+def test_when_the_configured_window_suffices_nothing_is_shrunk(tmp_path: Path) -> None:
+    rig = make_rig(tmp_path, {30: "performed_clears"}, configured_days=30)
+    _arm(rig)
+    rig.watcher.tick()
+    assert rig.compaction.calls == [30]  # no rung below the policy was tried
+    snapshot = rig.status.snapshot()
+    assert "dc_hard_window_days" not in snapshot and "dc_hard_window_note" not in snapshot
+    assert rig.status.health_fields() == {}
+    line = rig.lines()[0]
+    assert line["kind"] == "configured_window" and line["performed"] is True
+
+
+def test_the_ladder_starts_only_when_the_configured_window_is_not_enough(
+    tmp_path: Path,
+) -> None:
+    rig = make_rig(
+        tmp_path,
+        {30: "performed", 14: "nothing_due", 7: "performed_clears"},
+        configured_days=30,
+    )
+    _arm(rig)
+    rig.watcher.tick()
+    assert rig.compaction.calls == [30, 14, 7]
+    # only the shrinking rung is the window the Human is told about
+    assert rig.status.snapshot()["dc_hard_window_days"] == "7"
+
+
+def test_a_configured_window_of_zero_still_gets_its_one_compaction(
+    tmp_path: Path,
+) -> None:
+    rig = make_rig(tmp_path, {0: "performed_clears"}, ladder=(), configured_days=0)
+    _arm(rig)
+    rig.watcher.tick()
+    assert rig.compaction.calls == [0]
+    assert rig.hard_state() == "SERVING"
+    assert "dc_hard_window_days" not in rig.status.snapshot()
+    stuck = make_rig(tmp_path / "b", {}, ladder=(), configured_days=0)
+    _arm(stuck)
+    stuck.watcher.tick()
+    assert stuck.compaction.calls == [0]
+    assert stuck.status.snapshot()["dc_hard_reason"] == "ladder_empty"
+
+
+# ===================================== audit log: changes only, capped
+
+
+def test_a_permanently_stuck_ladder_does_not_grow_the_log(tmp_path: Path) -> None:
+    rig = make_rig(tmp_path, {}, configured_days=30)  # every rung: nothing_due
+    _arm(rig)
+    rig.watcher.tick()
+    first = rig.lines()
+    assert [x["rung_days"] for x in first] == [30, 14, 7, 3, 1, 0]
+    for _ in range(40):
+        rig.port.t += 400.0  # past every re-evaluation delay
+        rig.watcher.tick()
+    assert len(rig.compaction.calls) > 6 * 5  # it did retry
+    assert rig.lines() == first  # and wrote nothing new
+
+
+def test_a_change_of_outcome_and_every_performed_attempt_are_logged(
+    tmp_path: Path,
+) -> None:
+    rig = make_rig(tmp_path, {14: "compaction_failed"})
+    _arm(rig)
+    rig.watcher.tick()
+    rig.compaction.script = {14: "deferred_semantic"}
+    rig.port.t += 400
+    rig.watcher.tick()
+    rig.compaction.script = {14: "performed", 7: "performed_clears"}
+    rig.port.t += 400
+    rig.watcher.tick()
+    assert [(x["rung_days"], x["outcome"]) for x in rig.lines()] == [
+        (14, "compaction_failed"),
+        (14, "deferred_semantic"),
+        (14, "performed"),
+        (7, "performed"),
+    ]
+
+
+def test_the_log_is_capped_keeps_the_newest_lines_and_touches_nothing_else(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import suzka.runtime.hard_band_watcher as module
+
+    monkeypatch.setattr(module, "_LOG_MAX_BYTES", 2_000)
+    rig = make_rig(tmp_path, {})
+    sibling = rig.log.parent / "manifest.json"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("untouched")
+    for number in range(60):
+        rig.compaction.script = {}
+        rig.watcher._last_outcome.clear()
+        rig.watcher._log_attempt(14, "performed", True, number, True)
+    size = rig.log.stat().st_size
+    assert size < 2_000 + 400  # one line past the cap at most
+    lines = rig.lines()
+    assert lines and lines[-1]["live_bytes_before"] == 59  # the newest survives
+    assert [x["live_bytes_before"] for x in lines] == sorted(
+        x["live_bytes_before"] for x in lines
+    )
+    assert sorted(p.name for p in rig.log.parent.iterdir()) == [
+        HARD_BAND_LOG_NAME,
+        "manifest.json",
+    ]
+    assert sibling.read_text() == "untouched"
+
+
+# ============================== a persistent unexpected error never spins
+
+
+def test_a_persistent_unexpected_error_backs_off_and_is_not_shown_as_hard_stuck(
+    tmp_path: Path,
+) -> None:
+    rig = make_rig(tmp_path, {})
+    rig.journal.error = OSError(5, "EIO")  # not an EventJournalError
+    rig.watcher._poll_s = 0.005
+    rig.watcher.start()
+    try:
+        wait_until(lambda: rig.journal.status_calls >= 1, what="the first poll")
+        time.sleep(0.3)  # ~60 polls; the back-off allows no more than a few ticks
+        assert rig.journal.status_calls <= 3
+        assert rig.watcher.threads_alive()
+        assert rig.hard_state() == "SERVING"  # nothing claimed about HARD
+        rig.port.t += 10_000.0  # past the back-off: it tries again
+        wait_until(lambda: rig.journal.status_calls >= 2, what="a later retry")
+    finally:
+        rig.watcher.stop()
+
+
+# ============================ a watcher that cannot start never drops the subject
+
+
+def test_real_app_a_failed_watcher_start_is_not_fatal_and_leaves_no_stale_overlay(
+    tmp_path: Path, provider: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(self: HardBandWatcher) -> None:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(HardBandWatcher, "start", refuse)
+    app = server.create_app(_settings(tmp_path))
+    supervisor = _fast(app)
+    # an overlay left by a previous cycle
+    app.state.dc_status.note_hard_band(DcState.HARD_STUCK, "history_attestation_refused")
+    with TestClient(app) as client:
+        assert supervisor.wait_serving(120)
+        assert not hasattr(app.state, "hard_band_watcher")
+        assert app.state.dc_status.health_fields() == {}  # the stale overlay is gone
+        assert client.get("/health").json()["status"] == "ok"
+        assert _chat(client, "still here").status_code == 200
+    assert _hard_threads() == []
