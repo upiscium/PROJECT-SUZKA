@@ -31,7 +31,9 @@ from experiments.r20 import drivers, gpu, prereg, real_run
 from experiments.r20.caps import Ledger
 from experiments.r20.drivers import HumanApprover
 from experiments.r20.guards import GuardRefusal
-from experiments.r20.real_run import RealLock, Stopper, parser, release_stage_b, run_stage
+from experiments.r20.real_run import RealLock, Stopper, parser
+from experiments.r20.real_run import release_stage_b_with as release_stage_b
+from experiments.r20.real_run import run_stage_with as run_stage
 from experiments.r20.supervisor import ChildProcess
 
 GOOD_GPU = lambda: json.dumps({"free": 20 * gpu.GIB, "total": 24 * gpu.GIB, "reserved": 0})  # noqa: E731
@@ -51,6 +53,7 @@ def lab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         raise AssertionError("a refusal must happen before the drivers")
 
     monkeypatch.setattr(real_run, "dispatch", dispatch)
+    monkeypatch.setattr(real_run.factory, "git_head", lambda: "a" * 40)
     monkeypatch.setattr(real_run, "GLOBAL_LOCK", tmp_path / "global.lock")
     return {"base": base, "hf": hf, "digest": digest, "reached": reached, "tmp": tmp_path}
 
@@ -342,3 +345,19 @@ def test_the_watch_stops_a_launch_that_reaches_a_cap_during_a_wait(tmp_path: Pat
     for _ in range(Stopper.TICK_EVERY):
         other.poll_once()
     assert any(row["kind"] == "tick" and row["elapsed_s"] > 9000 for row in ledger.rows())  # recorded: a killed launcher counts it
+
+
+def test_the_public_entries_take_no_seam_and_the_code_must_be_the_preregistered_head(lab: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    import inspect
+
+    assert list(inspect.signature(real_run.run_stage).parameters) == ["args"]
+    assert list(inspect.signature(real_run.release_stage_b).parameters) == ["args"]
+    monkeypatch.setattr(real_run.factory, "git_head", lambda: "b" * 40)
+    assert refusal_code(launch, lab) == "GIT_HEAD_MISMATCH"
+    assert_nothing_started(lab)
+
+
+def test_a_second_s0_launch_after_a_completed_block_is_refused(lab: dict[str, Any]) -> None:
+    (lab["base"] / "results-S0-x.json").write_text(json.dumps({"stop_reason": "completed"}))
+    assert refusal_code(launch, lab, "S0") == "S0_ALREADY_RUN"
+    assert_nothing_started(lab)

@@ -19,13 +19,16 @@ check off.  ``HumanLaunch`` can be constructed only by ``attest_human_launch``
 (a module-private mint), and ``ChildProcess.spawn_real`` requires one that
 belongs to THIS process.
 
-Honest limit: a process that controls a pseudo-terminal master can still type
-the sentence.  The layers above (foreground group, agent-environment and
-ancestry refusals, the exact sentence, the check in the child) stop a script, a
-pipe, a background job and a harness-spawned child, and make a pty-driven
-launch a deliberate act; they cannot make one cryptographically impossible.
-The other half of the protection is the permission system that forbids the agent
-to start a real run at all.
+Honest limits.  A process that can allocate a pseudo-terminal (same uid) can type
+the sentence, and can also start ``experiments.r20.serve --provider real`` directly:
+the child's own check (a tty on stdin, a launch record whose nonce digest and parent
+pid match, a parent command line naming the launcher) needs NO typed sentence, and a
+parent can be made to carry that command line.  Python's privacy is by convention
+(``_MINT`` is importable).  What the layers stop: a script or pipe without a tty, a
+background job, a harness-spawned child, ``ChildProcess.spawn``, a ``S0Session`` or
+``spawn_real`` without a ``HumanLaunch``, a scripted approver with a real model.  What
+they cannot stop: a deliberate pty-driven launch.  The real protection is the
+permission system that forbids the agent to start a real run at all.
 """
 
 from __future__ import annotations

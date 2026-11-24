@@ -350,7 +350,7 @@ def check_reference(
     twelve.require("run_stays_below_the_soft_band", counts["live_bytes"] < soft_start,
                    {"live_bytes": counts["live_bytes"], "soft_band_start_bytes": soft_start})
     twelve.evidence["finding_if_crossed"] = "a run that crosses the soft band is a finding (HP-8)"
-    facts["identity"] = asdict(factory.verify_first_start(session.subject, provider={"mode": "scripted", "fixture_only": True}))
+    facts["identity"] = asdict(factory.verify_first_start(session.subject, provider=session.provider_identity()))
     facts["reference_counts"] = logical_counts(session)
     facts["replay_defects"] = replay_all(evidence)
     return session, facts, steps

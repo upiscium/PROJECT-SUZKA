@@ -120,14 +120,14 @@ def build_report(base: Path) -> str:
         )
     for result in results:
         stage = result.get("stage")
-        lines += ["", f"## Stage {stage}"]
+        lines += ["", f"## Stage {stage} (ended: {result.get('stop_reason')})"]
         if stage == "G1":
-            gate = result["g1"]
+            gate = result.get("g1") or {}
             lines.append(f"- G1 label: {gate['label']} (X not skipped as neutral: {gate.get('x_not_skipped_as_neutral')})")
             lines.append(f"- model load s: {gate.get('serving_after_s')}; GPU: {json.dumps(gate.get('gpu'), sort_keys=True)}")
             lines.append(f"- turn seconds (max {gate.get('max_turn_seconds')}): {gate.get('turn_seconds')}")
         if stage == "S0":
-            block = result["s0"]
+            block = result.get("s0") or {"s0": "NOT_COMPLETED", "attempts": []}
             lines.append(f"- S0: {block['s0']} (K = 3 rule: {content['s0']['k_rule']})")
             lines.append("| attempt | first row-4 row | interpretation / stage | receipts | S0 candidate | stop |")
             lines.append("| --- | --- | --- | --- | --- | --- |")
@@ -152,20 +152,20 @@ def build_report(base: Path) -> str:
             lines.append("- approval actor labels: S1 / S2 admission path HARNESS_BRIDGE; approval HUMAN (V1: authorized implies MATCH_SELF, "
                          "so MATCH_SELF is not independent evidence the forecast was right)")
         if stage == "S1":
-            block = result["s1"]
+            block = result.get("s1") or {"g2": {}, "s1": "NOT_COMPLETED", "attempts": []}
             lines.append(f"- G2: {json.dumps(block['g2'], sort_keys=True)}")
             lines.append(f"- S1: {block['s1']}; expectation (pre-registered): {content['s1']['expectation']}")
             for attempt in block["attempts"]:
                 lines.append(f"- attempt {attempt['attempt']}: {json.dumps({k: v for k, v in attempt.items() if k != 'run_id'}, sort_keys=True)}")
         if stage == "F1":
-            summary = result["f1"]["summary"]
+            summary = (result.get("f1") or {}).get("summary") or {"claim_ceiling": "NOT_COMPLETED", "i_to_s": "-", "e_r15": None, "valid_treatment_pairs": 0, "control_discordance": 0, "control_pairs_valid": 0, "classes": {}}
             lines.append(f"- F1 claim ceiling: {summary['claim_ceiling']}; I_TO_S: {summary['i_to_s']}")
             lines.append(f"- E_R15 {summary['e_r15']} over {summary['valid_treatment_pairs']} valid treatment pairs; "
                          f"control discordance {summary['control_discordance']} of {summary['control_pairs_valid']}; "
                          f"classes {summary['classes']}")
             lines.append("| pair | kind | class | rows (arm: row) |")
             lines.append("| --- | --- | --- | --- |")
-            for pair in result["f1"]["pairs"]:
+            for pair in (result.get("f1") or {}).get("pairs", []):
                 rows = ", ".join(f"{m['arm']}: {m.get('sealed_row')}" for m in pair["members"])
                 lines.append(f"| {pair['pair']} | {pair['kind']} | {pair['class']} | {rows} |")
     lines += ["", "## Defect labels (deterministic rules only; COGNITIVE_VARIATION is the Human's reading)"]

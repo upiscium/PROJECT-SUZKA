@@ -190,8 +190,7 @@ class ChildProcess:
             raise GuardRefusal("SECOND_REAL_PROCESS")
         guards.check_marker(subject.root, subject.run_id)
         record = subject.control_dir / "launch.json"
-        if not record.exists():
-            write_launch_record(record, launch)
+        write_launch_record(record, launch)  # exclusive create: a pre-existing record is refused
         command = [
             sys.executable, "-m", "experiments.r20.serve", str(subject.root),
             "--run-id", subject.run_id, "--provider", ProviderMode.REAL.value,

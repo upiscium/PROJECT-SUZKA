@@ -24,8 +24,10 @@ Commands:
 * ``erase``          remove the RAW parts of runs (explicit ``--confirm-erase``).
 
 NOTHING in this module starts a model unless every refusal of ``attest_human_launch``,
-the caps, the GPU check, the model pin and the one-real-process lock passed.  The agent
-and a script cannot satisfy them: see ``experiments/r20/launch.py``.
+the caps, the GPU check, the model pin and the one-real-process lock passed.  A process that can drive a pseudo-terminal can still start a child (see the honest limits
+in ``experiments/r20/launch.py``); the real protection is that an agent is not permitted to
+start a real run at all.  The stage-B release file and the pre-registration are forgeable by
+the same uid: they detect, they do not prevent.
 """
 
 from __future__ import annotations
@@ -99,7 +101,7 @@ def model_from_prereg(content: dict[str, Any]) -> ModelOverride:
     )
 
 
-def preflight(base: Path, caps: Caps, stage: str, prereg_sha256: str) -> None:
+def preflight(base: Path, caps: Caps, stage: str, prereg_sha256: str, content_git_head: str) -> None:
     """Cap refusals BEFORE the Human is asked to confirm anything."""
 
     ledger = Ledger(base)
@@ -109,6 +111,13 @@ def preflight(base: Path, caps: Caps, stage: str, prereg_sha256: str) -> None:
         raise GuardRefusal("CAP_TOTAL_HOURS", f"{ledger.seconds_used() / 3600:.2f} h")
     if (Path(base) / STOP_FILE).exists():
         raise GuardRefusal("STOP_FILE", "remove the stop file deliberately before a new launch")
+    if stage == "S0" and any(
+        json.loads(path.read_text(encoding="utf-8")).get("stop_reason") == "completed"
+        for path in Path(base).glob("results-S0-*.json")
+    ):
+        raise GuardRefusal("S0_ALREADY_RUN", "K = 3 allows no extra attempt in a second launch")
+    if factory.git_head() != content_git_head:
+        raise GuardRefusal("GIT_HEAD_MISMATCH", "the code is not the pre-registered git head")
     if stage == "F1" and not drivers.stage_b_released(base, prereg_sha256):
         raise GuardRefusal("STAGE_B_NOT_RELEASED", "stage B needs the release file the Human writes (release-stage-b)")
 
@@ -184,7 +193,7 @@ def write_results(base: Path, launch_id: str, stage: str, payload: dict[str, Any
     return path
 
 
-def run_stage(args: argparse.Namespace, *, terminal: Terminal | None = None,
+def run_stage_with(args: argparse.Namespace, *, terminal: Terminal | None = None,
               environ: dict[str, str] | None = None, gpu_runner: Any = None, lock: RealLock | None = None,
               ancestors: Callable[[], list[tuple[str, list[str]]]] | None = None) -> int:
     """The Human-launched stage.  ``terminal`` / ``environ`` / ``gpu_runner`` / ``ancestors`` are the
@@ -199,7 +208,7 @@ def run_stage(args: argparse.Namespace, *, terminal: Terminal | None = None,
     model = model_from_prereg(content)
     # a command-line value can only LOWER a cap: ``Caps`` refuses one above the Human's limit
     caps = Caps(max_subjects=args.max_subjects or HARD_MAX_SUBJECTS, turn_seconds=args.turn_seconds or HARD_TURN_SECONDS)
-    preflight(base, caps, stage, digest)
+    preflight(base, caps, stage, digest, str(content["git_head"]))
     with lock or RealLock(base):
         launch = attest_human_launch(
             stage, digest, human_flag=bool(args.human_launch), terminal=terminal or RealTerminal(),
@@ -252,7 +261,7 @@ def dispatch(ctx: RunContext, stage: str, content: dict[str, Any]) -> dict[str, 
     raise GuardRefusal("STAGE_UNKNOWN", stage)
 
 
-def release_stage_b(args: argparse.Namespace, *, terminal: Terminal | None = None,
+def release_stage_b_with(args: argparse.Namespace, *, terminal: Terminal | None = None,
                     environ: dict[str, str] | None = None,
                     ancestors: Callable[[], list[tuple[str, list[str]]]] | None = None) -> Path:
     """The Human's release of stage B: attested like a launch, bound to the pre-registration."""
@@ -271,8 +280,19 @@ def release_stage_b(args: argparse.Namespace, *, terminal: Terminal | None = Non
     return path
 
 
+def run_stage(args: argparse.Namespace) -> int:
+    """The public entry: NO seam (real terminal, real environment, real ancestry, real GPU probe)."""
+
+    return run_stage_with(args)
+
+
+def release_stage_b(args: argparse.Namespace) -> Path:
+    return release_stage_b_with(args)
+
+
 def create_prereg(args: argparse.Namespace) -> str:
     base = Path(args.base)
+    check_not_production(base)  # BEFORE anything is created
     base.mkdir(mode=0o700, parents=True, exist_ok=True)
     check_not_production(base)
     four = json.loads(Path(args.known_violations_file).read_text(encoding="utf-8"))
@@ -353,4 +373,4 @@ if __name__ == "__main__":
     sys.exit(main())
 
 
-__all__ = ["RealLock", "Stopper", "main", "model_from_prereg", "preflight", "run_stage", "ssh_line"]
+__all__ = ["RealLock", "Stopper", "main", "model_from_prereg", "preflight", "run_stage", "run_stage_with", "ssh_line"]
