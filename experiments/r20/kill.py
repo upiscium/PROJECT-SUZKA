@@ -161,8 +161,13 @@ def run_kill_point(base: Path, point: str, *, attempts: int = 3) -> tuple[KillRe
     result = KillResult(point)
     for _ in range(attempts):
         session = S0Session(base)
-        result = _once(session, point)
-        if result.window_hit:
+        try:
+            result = _once(session, point)
+        except BaseException:
+            session.stop()
+            raise
+        # a window that the frozen store no longer shows is a miss too (the poll raced the server)
+        if result.window_hit and result.window_confirmed:
             return result, session
         session.stop()
     return result, session

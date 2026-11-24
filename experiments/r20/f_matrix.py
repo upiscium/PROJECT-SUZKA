@@ -578,7 +578,8 @@ F15_KNOWN_VIOLATIONS: tuple[KnownViolation, ...] = (
     _kv(
         "KV-STALE-RESTORE", "a stale restore over a quarantined store",
         "A restored or hand-replaced memory directory cannot be re-quarantined safely without a Journal-side epoch "
-        "marker: detection and block only (RECONCILING, domain_store_replaced); no automatic action.",
+        "marker: detection and block only (RECONCILING, domain_store_replaced); no automatic action.  Observed in T2 "
+        "(F15-x-2): the real start path ends REFUSED_RUNNING(StateRecoveryError) when no transaction is open.",
         f"{_ACC}; {_D1} K11, F-15",
         _t('test_dc4_participant_quarantine.py', 'test_a_restored_directory_over_a_quarantined_store_is_detected_and_blocks'),
     ),
@@ -628,7 +629,8 @@ F15_KNOWN_VIOLATIONS: tuple[KnownViolation, ...] = (
     _kv(
         "KV-MODE-REFUSE", "degraded_continuation.mode = refuse",
         "mode = 'refuse' is the exact legacy behaviour (no supervisor, no quarantine, no ladder; the first start "
-        "raises, DEGRADED-UP and FAILED are permanent): none of the covered classes holds under it.",
+        "raises, DEGRADED-UP and FAILED are permanent): none of the covered classes holds under it, and 'refuse' is "
+        "the product default today (the D1 says 'continue'; flipping it is the Human's explicit step).",
         f"{_D1} sec. 8",
         _t('test_dc4_real_app.py', 'test_mode_refuse_never_quarantines_and_never_creates_a_file'),
         _t('test_dc6_hard_band.py', 'test_flag_off_mode_refuse_the_hard_band_behaves_as_before'),
@@ -747,7 +749,11 @@ def _is_disabled(node: ast.AST) -> bool:
 
 def uses_process_tier(node: ast.AST) -> bool:
     text = ast.unparse(node)
-    return any(marker in text for marker in ("Tier.T2", "ChildProcess", "S0Session", "run_kill_point", "_t2_quarantined_subject("))
+    markers = (
+        "Tier.T2", "ChildProcess", "S0Session", "run_kill_point", "_t2_quarantined_subject(", "run_dry_run(",
+        "new_session(", "kill_run(", "reference_run(", "receipt_runs(", "BoundClient(",
+    )
+    return any(marker in text for marker in markers)
 
 
 def check_table(root: Path | None = None) -> list[str]:

@@ -146,7 +146,10 @@ def test_f15_x_1_a_covered_experience_fault_after_a_kill_is_quarantined_and_the_
         reply = session.chat("hello after the quarantine")
         assert reply["response"] and reply["experience_id"]
 
-        # (3) no new Action on unproven history (a window in which an Action could appear)
+        # (3) the process admits no new Action by itself on unproven history.  Nothing here
+        # sends the approval: an already approved Intent lives in SubjectHistory, which this
+        # quarantine does not touch (D1 sec. 6), so the claim is only that the process
+        # itself issues nothing new (no Decision / Intent / Policy / challenge / claim).
         time.sleep(8)
         after = _actions(session)
         assert after == q.before, (q.before, after)
@@ -190,6 +193,11 @@ def test_f15_x_2_a_restored_copy_of_the_quarantined_tree_is_detected_blocks_and_
         qdir = session.subject.root / ".suzka" / "quarantine"
         epochs_before = sorted(path.name for path in qdir.iterdir() if path.is_dir())
         assert epochs_before == [q.epoch]
+        # CONTROL: an ordinary restart after the quarantine (nothing restored) serves again, so the
+        # state seen after the restore below is caused by the restored copy
+        session.kill()
+        session.start()
+        assert session.health_dc()["dc_state"] == "SERVING"
         session.kill()
         # the Human puts a copy of the quarantined directory back over the live root
         aside = q.root.with_name(q.root.name + ".live-aside")

@@ -121,6 +121,14 @@ def reference_run(base: Path) -> tuple[S0Session, dict[str, Any], dict[str, Step
 
     steps: dict[str, Step] = {str(n): Step() for n in (1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12)}
     session = S0Session(base)
+    try:
+        return _reference_body(session, steps)
+    except BaseException:
+        session.stop()
+        raise
+
+
+def _reference_body(session: S0Session, steps: dict[str, Step]) -> tuple[S0Session, dict[str, Any], dict[str, Step]]:
     session.start()
     facts: dict[str, Any] = {}
     chain = _try(steps["1"], "chain", session.drive_to_claim)
@@ -177,6 +185,8 @@ def reference_run(base: Path) -> tuple[S0Session, dict[str, Any], dict[str, Step
     if row4 is not None:
         stage = _sealed(row4.sealed_input).interpretation_stage
         two.require("row4_stage_is_S2", stage is InterpretationStage.S2, stage.value)
+    else:
+        two.problems.append("no row-4 Decision")
 
     # ---- 3: the first row-4 Decision
     three = steps["3"]
@@ -194,11 +204,17 @@ def reference_run(base: Path) -> tuple[S0Session, dict[str, Any], dict[str, Step
 
     # ---- 4: DRV-1 D
     four = steps["4"]
-    four.require("provider_loss_is_large", NON_NEUTRAL_LOSS >= 1000.0, NON_NEUTRAL_LOSS)
-    four.require("no_attempt_was_skipped_as_neutral",
-                 not any("neutral" in reason.lower() for reason in chain["adopt"]["refused"]), chain["adopt"])
-    four.require("goal_adopted_on_x_after_its_interest", row3 is not None, {"x": session.x})
-    four.evidence["note"] = "a Goal adopted by REVIEW_EXPERIENCE needs the INTEREST Motivation of X; X was not skipped as neutral"
+    interest_reviews = [e for e in events if e["event_type"] == "motivation_source_review"]
+    four.require("the_u2a_interest_review_ran", len(interest_reviews) >= 1, [e["sequence"] for e in interest_reviews])
+    if row3 is not None:
+        refs3 = _sealed(row3.sealed_input).source_refs
+        four.require("the_goal_decision_names_x_and_a_goal",
+                     any(r.kind == "experience" and r.ref_id == session.x for r in refs3)
+                     and any(r.kind == "goal" for r in refs3), [(r.kind, r.ref_id[:24]) for r in refs3])
+    else:
+        four.problems.append("no row-3 Decision")
+    four.evidence["provider_loss"] = NON_NEUTRAL_LOSS
+    four.evidence["note"] = "the Goal was adopted on X by REVIEW_EXPERIENCE, which needs the INTEREST Motivation of X (the U2a review event ran): X was not skipped as neutral"
 
     # ---- 5: Intent, forecast, Policy, approval, claim, effect
     five = steps["5"]
@@ -228,6 +244,8 @@ def reference_run(base: Path) -> tuple[S0Session, dict[str, Any], dict[str, Step
     if cycle is not None:
         seven.require("feedback_is_match_self", _sealed(cycle.sealed_input).feedback is FeedbackState.MATCH_SELF,
                       _sealed(cycle.sealed_input).feedback.value)
+    else:
+        seven.problems.append("no wake-origin Decision to read the Feedback from")
     seven.evidence["note"] = (
         "D-R17: in V1 an authorized, verified effect implies MATCH_SELF, so MATCH_SELF is not independent "
         "evidence that the forecast was right"
@@ -239,6 +257,8 @@ def reference_run(base: Path) -> tuple[S0Session, dict[str, Any], dict[str, Step
     eight.require("causes", "OUTCOME_VERIFIED_NO_FEEDBACK" not in causes and causes.count("FEEDBACK_ADMITTED") == 1, causes)
     feedback_seq = evidence.sequences("R17_FEEDBACK_COMMIT")
     wake_review = [e["sequence"] for e in events if e["event_type"] == "r16_wake_review"]
+    eight.require("control_chat_events_are_visible_in_the_journal",
+                  sum(1 for e in events if e["event_type"] == "chat") >= 5, sum(1 for e in events if e["event_type"] == "chat"))
     chat_between = [
         e["sequence"] for e in events
         if e["event_type"] == "chat" and feedback_seq and wake_review and feedback_seq[0] < e["sequence"] < wake_review[0]
@@ -286,11 +306,16 @@ def reference_run(base: Path) -> tuple[S0Session, dict[str, Any], dict[str, Step
         {"approval_window_end_utc": approval["window_end_utc"], "commitment_deadline_utc": approval["commitment_deadline_utc"],
          "approval_window_seconds": window},
     )
-    if cycle is not None and row4 is not None:
+    if cycle is None or row4 is None:
+        eleven.problems.append("no wake-origin Decision to time")
+    else:
         deadline = _utc(approval["commitment_deadline_utc"])
         eleven.require("the_cycle_decision_precedes_the_u2c_deadline", _utc(_sealed(cycle.sealed_input).now_utc) < deadline,
                        _sealed(cycle.sealed_input).now_utc)
+    eleven.require("approval_window_at_least_600_s", window >= 600, window)
     eleven.evidence["wake_expiry_s"] = 604_800
+    eleven.evidence["note"] = "WakeExpiry is the 7-day Wake TTL (a constant of the contract), compared only by the "\
+        "cycle Decision time being inside the U2c deadline"
 
     # ---- 12: the Journal budget
     twelve = steps["12"]
@@ -398,6 +423,8 @@ def receipt_runs(base: Path) -> tuple[Step, dict[str, Any]]:
             evidence = session.evidence
             receipts = evidence.records("plan_hold_receipts")
             out[name] = {"receipts": len(receipts), "decisions": session.counters()["R16_DECISION_ISSUE"]}
+            previews = [e for e in evidence.journal_events() if e["event_type"] == "plan_preview_review"]
+            step.require(f"{name}_the_plan_preview_ran", len(previews) >= 1, len(previews))
             if profile == "F1":
                 step.require("exactly_one_receipt", len(receipts) == 1, len(receipts))
                 if receipts:
@@ -435,7 +462,8 @@ def receipt_runs(base: Path) -> tuple[Step, dict[str, Any]]:
             session.stop()
     step.evidence["replay_of_the_same_evidence"] = (
         "merged T1 test tests/test_r16_ip14b3_plan_hold_writer.py::test_the_2b_hold_is_sealed_exactly_once "
-        "(the SAME evidence again: no second receipt); the chain cannot re-send the same evidence over HTTP "
+        "(the SAME evidence again: no second receipt) and is NOT re-run in this subject; the chain cannot re-send "
+        "the same evidence over HTTP "
         "(a second REVIEW_EXPERIENCE after the adoption is a hold and issues no preview)"
     )
     return step, out
@@ -498,9 +526,9 @@ def run_dry_run(base: Path, *, kill_point: str = "K4") -> tuple[dict[str, Any], 
     """Run everything; returns the manifest dict, the exit code (0 = no
     attempted item failed; 1 = an attempted item failed) and the manifest path.
 
-    The five subjects (A reference, B killed at ``kill_point``, C killed at K2,
-    D / E receipts) are independent genesis subjects on their own ports and
-    roots; they run CONCURRENTLY to keep the command short.  Nothing is shared."""
+    The subjects (A reference, B killed at ``kill_point``, C killed at K2,
+    D / E receipts, the last two one after the other) are independent genesis
+    subjects on their own ports and roots; four groups run CONCURRENTLY to keep the command short.  Nothing is shared."""
 
     from concurrent.futures import ThreadPoolExecutor
 
@@ -531,10 +559,11 @@ def run_dry_run(base: Path, *, kill_point: str = "K4") -> tuple[dict[str, Any], 
     manifest.append("kill_points", neg_entry)
 
     steps["10"] = kill_step
-    steps["6"].evidence["negative_variant_subject"] = {
-        "variant": "SIGKILL at K2, restart: one effect or none, never two (a separate subject, D2-6)",
-        "checks": neg_step.evidence, "problems": neg_step.problems,
-    }
+    if "active_verified_authorized" in steps["6"].evidence:  # only on top of the reference's own check
+        steps["6"].evidence["negative_variant_subject"] = {
+            "variant": "SIGKILL at K2, restart: one effect or none, never two (a separate subject, D2-6)",
+            "checks": neg_step.evidence, "problems": neg_step.problems,
+        }
     if neg_step.problems:
         steps["6"].problems.append("negative variant failed: " + "; ".join(neg_step.problems))
     steps["15"] = receipt_step

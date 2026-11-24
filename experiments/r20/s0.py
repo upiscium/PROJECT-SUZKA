@@ -360,6 +360,12 @@ class S0Session:
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(0.2)
+            except (TimeoutError, ConnectionError):
+                # A busy child (GIL starved while it commits) can miss a 30 s connect.  Only a
+                # read-only GET is retried: nothing was changed, and a POST that timed out may have been applied.
+                if method.upper() != "GET" or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.5)
 
     def health(self) -> dict[str, Any]:
         result = self.request("GET", "/health", timeout_s=5)
