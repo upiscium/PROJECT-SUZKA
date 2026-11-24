@@ -219,18 +219,26 @@ def test_f15_x_2_a_restored_copy_of_the_quarantined_tree_is_detected_blocks_and_
         # state visible, re-evaluated, restored tree unused); the deviation from the D1
         # text is recorded in the manifest and reported, not hidden, and not fixed here
         # (IP-22 changes no product code).
-        observed = (health["dc_state"], health["dc_reason"])
-        assert observed in {
+        # The supervisor alternates REFUSED_RUNNING <-> RESTARTING between re-evaluations, so a
+        # single-state label is timing-dependent: EVERY sample over a window must be in the
+        # safe set (neither state is required to appear), and SERVING must never appear.
+        safe = {
             ("RECONCILING", "domain_store_replaced"),
             ("REFUSED_RUNNING", "suzka.runtime.state_recovery.StateRecoveryError"),
-        }, observed
-        d1_state = observed == ("RECONCILING", "domain_store_replaced")
+            ("RESTARTING", "suzka.runtime.state_recovery.StateRecoveryError"),
+        }
+        samples = [(health["dc_state"], health["dc_reason"])]
+        for _ in range(12):
+            time.sleep(0.5)
+            now = session.health_dc()
+            samples.append((now["dc_state"], now["dc_reason"]))
+        assert set(samples) <= safe, samples
+        d1_state = all(sample == ("RECONCILING", "domain_store_replaced") for sample in samples)
+        observed = sorted(set(samples))[0] if len(set(samples)) == 1 else tuple(sorted(set(samples)))
         # the process answers, but the subject does NOT serve while this lasts (known violation F-15)
         assert session.health()["status"] == "degraded"
         assert session.request("GET", "/api/contexts", timeout_s=10).status == 503
-        # re-evaluated, not resolved by itself: still the same state a while later
-        time.sleep(6)
-        assert (session.health_dc()["dc_state"], session.health_dc()["dc_reason"]) == observed
+        assert child.alive()
         # nothing of the restored tree was used, moved or changed; no second epoch; no Action
         assert_trees_equal(restored, tree_snapshot(q.root))
         assert_trees_equal(old, tree_snapshot(quarantined))
@@ -241,7 +249,7 @@ def test_f15_x_2_a_restored_copy_of_the_quarantined_tree_is_detected_blocks_and_
         manifest.result("F15-x-2", "SMOKE_T2_NOT_COUNTED")
         manifest.result(
             "F15-x-2.d1_predicted_state_observed",
-            "YES" if d1_state else f"NO: observed {observed[0]}({observed[1]}) instead of RECONCILING(domain_store_replaced)",
+            "YES" if d1_state else f"NO: observed {observed} instead of RECONCILING(domain_store_replaced)",
         )
         manifest.result("F15-x-2.known_violation", "NOT_COVERED_KNOWN_VIOLATION: stale restore over a quarantined store (F-15)")
         manifest.write()
@@ -275,7 +283,7 @@ def test_f15_x_3_an_uncovered_fault_stays_refused_with_the_process_alive_and_not
         child = session.child
         assert child is not None and child.alive()  # the process stays alive (R-B: not dead, not hidden)
         health = session.health_dc()
-        assert health["dc_state"] == "REFUSED_RUNNING" and health["dc_reason"]
+        assert health["dc_state"] in {"REFUSED_RUNNING", "RESTARTING"} and health["dc_reason"]
         assert session.health()["status"] == "degraded"  # /health answers
         # known violation: the subject does not serve (chat is refused), and nothing recovers by itself
         # (a POST cannot even be addressed: the child has no Journal lineage to verify, so the
