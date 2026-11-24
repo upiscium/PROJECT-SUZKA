@@ -78,11 +78,11 @@ def test_the_gpu_and_the_stop_check_and_the_budget_run_before_every_real_subject
         raise GuardRefusal("STOP_FILE", "stop requested")
 
     assert refusal_code(real_context(r20_base, stop_check=stop).new_session, "S0", stage="G1") == "STOP_FILE"
-    budget = Session(Ledger(r20_base), Caps(max_subjects=1), "L", "G1")
+    budget = Session(Ledger(r20_base / "l.jsonl"), Caps(max_subjects=1), "L", "G1")
     ctx = real_context(r20_base, budget=budget, gpu_check=lambda: None)
     ctx.new_session("S0", stage="G1")  # constructs the subject; no child, no model
     assert refusal_code(ctx.new_session, "S0", stage="G1") == "CAP_MAX_SUBJECTS"  # a stopped attempt counts
-    assert Ledger(r20_base).subjects_used() == 1
+    assert Ledger(r20_base / "l.jsonl").subjects_used() == 1
 
 
 def test_a_real_session_keeps_raw_transcripts_private_and_never_starts_here(r20_base: Path) -> None:
@@ -247,18 +247,18 @@ def test_f1_stays_refused_while_the_arm_template_is_not_wired(r20_base: Path, mo
 
 
 def test_g1_scripted_dry_run_reports_the_gate_and_the_measurements(r20_base: Path) -> None:
-    ctx = scripted(r20_base, budget=Session(Ledger(r20_base), Caps(), "L", "G1"))
+    ctx = scripted(r20_base, budget=Session(Ledger(r20_base / "l.jsonl"), Caps(), "L", "G1"))
     outcome = drivers.run_g1(ctx)
     assert outcome["label"] == "GATE_PASSED" and outcome["x_not_skipped_as_neutral"] is True and outcome["u2a_review_events"] >= 1
     assert outcome["serving_after_s"] > 0 and len(outcome["turn_seconds"]) >= 3 and outcome["gpu"] == {}  # no GPU log for a fixture
     manifest = manifest_of(outcome, r20_base)
     assert manifest["fixture_only"] is True and manifest["preregistration_sha256"] == "c" * 64
     assert manifest["real_run"]["label"] == "GATE_PASSED"
-    assert Ledger(r20_base).subjects_used("G1") == 1
+    assert Ledger(r20_base / "l.jsonl").subjects_used("G1") == 1
 
 
 def test_s0_block_scripted_reaches_s0_with_the_kill_the_structural_counts_and_the_negative_variant(r20_base: Path) -> None:
-    ctx = scripted(r20_base, budget=Session(Ledger(r20_base), Caps(), "L", "S0"))
+    ctx = scripted(r20_base, budget=Session(Ledger(r20_base / "l.jsonl"), Caps(), "L", "S0"))
     block = drivers.run_s0_block(ctx, negative_wait_s=2.0)
     assert block["s0"] == "reached" and len(block["attempts"]) == 1  # the first attempt qualifies: no further attempt
     attempt = block["attempts"][0]
@@ -280,11 +280,11 @@ def test_s0_block_scripted_reaches_s0_with_the_kill_the_structural_counts_and_th
     text = json.dumps(manifest)
     for raw in ("synthetic visible answer", "比較用の案"):  # the closed key set holds no text
         assert raw not in text
-    assert Ledger(r20_base).subjects_used("S0") == 2  # the attempt and the negative variant
+    assert Ledger(r20_base / "l.jsonl").subjects_used("S0") == 2  # the attempt and the negative variant
 
 
 def test_the_k3_rule_blocks_s0_after_three_non_settled_attempts_and_reports_each(r20_base: Path) -> None:
-    ctx = scripted(r20_base, budget=Session(Ledger(r20_base), Caps(), "L", "S0"))
+    ctx = scripted(r20_base, budget=Session(Ledger(r20_base / "l.jsonl"), Caps(), "L", "S0"))
     block = drivers.run_s0_block(ctx, script=s2_status_script("CONTESTED"))
     assert block["s0"] == "BLOCKED" and "negative_variant" not in block  # no further subject is spent
     assert [a["attempt"] for a in block["attempts"]] == [1, 2, 3]  # at most three, no extra attempt
@@ -292,7 +292,7 @@ def test_the_k3_rule_blocks_s0_after_three_non_settled_attempts_and_reports_each
         selector = attempt["first_row4"]
         assert selector["row"] == "4b" and selector["interpretation"] == "UNCERTAIN" and not attempt["qualifies_as_s0"]
         assert "row 4b" in attempt["not_s0_because"]  # reported with why
-    assert Ledger(r20_base).subjects_used("S0") == 3
+    assert Ledger(r20_base / "l.jsonl").subjects_used("S0") == 3
 
 
 def test_s1_gate_g2_blocks_s1_when_the_salience_is_below_the_threshold(r20_base: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -302,7 +302,7 @@ def test_s1_gate_g2_blocks_s1_when_the_salience_is_below_the_threshold(r20_base:
 
 
 def test_s1_scripted_dry_run_reports_the_observed_result_against_the_expectation(r20_base: Path) -> None:
-    ctx = scripted(r20_base, budget=Session(Ledger(r20_base), Caps(), "L", "S1"))
+    ctx = scripted(r20_base, budget=Session(Ledger(r20_base / "l.jsonl"), Caps(), "L", "S1"))
     block = drivers.run_s1_block(ctx)
     assert block["g2"]["label"] == "GATE_PASSED" and block["g2"]["salience"] >= 0.5 and block["s1"] == "OBSERVED"
     attempt = block["attempts"][0]
@@ -312,11 +312,11 @@ def test_s1_scripted_dry_run_reports_the_observed_result_against_the_expectation
     assert attempt["resolution_kinds"] == ["EXISTING_DECISION"]  # the row-3 Decision exists: the same fingerprint, no ABANDON path
     assert attempt["wake_outcome"]["output"] == "PLAN_A" and attempt["matches_expectation"] is True
     assert attempt["user_request_on_x"]["reason"] == "self_goal_occupies_target" and attempt["self_goal_occupies_target"] is True
-    assert Ledger(r20_base).subjects_used("G2") == 1 and Ledger(r20_base).subjects_used("S1") == 1
+    assert Ledger(r20_base / "l.jsonl").subjects_used("G2") == 1 and Ledger(r20_base / "l.jsonl").subjects_used("S1") == 1
 
 
 def test_f1_pair_driver_scripted_dry_run_with_a_sealed_contradictory_member_and_a_control(r20_base: Path) -> None:
-    ctx = scripted(r20_base, budget=Session(Ledger(r20_base), Caps(), "L", "F1"))
+    ctx = scripted(r20_base, budget=Session(Ledger(r20_base / "l.jsonl"), Caps(), "L", "F1"))
     plan = prereg.derive_f1_plan(7, "dry")
 
     def statuses(pair: dict[str, Any]) -> dict[str, str | None]:
@@ -336,4 +336,11 @@ def test_f1_pair_driver_scripted_dry_run_with_a_sealed_contradictory_member_and_
     assert order[0] == first  # the pre-registered branch order
     summary = run["summary"]
     assert summary["claim_ceiling"] == "PARTIAL_VALID_EVIDENCE" and summary["planned"] == 12 and summary["pairs"] == 2
-    assert Ledger(r20_base).subjects_used("F1") == 4
+    assert Ledger(r20_base / "l.jsonl").subjects_used("F1") == 4
+
+
+def test_f1_subject_creation_for_a_real_model_goes_through_the_one_choke_point(r20_base: Path) -> None:
+    ctx = real_context(r20_base, gpu_check=lambda: None)
+    assert refusal_code(ctx.new_session, "F1", stage="F1") == "STAGE_B_NOT_RELEASED"
+    assert refusal_code(drivers.run_f1_member, ctx, 1, "NEUTRAL", None) == "STAGE_B_NOT_RELEASED"
+    assert [p for p in r20_base.iterdir()] == [] and not ctx.sessions

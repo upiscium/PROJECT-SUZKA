@@ -4,7 +4,7 @@
 The Human's commands (on the lab host, in a real terminal; nothing here may be run by an agent):
 
     python -m experiments.r20.real_run prereg --base B --model-id ORG/NAME --hf-home H \
-        --model-revision <40-hex> --master-seed N --trial-id T --known-violations-file four.json
+        --model-revision <40-hex> --master-seed N --trial-id T --human-launch   # you type the four known violations
     python -m experiments.r20.real_run run --base B --stage G1 --human-launch --ssh-host <ssh name of this host>
     python -m experiments.r20.real_run run --base B --stage S0 --human-launch --ssh-host <...>
     python -m experiments.r20.real_run run --base B --stage S1 --human-launch --ssh-host <...>
@@ -15,7 +15,8 @@ The Human's commands (on the lab host, in a real terminal; nothing here may be r
 
 Commands:
 
-* ``prereg``         create the immutable pre-registration (no model, no TTY needed);
+* ``prereg``         create the immutable pre-registration: the same launch guard, the four known
+                     violations typed at the terminal, the whole content shown before you confirm;
 * ``run``            one stage (G1 / S0 / S1 / F1) with the real model: needs ``--human-launch``, a
                      terminal, the typed confirmation sentence, a free GPU, a pinned and cached model;
 * ``release-stage-b`` the Human's release of stage B (F1), same launch guard;
@@ -40,7 +41,6 @@ import os
 from pathlib import Path
 import signal
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -50,28 +50,51 @@ from experiments.r20 import artifacts, drivers, factory, gpu, prereg
 from experiments.r20.caps import HARD_MAX_SUBJECTS, HARD_TURN_SECONDS, Caps, Ledger, Session
 from experiments.r20.drivers import HumanApprover, RunContext, ssh_line
 from experiments.r20.guards import GuardRefusal, check_not_production
-from experiments.r20.launch import RealTerminal, Terminal, ancestor_commands, attest_human_launch
+from experiments.r20.launch import HumanLaunch, attest_human_launch
 from experiments.r20.model_config import ModelOverride, check_pinned_revision
 from experiments.r20.report import write_report
 from experiments.r20.supervisor import ChildProcess
 
 STAGES = ("G1", "S0", "S1", "F1")
 STOP_FILE = "STOP"
-GLOBAL_LOCK = Path(tempfile.gettempdir()) / "suzka-r20-real.lock"
 EXIT_REFUSED = 2
+Attest = Callable[..., HumanLaunch]
+
+
+def user_state_dir() -> Path:
+    """Per-user state OUTSIDE any ``--base``: the cumulative ledger and the global lock live here, so
+    a new base or a deleted base does not reset the totals (a same-uid process can still edit them)."""
+
+    directory = Path.home() / ".local" / "state" / "suzka-r20"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    return directory
+
+
+def default_ledger_path() -> Path:
+    return user_state_dir() / "ledger.jsonl"
+
+
+def default_global_lock() -> Path:
+    return user_state_dir() / "real.lock"
+
+
+def _open_lock(path: Path) -> Any:
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)  # never follows a link
+    return os.fdopen(descriptor, "a+")
 
 
 class RealLock:
-    """One real-model launcher at a time, machine-wide (a lock under the base AND one
-    in the temp directory): the GPU has no room for two."""
+    """One real-model launcher at a time (a lock under the base AND a per-user one): the GPU has
+    no room for two.  ``spawn_real`` also refuses a second live real child in its own process."""
 
-    def __init__(self, base: Path, global_lock: Path = GLOBAL_LOCK) -> None:
-        self._paths = (Path(base) / "real.lock", Path(global_lock))
+    def __init__(self, base: Path, global_lock: Path | None = None) -> None:
+        self._paths = (Path(base) / "real.lock", Path(global_lock) if global_lock else default_global_lock())
         self._handles: list[Any] = []
 
     def __enter__(self) -> RealLock:
         for path in self._paths:
-            handle = open(path, "a+")  # noqa: SIM115 (held for the lifetime of the launcher)
+            handle = _open_lock(path)
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as error:
@@ -101,10 +124,37 @@ def model_from_prereg(content: dict[str, Any]) -> ModelOverride:
     )
 
 
-def preflight(base: Path, caps: Caps, stage: str, prereg_sha256: str, content_git_head: str) -> None:
-    """Cap refusals BEFORE the Human is asked to confirm anything."""
+def check_code(content_git_head: str) -> None:
+    """The code that runs must be the pre-registered code: a known head, equal to the record, a clean
+    working tree (``git status --porcelain``), and the digests of the config template, the request
+    templates and the fixtures equal to the recorded ones."""
 
-    ledger = Ledger(base)
+    head = factory.git_head()
+    if head == "unknown":
+        raise GuardRefusal("GIT_HEAD_UNKNOWN", "the git head cannot be read")
+    if head != content_git_head:
+        raise GuardRefusal("GIT_HEAD_MISMATCH", "the code is not the pre-registered git head")
+    if factory.git_dirty() is not False:
+        raise GuardRefusal("GIT_TREE_DIRTY", "the working tree is not clean (or cannot be read)")
+
+
+def check_digests(content: dict[str, Any]) -> None:
+    current = prereg.code_digests()
+    recorded = {
+        "config_template_sha256": content["config_template_sha256"],
+        "request_templates_sha256": content["request_templates_sha256"],
+        "fixtures_sha256": prereg.fixtures_digest(content["fixtures"]),
+    }
+    differing = sorted(name for name, value in recorded.items() if current[name] != value)
+    if differing:
+        raise GuardRefusal("CODE_DIGEST_MISMATCH", ",".join(differing))
+
+
+def preflight(base: Path, caps: Caps, stage: str, prereg_sha256: str, content: dict[str, Any],
+              ledger_path: Path) -> None:
+    """Refusals BEFORE the Human is asked to confirm anything."""
+
+    ledger = Ledger(ledger_path)
     if ledger.subjects_used() >= caps.max_subjects:
         raise GuardRefusal("CAP_MAX_SUBJECTS", str(caps.max_subjects))
     if ledger.seconds_used() >= caps.total_seconds:
@@ -116,8 +166,8 @@ def preflight(base: Path, caps: Caps, stage: str, prereg_sha256: str, content_gi
         for path in Path(base).glob("results-S0-*.json")
     ):
         raise GuardRefusal("S0_ALREADY_RUN", "K = 3 allows no extra attempt in a second launch")
-    if factory.git_head() != content_git_head:
-        raise GuardRefusal("GIT_HEAD_MISMATCH", "the code is not the pre-registered git head")
+    check_code(str(content["git_head"]))
+    check_digests(content)
     if stage == "F1" and not drivers.stage_b_released(base, prereg_sha256):
         raise GuardRefusal("STAGE_B_NOT_RELEASED", "stage B needs the release file the Human writes (release-stage-b)")
 
@@ -193,11 +243,10 @@ def write_results(base: Path, launch_id: str, stage: str, payload: dict[str, Any
     return path
 
 
-def run_stage_with(args: argparse.Namespace, *, terminal: Terminal | None = None,
-              environ: dict[str, str] | None = None, gpu_runner: Any = None, lock: RealLock | None = None,
-              ancestors: Callable[[], list[tuple[str, list[str]]]] | None = None) -> int:
-    """The Human-launched stage.  ``terminal`` / ``environ`` / ``gpu_runner`` / ``ancestors`` are the
-    seams of the tests; ``main`` never passes them, so the command line has no way to relax a check."""
+def _run_stage(args: argparse.Namespace, *, attest: Attest, gpu_runner: Any, lock: RealLock | None,
+               ledger_path: Path) -> int:
+    """The Human-launched stage.  PRIVATE seam version (``attest`` / ``gpu_runner`` / ``lock`` /
+    ``ledger_path``): only tests call it; ``run_stage`` below is hard-wired."""
 
     base = Path(args.base)
     stage = str(args.stage)
@@ -208,17 +257,15 @@ def run_stage_with(args: argparse.Namespace, *, terminal: Terminal | None = None
     model = model_from_prereg(content)
     # a command-line value can only LOWER a cap: ``Caps`` refuses one above the Human's limit
     caps = Caps(max_subjects=args.max_subjects or HARD_MAX_SUBJECTS, turn_seconds=args.turn_seconds or HARD_TURN_SECONDS)
-    preflight(base, caps, stage, digest, str(content["git_head"]))
+    preflight(base, caps, stage, digest, content, ledger_path)
     with lock or RealLock(base):
-        launch = attest_human_launch(
-            stage, digest, human_flag=bool(args.human_launch), terminal=terminal or RealTerminal(),
-            environ=dict(os.environ) if environ is None else environ, ancestors=ancestors or ancestor_commands,
-        )
+        assert model.revision is not None
+        launch = attest(stage, digest, human_flag=bool(args.human_launch), revision8=model.revision[:8])
         revision = check_pinned_revision(model)  # the cache holds exactly the pinned digest
         reading = gpu.check_free(caps.min_free_bytes, gpu_runner)  # CUDA runtime, never NVML
         artifacts.mark_base(base, digest)
         launch_id = uuid.uuid4().hex[:10]
-        budget = Session(Ledger(base), caps, launch_id, stage)
+        budget = Session(Ledger(ledger_path), caps, launch_id, stage)
         stopper = Stopper(base, budget)
         stopper.install()
         ctx = RunContext(
@@ -229,15 +276,19 @@ def run_stage_with(args: argparse.Namespace, *, terminal: Terminal | None = None
         print(f"pre-registration {digest}\nstage {stage}  model {model.model_id}  revision {revision}\n"
               f"GPU free at launch {reading.free_bytes / gpu.GIB:.1f} GiB of {reading.total_bytes / gpu.GIB:.1f} GiB\n"
               f"caps {json.dumps(caps.record(), sort_keys=True)}\nstop: python -m experiments.r20.real_run stop --base {base}  (or Ctrl-C)")
-        reason = "completed"
+        reason = "crashed"  # only a stage that really finished is "completed"
         payload: dict[str, Any] = {}
         try:
             payload = dispatch(ctx, stage, content)
+            reason = "completed"
         except KeyboardInterrupt:
             reason = stopper.reason or "interrupted"
         except GuardRefusal as refusal:
             reason = refusal.code
             payload = {"refused": refusal.code}
+        except BaseException as error:  # an unexpected failure is recorded, and the results are still written
+            reason = f"crashed:{type(error).__name__}"
+            payload = {"exception": type(error).__name__}
         finally:
             stopper.stop_children()
             stopper.restore()
@@ -261,18 +312,12 @@ def dispatch(ctx: RunContext, stage: str, content: dict[str, Any]) -> dict[str, 
     raise GuardRefusal("STAGE_UNKNOWN", stage)
 
 
-def release_stage_b_with(args: argparse.Namespace, *, terminal: Terminal | None = None,
-                    environ: dict[str, str] | None = None,
-                    ancestors: Callable[[], list[tuple[str, list[str]]]] | None = None) -> Path:
+def _release_stage_b(args: argparse.Namespace, *, attest: Attest) -> Path:
     """The Human's release of stage B: attested like a launch, bound to the pre-registration."""
 
     base = Path(args.base)
     content, digest = prereg.load(base)
-    del content
-    attest_human_launch(
-        "RELEASE-STAGE-B", digest, human_flag=bool(args.human_launch), terminal=terminal or RealTerminal(),
-        environ=dict(os.environ) if environ is None else environ, ancestors=ancestors or ancestor_commands,
-    )
+    attest("RELEASE-STAGE-B", digest, human_flag=bool(args.human_launch), revision8=str(content["model"]["revision_pinned"])[:8])
     path = Path(base) / drivers.STAGE_B_RELEASE
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -281,32 +326,55 @@ def release_stage_b_with(args: argparse.Namespace, *, terminal: Terminal | None 
 
 
 def run_stage(args: argparse.Namespace) -> int:
-    """The public entry: NO seam (real terminal, real environment, real ancestry, real GPU probe)."""
+    """The public entry: NO seam (real terminal, real environment, real ancestry, real GPU probe,
+    the per-user cumulative ledger)."""
 
-    return run_stage_with(args)
+    return _run_stage(args, attest=attest_human_launch, gpu_runner=None, lock=None, ledger_path=default_ledger_path())
 
 
 def release_stage_b(args: argparse.Namespace) -> Path:
-    return release_stage_b_with(args)
+    return _release_stage_b(args, attest=attest_human_launch)
 
 
-def create_prereg(args: argparse.Namespace) -> str:
+def _create_prereg(args: argparse.Namespace, *, attest: Attest) -> str:
+    """The pre-registration is the Human's act: ``--human-launch``, a terminal, the four known
+    violations typed at the terminal, the whole content shown, and a confirmation sentence that
+    carries the stage and the first 8 characters of the model revision."""
+
     base = Path(args.base)
     check_not_production(base)  # BEFORE anything is created
-    base.mkdir(mode=0o700, parents=True, exist_ok=True)
-    check_not_production(base)
-    four = json.loads(Path(args.known_violations_file).read_text(encoding="utf-8"))
-    if not isinstance(four, list):
-        raise GuardRefusal("FOUR_KNOWN_VIOLATIONS_REQUIRED", "a JSON list of four strings")
+    head = factory.git_head()
+    if head == "unknown":
+        raise GuardRefusal("GIT_HEAD_UNKNOWN", "the git head cannot be read")
+    if factory.git_dirty() is not False:
+        raise GuardRefusal("GIT_TREE_DIRTY", "pre-register from a clean checkout")
     model = ModelOverride(
         provider="transformers", model_id=args.model_id, load_in_4bit=not args.no_4bit, max_new_tokens=args.max_new_tokens,
         hf_home=Path(args.hf_home), revision=args.model_revision,
     )
+    assert model.revision is not None
+    typed: list[str] = []
+
+    def gather(terminal: Any) -> list[str]:
+        for index in range(1, 5):
+            typed.append(terminal.prompt(f"Known violation {index} of 4 (the Human's own words, one line)").strip())
+        prereg.check_four(typed)
+        return [
+            f"model id: {model.model_id}", f"hf_home: {model.hf_home}", f"revision: {model.revision}",
+            f"git head: {head}", f"caps: {json.dumps(Caps().record(), sort_keys=True)}",
+            *[f"known violation {i}: {text}" for i, text in enumerate(typed, 1)],
+        ]
+
+    attest("PREREG", "NEW", human_flag=bool(args.human_launch), revision8=model.revision[:8], before_confirm=gather)
+    base.mkdir(mode=0o700, parents=True, exist_ok=True)
     content = prereg.build_content(
-        git_head=factory.git_head(), model=model, caps=Caps(), four_violations=four, master_seed=args.master_seed,
-        trial_id=args.trial_id,
+        git_head=head, model=model, caps=Caps(), four_violations=typed, master_seed=args.master_seed, trial_id=args.trial_id,
     )
     return prereg.create(base, content)
+
+
+def create_prereg(args: argparse.Namespace) -> str:
+    return _create_prereg(args, attest=attest_human_launch)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -321,7 +389,7 @@ def parser() -> argparse.ArgumentParser:
     one.add_argument("--max-new-tokens", type=int)
     one.add_argument("--master-seed", type=int, required=True)
     one.add_argument("--trial-id", required=True)
-    one.add_argument("--known-violations-file", required=True, help="JSON list of the Human's FOUR unlisted known violations")
+    one.add_argument("--human-launch", action="store_true")
     two = commands.add_parser("run")
     two.add_argument("--base", required=True)
     two.add_argument("--stage", required=True, choices=STAGES)
@@ -373,4 +441,4 @@ if __name__ == "__main__":
     sys.exit(main())
 
 
-__all__ = ["RealLock", "Stopper", "main", "model_from_prereg", "preflight", "run_stage", "run_stage_with", "ssh_line"]
+__all__ = ["RealLock", "Stopper", "main", "model_from_prereg", "preflight", "run_stage", "ssh_line"]

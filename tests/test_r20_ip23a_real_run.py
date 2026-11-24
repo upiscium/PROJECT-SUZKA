@@ -25,18 +25,37 @@ from r20_ip23_helpers import (
     make_prereg,
     real_model,
     refusal_code,
+    sentence,
 )
 
 from experiments.r20 import drivers, gpu, prereg, real_run
+from experiments.r20.caps import Caps
 from experiments.r20.caps import Ledger
 from experiments.r20.drivers import HumanApprover
 from experiments.r20.guards import GuardRefusal
+from functools import partial
+
+from experiments.r20.launch import _attest
 from experiments.r20.real_run import RealLock, Stopper, parser
-from experiments.r20.real_run import release_stage_b_with as release_stage_b
-from experiments.r20.real_run import run_stage_with as run_stage
 from experiments.r20.supervisor import ChildProcess
 
 GOOD_GPU = lambda: json.dumps({"free": 20 * gpu.GIB, "total": 24 * gpu.GIB, "reserved": 0})  # noqa: E731
+
+
+def run_stage(namespace: Any, *, terminal: Any = None, environ: Any = None, gpu_runner: Any = None, lock: Any = None,
+              ancestors: Any = None) -> int:
+    """Adapter onto the PRIVATE seam version (the public ``run_stage`` has no seams)."""
+
+    attest = partial(_attest, terminal=terminal or FakeTerminal(), environ={} if environ is None else environ,
+                     ancestors=ancestors or (lambda: []))
+    return real_run._run_stage(namespace, attest=attest, gpu_runner=gpu_runner, lock=lock,  # noqa: SLF001
+                               ledger_path=real_run.default_ledger_path())
+
+
+def release_stage_b(namespace: Any, *, terminal: Any = None, environ: Any = None, ancestors: Any = None) -> Path:
+    attest = partial(_attest, terminal=terminal or FakeTerminal(), environ={} if environ is None else environ,
+                     ancestors=ancestors or (lambda: []))
+    return real_run._release_stage_b(namespace, attest=attest)  # noqa: SLF001
 
 
 @pytest.fixture
@@ -54,8 +73,12 @@ def lab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     monkeypatch.setattr(real_run, "dispatch", dispatch)
     monkeypatch.setattr(real_run.factory, "git_head", lambda: "a" * 40)
-    monkeypatch.setattr(real_run, "GLOBAL_LOCK", tmp_path / "global.lock")
-    return {"base": base, "hf": hf, "digest": digest, "reached": reached, "tmp": tmp_path}
+    monkeypatch.setattr(real_run.factory, "git_dirty", lambda: False)
+    ledger = tmp_path / "state" / "ledger.jsonl"
+    ledger.parent.mkdir()
+    monkeypatch.setattr(real_run, "default_ledger_path", lambda: ledger)
+    monkeypatch.setattr(real_run, "default_global_lock", lambda: tmp_path / "state" / "real.lock")
+    return {"base": base, "hf": hf, "digest": digest, "reached": reached, "tmp": tmp_path, "ledger": ledger}
 
 
 def args(base: Path, stage: str = "G1", *extra: str) -> Any:
@@ -105,7 +128,7 @@ def test_the_gpu_and_the_model_are_checked_before_anything_starts(lab: dict[str,
 
 def test_the_caps_refuse_before_the_human_is_even_asked(lab: dict[str, Any]) -> None:
     terminal = FakeTerminal()
-    ledger = Ledger(lab["base"])
+    ledger = Ledger(lab["ledger"])
     assert refusal_code(launch, lab, "G1", "--max-subjects", "43", terminal=terminal) == "CAP_ABOVE_LIMIT"
     assert refusal_code(launch, lab, "G1", "--turn-seconds", "121", terminal=terminal) == "CAP_ABOVE_LIMIT"
     for index in range(42):
@@ -117,7 +140,7 @@ def test_the_caps_refuse_before_the_human_is_even_asked(lab: dict[str, Any]) -> 
 
 
 def test_the_total_hours_cap_counts_every_earlier_launch(lab: dict[str, Any]) -> None:
-    ledger = Ledger(lab["base"])
+    ledger = Ledger(lab["ledger"])
     for index in range(5):
         ledger.append(kind="end", launch=f"L{index}", elapsed_s=2.5 * 3600)
     assert refusal_code(launch, lab) == "CAP_TOTAL_HOURS"
@@ -219,7 +242,7 @@ def test_a_human_launch_runs_the_stage_and_records_the_ledger_and_the_results(la
     assert len(results) == 1 and stat.S_IMODE(results[0].stat().st_mode) == 0o600
     data = json.loads(results[0].read_text())
     assert data["prereg_sha256"] == lab["digest"] and data["stop_reason"] == "completed" and data["g1"]["label"] == "GATE_PASSED"
-    ends = [row for row in Ledger(lab["base"]).rows() if row["kind"] == "end"]
+    ends = [row for row in Ledger(lab["ledger"]).rows() if row["kind"] == "end"]
     assert ends and ends[-1]["reason"] == "completed"
     assert (lab["base"] / artifacts_marker()).exists()
 
@@ -243,7 +266,7 @@ def test_the_fixed_launch_stops_when_the_stop_file_appears_and_records_the_reaso
     assert time.monotonic() - started < 15
     result = json.loads(next(lab["base"].glob("results-G1-*.json")).read_text())
     assert result["stop_reason"] == "STOP_FILE"
-    assert [row["reason"] for row in Ledger(lab["base"]).rows() if row["kind"] == "end"] == ["STOP_FILE"]
+    assert [row["reason"] for row in Ledger(lab["ledger"]).rows() if row["kind"] == "end"] == ["STOP_FILE"]
     assert signal.getsignal(signal.SIGINT) is before_handler  # the handlers were restored
 
 
@@ -311,20 +334,116 @@ def test_the_stopper_watch_thread_does_not_outlive_the_stopper(tmp_path: Path) -
     assert {t.name for t in threading.enumerate()} - before == set()
 
 
-def test_prereg_through_the_command_line_creates_once_and_demands_the_four(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    four = tmp_path / "four.json"
-    four.write_text(json.dumps(FOUR))
-    base = tmp_path / "pb"
-    argv = ["prereg", "--base", str(base), "--model-id", "example-org/example-12b-it", "--hf-home", str(tmp_path / "hf"),
-            "--model-revision", REVISION, "--master-seed", "5", "--trial-id", "t1", "--known-violations-file", str(four)]
-    assert real_run.main(argv) == 0
-    digest = capsys.readouterr().out.strip()
-    assert prereg.load(base)[1] == digest
-    assert real_run.main(argv) == real_run.EXIT_REFUSED and "PREREG_EXISTS" in capsys.readouterr().err
-    four.write_text(json.dumps(["x"]))
-    assert real_run.main([*argv[:2], str(tmp_path / "pb2"), *argv[3:]]) == real_run.EXIT_REFUSED
-    assert "FOUR_KNOWN_VIOLATIONS_REQUIRED" in capsys.readouterr().err
-    assert real_model().model_id in json.loads((base / prereg.PREREG_NAME).read_text())["model"]["model_id"]
+def prereg_args(tmp_path: Path, name: str = "pb", *extra: str) -> Any:
+    return parser().parse_args(["prereg", "--base", str(tmp_path / name), "--model-id", "example-org/example-12b-it",
+                                "--hf-home", str(tmp_path / "hf"), "--model-revision", REVISION, "--master-seed", "5",
+                                "--trial-id", "t1", *extra])
+
+
+def create(tmp_path: Path, namespace: Any, terminal: FakeTerminal | None = None, **seams: Any) -> str:
+    attest = partial(_attest, terminal=terminal or FakeTerminal(lines=list(FOUR)), environ=seams.get("environ", {}),
+                     ancestors=lambda: [])
+    return real_run._create_prereg(namespace, attest=attest)  # noqa: SLF001
+
+
+def test_the_preregistration_is_the_humans_act_with_the_content_shown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(real_run.factory, "git_head", lambda: "a" * 40)
+    monkeypatch.setattr(real_run.factory, "git_dirty", lambda: False)
+    terminal = FakeTerminal(lines=list(FOUR))
+    assert refusal_code(create, tmp_path, prereg_args(tmp_path, "pb0"), terminal) == "HUMAN_LAUNCH_FLAG_MISSING"
+    assert not (tmp_path / "pb0").exists() and terminal.lines == FOUR  # nothing was asked, nothing created
+    args_ = prereg_args(tmp_path, "pb", "--human-launch")
+    digest = create(tmp_path, args_, terminal)
+    shown = terminal.prompts[-1]
+    for needed in ("example-org/example-12b-it", REVISION, "a" * 40, str(tmp_path / "hf"), *FOUR, '"max_subjects": 42'):
+        assert needed in shown  # the Human reads the content before confirming
+    assert f"model revision {REVISION[:8]}" in shown and "STAGE PREREG" in shown
+    assert prereg.load(tmp_path / "pb")[1] == digest
+    assert prereg.load(tmp_path / "pb")[0]["known_violations"]["four_unlisted_known_violations"] == FOUR  # typed, not from a file
+    assert refusal_code(create, tmp_path, args_) == "PREREG_EXISTS"
+
+
+def test_the_preregistration_refuses_a_bad_terminal_a_wrong_sentence_a_dirty_tree_and_an_unknown_head(tmp_path: Path,
+                                                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(real_run.factory, "git_head", lambda: "a" * 40)
+    monkeypatch.setattr(real_run.factory, "git_dirty", lambda: False)
+    namespace = prereg_args(tmp_path, "pc", "--human-launch")
+    assert refusal_code(create, tmp_path, namespace, FakeTerminal(tty=False, lines=list(FOUR))) == "NO_TTY"
+    assert refusal_code(create, tmp_path, namespace, FakeTerminal(answer="yes", lines=list(FOUR))) == "CONFIRMATION_MISMATCH"
+    assert refusal_code(create, tmp_path, namespace, FakeTerminal(lines=["x", "y", "z", "w"])) == "FOUR_KNOWN_VIOLATIONS_REQUIRED"
+    wrong_revision = FakeTerminal(answer=sentence("PREREG", "NEW"), lines=list(FOUR))  # without the revision: not the sentence
+    assert refusal_code(create, tmp_path, namespace, wrong_revision) == "CONFIRMATION_MISMATCH"
+    assert not (tmp_path / "pc").exists()
+    monkeypatch.setattr(real_run.factory, "git_dirty", lambda: True)
+    assert refusal_code(create, tmp_path, namespace) == "GIT_TREE_DIRTY"
+    monkeypatch.setattr(real_run.factory, "git_dirty", lambda: False)
+    monkeypatch.setattr(real_run.factory, "git_head", lambda: "unknown")
+    assert refusal_code(create, tmp_path, namespace) == "GIT_HEAD_UNKNOWN"
+    assert refusal_code(prereg.build_content, git_head="unknown", model=real_model(), caps=Caps(), four_violations=FOUR,
+                        master_seed=1, trial_id="t") == "GIT_HEAD_UNKNOWN"
+    import argparse
+
+    etc = argparse.Namespace(base="/etc/r20", model_id="a/b", hf_home="/h", model_revision=REVISION, no_4bit=False,
+                             max_new_tokens=None, master_seed=1, trial_id="t", human_launch=True)
+    monkeypatch.setattr(real_run.factory, "git_head", lambda: "a" * 40)
+    assert refusal_code(create, tmp_path, etc) == "PRODUCTION_PATH"
+    assert real_run.main(["prereg", "--base", str(tmp_path / "pd"), "--model-id", "a/b", "--hf-home", "/h",
+                          "--model-revision", REVISION, "--master-seed", "1", "--trial-id", "t"]) == real_run.EXIT_REFUSED
+    assert not (tmp_path / "pd").exists()
+
+
+def test_the_launch_sentence_carries_the_stage_and_the_model_revision_and_the_content_is_pinned(lab: dict[str, Any]) -> None:
+    terminal = FakeTerminal()
+    assert launch(lab, "G1", terminal=terminal) == 1  # the stub dispatch asserts: the run reached the drivers
+    assert f"STAGE G1 OF A REAL-MODEL RUN (pre-registration {lab['digest'][:12]}, model revision {REVISION[:8]})" in terminal.prompts[0]
+    assert refusal_code(launch, lab, terminal=FakeTerminal(answer=sentence("G1", lab["digest"]))) == "CONFIRMATION_MISMATCH"
+
+
+def test_a_dirty_tree_an_unknown_head_and_changed_code_digests_are_refused_before_the_human_is_asked(lab: dict[str, Any],
+                                                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    terminal = FakeTerminal()
+    monkeypatch.setattr(real_run.factory, "git_dirty", lambda: True)
+    assert refusal_code(launch, lab, terminal=terminal) == "GIT_TREE_DIRTY"
+    monkeypatch.setattr(real_run.factory, "git_dirty", lambda: None)
+    assert refusal_code(launch, lab, terminal=terminal) == "GIT_TREE_DIRTY"  # unreadable is not clean
+    monkeypatch.setattr(real_run.factory, "git_dirty", lambda: False)
+    monkeypatch.setattr(real_run.factory, "git_head", lambda: "unknown")
+    assert refusal_code(launch, lab, terminal=terminal) == "GIT_HEAD_UNKNOWN"
+    monkeypatch.setattr(real_run.factory, "git_head", lambda: "a" * 40)
+    real = prereg.code_digests()
+    for name in ("config_template_sha256", "request_templates_sha256", "fixtures_sha256"):
+        monkeypatch.setattr(prereg, "code_digests", lambda name=name: {**real, name: "0" * 64})
+        with pytest.raises(GuardRefusal) as refused:
+            launch(lab, "G1", terminal=terminal)
+        assert refused.value.code == "CODE_DIGEST_MISMATCH" and name in refused.value.detail
+    assert terminal.prompts == []
+    assert_nothing_started(lab)
+
+
+def test_an_unexpected_exception_is_recorded_as_a_crash_and_the_results_are_written(lab: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    def dispatch(ctx: drivers.RunContext, stage: str, content: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(real_run, "dispatch", dispatch)
+    assert launch(lab, "G1") == 1
+    result = json.loads(next(lab["base"].glob("results-G1-*.json")).read_text())
+    assert result["stop_reason"] == "crashed:RuntimeError" and result["exception"] == "RuntimeError"
+    assert [row["reason"] for row in Ledger(lab["ledger"]).rows() if row["kind"] == "end"] == ["crashed:RuntimeError"]
+    assert "boom" not in json.dumps(result)
+
+
+def test_the_ledger_is_cumulative_across_bases_and_lives_outside_any_base(lab: dict[str, Any], tmp_path: Path) -> None:
+    ledger = Ledger(lab["ledger"])
+    for index in range(42):
+        ledger.append(kind="subject", launch="L", stage="F1", run_id=str(index), elapsed_s=1.0)
+    other_hf = make_cache(tmp_path / "hf2")
+    other_base = tmp_path / "base2"  # a NEW base does not reset the totals
+    make_prereg(other_base, other_hf)
+    assert refusal_code(run_stage, args(other_base, "G1", "--human-launch"), terminal=FakeTerminal(), gpu_runner=GOOD_GPU) == "CAP_MAX_SUBJECTS"
+    assert not (lab["base"] / "ledger.jsonl").exists() and not (other_base / "ledger.jsonl").exists()
+    import inspect
+
+    assert "Path.home()" in inspect.getsource(real_run.user_state_dir)  # fixed per-user location
 
 
 def test_the_watch_stops_a_launch_that_reaches_a_cap_during_a_wait(tmp_path: Path) -> None:
@@ -333,7 +452,7 @@ def test_the_watch_stops_a_launch_that_reaches_a_cap_during_a_wait(tmp_path: Pat
     from experiments.r20.caps import Caps, Session
 
     clock = [0.0]
-    ledger = Ledger(tmp_path)
+    ledger = Ledger(tmp_path / "l.jsonl")
     budget = Session(ledger, Caps(), "L1", "S0", clock=lambda: clock[0])
     stopper = Stopper(tmp_path, budget)
     assert stopper.poll_once() is None and stopper.check() is None
@@ -348,11 +467,7 @@ def test_the_watch_stops_a_launch_that_reaches_a_cap_during_a_wait(tmp_path: Pat
     assert any(row["kind"] == "tick" and row["elapsed_s"] > 9000 for row in ledger.rows())  # recorded: a killed launcher counts it
 
 
-def test_the_public_entries_take_no_seam_and_the_code_must_be_the_preregistered_head(lab: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
-    import inspect
-
-    assert list(inspect.signature(real_run.run_stage).parameters) == ["args"]
-    assert list(inspect.signature(real_run.release_stage_b).parameters) == ["args"]
+def test_the_code_must_be_the_preregistered_head(lab: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(real_run.factory, "git_head", lambda: "b" * 40)
     assert refusal_code(launch, lab) == "GIT_HEAD_MISMATCH"
     assert_nothing_started(lab)

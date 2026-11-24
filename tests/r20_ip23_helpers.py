@@ -9,7 +9,7 @@ from pathlib import Path
 from experiments.r20 import prereg
 from experiments.r20.caps import Caps
 from experiments.r20.guards import GuardRefusal
-from experiments.r20.launch import HumanLaunch, attest_human_launch, confirmation_sentence
+from experiments.r20.launch import HumanLaunch, _attest, confirmation_sentence
 from experiments.r20.model_config import ModelOverride, cache_dir_name
 
 REVISION = "0123456789abcdef0123456789abcdef01234567"
@@ -25,11 +25,11 @@ FOUR = [
 class FakeTerminal:
     """A terminal that types ``answer`` (or the exact sentence)."""
 
-    def __init__(self, *, tty: bool = True, foreground: bool = True, answer: str | None = None, expected: str | None = None):
+    def __init__(self, *, tty: bool = True, foreground: bool = True, answer: str | None = None, lines: list[str] | None = None):
+        self.lines = list(lines or [])
         self.tty = tty
         self.foreground = foreground
         self.answer = answer
-        self.expected = expected
         self.prompts: list[str] = []
 
     def is_tty(self) -> bool:
@@ -40,6 +40,8 @@ class FakeTerminal:
 
     def prompt(self, text: str) -> str:
         self.prompts.append(text)
+        if text.startswith("Known violation"):
+            return self.lines.pop(0)
         if self.answer is not None:
             return self.answer
         # the Human reads the sentence off the screen and types it
@@ -70,9 +72,7 @@ def real_model(hf_home: Path | None = None, **changes: object) -> ModelOverride:
 def human_launch(stage: str = "S0", digest: str = "a" * 64) -> HumanLaunch:
     """A launch minted the only legal way: through the guard, with a fake terminal."""
 
-    return attest_human_launch(
-        stage, digest, human_flag=True, terminal=FakeTerminal(), environ={}, ancestors=lambda: [],
-    )
+    return _attest(stage, digest, human_flag=True, terminal=FakeTerminal(), environ={}, ancestors=lambda: [])
 
 
 def make_prereg(base: Path, hf_home: Path, *, master_seed: int = 7) -> tuple[dict[str, object], str]:
@@ -93,8 +93,8 @@ def refusal_code(function: object, *args: object, **kwargs: object) -> str:
     raise AssertionError("no refusal")
 
 
-def sentence(stage: str, digest: str) -> str:
-    return confirmation_sentence(stage, digest)
+def sentence(stage: str, digest: str, revision8: str = "") -> str:
+    return confirmation_sentence(stage, digest, revision8)
 
 
 def write_json(path: Path, data: object) -> None:

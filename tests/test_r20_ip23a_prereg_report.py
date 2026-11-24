@@ -169,7 +169,7 @@ def test_the_report_never_states_a_pass_of_r20(tmp_path: Path) -> None:
     import experiments.r20.report as report
 
     original = report.build_report
-    report.build_report = lambda _base: "R20 PASS\n"  # type: ignore[assignment]
+    report.build_report = lambda _base, _ledger=None: "R20 PASS\n"  # type: ignore[assignment]
     try:
         assert refusal_code(report.write_report, tmp_path / "base", tmp_path / "x.md") == "REPORT_STATES_A_PASS"
     finally:
@@ -189,3 +189,55 @@ def test_the_labels_follow_deterministic_rules_only() -> None:
 
 def test_the_report_needs_the_preregistration(tmp_path: Path) -> None:
     assert refusal_code(build_report, tmp_path) == "PREREG_MISSING"
+
+
+# --------------------------------------------- review round 2 (IP-23a)
+
+
+@pytest.fixture(autouse=True)
+def _ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from experiments.r20 import real_run
+
+    monkeypatch.setattr(real_run, "default_ledger_path", lambda: tmp_path / "ledger-for-report.jsonl")
+
+
+def test_a_stray_cognitive_variation_in_a_member_is_never_counted_as_one() -> None:
+    results = [{"stage": "F1", "f1": {"pairs": [{"members": [{"arm": "A", "defect": "COGNITIVE_VARIATION"}, {}]}, {"pair": 2}]}},
+               {"stage": "S0", "s0": {"attempts": [{}, {"kill": None, "step9_structural": None}]}}]
+    labelled = defect_labels(results)
+    assert labelled["COGNITIVE_VARIATION"] == [] and any("unrecognised" in item for item in labelled["UNDETERMINED"])
+
+
+def test_the_lexical_guard_covers_generated_text_only(tmp_path: Path) -> None:
+    from experiments.r20 import report
+
+    assert report._FORBIDDEN.search("R20 passed all of it") and report._FORBIDDEN.search("the R20 stage succeeded")  # noqa: SLF001
+    assert report._FORBIDDEN.search("PASS") and not report._FORBIDDEN.search("GATE_PASSED")  # noqa: SLF001
+    base = tmp_path / "base"
+    hf = make_cache(tmp_path / "hf")
+    base.mkdir(mode=0o700)
+    content = prereg.build_content(
+        git_head="a" * 40, model=real_model(hf), caps=Caps(), master_seed=1, trial_id="t",
+        four_violations=[*FOUR[:3], "the Human's own line: a PASS in a fixture name does not break the report"],
+    )
+    prereg.create(base, content)
+    path = write_report(base)  # the Human's line contains PASS: only generated text is checked
+    assert "a PASS in a fixture name" in path.read_text()
+
+
+def test_the_report_target_is_never_a_followed_link_or_an_overwritten_file(tmp_path: Path) -> None:
+    base = tmp_path / "base"
+    make_prereg(base, make_cache(tmp_path / "hf"))
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep")
+    link = tmp_path / "link.md"
+    link.symlink_to(victim)
+    assert refusal_code(write_report, base, link) == "REPORT_TARGET_IS_A_LINK" and victim.read_text() == "keep"
+    existing = tmp_path / "exists.md"
+    existing.write_text("mine")
+    assert refusal_code(write_report, base, existing) == "REPORT_EXISTS" and existing.read_text() == "mine"
+    first = write_report(base)
+    assert write_report(base) == first  # the default report.md is regenerated, not appended or linked
+    (base / "report.md").unlink()
+    (base / "report.md").symlink_to(victim)
+    assert refusal_code(write_report, base) == "REPORT_TARGET_IS_A_LINK" and victim.read_text() == "keep"

@@ -30,8 +30,9 @@ from experiments.r20.caps import Ledger
 from experiments.r20.guards import GuardRefusal
 from experiments.r20.prereg import load
 
+AUTOMATIC = ("GATE_CONFORMANCE_DEFECT", "ENGINEERING_DEFECT")
 LABELS = ("GATE_CONFORMANCE_DEFECT", "ENGINEERING_DEFECT", "COGNITIVE_VARIATION", "UNDETERMINED")
-_FORBIDDEN = re.compile(r"\bPASS(ED)?\b|(?i:r20[^.\n]{0,24}\bpass(ed)?\b)")
+_FORBIDDEN = re.compile(r"\bPASS(ED)?\b|(?i:r20[^.\n]{0,40}\b(pass(ed|es)?|succe(ss|ssful|eded|eds))\b)")
 STAGE_JUDGEMENT = "The R20 Stage judgement is the Human's. This report states no R20 result."
 
 
@@ -58,19 +59,23 @@ def defect_labels(results: Iterable[dict[str, Any]]) -> dict[str, list[str]]:
     for result in results:
         for pair in (result.get("f1") or {}).get("pairs", []):
             for member in pair.get("members", []):
-                if member.get("defect"):
-                    labels[str(member["defect"])].append(f"F1 pair {pair['pair']} {member['arm']}: {member.get('sealed_row')}")
+                where = f"F1 pair {pair.get('pair')} {member.get('arm')}"
+                defect = member.get("defect")
+                if defect in AUTOMATIC:
+                    labels[str(defect)].append(f"{where}: {member.get('sealed_row')}")
+                elif defect:  # anything else, e.g. a stray COGNITIVE_VARIATION, is never counted as such
+                    labels["UNDETERMINED"].append(f"{where}: unrecognised label {defect!r}")
                 if member.get("infra") or member.get("stop_reason"):
-                    labels["UNDETERMINED"].append(f"F1 pair {pair['pair']} {member['arm']}: {member.get('infra') or member.get('stop_reason')}")
+                    labels["UNDETERMINED"].append(f"{where}: {member.get('infra') or member.get('stop_reason')}")
         for attempt in (result.get("s0") or {}).get("attempts", []):
             kill = attempt.get("kill") or {}
             if kill.get("checks", {}).get("replay_of_every_sealed_input_equal") is False:
-                labels["ENGINEERING_DEFECT"].append(f"S0 attempt {attempt['attempt']}: a sealed input does not replay")
+                labels["ENGINEERING_DEFECT"].append(f"S0 attempt {attempt.get('attempt')}: a sealed input does not replay")
             counted = attempt.get("step9_structural") or {}
             if counted and not counted.get("equal"):
-                labels["UNDETERMINED"].append(f"S0 attempt {attempt['attempt']}: step 9 counts {counted.get('differing')}")
+                labels["UNDETERMINED"].append(f"S0 attempt {attempt.get('attempt')}: step 9 counts {counted.get('differing')}")
             if attempt.get("stop_reason"):
-                labels["UNDETERMINED"].append(f"S0 attempt {attempt['attempt']}: stopped {attempt['stop_reason']}")
+                labels["UNDETERMINED"].append(f"S0 attempt {attempt.get('attempt')}: stopped {attempt.get('stop_reason')}")
     return labels
 
 
@@ -94,9 +99,11 @@ def _kv_lines(known: dict[str, Any]) -> list[str]:
     return lines
 
 
-def build_report(base: Path) -> str:
+def build_report(base: Path, ledger_path: Path | None = None) -> str:
     content, digest = load(base)
-    ledger = Ledger(base)
+    from experiments.r20.real_run import default_ledger_path
+
+    ledger = Ledger(ledger_path or default_ledger_path())
     results = [json.loads(path.read_text(encoding="utf-8")) for path in results_files(base)]
     lines: list[str] = [f"# R20 real-run report (pre-registration {digest})", ""]
     lines += [
@@ -134,7 +141,7 @@ def build_report(base: Path) -> str:
             for attempt in block["attempts"]:
                 first = attempt.get("first_row4") or {}
                 lines.append(
-                    f"| {attempt['attempt']} | {first.get('row')} | {first.get('interpretation')}/{first.get('stage')} | "
+                    f"| {attempt.get('attempt')} | {first.get('row')} | {first.get('interpretation')}/{first.get('stage')} | "
                     f"{first.get('receipts')} | {attempt.get('qualifies_as_s0')} | {attempt.get('stop_reason')} |"
                 )
                 if attempt.get("step9_structural"):
@@ -156,7 +163,7 @@ def build_report(base: Path) -> str:
             lines.append(f"- G2: {json.dumps(block['g2'], sort_keys=True)}")
             lines.append(f"- S1: {block['s1']}; expectation (pre-registered): {content['s1']['expectation']}")
             for attempt in block["attempts"]:
-                lines.append(f"- attempt {attempt['attempt']}: {json.dumps({k: v for k, v in attempt.items() if k != 'run_id'}, sort_keys=True)}")
+                lines.append(f"- attempt {attempt.get('attempt')}: {json.dumps({k: v for k, v in attempt.items() if k != 'run_id'}, sort_keys=True)}")
         if stage == "F1":
             summary = (result.get("f1") or {}).get("summary") or {"claim_ceiling": "NOT_COMPLETED", "i_to_s": "-", "e_r15": None, "valid_treatment_pairs": 0, "control_discordance": 0, "control_pairs_valid": 0, "classes": {}}
             lines.append(f"- F1 claim ceiling: {summary['claim_ceiling']}; I_TO_S: {summary['i_to_s']}")
@@ -178,12 +185,28 @@ def build_report(base: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_report(base: Path, out: Path | None = None) -> Path:
-    text = build_report(base)
-    if _FORBIDDEN.search(text):
+def generated_text(text: str, content: dict[str, Any]) -> str:
+    """The text with the Human's own words removed: the lexical guard is for GENERATED text only."""
+
+    human = content.get("known_violations", {}).get("four_unlisted_known_violations", [])
+    for line in human:
+        text = text.replace(str(line), "")
+    return text
+
+
+def write_report(base: Path, out: Path | None = None, ledger_path: Path | None = None) -> Path:
+    text = build_report(base, ledger_path)
+    content, _digest = load(base)
+    if _FORBIDDEN.search(generated_text(text, content)):
         raise GuardRefusal("REPORT_STATES_A_PASS", "the report never states a pass of R20")
-    target = out or Path(base) / "report.md"
-    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    target = Path(out) if out else Path(base) / "report.md"
+    if target.is_symlink():
+        raise GuardRefusal("REPORT_TARGET_IS_A_LINK", str(target))
+    if target.exists():
+        if out is not None:
+            raise GuardRefusal("REPORT_EXISTS", str(target))
+        target.unlink()  # the default report.md is regenerated; a custom --out is never overwritten
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(text)
     return Path(target)

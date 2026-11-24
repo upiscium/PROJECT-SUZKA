@@ -16,7 +16,7 @@ from pathlib import Path
 import shutil
 import time
 
-from experiments.r20.guards import MARKER_NAME, GuardRefusal
+from experiments.r20.guards import MARKER_NAME, GuardRefusal, check_not_production
 
 PRIVATE_NAME = "private"
 RETENTION_DAYS = 14
@@ -88,6 +88,7 @@ def erase(
     if not confirmed:
         raise GuardRefusal("ERASE_NOT_CONFIRMED", "--confirm-erase is required")
     base = Path(base)
+    check_not_production(base)
     if not (base / BASE_MARKER).is_file() or base.is_symlink():
         raise GuardRefusal("ERASE_NOT_A_REAL_RUN_BASE", str(base))
     moment = time.time() if now is None else now

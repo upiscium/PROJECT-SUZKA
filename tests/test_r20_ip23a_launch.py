@@ -3,6 +3,7 @@ refusals and the child-side checks.  No real model, no GPU, no terminal."""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 import os
 from pathlib import Path
 import subprocess
@@ -14,7 +15,7 @@ from r20_ip23_helpers import FakeTerminal, human_launch, real_model, refusal_cod
 from experiments.r20 import launch
 from experiments.r20.factory import Tier, create_subject
 from experiments.r20.guards import GuardRefusal, repo_root
-from experiments.r20.launch import HumanLaunch, attest_human_launch, harness_ancestry
+from experiments.r20.launch import UNREADABLE, HumanLaunch, _attest, harness_ancestry
 from experiments.r20.provider import ApprovalActor, ProviderMode
 from experiments.r20.supervisor import ChildProcess
 
@@ -26,7 +27,7 @@ def attest(**changes: object) -> HumanLaunch:
         "human_flag": True, "terminal": FakeTerminal(), "environ": {}, "ancestors": lambda: [],
     }
     arguments.update(changes)
-    return attest_human_launch("S0", DIGEST, **arguments)  # type: ignore[arg-type]
+    return _attest("S0", DIGEST, **arguments)  # type: ignore[arg-type]
 
 
 def test_a_human_at_a_terminal_who_types_the_sentence_is_attested() -> None:
@@ -63,7 +64,7 @@ def test_a_pipe_or_a_script_without_a_terminal_cannot_launch(monkeypatch: pytest
     monkeypatch.setattr(os, "isatty", lambda _fd: False)
     assert launch.RealTerminal().is_tty() is False
     assert refusal_code(
-        attest_human_launch, "S0", DIGEST, human_flag=True, terminal=launch.RealTerminal(), environ={},
+        _attest, "S0", DIGEST, human_flag=True, terminal=launch.RealTerminal(), environ={},
         ancestors=lambda: [],
     ) == "NO_TTY"
 
@@ -173,3 +174,145 @@ def test_a_scripted_child_refuses_a_real_model_config(r20_base: Path) -> None:
     subject = create_subject("NEG-plain", base=r20_base, tier=Tier.T2, model=real_model())
     done = _serve(subject.root, subject.run_id, "--provider", "scripted")
     assert done.returncode == 2 and "MODEL_CONFIG_MODE_MISMATCH" in done.stderr
+
+
+# ------------------------------------------------ review round 2 (IP-23a)
+
+
+def test_an_unreadable_proc_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert harness_ancestry([(UNREADABLE, [UNREADABLE])])
+    monkeypatch.setattr(os, "getppid", lambda: 2**30)  # a pid with no /proc entry
+    assert launch.ancestor_commands() == [(UNREADABLE, [UNREADABLE])]
+    assert refusal_code(attest, ancestors=launch.ancestor_commands) == "HARNESS_PARENT"
+
+
+def test_the_public_attestation_takes_no_seam_and_production_never_imports_the_private_ones() -> None:
+    """AST: ``_attest`` / ``_run_stage`` / ``_release_stage_b`` / ``_create_prereg`` / ``_MINT`` are
+    reached only from their own module and from tests."""
+
+    import ast
+    import inspect
+
+    assert set(inspect.signature(launch.attest_human_launch).parameters) == {
+        "stage", "prereg_sha256", "human_flag", "revision8", "before_confirm"}
+    private = {"_attest", "_run_stage", "_release_stage_b", "_create_prereg", "_MINT"}
+    owners = {"_attest": "launch.py", "_MINT": "launch.py", "_run_stage": "real_run.py", "_release_stage_b": "real_run.py",
+              "_create_prereg": "real_run.py"}
+    offenders: list[str] = []
+    for root in (repo_root() / "experiments",):  # suzka/ never imports experiments (an existing architecture test)
+        for path in root.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                names: set[str] = set()
+                if isinstance(node, ast.ImportFrom):
+                    names = {alias.name for alias in node.names}
+                elif isinstance(node, ast.Attribute):
+                    names = {node.attr}
+                for name in names & private:
+                    if path.name != owners[name]:
+                        offenders.append(f"{path}:{name}")
+    assert offenders == []
+    # the real entries call the public attestation
+    import experiments.r20.real_run as real_run
+
+    source = inspect.getsource(real_run.run_stage) + inspect.getsource(real_run.release_stage_b) + inspect.getsource(real_run.create_prereg)
+    assert source.count("attest_human_launch") == 3
+
+
+def test_the_model_loader_never_trusts_remote_code() -> None:
+    """A hostile snapshot would be code execution: ``from_pretrained`` is called without it, and the
+    default is False."""
+
+    for path in (repo_root() / "suzka").rglob("*.py"):
+        assert "trust_remote_code" not in path.read_text(encoding="utf-8"), path
+
+
+# ----------------------------------------- the launch record across a restart
+
+
+def test_a_restart_accepts_the_same_binding_and_refuses_any_other(tmp_path: Path) -> None:
+    launched = human_launch()
+    record = tmp_path / "launch.json"
+    launch.write_launch_record(record, launched)
+    launch.write_launch_record(record, launched)  # the planned SIGKILL restart: same subject, same launch
+    other = human_launch(stage="S1")
+    assert refusal_code(launch.write_launch_record, record, other) == "LAUNCH_RECORD_MISMATCH"
+    foreign = human_launch()
+    object.__setattr__(foreign, "pid", foreign.pid + 1)
+    assert refusal_code(launch.write_launch_record, record, foreign) == "LAUNCH_RECORD_MISMATCH"
+    record.write_text("not json")
+    assert refusal_code(launch.write_launch_record, record, launched) == "LAUNCH_RECORD_MISMATCH"
+
+
+class StubProcess:
+    """A successful child that has not exited, until the group is killed."""
+
+    _next = 4_000_000
+
+    def __init__(self) -> None:
+        StubProcess._next += 1
+        self.pid = StubProcess._next
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
+@pytest.fixture
+def stub_popen(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[StubProcess]]:
+    from experiments.r20 import supervisor
+
+    made: list[StubProcess] = []
+
+    def popen(command: list[str], **_kwargs: object) -> StubProcess:
+        made.append(StubProcess())
+        assert "--provider" in command and "real" in command
+        return made[-1]
+
+    def killpg(pgid: int, _sig: int) -> None:  # NEVER a real signal to a made-up pid
+        for process in made:
+            if process.pid == pgid:
+                process.returncode = -9
+
+    monkeypatch.setattr(supervisor, "pid_alive_as", lambda pid, ticks: any(p.pid == pid and p.returncode is None for p in made))
+    monkeypatch.setattr(supervisor.subprocess, "Popen", popen)
+    monkeypatch.setattr(supervisor.os, "killpg", killpg)
+    yield made
+    for process in made:  # no made-up pid may reach the atexit killpg of a real run
+        process.returncode = process.returncode if process.returncode is not None else -9
+    ChildProcess._live[:] = [c for c in ChildProcess._live if c.process not in made]  # noqa: SLF001
+
+
+def test_spawn_real_twice_on_one_subject_succeeds_both_times(r20_base: Path, stub_popen: list[StubProcess]) -> None:
+    subject = create_subject("S0", base=r20_base, tier=Tier.T2, model=real_model())
+    launched = human_launch()
+    first = ChildProcess.spawn_real(subject, launched, hf_home=None, turn_cap_s=120.0)
+    record = (subject.control_dir / "launch.json").read_text()
+    assert first.real and ChildProcess._live.count(first) == 1  # noqa: SLF001
+    assert refusal_code(ChildProcess.spawn_real, subject, launched, hf_home=None, turn_cap_s=120.0) == "SECOND_REAL_PROCESS"
+    first.kill_group()  # the planned SIGKILL
+    second = ChildProcess.spawn_real(subject, launched, hf_home=None, turn_cap_s=120.0)
+    assert second.pid != first.pid and (subject.control_dir / "launch.json").read_text() == record
+    other = human_launch(stage="S1")
+    second.kill_group()
+    assert refusal_code(ChildProcess.spawn_real, subject, other, hf_home=None, turn_cap_s=120.0) == "LAUNCH_RECORD_MISMATCH"
+    assert len(stub_popen) == 2  # no third child was started
+
+
+def test_the_s0_kill_and_restart_path_goes_through_spawn_real_twice(
+    r20_base: Path, stub_popen: list[StubProcess], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from experiments.r20 import s0
+
+    monkeypatch.setattr(ChildProcess, "wait_ready", lambda self, timeout_s=0: {"ready": True})
+    monkeypatch.setattr(s0.factory, "verify_first_start", lambda subject, provider=None: object())
+    monkeypatch.setattr(s0.factory, "write_identity_record", lambda subject, record: subject.subject_json)
+    session = s0.S0Session(r20_base, profile="S0", model=real_model(), launch=human_launch(), dc={"mode": "refuse"})
+    first = session.start()
+    session.kill()  # kill_phase: SIGKILL of the group ...
+    second = session.start()  # ... then the restart of the SAME subject through spawn_real
+    assert second.pid != first.pid and len(stub_popen) == 2 and second.real
+    assert session.child is second and len(session._lives) == 2  # noqa: SLF001

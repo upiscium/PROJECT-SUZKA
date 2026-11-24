@@ -19,7 +19,11 @@ check off.  ``HumanLaunch`` can be constructed only by ``attest_human_launch``
 (a module-private mint), and ``ChildProcess.spawn_real`` requires one that
 belongs to THIS process.
 
-Honest limits.  A process that can allocate a pseudo-terminal (same uid) can type
+Honest limits (KNOWN, NOT PREVENTED): (a) an in-process Python caller that imports the
+private seam ``_attest`` (or ``launch._MINT``) can mint a ``HumanLaunch`` with a fake terminal;
+(b) a same-uid process driving a pty (script / expect / pty.spawn / setsid -f, a double fork that
+also drops the ``CLAUDE*`` variables and the agent ancestry) passes every terminal check.
+In detail: a process that can allocate a pseudo-terminal (same uid) can type
 the sentence, and can also start ``experiments.r20.serve --provider real`` directly:
 the child's own check (a tty on stdin, a launch record whose nonce digest and parent
 pid match, a parent command line naming the launcher) needs NO typed sentence, and a
@@ -48,11 +52,16 @@ from experiments.r20.guards import GuardRefusal
 LAUNCHER_MODULE = "experiments.r20.real_run"
 AGENT_ENV_PREFIXES = ("CLAUDE",)
 AGENT_COMMANDS = ("claude",)
+UNREADABLE = "<unreadable>"
 _MINT = object()
 
 
-def confirmation_sentence(stage: str, prereg_sha256: str) -> str:
-    return f"I AM THE HUMAN OPERATOR AND I LAUNCH STAGE {stage} OF A REAL-MODEL RUN (pre-registration {prereg_sha256[:12]})"
+def confirmation_sentence(stage: str, prereg_sha256: str, revision8: str = "") -> str:
+    """Names the stage, the pre-registration hash and the first 8 characters of the model
+    revision, so the Human has to read what is on the screen."""
+
+    tail = f", model revision {revision8}" if revision8 else ""
+    return f"I AM THE HUMAN OPERATOR AND I LAUNCH STAGE {stage} OF A REAL-MODEL RUN (pre-registration {prereg_sha256[:12]}{tail})"
 
 
 class Terminal(Protocol):
@@ -110,6 +119,8 @@ def ancestor_commands() -> list[tuple[str, list[str]]]:
     """``(comm, argv)`` of every ancestor of this process (``/proc`` walk)."""
 
     found: list[tuple[str, list[str]]] = []
+    if not Path(f"/proc/{os.getppid()}/stat").exists():
+        return [(UNREADABLE, [UNREADABLE])]  # fail CLOSED: an unreadable /proc is not "no ancestors"
     pid = os.getppid()
     seen: set[int] = set()
     while pid > 1 and pid not in seen:
@@ -128,6 +139,8 @@ def harness_ancestry(ancestors: list[tuple[str, list[str]]]) -> list[str]:
 
     reasons: list[str] = []
     for comm, argv in ancestors:
+        if comm == UNREADABLE:
+            reasons.append("ancestry unreadable (fail closed)")
         program = os.path.basename(argv[0]) if argv else ""
         if comm in AGENT_COMMANDS or program in AGENT_COMMANDS or any("claude-code" in word for word in argv[:3]):
             reasons.append(f"agent CLI ({comm or program})")
@@ -167,10 +180,34 @@ def attest_human_launch(
     prereg_sha256: str,
     *,
     human_flag: bool,
+    revision8: str = "",
+    before_confirm: Callable[[Terminal], list[str]] | None = None,
+) -> HumanLaunch:
+    """The PUBLIC attestation: hard-wired to the real terminal, the real environment and the
+    real ancestry; it takes no seam.  ``before_confirm`` may prompt the Human for more input
+    and returns the summary lines shown above the confirmation sentence."""
+
+    return _attest(
+        stage, prereg_sha256, human_flag=human_flag, terminal=RealTerminal(), environ=dict(os.environ),
+        ancestors=ancestor_commands, revision8=revision8, before_confirm=before_confirm,
+    )
+
+
+def _attest(
+    stage: str,
+    prereg_sha256: str,
+    *,
+    human_flag: bool,
     terminal: Terminal,
     environ: Mapping[str, str],
-    ancestors: Callable[[], list[tuple[str, list[str]]]] = ancestor_commands,
+    ancestors: Callable[[], list[tuple[str, list[str]]]],
+    revision8: str = "",
+    before_confirm: Callable[[Terminal], list[str]] | None = None,
 ) -> HumanLaunch:
+    """The seam version.  PRIVATE: only tests import it; production code never does (an AST
+    test pins that).  A caller that imports it can mint a launch with a fake terminal: that is a
+    documented limit, not a prevented one."""
+
     if not human_flag:
         raise GuardRefusal("HUMAN_LAUNCH_FLAG_MISSING", "--human-launch is required")
     if not terminal.is_tty():
@@ -183,24 +220,39 @@ def attest_human_launch(
     reasons = harness_ancestry(ancestors())
     if reasons:
         raise GuardRefusal("HARNESS_PARENT", "; ".join(sorted(set(reasons))))
-    expected = confirmation_sentence(stage, prereg_sha256)
-    typed = terminal.prompt(f"Type exactly this line to launch (anything else aborts):\n  {expected}")
+    expected = confirmation_sentence(stage, prereg_sha256, revision8)
+    summary = "\n".join(before_confirm(terminal)) + "\n" if before_confirm is not None else ""
+    typed = terminal.prompt(f"{summary}Type exactly this line to launch (anything else aborts):\n  {expected}")
     if typed.strip() != expected:
         raise GuardRefusal("CONFIRMATION_MISMATCH")
     return HumanLaunch(stage, prereg_sha256, secrets.token_hex(16), os.getpid(), time.time(), _MINT)
 
 
-def write_launch_record(path: Path, launch: HumanLaunch) -> None:
-    """``control/launch.json`` (0600): what the real ``serve`` child checks.
-    The nonce itself is passed on the command line; only its digest is stored."""
+def _binding(launch: HumanLaunch) -> dict[str, object]:
+    # What the record binds: this Human launch (its nonce digest, stage, pre-registration) and the
+    # launcher process.  A restart of the SAME subject by the SAME launcher presents the same binding.
+    return {"nonce_sha256": launch.nonce_sha256(), "launcher_pid": launch.pid, "stage": launch.stage,
+            "prereg_sha256": launch.prereg_sha256}
 
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+
+def write_launch_record(path: Path, launch: HumanLaunch) -> None:
+    """``control/launch.json`` (0600): what the real ``serve`` child checks.  Written ONCE per
+    subject (exclusive create); a restart of the same subject finds it and accepts it only when
+    the binding is identical, else it is refused.  The nonce itself is passed on the command
+    line; only its digest is stored."""
+
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        try:
+            existing = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise GuardRefusal("LAUNCH_RECORD_MISMATCH", "unreadable existing record") from error
+        if existing != _binding(launch):
+            raise GuardRefusal("LAUNCH_RECORD_MISMATCH", "an existing record binds another launch")
+        return
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump(
-            {"nonce_sha256": launch.nonce_sha256(), "launcher_pid": launch.pid, "stage": launch.stage,
-             "prereg_sha256": launch.prereg_sha256},
-            handle,
-        )
+        json.dump(_binding(launch), handle)
 
 
 def check_launch_record(path: Path, nonce: str | None, parent_pid: int) -> None:

@@ -99,7 +99,7 @@ def test_the_caps_are_the_humans_and_a_value_can_only_lower_them() -> None:
 
 def test_the_ledger_counts_subjects_and_hours_across_launches(tmp_path: Path) -> None:
     clock = [0.0]
-    ledger = Ledger(tmp_path)
+    ledger = Ledger(tmp_path / "l.jsonl")
     caps = Caps(max_subjects=3)
     first = Session(ledger, caps, "L1", "S0", clock=lambda: clock[0])
     first.begin_subject("a")
@@ -115,7 +115,7 @@ def test_the_ledger_counts_subjects_and_hours_across_launches(tmp_path: Path) ->
 
 def test_per_stage_limits_the_session_cap_and_the_total_cap(tmp_path: Path) -> None:
     clock = [0.0]
-    ledger = Ledger(tmp_path)
+    ledger = Ledger(tmp_path / "l.jsonl")
     session = Session(ledger, Caps(), "L1", "G1", clock=lambda: clock[0])
     session.begin_subject("g1a")
     assert refusal_code(session.begin_subject, "g1b") == "CAP_STAGE_SUBJECTS"  # G1 is one subject
@@ -133,7 +133,7 @@ def test_per_stage_limits_the_session_cap_and_the_total_cap(tmp_path: Path) -> N
 
 
 def test_an_unknown_stage_is_refused(tmp_path: Path) -> None:
-    assert refusal_code(Session, Ledger(tmp_path), Caps(), "L", "NOPE") == "STAGE_UNKNOWN"
+    assert refusal_code(Session, Ledger(tmp_path / "l.jsonl"), Caps(), "L", "NOPE") == "STAGE_UNKNOWN"
 
 
 # --------------------------------------------------------------- the GPU probe
@@ -270,3 +270,24 @@ def test_erase_refuses_a_symlinked_part(tmp_path: Path) -> None:
     (run / "home").symlink_to(keep)
     assert refusal_code(artifacts.erase, base, confirmed=True) == "ERASE_SYMLINK"
     assert (keep / "x").exists()
+
+
+def test_erase_refuses_a_production_base_first(tmp_path: Path) -> None:
+    for place in ("/etc", "/var/lib/suzka", "/opt/project-suzka"):
+        assert refusal_code(artifacts.erase, Path(place), confirmed=True) == "PRODUCTION_PATH"
+
+
+def test_the_locks_are_opened_without_following_links_and_private(tmp_path: Path) -> None:
+    from experiments.r20 import real_run
+
+    target = tmp_path / "victim"
+    target.write_text("x")
+    link = tmp_path / "real.lock"
+    link.symlink_to(target)
+    with pytest.raises(OSError):
+        real_run._open_lock(link)  # noqa: SLF001
+    handle = real_run._open_lock(tmp_path / "fresh.lock")  # noqa: SLF001
+    handle.close()
+    assert stat.S_IMODE((tmp_path / "fresh.lock").stat().st_mode) == 0o600
+    assert real_run.default_global_lock().parent == real_run.default_ledger_path().parent
+    assert str(real_run.default_ledger_path()).startswith(str(Path.home()))  # one fixed per-user place, no /tmp name

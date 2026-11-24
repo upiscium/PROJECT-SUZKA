@@ -7,8 +7,9 @@ one is a refusal), so no launch flag raises a cap.  Exceeding a cap stops the
 run and asks the Human: nothing is extended silently, and a stopped attempt
 still counts (no silent restart).
 
-The ledger (``<base>/ledger.jsonl``, 0600, append-only lines) is what makes the
-subject and hour totals hold ACROSS launches; the pre-registration and the
+The ledger (ONE cumulative file in the per-user state directory, outside any base, 0600,
+append-only lines) is what makes the subject and hour totals hold ACROSS launches and bases
+(a same-uid process can still edit it: it detects nothing, it is a running count); the pre-registration and the
 manifests copy the numbers, the ledger is the running count.
 """
 
@@ -32,7 +33,6 @@ HARD_TURN_SECONDS = 120.0
 # Subjects per stage of the plan sec. 4: G1 1; S0 <= 3 + 1 negative variant; G2 1; S1 <= 2; G3 <= 4;
 # F1 24 + retries <= 6.  The sum (1 + 4 + 1 + 2 + 4 + 30 = 42) is the total cap.
 STAGE_LIMITS = {"G1": 1, "S0": 4, "G2": 1, "S1": 2, "G3": 4, "F1": 30}
-LEDGER_NAME = "ledger.jsonl"
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,8 +62,8 @@ class Caps:
 class Ledger:
     """Append-only counts of subjects started and wall-clock seconds used."""
 
-    def __init__(self, base: Path) -> None:
-        self.path = Path(base) / LEDGER_NAME
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
 
     def _append(self, row: dict[str, object]) -> None:
         descriptor = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)

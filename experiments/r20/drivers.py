@@ -172,6 +172,8 @@ class RunContext:
     def new_session(self, profile: str, *, stage: str, **options: Any) -> S0Session:
         self.stop_check()
         self.check_actor()
+        if stage == "F1":
+            guard_f1(self)  # the single choke point: no F1 subject is created for a real model before this passes
         if self.real and self.gpu_check is not None:
             self.gpu_check()  # >= 14 GiB free, device-wide, from the CUDA runtime
         run_id = uuid.uuid4().hex[:8]

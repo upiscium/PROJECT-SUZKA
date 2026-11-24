@@ -177,6 +177,22 @@ def derive_f1_plan(master_seed: int, trial_id: str) -> dict[str, Any]:
             "formulas": F1_FORMULAS}
 
 
+def fixtures_digest(fixtures: dict[str, Any]) -> str:
+    return sha256_hex(json.dumps(fixtures, sort_keys=True, ensure_ascii=False).encode())
+
+
+def code_digests() -> dict[str, str]:
+    """The digests of the current code that the record pins: the config template, the request
+    templates and the fixtures."""
+
+    repository = repo_root()
+    return {
+        "config_template_sha256": sha256_hex((repository / "config.yaml").read_bytes()),
+        "request_templates_sha256": sha256_hex((repository / "suzka" / "r15" / "request_templates.py").read_bytes()),
+        "fixtures_sha256": fixtures_digest(fixtures_section()),
+    }
+
+
 def fixtures_section() -> dict[str, Any]:
     case = Case("r20-fixture", "B", "forced", 0, "normal")
     prompts = case.prompts()
@@ -198,14 +214,16 @@ def build_content(
     trial_id: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    repository = repo_root()
+    if git_head == "unknown":
+        raise GuardRefusal("GIT_HEAD_UNKNOWN", "a pre-registration needs a known git head")
+    digests = code_digests()
     return {
         "schema": SCHEMA,
         "created_utc": (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "git_head": git_head,
         "model": model.record(),
-        "config_template_sha256": sha256_hex((repository / "config.yaml").read_bytes()),
-        "request_templates_sha256": sha256_hex((repository / "suzka" / "r15" / "request_templates.py").read_bytes()),
+        "config_template_sha256": digests["config_template_sha256"],
+        "request_templates_sha256": digests["request_templates_sha256"],
         "fixtures": fixtures_section(),
         "s0": {
             "k_rule": K_RULE,

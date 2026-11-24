@@ -213,6 +213,19 @@ def git_head() -> str:
     return done.stdout.strip() if done.returncode == 0 and done.stdout.strip() else "unknown"
 
 
+def git_dirty() -> bool | None:
+    """``True`` when ``git status --porcelain`` lists anything, ``None`` when it cannot be read."""
+
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(guards.repo_root()), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return bool(done.stdout.strip()) if done.returncode == 0 else None
+
+
 def _relocate(raw: dict[str, Any], root: Path, tier: Tier) -> None:
     for section, key in _PATH_KEYS:
         value = raw.setdefault(section, {}).get(key)
