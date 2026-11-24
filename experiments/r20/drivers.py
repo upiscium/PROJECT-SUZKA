@@ -154,6 +154,7 @@ class RunContext:
     prereg_sha256: str | None = None
     gpu_check: Callable[[], object] | None = None
     stop_check: Callable[[], None] = lambda: None
+    code_check: Callable[[], None] | None = None  # head / clean tree / digests, recomputed per subject
     announce: Callable[[str], None] = print
     sessions: list[S0Session] = field(default_factory=list)
 
@@ -171,6 +172,8 @@ class RunContext:
 
     def new_session(self, profile: str, *, stage: str, **options: Any) -> S0Session:
         self.stop_check()
+        if self.code_check is not None:
+            self.code_check()
         self.check_actor()
         if stage == "F1":
             guard_f1(self)  # the single choke point: no F1 subject is created for a real model before this passes
@@ -766,6 +769,10 @@ def summarize_f1(pairs: list[dict[str, Any]], *, planned: int = 12) -> dict[str,
 
 
 def stage_b_released(base: Path, prereg_sha256: str | None) -> bool:
+    """The release file has no nonce and no MAC: a same-uid writer can forge it, so this gate holds
+    against CODE PATHS only (a driver, a script that does not write the file).  The other stage-B
+    gates are the registered IP-R15b template and the Human's own launch."""
+
     path = Path(base) / STAGE_B_RELEASE
     try:
         data = json.loads(path.read_text(encoding="utf-8"))

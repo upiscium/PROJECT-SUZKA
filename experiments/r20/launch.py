@@ -125,12 +125,15 @@ def ancestor_commands() -> list[tuple[str, list[str]]]:
     seen: set[int] = set()
     while pid > 1 and pid not in seen:
         seen.add(pid)
-        found.append(_command_words(pid))
+        words = _command_words(pid)
+        if words == ("", []):  # a hop that cannot be read is not "no agent": fail CLOSED
+            return [*found, (UNREADABLE, [UNREADABLE])]
+        found.append(words)
         try:
             stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
             pid = int(stat.rsplit(")", 1)[1].split()[1])
         except (OSError, ValueError, IndexError):
-            break
+            return [*found, (UNREADABLE, [UNREADABLE])]
     return found
 
 

@@ -39,7 +39,9 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import pwd
 import signal
+import stat
 import sys
 import threading
 import time
@@ -65,9 +67,15 @@ def user_state_dir() -> Path:
     """Per-user state OUTSIDE any ``--base``: the cumulative ledger and the global lock live here, so
     a new base or a deleted base does not reset the totals (a same-uid process can still edit them)."""
 
-    directory = Path.home() / ".local" / "state" / "suzka-r20"
+    # the account database, NOT $HOME: ``HOME=/tmp/x`` cannot move the ledger or the lock
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    directory = home / ".local" / "state" / "suzka-r20"
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(directory, 0o700)
+    info = directory.lstat()
+    if directory.is_symlink() or info.st_uid != os.getuid():
+        raise GuardRefusal("STATE_DIR_NOT_OURS", str(directory))
+    if stat.S_IMODE(info.st_mode) != 0o700:  # refused, never chmod-ed silently
+        raise GuardRefusal("STATE_DIR_MODE", oct(stat.S_IMODE(info.st_mode)))
     return directory
 
 
@@ -150,6 +158,15 @@ def check_digests(content: dict[str, Any]) -> None:
         raise GuardRefusal("CODE_DIGEST_MISMATCH", ",".join(differing))
 
 
+def recheck(content: dict[str, Any]) -> None:
+    """Head, clean tree and digests, RECOMPUTED every time (no cache): called at preflight, right
+    after the Human's attestation, inside the lock, and before every subject, so a change made while
+    the Human types or during a multi-hour run is caught."""
+
+    check_code(str(content["git_head"]))
+    check_digests(content)
+
+
 def preflight(base: Path, caps: Caps, stage: str, prereg_sha256: str, content: dict[str, Any],
               ledger_path: Path) -> None:
     """Refusals BEFORE the Human is asked to confirm anything."""
@@ -166,8 +183,7 @@ def preflight(base: Path, caps: Caps, stage: str, prereg_sha256: str, content: d
         for path in Path(base).glob("results-S0-*.json")
     ):
         raise GuardRefusal("S0_ALREADY_RUN", "K = 3 allows no extra attempt in a second launch")
-    check_code(str(content["git_head"]))
-    check_digests(content)
+    recheck(content)
     if stage == "F1" and not drivers.stage_b_released(base, prereg_sha256):
         raise GuardRefusal("STAGE_B_NOT_RELEASED", "stage B needs the release file the Human writes (release-stage-b)")
 
@@ -261,6 +277,7 @@ def _run_stage(args: argparse.Namespace, *, attest: Attest, gpu_runner: Any, loc
     with lock or RealLock(base):
         assert model.revision is not None
         launch = attest(stage, digest, human_flag=bool(args.human_launch), revision8=model.revision[:8])
+        recheck(content)  # again, now that the Human has typed and the lock is held
         revision = check_pinned_revision(model)  # the cache holds exactly the pinned digest
         reading = gpu.check_free(caps.min_free_bytes, gpu_runner)  # CUDA runtime, never NVML
         artifacts.mark_base(base, digest)
@@ -272,6 +289,7 @@ def _run_stage(args: argparse.Namespace, *, attest: Attest, gpu_runner: Any, loc
             base=base, approver=HumanApprover(print, args.ssh_host), model=model, launch=launch, budget=budget,
             turn_cap_s=caps.turn_seconds, prereg_sha256=digest,
             gpu_check=lambda: gpu.check_free(caps.min_free_bytes, gpu_runner), stop_check=stopper.check,
+            code_check=lambda: recheck(content),
         )
         print(f"pre-registration {digest}\nstage {stage}  model {model.model_id}  revision {revision}\n"
               f"GPU free at launch {reading.free_bytes / gpu.GIB:.1f} GiB of {reading.total_bytes / gpu.GIB:.1f} GiB\n"
@@ -290,9 +308,14 @@ def _run_stage(args: argparse.Namespace, *, attest: Attest, gpu_runner: Any, loc
             reason = f"crashed:{type(error).__name__}"
             payload = {"exception": type(error).__name__}
         finally:
-            stopper.stop_children()
-            stopper.restore()
-            budget.end(reason)
+            cleanup_errors: list[str] = []
+            for step in (stopper.stop_children, stopper.restore, lambda: budget.end(reason)):
+                try:  # each step on its own: one failing never skips the ledger entry or the results
+                    step()
+                except BaseException as error:
+                    cleanup_errors.append(type(error).__name__)
+        if cleanup_errors:
+            payload = {**payload, "cleanup_errors": cleanup_errors}
         path = write_results(base, launch_id, stage, {**payload, "stop_reason": reason}, digest)
         print(f"stage {stage} ended: {reason}\nresults: {path}\nreport: python -m experiments.r20.real_run report --base {base}")
         return 0 if reason == "completed" else 1
@@ -343,6 +366,8 @@ def _create_prereg(args: argparse.Namespace, *, attest: Attest) -> str:
 
     base = Path(args.base)
     check_not_production(base)  # BEFORE anything is created
+    if (base / prereg.PREREG_NAME).exists() or (base / prereg.HASH_NAME).exists():
+        raise GuardRefusal("PREREG_EXISTS", "refused before the Human is asked anything")
     head = factory.git_head()
     if head == "unknown":
         raise GuardRefusal("GIT_HEAD_UNKNOWN", "the git head cannot be read")
@@ -367,6 +392,7 @@ def _create_prereg(args: argparse.Namespace, *, attest: Attest) -> str:
 
     attest("PREREG", "NEW", human_flag=bool(args.human_launch), revision8=model.revision[:8], before_confirm=gather)
     base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    check_not_production(base)  # again, after the directory exists (a link planted meanwhile)
     content = prereg.build_content(
         git_head=head, model=model, caps=Caps(), four_violations=typed, master_seed=args.master_seed, trial_id=args.trial_id,
     )

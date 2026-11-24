@@ -9,7 +9,9 @@ still counts (no silent restart).
 
 The ledger (ONE cumulative file in the per-user state directory, outside any base, 0600,
 append-only lines) is what makes the subject and hour totals hold ACROSS launches and bases
-(a same-uid process can still edit it: it detects nothing, it is a running count); the pre-registration and the
+(a same-uid process can still edit it: it detects nothing, it is a running count).  It is
+machine-wide for this user: to reset it DELIBERATELY the Human deletes
+``~/.local/state/suzka-r20/ledger.jsonl`` (and says so in the pre-registration record of the run); the pre-registration and the
 manifests copy the numbers, the ledger is the running count.
 """
 
@@ -66,15 +68,19 @@ class Ledger:
         self.path = Path(path)
 
     def _append(self, row: dict[str, object]) -> None:
-        descriptor = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        descriptor = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
 
     def rows(self) -> list[dict[str, object]]:
-        if not self.path.is_file():
-            return []
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return []  # ONLY a missing file is empty; EACCES, EISDIR, ... fail closed
+        except OSError as error:
+            raise GuardRefusal("LEDGER_UNREADABLE", type(error).__name__) from error
         out: list[dict[str, object]] = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
+        for line in text.splitlines():
             try:
                 row = json.loads(line)
             except ValueError:

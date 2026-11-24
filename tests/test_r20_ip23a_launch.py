@@ -249,6 +249,8 @@ class StubProcess:
 
     _next = 4_000_000
 
+    command: list[str] = []
+
     def __init__(self) -> None:
         StubProcess._next += 1
         self.pid = StubProcess._next
@@ -269,6 +271,8 @@ def stub_popen(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[StubProcess]]:
 
     def popen(command: list[str], **_kwargs: object) -> StubProcess:
         made.append(StubProcess())
+        made[-1].command = command
+        made[-1].env = _kwargs.get("env")  # type: ignore[attr-defined]
         assert "--provider" in command and "real" in command
         return made[-1]
 
@@ -316,3 +320,31 @@ def test_the_s0_kill_and_restart_path_goes_through_spawn_real_twice(
     second = session.start()  # ... then the restart of the SAME subject through spawn_real
     assert second.pid != first.pid and len(stub_popen) == 2 and second.real
     assert session.child is second and len(session._lives) == 2  # noqa: SLF001
+
+
+# ------------------------------------------------ review round 3 (IP-23a)
+
+
+def test_a_real_child_never_writes_bytecode(r20_base: Path, stub_popen: list[StubProcess]) -> None:
+    subject = create_subject("S0", base=r20_base, tier=Tier.T2, model=real_model())
+    ChildProcess.spawn_real(subject, human_launch(), hf_home=None, turn_cap_s=120.0)
+    command = stub_popen[0].command
+    assert command[1] == "-B" and command[2] == "-m"
+    assert stub_popen[0].env["PYTHONDONTWRITEBYTECODE"] == "1"  # type: ignore[attr-defined]
+    from experiments.r20.supervisor import child_environment
+
+    assert child_environment(subject, {"PATH": "/bin"})["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
+def test_an_ancestor_hop_that_cannot_be_read_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"n": 0}
+    real = launch._command_words  # noqa: SLF001
+
+    def second_hop_unreadable(pid: int) -> tuple[str, list[str]]:
+        calls["n"] += 1
+        return real(pid) if calls["n"] == 1 else ("", [])
+
+    monkeypatch.setattr(launch, "_command_words", second_hop_unreadable)
+    found = launch.ancestor_commands()
+    if calls["n"] >= 2:  # (a machine whose parent has no further ancestor above pid 1 never reaches hop 2)
+        assert found[-1] == (UNREADABLE, [UNREADABLE]) and harness_ancestry(found)

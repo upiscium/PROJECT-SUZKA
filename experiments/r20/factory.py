@@ -213,17 +213,44 @@ def git_head() -> str:
     return done.stdout.strip() if done.returncode == 0 and done.stdout.strip() else "unknown"
 
 
-def git_dirty() -> bool | None:
-    """``True`` when ``git status --porcelain`` lists anything, ``None`` when it cannot be read."""
+# Ignored paths that are DATA, not code under test: tool caches and the interpreter environment.  Any
+# other ignored file (a ``sitecustomize.py``, a stray module) is refused; a ``.pyc`` under ``__pycache__``
+# is allowed (the source is the truth; the child also runs ``python -B``).
+IGNORED_OK_PREFIXES = (".venv/", ".mypy_cache/", ".pytest_cache/", ".ruff_cache/")
 
+
+def _git(root: Path, *arguments: str) -> str | None:
     try:
         done = subprocess.run(
-            ["git", "-C", str(guards.repo_root()), "status", "--porcelain"],
-            capture_output=True, text=True, timeout=30, check=False,
+            ["git", "-C", str(root), *arguments], capture_output=True, text=True, timeout=60, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return bool(done.stdout.strip()) if done.returncode == 0 else None
+    return done.stdout if done.returncode == 0 else None
+
+
+def git_dirty(root: Path | None = None) -> bool | None:
+    """``True`` when the working tree differs from its head in ANY way that could change what runs:
+    modified / untracked files (all of them, submodules included), ignored files other than data
+    caches and ``__pycache__/*.pyc``, and ``assume-unchanged`` / ``skip-worktree`` entries (which
+    hide a modification from ``git status``).  ``None`` when git cannot be read."""
+
+    where = root or guards.repo_root()
+    status = _git(where, "-c", "status.showUntrackedFiles=all", "status", "--porcelain", "--untracked-files=all",
+                  "--ignore-submodules=none")
+    ignored = _git(where, "ls-files", "--others", "--ignored", "--exclude-standard")
+    tagged = _git(where, "ls-files", "-v")
+    if status is None or ignored is None or tagged is None:
+        return None
+    if status.strip():
+        return True
+    for line in ignored.splitlines():
+        path = line.strip()
+        if path.startswith(IGNORED_OK_PREFIXES) or (path.endswith(".pyc") and "__pycache__/" in path):
+            continue
+        return True
+    # lowercase tag = assume-unchanged; ``S`` = skip-worktree: both hide edits from ``git status``
+    return any(line[:1].islower() or line[:1] == "S" for line in tagged.splitlines() if line)
 
 
 def _relocate(raw: dict[str, Any], root: Path, tier: Tier) -> None:

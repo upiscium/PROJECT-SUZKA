@@ -56,6 +56,7 @@ def child_environment(
         {
             "PYTHONPATH": str(guards.repo_root()),
             "SUZKA_CONFIG_PATH": str(subject.config_path),
+            "PYTHONDONTWRITEBYTECODE": "1",  # no new .pyc is written by (or planted for) a run
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
             "HOME": str(child_home(subject)),
@@ -192,7 +193,7 @@ class ChildProcess:
         # once per subject: a restart (the planned SIGKILL) finds the record and must match its binding
         write_launch_record(subject.control_dir / "launch.json", launch)
         command = [
-            sys.executable, "-m", "experiments.r20.serve", str(subject.root),
+            sys.executable, "-B", "-m", "experiments.r20.serve", str(subject.root),
             "--run-id", subject.run_id, "--provider", ProviderMode.REAL.value,
             "--approval-actor", ApprovalActor.HUMAN.value, "--human-launch",
             "--launch-nonce", launch.nonce, "--turn-cap-s", str(turn_cap_s),

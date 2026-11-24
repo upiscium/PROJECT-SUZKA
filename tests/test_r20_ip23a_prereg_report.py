@@ -155,7 +155,7 @@ def test_the_report_shows_the_runs_the_labels_and_the_known_violations(tmp_path:
     for item in FOUR:
         assert item in text
     assert "COGNITIVE_VARIATION" in text and "HARNESS_BRIDGE" in text and "permanent core-store faults" in text
-    assert "ledger: 0 subjects started" in text
+    assert "0 subjects started" in text
 
 
 def test_the_report_never_states_a_pass_of_r20(tmp_path: Path) -> None:
@@ -241,3 +241,22 @@ def test_the_report_target_is_never_a_followed_link_or_an_overwritten_file(tmp_p
     (base / "report.md").unlink()
     (base / "report.md").symlink_to(victim)
     assert refusal_code(write_report, base) == "REPORT_TARGET_IS_A_LINK" and victim.read_text() == "keep"
+
+
+def test_a_human_line_cannot_hide_a_generated_statement_and_the_ledger_is_labelled(tmp_path: Path) -> None:
+    from experiments.r20 import report
+
+    base = tmp_path / "base"
+    make_prereg(base, make_cache(tmp_path / "hf"))
+    assert "machine-wide" in build_report(base)
+    original = report.build_report
+    try:
+        for generated in ("R20 PASS", "the R20 stage will succeed", "R20 passed"):
+            report.build_report = lambda _b, _l=None, g=generated: f"## Stage S0\n{g}\n\n## Known violations (x)\n- PASS\n\n## Not claimed\nfine\n"  # type: ignore[assignment]
+            assert refusal_code(report.write_report, base, tmp_path / "x.md") == "REPORT_STATES_A_PASS"
+        report.build_report = lambda _b, _l=None: "## Stage S0\nfine\n\n## Known violations (x)\n- PASS the human's word\n\n## Not claimed\nfine\n"  # type: ignore[assignment]
+        assert report.write_report(base, tmp_path / "ok.md").exists()  # only the known-violations section is exempt
+        report.build_report = lambda _b, _l=None: "## Known violations (x)\n- PASS\n\n## Not claimed\nR20 PASS\n"  # type: ignore[assignment]
+        assert refusal_code(report.write_report, base, tmp_path / "y.md") == "REPORT_STATES_A_PASS"  # a later section is still checked
+    finally:
+        report.build_report = original  # type: ignore[assignment]

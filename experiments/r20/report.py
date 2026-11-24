@@ -32,7 +32,7 @@ from experiments.r20.prereg import load
 
 AUTOMATIC = ("GATE_CONFORMANCE_DEFECT", "ENGINEERING_DEFECT")
 LABELS = ("GATE_CONFORMANCE_DEFECT", "ENGINEERING_DEFECT", "COGNITIVE_VARIATION", "UNDETERMINED")
-_FORBIDDEN = re.compile(r"\bPASS(ED)?\b|(?i:r20[^.\n]{0,40}\b(pass(ed|es)?|succe(ss|ssful|eded|eds))\b)")
+_FORBIDDEN = re.compile(r"\bPASS(ED)?\b|(?i:r20[^.\n]{0,40}\b(pass(ed|es)?|succe(ed|eds|eded|ss|ssful))\b)")
 STAGE_JUDGEMENT = "The R20 Stage judgement is the Human's. This report states no R20 result."
 
 
@@ -113,7 +113,8 @@ def build_report(base: Path, ledger_path: Path | None = None) -> str:
         f"- git head (pre-registered): {content['git_head']}",
         f"- model (pre-registered): {content['model'].get('model_id')} pinned revision {content['model'].get('revision_pinned')}",
         f"- caps (pre-registered): {json.dumps(content['caps'], sort_keys=True)}",
-        f"- ledger: {ledger.subjects_used()} subjects started, {ledger.seconds_used() / 3600:.2f} h used",
+        f"- ledger (cumulative, machine-wide for this user, not per base): {ledger.subjects_used()} subjects started, "
+        f"{ledger.seconds_used() / 3600:.2f} h used",
         f"- result files: {', '.join(path.name for path in results_files(base)) or 'none'}",
         "",
         "## Runs (from the manifests; approval actor HUMAN means the Human approved in the browser)",
@@ -185,19 +186,22 @@ def build_report(base: Path, ledger_path: Path | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
-def generated_text(text: str, content: dict[str, Any]) -> str:
-    """The text with the Human's own words removed: the lexical guard is for GENERATED text only."""
+def generated_text(text: str) -> str:
+    """The text checked by the lexical guard: every section EXCEPT the known-violations section
+    (the only place the Human's own words appear).  Section by section, never a global
+    ``replace`` of the Human's lines, so a Human line cannot hide a generated statement."""
 
-    human = content.get("known_violations", {}).get("four_unlisted_known_violations", [])
-    for line in human:
-        text = text.replace(str(line), "")
-    return text
+    marker = "## Known violations"
+    start = text.find(marker)
+    if start < 0:
+        return text
+    end = text.find("\n## ", start + len(marker))
+    return text[:start] + ("" if end < 0 else text[end:])
 
 
 def write_report(base: Path, out: Path | None = None, ledger_path: Path | None = None) -> Path:
     text = build_report(base, ledger_path)
-    content, _digest = load(base)
-    if _FORBIDDEN.search(generated_text(text, content)):
+    if _FORBIDDEN.search(generated_text(text)):
         raise GuardRefusal("REPORT_STATES_A_PASS", "the report never states a pass of R20")
     target = Path(out) if out else Path(base) / "report.md"
     if target.is_symlink():

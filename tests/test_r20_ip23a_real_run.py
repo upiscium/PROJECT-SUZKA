@@ -443,7 +443,8 @@ def test_the_ledger_is_cumulative_across_bases_and_lives_outside_any_base(lab: d
     assert not (lab["base"] / "ledger.jsonl").exists() and not (other_base / "ledger.jsonl").exists()
     import inspect
 
-    assert "Path.home()" in inspect.getsource(real_run.user_state_dir)  # fixed per-user location
+    source = inspect.getsource(real_run.user_state_dir)
+    assert "pwd.getpwuid" in source and "Path.home()" not in source and "environ" not in source  # not $HOME
 
 
 def test_the_watch_stops_a_launch_that_reaches_a_cap_during_a_wait(tmp_path: Path) -> None:
@@ -477,3 +478,76 @@ def test_a_second_s0_launch_after_a_completed_block_is_refused(lab: dict[str, An
     (lab["base"] / "results-S0-x.json").write_text(json.dumps({"stop_reason": "completed"}))
     assert refusal_code(launch, lab, "S0") == "S0_ALREADY_RUN"
     assert_nothing_started(lab)
+
+
+# ------------------------------------------------ review round 3 (IP-23a)
+
+
+class FlippingTerminal(FakeTerminal):
+    """A Human who takes a while to type: something changes while the prompt is on the screen."""
+
+    def __init__(self, change: Any) -> None:
+        super().__init__()
+        self.change = change
+
+    def prompt(self, text: str) -> str:
+        self.change()
+        return super().prompt(text)
+
+
+def test_a_change_made_while_the_human_types_is_caught_after_the_attestation(lab: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    state = {"dirty": False}
+    monkeypatch.setattr(real_run.factory, "git_dirty", lambda: state["dirty"])
+    terminal = FlippingTerminal(lambda: state.update(dirty=True))
+    assert refusal_code(launch, lab, terminal=terminal) == "GIT_TREE_DIRTY"
+    assert len(terminal.prompts) == 1 and lab["reached"] == []  # asked once, then refused: nothing started
+    state["dirty"] = False
+    real = prereg.code_digests()
+    flipped = {"on": False}
+    monkeypatch.setattr(prereg, "code_digests", lambda: {**real, "config_template_sha256": "0" * 64} if flipped["on"] else real)
+    with pytest.raises(GuardRefusal) as refused:
+        launch(lab, "G1", terminal=FlippingTerminal(lambda: flipped.update(on=True)))
+    assert refused.value.code == "CODE_DIGEST_MISMATCH"
+    assert_nothing_started(lab)
+
+
+def test_a_tracked_file_changed_between_attest_and_the_next_subject_is_refused(lab: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    state = {"dirty": False}
+    monkeypatch.setattr(real_run.factory, "git_dirty", lambda: state["dirty"])
+    seen: dict[str, Any] = {}
+
+    def dispatch(ctx: drivers.RunContext, stage: str, content: dict[str, Any]) -> dict[str, Any]:
+        ctx.gpu_check = lambda: None
+        state["dirty"] = True  # a tracked file is edited during the (multi-hour) run
+        seen["second"] = refusal_code(ctx.new_session, "S0", stage="G1")
+        return {}
+
+    monkeypatch.setattr(real_run, "dispatch", dispatch)
+    assert launch(lab, "G1") == 0
+    assert seen["second"] == "GIT_TREE_DIRTY"
+    assert not [p for p in lab["base"].iterdir() if p.is_dir()]  # no subject was created for it
+
+
+def test_a_failing_cleanup_step_neither_skips_the_ledger_entry_nor_the_results(lab: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(real_run, "dispatch", lambda ctx, stage, content: {"g1": {"label": "x"}})
+
+    def boom(self: Stopper) -> None:
+        raise OSError("cannot stop")
+
+    monkeypatch.setattr(Stopper, "stop_children", boom)
+    before = signal.getsignal(signal.SIGTERM)
+    assert launch(lab, "G1") == 0
+    result = json.loads(next(lab["base"].glob("results-G1-*.json")).read_text())
+    assert result["cleanup_errors"] == ["OSError"] and result["stop_reason"] == "completed"
+    assert [row["reason"] for row in Ledger(lab["ledger"]).rows() if row["kind"] == "end"] == ["completed"]
+    assert signal.getsignal(signal.SIGTERM) is before  # the handlers were still restored
+
+
+def test_an_existing_preregistration_is_refused_before_the_human_is_asked_anything(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(real_run.factory, "git_head", lambda: "a" * 40)
+    monkeypatch.setattr(real_run.factory, "git_dirty", lambda: False)
+    namespace = prereg_args(tmp_path, "pe", "--human-launch")
+    create(tmp_path, namespace)
+    again = FakeTerminal(lines=list(FOUR))
+    assert refusal_code(create, tmp_path, namespace, again) == "PREREG_EXISTS"
+    assert again.prompts == [] and again.lines == FOUR

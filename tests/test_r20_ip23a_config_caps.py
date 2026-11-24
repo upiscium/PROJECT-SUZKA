@@ -290,4 +290,89 @@ def test_the_locks_are_opened_without_following_links_and_private(tmp_path: Path
     handle.close()
     assert stat.S_IMODE((tmp_path / "fresh.lock").stat().st_mode) == 0o600
     assert real_run.default_global_lock().parent == real_run.default_ledger_path().parent
-    assert str(real_run.default_ledger_path()).startswith(str(Path.home()))  # one fixed per-user place, no /tmp name
+
+
+# ------------------------------------------------ review round 3 (IP-23a)
+
+
+def _git_repo(path: Path) -> Path:
+    import subprocess
+
+    path.mkdir()
+    def run(*arguments: str) -> None:
+        subprocess.run(["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@t", *arguments], check=True, capture_output=True)
+
+    run("init", "-q")
+    (path / "code.py").write_text("x = 1\n")
+    (path / ".gitignore").write_text("ignored.py\n.venv/\n__pycache__/\n")
+    run("add", ".")
+    run("commit", "-q", "-m", "c")
+    return path
+
+
+def test_the_tree_check_sees_every_way_to_change_what_runs(tmp_path: Path) -> None:
+    import subprocess
+
+    repo = _git_repo(tmp_path / "r")
+    assert factory.git_dirty(repo) is False
+    (repo / "__pycache__").mkdir()
+    (repo / "__pycache__" / "code.cpython-313.pyc").write_bytes(b"x")  # a pyc is allowed
+    (repo / ".venv").mkdir()
+    (repo / ".venv" / "lib.py").write_text("x")  # the interpreter environment is allowed
+    assert factory.git_dirty(repo) is False
+    (repo / "ignored.py").write_text("print('planted')")  # an IGNORED module is code that would run
+    assert factory.git_dirty(repo) is True
+    (repo / "ignored.py").unlink()
+    (repo / "sitecustomize.py").write_text("print('x')")
+    assert factory.git_dirty(repo) is True  # untracked
+    (repo / "sitecustomize.py").unlink()
+    (repo / "code.py").write_text("x = 2\n")
+    assert factory.git_dirty(repo) is True  # modified
+    subprocess.run(["git", "-C", str(repo), "update-index", "--assume-unchanged", "code.py"], check=True)
+    assert factory.git_dirty(repo) is True  # hidden from `git status`, but refused
+    subprocess.run(["git", "-C", str(repo), "update-index", "--no-assume-unchanged", "code.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "checkout", "--", "code.py"], check=True)
+    assert factory.git_dirty(repo) is False
+    subprocess.run(["git", "-C", str(repo), "update-index", "--skip-worktree", "code.py"], check=True)
+    assert factory.git_dirty(repo) is True
+    assert factory.git_dirty(tmp_path / "not-a-repo-at-all") is None
+
+
+def test_the_state_directory_comes_from_the_account_database_not_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from experiments.r20 import real_run
+
+    account = tmp_path / "account"
+    account.mkdir()
+    monkeypatch.setattr(real_run.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(account)))
+    monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))  # HOME=/tmp/x must not move the ledger
+    directory = real_run.user_state_dir()
+    assert directory == account / ".local" / "state" / "suzka-r20" and not (tmp_path / "elsewhere").exists()
+    assert real_run.default_ledger_path().parent == directory == real_run.default_global_lock().parent
+    os.chmod(directory, 0o755)
+    assert refusal_code(real_run.user_state_dir) == "STATE_DIR_MODE" and stat.S_IMODE(directory.stat().st_mode) == 0o755  # not chmod-ed
+    os.chmod(directory, 0o700)
+    monkeypatch.setattr(real_run.os, "getuid", lambda: os.geteuid() + 1)
+    assert refusal_code(real_run.user_state_dir) == "STATE_DIR_NOT_OURS"
+
+
+def test_a_ledger_that_cannot_be_read_is_not_empty_and_is_never_written_through_a_link(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "l.jsonl")
+    assert ledger.rows() == [] and ledger.subjects_used() == 0  # only a MISSING file is empty
+    ledger.append(kind="subject", launch="L", stage="G1", run_id="a", elapsed_s=1.0)
+    (tmp_path / "dir.jsonl").mkdir()
+    assert refusal_code(Ledger(tmp_path / "dir.jsonl").rows) == "LEDGER_UNREADABLE"
+    if os.geteuid() != 0:
+        os.chmod(ledger.path, 0)
+        try:
+            assert refusal_code(ledger.rows) == "LEDGER_UNREADABLE"
+        finally:
+            os.chmod(ledger.path, 0o600)
+    target = tmp_path / "victim.txt"
+    target.write_text("keep")
+    link = tmp_path / "link.jsonl"
+    link.symlink_to(target)
+    with pytest.raises(OSError):
+        Ledger(link).append(kind="x")
+    assert target.read_text() == "keep"
