@@ -350,8 +350,13 @@ class DegradedContinuationSettings(StrictBaseModel):
     """
 
     # "refuse" is the exact legacy behaviour: no supervisor, no quarantine, no
-    # ladder.
-    mode: Literal["continue", "refuse"] = "continue"
+    # ladder.  DEFAULT "refuse" (DC-5 decision, to be confirmed by the Human at
+    # the deploy that flips it): the production config does not set this key,
+    # so a deploy of the supervisor must not change eve's start-up semantics
+    # (a start-time refusal exits the process; a FAILED Runtime stays FAILED)
+    # until the Human turns "continue" on.  The D1's HD-F15-1 (a) "continue is
+    # the default" is therefore a later, explicit flip of this one default.
+    mode: Literal["continue", "refuse"] = "refuse"
     # Manifests and the HARD-band log only; ``None`` -> ``<journal dir>/quarantine``.
     quarantine_dir: Path | None = None
     # T_retry: one shared deadline per start attempt.
@@ -374,6 +379,11 @@ class DegradedContinuationSettings(StrictBaseModel):
     cycle_restart_cap: int = Field(default=3, ge=1, le=1_000)
     # HD-F15S-2 (e): only the terminal ``threads_not_stopped`` state exits.
     exit_on_threads_not_stopped: bool = False
+    # A build still running at ``t_boot_max_s`` (a hung model load / Chroma open)
+    # is neither terminal nor re-evaluable (a synchronous build cannot be
+    # interrupted).  Opt-in, like the one above: exit non-zero in that state so
+    # a host restarter can clear it.  Off by default (the legacy start hangs too).
+    exit_on_boot_timeout: bool = False
     # HD-new-2: quarantine on ``Unavailable`` too?  "never" is the recommendation.
     quarantine_unavailable: Literal["never", "after_t_retry", "after_s"] = "never"
     quarantine_unavailable_after_s: _DcSeconds = 86_400.0

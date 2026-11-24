@@ -110,3 +110,55 @@ def QuarantineAccessSpy() -> Iterator[list[str]]:
         os.open = real_os_open
         os.scandir = real_scandir
         os.listdir = real_listdir
+
+
+# ---------------------------------------------------------------- DC-5 kit
+
+import threading  # noqa: E402
+import time  # noqa: E402
+
+from suzka.api.supervisor import Timebase  # noqa: E402
+
+
+class FakeTimebase(Timebase):
+    """Virtual time for the supervisor tests: a bounded wait advances the
+    virtual clock instead of sleeping (a few real milliseconds per virtual
+    minute).  An UNBOUNDED wait never advances it, so a parked supervisor does
+    not make time run away.  ``sleep`` is for the scripted cycles, so that a
+    "140 second teardown" is virtual too."""
+
+    def __init__(self, step: float = 0.5, tick: float = 0.0005) -> None:
+        self._lock = threading.Lock()
+        self._t = 1000.0
+        self._step = step
+        self._tick = tick
+
+    def now(self) -> float:
+        with self._lock:
+            return self._t
+
+    def _advance(self) -> None:
+        with self._lock:
+            self._t += self._step
+
+    def sleep(self, seconds: float) -> None:
+        end = self.now() + seconds
+        while self.now() < end:
+            time.sleep(self._tick)
+            self._advance()
+
+    def wait_for(  # type: ignore[override]
+        self,
+        condition: threading.Condition,
+        predicate: Any,
+        timeout: float | None,
+    ) -> bool:
+        end = None if timeout is None else self.now() + timeout
+        while True:
+            if predicate():
+                return True
+            if end is not None and self.now() >= end:
+                return False
+            condition.wait(self._tick)
+            if end is not None:
+                self._advance()

@@ -94,6 +94,23 @@ class TransformersProvider:
             outputs = self.model(**full_inputs, labels=labels)
         return float(outputs.loss.detach().cpu().item())
 
+    def release(self) -> None:
+        """Drop the model and processor and give the GPU cache back (F15 DC-5:
+        the supervisor releases a provider that served before it builds a new
+        one, so two models are not alive during the new load).  The provider is
+        unusable afterwards.  Not exercised on a real GPU in the tests."""
+
+        self.model = None
+        self.processor = None
+        import gc
+
+        gc.collect()
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     def get_model(self) -> Any:
         return self.model
 

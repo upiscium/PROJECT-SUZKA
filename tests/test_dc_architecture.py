@@ -15,9 +15,10 @@ PACKAGE = ROOT / "suzka"
 MODULE = PACKAGE / "runtime" / "degraded_continuation.py"
 
 # Modules that import the primitives.  Inert in DC-1: only the health routes.
-IMPORTERS_OF_PRIMITIVES = {"suzka/api/server.py"}
-# Modules that read ``settings.degraded_continuation``.  None in DC-1.
-READERS_OF_SETTINGS: set[str] = set()
+IMPORTERS_OF_PRIMITIVES = {"suzka/api/server.py", "suzka/api/supervisor.py"}
+# Modules that read ``settings.degraded_continuation``: create_app (DC-5: it
+# chooses the supervised lifespan with ``mode``).
+READERS_OF_SETTINGS: set[str] = {"suzka/api/server.py"}
 
 
 def _tree(path: Path) -> ast.Module:
@@ -258,6 +259,9 @@ def test_every_thread_site_is_covered_by_the_termination_proof() -> None:
         )
         if count:
             sites[path.relative_to(ROOT).as_posix()] = count
+    # DC-5: the supervisor's own control / cycle threads are proven by the
+    # cycle-thread check of the proof itself, not by a ``threads_alive`` owner.
+    sites.pop("suzka/api/supervisor.py", None)
     assert set(sites) == {
         "suzka/runtime/agent_runtime.py",
         "suzka/runtime/emotion_timer.py",

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import uuid
 import ast
 import importlib.util
 import os
@@ -38,7 +39,7 @@ def test_refuses_a_root_outside_the_base(r20_base: Path, tmp_path: Path) -> None
     other = tmp_path / "elsewhere" / "run"
     assert refusal_code(guards.check_root_location, other, r20_base) == "ROOT_OUTSIDE_BASE"
     # ``..`` cannot climb out of the base either.
-    assert refusal_code(guards.check_root_location, r20_base / ".." / "x", r20_base) == "ROOT_OUTSIDE_BASE"
+    assert refusal_code(guards.check_root_location, r20_base / ".." / f"outside-{uuid.uuid4().hex}", r20_base) == "ROOT_OUTSIDE_BASE"
 
 
 @pytest.mark.parametrize("path", ["/opt/project-suzka/x", "/var/lib/suzka/run", "/etc/suzka/sub"])
