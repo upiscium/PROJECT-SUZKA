@@ -1,5 +1,5 @@
 """R20 S0: the COMPROMISED, experiment-side-only S1 / S2 reply normalisation (HD-23, a').
-No model, no process: the chat route is replaced with fixed replies."""
+Pure function tests; the model-call-layer wiring is in test_r20_normalizing_provider.py."""
 
 from __future__ import annotations
 
@@ -9,11 +9,9 @@ from typing import Any
 
 import pytest
 from r20_ip23_helpers import make_cache, make_prereg
-from test_r20_ip23a_drivers import _answering, real_context, scripted
 
 from experiments.r15_p1.protocol import parse_candidate
 from experiments.r20 import prereg
-from experiments.r20.guards import GuardRefusal
 from experiments.r20.report import build_report
 from experiments.r20.reply_normalizer import normalize_reply
 
@@ -77,50 +75,12 @@ def test_a_canonical_reply_is_byte_identical_and_records_nothing() -> None:
     assert normalize_reply("whatever", None) == ("whatever", [])
 
 
-def _five(s1: str, s2: str) -> list[str]:
-    return ["setup reply", "E reply", s1, "E2 reply", s2]
-
-
-def test_session_records_names_only_and_keeps_raw_in_the_private_turns_file(r20_base: Path) -> None:
-    session = real_context(r20_base, gpu_check=lambda: None).new_session("S0", stage="G1")
-    s1_raw = "```json\n" + json.dumps(_good("S1", FREE)) + "\n```"
-    s2_raw = json.dumps(_good("S2", FREE))
-    _answering(session, _five(s1_raw, s2_raw))
-    session.review = lambda stage: {"stage": stage}  # type: ignore[method-assign]
-    session.run_r15_protocol()
-    assert session.reply_normalizations == {
-        "S1": ["fence_stripped", "evidence_steps_replaced"], "S2": ["evidence_steps_replaced"],
-    }
-    rows = [json.loads(line) for line in (session.capture_dir / "p1.turns.jsonl").read_text().splitlines()]
-    assert rows[2]["response"] == s1_raw and rows[2]["normalizations"] == ["fence_stripped", "evidence_steps_replaced"]
-    assert rows[4]["response"] == s2_raw and rows[0]["normalizations"] == []
-    from experiments.r20.drivers import measurements
-
-    recorded = json.dumps(measurements(session)["reply_normalizations"])
-    assert "I looked at E" not in recorded and "fence_stripped" in recorded
-    for path in session.subject.evidence_dir.rglob("*"):
-        if path.is_file():
-            assert "Finally I answered" not in path.read_text(errors="ignore")
-
-
-def test_dry_run_path_normalises_and_unparseable_still_refuses(r20_base: Path) -> None:
-    plain = scripted(r20_base).new_session("S0", stage="G1")
-    _answering(plain, _five(json.dumps(_good("S1", FREE)), json.dumps(_good("S2", FREE))))
-    plain.review = lambda stage: {}  # type: ignore[method-assign]
-    plain.run_r15_protocol()
-    assert plain.reply_normalizations["S1"] == ["evidence_steps_replaced"]
-    assert not list(plain.subject.run_dir.rglob("p1.turns.jsonl"))
-    bad = scripted(r20_base).new_session("S0", stage="G1")
-    _answering(bad, _five("```json\n{}\n```", "x"))
-    bad.review = lambda stage: {}  # type: ignore[method-assign]
-    with pytest.raises(GuardRefusal) as refused:
-        bad.run_r15_protocol()
-    assert refused.value.code == "P1_PROTOCOL_REFUSED" and bad.reply_normalizations["S1"] == []
-
-
 def test_the_compromise_is_in_not_claimed_and_in_the_report(tmp_path: Path) -> None:
     assert "COMPROMISE (HD-23, a')" in prereg.NOT_CLAIMED
     assert "evidence enumeration is NOT measured" in prereg.NOT_CLAIMED
+    assert "model-call layer BEFORE the subject stores" in prereg.NOT_CLAIMED
+    assert "subject's memory holds the normalised text" in prereg.NOT_CLAIMED
+    assert "private 0600 file" in prereg.NOT_CLAIMED
     base = tmp_path / "base"
     make_prereg(base, make_cache(tmp_path / "hf"))
     assert "COMPROMISE (HD-23, a')" in build_report(base)

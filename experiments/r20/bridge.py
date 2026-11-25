@@ -28,6 +28,26 @@ class BridgeRefused(Exception):
     """A closed reason; the bridge never admits on a mismatch."""
 
 
+DETAIL_MAX = 200
+
+
+def root_cause(error: BaseException) -> str:
+    """``ClassName: message`` of the innermost cause, at most ``DETAIL_MAX`` characters.
+
+    The source gate's and the owner's refusal messages are coarse by contract (no transcript, path
+    or id), so the class name and message are safe to report; the run no longer fails silently.
+    """
+
+    seen: set[int] = set()
+    while id(error) not in seen:
+        seen.add(id(error))
+        nxt = error.__cause__ if error.__cause__ is not None else error.__context__
+        if nxt is None:
+            break
+        error = nxt
+    return f"{type(error).__name__}: {error}"[:DETAIL_MAX]
+
+
 def committed_chat_turns(state: Any) -> list[QualifiedTurnRef]:
     """The committed CHAT turns, in processing order."""
 
@@ -63,7 +83,12 @@ def review(state: Any, stage: str, timeout_s: float = TIMEOUT_S) -> dict[str, ob
         AgentEventSource.RUNTIME_NARRATIVE_REVIEW,
         lambda: owner._review_committed_turns(tuple(refs)),
     )
-    result = future.result(timeout=timeout_s).value
+    try:
+        result = future.result(timeout=timeout_s).value
+    except TimeoutError:
+        raise
+    except Exception as error:
+        raise BridgeRefused(f"REVIEW_FAILED: {root_cause(error)}") from error
     return {
         "stage": stage,
         "changed": bool(result.changed),
