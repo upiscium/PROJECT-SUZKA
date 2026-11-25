@@ -85,7 +85,10 @@ NOT_CLAIMED = (
     "COMPROMISE (HD-23, a, retry): an S1/S2 reply that is still not acceptable after that normalisation is regenerated "
     "from the same request, up to 3 attempts in total (reply_attempts_max); the number of attempts per phase is reported "
     "(numbers only); the stored text is the first acceptable attempt (normalised as before), or the last attempt when "
-    "none is acceptable (the P1 / R15 refusal then fires); no other repair is applied."
+    "none is acceptable (the P1 / R15 refusal then fires); no other repair is applied. "
+    "COMPROMISE (HD-23, E retry): the E reply is regenerated the same way (up to 3 attempts, no normalisation); the "
+    "stored original answer E is the first attempt whose prior-referent set is exactly one option, so this selects E, "
+    "and the effect of that selection on S1-versus-E comparisons is NOT claimed away; its attempts are reported."
 )
 STOP_RULES = (
     "free GPU below the minimum; a turn longer than the turn cap; 3 consecutive INFRA failures; a guard refusal; a "

@@ -49,11 +49,11 @@ def test_end_to_end_a_raw_fenced_free_evidence_reply_passes_the_production_sourc
         session.stop()
     assert reviews["S1"]["changed"] is True and reviews["S2"]["changed"] is True
     assert session.reply_normalizations == {
-        "S1": ["fence_stripped", "evidence_steps_replaced"], "S2": ["fence_stripped", "evidence_steps_replaced"],
+        "E": [], "S1": ["fence_stripped", "evidence_steps_replaced"], "S2": ["fence_stripped", "evidence_steps_replaced"],
     }
     private = session.subject.run_dir / "private"
     raw_rows = [json.loads(line) for line in (private / RAW_NAME).read_text().splitlines()]
-    assert [row["phase"] for row in raw_rows] == ["S1", "S2"] and raw_rows[0]["raw"] == _raw_script()[2]
+    assert [row["phase"] for row in raw_rows] == ["E", "S1", "S2"] and raw_rows[1]["raw"] == _raw_script()[2]
     for name in (RAW_NAME, NAMES_NAME):
         assert stat.S_IMODE((private / name).stat().st_mode) == 0o600
     assert "I looked at E" not in (private / NAMES_NAME).read_text()
