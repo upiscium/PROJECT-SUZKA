@@ -207,6 +207,7 @@ def measurements(session: S0Session) -> dict[str, Any]:
         "serving_after_s": None if session.serving_after_s is None else round(session.serving_after_s, 2),
         "turn_seconds": list(session.turn_seconds),
         "max_turn_seconds": max(session.turn_seconds, default=0.0),
+        "reply_normalizations": {phase: list(names) for phase, names in session.reply_normalizations.items()},
         "gpu": gpu,
         "packages": package_versions() if session.real else {},
     }
