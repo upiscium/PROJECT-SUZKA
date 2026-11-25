@@ -208,6 +208,7 @@ def measurements(session: S0Session) -> dict[str, Any]:
         "turn_seconds": list(session.turn_seconds),
         "max_turn_seconds": max(session.turn_seconds, default=0.0),
         "reply_normalizations": {phase: list(names) for phase, names in session.reply_normalizations.items()},
+        "reply_attempts": {phase: dict(row) for phase, row in session.reply_attempts.items()},
         "gpu": gpu,
         "packages": package_versions() if session.real else {},
     }

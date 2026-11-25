@@ -35,6 +35,7 @@ from experiments.r20.f1_table import (
 )
 from experiments.r20.guards import GuardRefusal, repo_root
 from experiments.r20.model_config import ModelOverride
+from experiments.r20.normalizing_provider import REPLY_ATTEMPTS_MAX
 
 PREREG_NAME = "preregistration.json"
 HASH_NAME = "preregistration.sha256"
@@ -80,7 +81,11 @@ NOT_CLAIMED = (
     "them (code-fence stripped; evidence_steps replaced by the fixed expected list); the subject's memory holds the "
     "normalised text, and the model's literal text is kept only in a private 0600 file; the model's own evidence "
     "enumeration is NOT measured; assumed_referent / assessment / uncertainty / rationale are the model's own. "
-    "Reports list which normalisations were applied (names only)."
+    "Reports list which normalisations were applied (names only). "
+    "COMPROMISE (HD-23, a, retry): an S1/S2 reply that is still not acceptable after that normalisation is regenerated "
+    "from the same request, up to 3 attempts in total (reply_attempts_max); the number of attempts per phase is reported "
+    "(numbers only); the stored text is the first acceptable attempt (normalised as before), or the last attempt when "
+    "none is acceptable (the P1 / R15 refusal then fires); no other repair is applied."
 )
 STOP_RULES = (
     "free GPU below the minimum; a turn longer than the turn cap; 3 consecutive INFRA failures; a guard refusal; a "
@@ -88,7 +93,7 @@ STOP_RULES = (
 )
 REQUIRED_KEYS = (
     "schema", "created_utc", "git_head", "model", "config_template_sha256", "request_templates_sha256",
-    "fixtures", "s0", "s1", "f1", "caps", "stop_rules", "known_violations", "not_claimed",
+    "fixtures", "s0", "s1", "f1", "caps", "stop_rules", "known_violations", "reply_attempts_max", "not_claimed",
 )
 
 
@@ -221,6 +226,7 @@ def build_content(
         "caps": caps.record(),
         "stop_rules": STOP_RULES,
         "known_violations": known_violations_section(),
+        "reply_attempts_max": REPLY_ATTEMPTS_MAX,
         "not_claimed": NOT_CLAIMED,
     }
 
