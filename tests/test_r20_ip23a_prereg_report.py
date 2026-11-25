@@ -9,12 +9,11 @@ from pathlib import Path
 import stat
 
 import pytest
-from r20_ip23_helpers import FOUR, MODEL_ID, REVISION, make_cache, make_prereg, real_model, refusal_code
+from r20_ip23_helpers import MODEL_ID, REVISION, make_cache, make_prereg, real_model, refusal_code
 
 from experiments.r20 import f_matrix, prereg
 from experiments.r20.caps import Caps
 from experiments.r20.f1_table import F1_PREREGISTRATION_TEXT
-from experiments.r20.guards import GuardRefusal
 from experiments.r20.report import (
     LABELS,
     STAGE_JUDGEMENT,
@@ -70,28 +69,15 @@ def test_the_record_holds_what_the_plan_says(tmp_path: Path) -> None:
     known = content["known_violations"]
     assert [case["case"] for case in known["f_matrix"]] == list(f_matrix.EXPECTED_CASES)  # type: ignore[index]
     assert {item["label"] for item in known["f15_known_violations"]} == {"NOT_COVERED_KNOWN_VIOLATION"}  # type: ignore[index]
-    assert known["four_unlisted_known_violations"] == FOUR  # type: ignore[index]
+    assert "four_unlisted_known_violations" not in known  # type: ignore[operator]
     assert "TRANSITIONAL" in known["f14_transitional"] and "partial" in known["f12_partial_coverage"]  # type: ignore[index]
     assert "no R20 Stage result" in content["not_claimed"]  # type: ignore[operator]
 
 
-def test_the_humans_four_unlisted_known_violations_are_required(tmp_path: Path) -> None:
-    for bad in ([], FOUR[:3], [*FOUR[:3], "TODO"], [*FOUR[:3], FOUR[0]], [*FOUR[:3], "tbd"], [*FOUR, "a fifth one of them"],
-                [*FOUR[:3], "short"]):
-        with pytest.raises(GuardRefusal) as refused:
-            prereg.build_content(git_head="a" * 40, model=real_model(), caps=Caps(), four_violations=bad, master_seed=1,
-                                 trial_id="t")
-        assert refused.value.code == "FOUR_KNOWN_VIOLATIONS_REQUIRED"
-        if len(bad) != 4:
-            continue
-        assert "V1" in refused.value.detail  # the agent's candidates are offered to choose from, never filled in
+def test_an_incomplete_preregistration_is_refused(tmp_path: Path) -> None:
     base = tmp_path / "base"
     base.mkdir()
     content, _ = make_prereg(tmp_path / "ok", make_cache(tmp_path / "hf"))
-    broken = json.loads(json.dumps(content))
-    broken["known_violations"]["four_unlisted_known_violations"] = []
-    assert refusal_code(prereg.create, base, broken) == "FOUR_KNOWN_VIOLATIONS_REQUIRED"
-    assert not (base / prereg.PREREG_NAME).exists()
     incomplete = {key: value for key, value in content.items() if key != "caps"}
     assert refusal_code(prereg.create, base, incomplete) == "PREREG_INCOMPLETE"
 
@@ -151,9 +137,7 @@ def test_the_report_shows_the_runs_the_labels_and_the_known_violations(tmp_path:
     assert "S0: reached" in text and "GATE_PASSED" in text and "PARTIAL_VALID_EVIDENCE" in text
     for case in f_matrix.EXPECTED_CASES:
         assert case in text
-    assert "NOT_COVERED_KNOWN_VIOLATION" in text and "KV-JOURNAL" in text and "Four unlisted known violations" in text
-    for item in FOUR:
-        assert item in text
+    assert "NOT_COVERED_KNOWN_VIOLATION" in text and "KV-JOURNAL" in text and "Four unlisted" not in text
     assert "COGNITIVE_VARIATION" in text and "HARNESS_BRIDGE" in text and "permanent core-store faults" in text
     assert "0 subjects started" in text
 
@@ -208,7 +192,7 @@ def test_a_stray_cognitive_variation_in_a_member_is_never_counted_as_one() -> No
     assert labelled["COGNITIVE_VARIATION"] == [] and any("unrecognised" in item for item in labelled["UNDETERMINED"])
 
 
-def test_the_lexical_guard_covers_generated_text_only(tmp_path: Path) -> None:
+def test_the_lexical_guard_exempts_only_the_known_violations_section(tmp_path: Path) -> None:
     from experiments.r20 import report
 
     assert report._FORBIDDEN.search("R20 passed all of it") and report._FORBIDDEN.search("the R20 stage succeeded")  # noqa: SLF001
@@ -218,11 +202,9 @@ def test_the_lexical_guard_covers_generated_text_only(tmp_path: Path) -> None:
     base.mkdir(mode=0o700)
     content = prereg.build_content(
         git_head="a" * 40, model=real_model(hf), caps=Caps(), master_seed=1, trial_id="t",
-        four_violations=[*FOUR[:3], "the Human's own line: a PASS in a fixture name does not break the report"],
     )
     prereg.create(base, content)
-    path = write_report(base)  # the Human's line contains PASS: only generated text is checked
-    assert "a PASS in a fixture name" in path.read_text()
+    assert write_report(base).is_file()  # the known-violations section (matrix status words) is exempt
 
 
 def test_the_report_target_is_never_a_followed_link_or_an_overwritten_file(tmp_path: Path) -> None:
@@ -243,7 +225,7 @@ def test_the_report_target_is_never_a_followed_link_or_an_overwritten_file(tmp_p
     assert refusal_code(write_report, base) == "REPORT_TARGET_IS_A_LINK" and victim.read_text() == "keep"
 
 
-def test_a_human_line_cannot_hide_a_generated_statement_and_the_ledger_is_labelled(tmp_path: Path) -> None:
+def test_a_generated_statement_outside_the_known_violations_section_is_always_checked_and_the_ledger_is_labelled(tmp_path: Path) -> None:
     from experiments.r20 import report
 
     base = tmp_path / "base"
@@ -254,7 +236,7 @@ def test_a_human_line_cannot_hide_a_generated_statement_and_the_ledger_is_labell
         for generated in ("R20 PASS", "the R20 stage will succeed", "R20 passed"):
             report.build_report = lambda _b, _l=None, g=generated: f"## Stage S0\n{g}\n\n## Known violations (x)\n- PASS\n\n## Not claimed\nfine\n"  # type: ignore[assignment]
             assert refusal_code(report.write_report, base, tmp_path / "x.md") == "REPORT_STATES_A_PASS"
-        report.build_report = lambda _b, _l=None: "## Stage S0\nfine\n\n## Known violations (x)\n- PASS the human's word\n\n## Not claimed\nfine\n"  # type: ignore[assignment]
+        report.build_report = lambda _b, _l=None: "## Stage S0\nfine\n\n## Known violations (x)\n- PASS (a matrix status word)\n\n## Not claimed\nfine\n"  # type: ignore[assignment]
         assert report.write_report(base, tmp_path / "ok.md").exists()  # only the known-violations section is exempt
         report.build_report = lambda _b, _l=None: "## Known violations (x)\n- PASS\n\n## Not claimed\nR20 PASS\n"  # type: ignore[assignment]
         assert refusal_code(report.write_report, base, tmp_path / "y.md") == "REPORT_STATES_A_PASS"  # a later section is still checked

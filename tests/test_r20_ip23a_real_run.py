@@ -18,7 +18,6 @@ from typing import Any
 
 import pytest
 from r20_ip23_helpers import (
-    FOUR,
     REVISION,
     FakeTerminal,
     make_cache,
@@ -352,7 +351,7 @@ def prereg_args(tmp_path: Path, name: str = "pb", *extra: str) -> Any:
 
 
 def create(tmp_path: Path, namespace: Any, terminal: FakeTerminal | None = None, **seams: Any) -> str:
-    attest = partial(_attest, terminal=terminal or FakeTerminal(lines=list(FOUR)), environ=seams.get("environ", {}),
+    attest = partial(_attest, terminal=terminal or FakeTerminal(), environ=seams.get("environ", {}),
                      ancestors=lambda: [])
     return real_run._create_prereg(namespace, attest=attest)  # noqa: SLF001
 
@@ -360,17 +359,17 @@ def create(tmp_path: Path, namespace: Any, terminal: FakeTerminal | None = None,
 def test_the_preregistration_is_the_humans_act_with_the_content_shown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(real_run.factory, "git_head", lambda: "a" * 40)
     monkeypatch.setattr(real_run.factory, "git_dirty", lambda: False)
-    terminal = FakeTerminal(lines=list(FOUR))
+    terminal = FakeTerminal()
     assert refusal_code(create, tmp_path, prereg_args(tmp_path, "pb0"), terminal) == "HUMAN_LAUNCH_FLAG_MISSING"
-    assert not (tmp_path / "pb0").exists() and terminal.lines == FOUR  # nothing was asked, nothing created
+    assert not (tmp_path / "pb0").exists() and terminal.prompts == []  # nothing was asked, nothing created
     args_ = prereg_args(tmp_path, "pb", "--human-launch")
     digest = create(tmp_path, args_, terminal)
     shown = terminal.prompts[-1]
-    for needed in ("example-org/example-12b-it", REVISION, "a" * 40, str(tmp_path / "hf"), *FOUR, '"max_subjects": 42'):
+    for needed in ("example-org/example-12b-it", REVISION, "a" * 40, str(tmp_path / "hf"), '"max_subjects": 42'):
         assert needed in shown  # the Human reads the content before confirming
     assert f"model revision {REVISION[:8]}" in shown and "STAGE PREREG" in shown
     assert prereg.load(tmp_path / "pb")[1] == digest
-    assert prereg.load(tmp_path / "pb")[0]["known_violations"]["four_unlisted_known_violations"] == FOUR  # typed, not from a file
+    assert "four_unlisted_known_violations" not in prereg.load(tmp_path / "pb")[0]["known_violations"]
     assert refusal_code(create, tmp_path, args_) == "PREREG_EXISTS"
 
 
@@ -379,10 +378,9 @@ def test_the_preregistration_refuses_a_bad_terminal_a_wrong_sentence_a_dirty_tre
     monkeypatch.setattr(real_run.factory, "git_head", lambda: "a" * 40)
     monkeypatch.setattr(real_run.factory, "git_dirty", lambda: False)
     namespace = prereg_args(tmp_path, "pc", "--human-launch")
-    assert refusal_code(create, tmp_path, namespace, FakeTerminal(tty=False, lines=list(FOUR))) == "NO_TTY"
-    assert refusal_code(create, tmp_path, namespace, FakeTerminal(answer="yes", lines=list(FOUR))) == "CONFIRMATION_MISMATCH"
-    assert refusal_code(create, tmp_path, namespace, FakeTerminal(lines=["x", "y", "z", "w"])) == "FOUR_KNOWN_VIOLATIONS_REQUIRED"
-    wrong_revision = FakeTerminal(answer=sentence("PREREG", "NEW"), lines=list(FOUR))  # without the revision: not the sentence
+    assert refusal_code(create, tmp_path, namespace, FakeTerminal(tty=False)) == "NO_TTY"
+    assert refusal_code(create, tmp_path, namespace, FakeTerminal(answer="yes")) == "CONFIRMATION_MISMATCH"
+    wrong_revision = FakeTerminal(answer=sentence("PREREG", "NEW"))  # without the revision: not the sentence
     assert refusal_code(create, tmp_path, namespace, wrong_revision) == "CONFIRMATION_MISMATCH"
     assert not (tmp_path / "pc").exists()
     monkeypatch.setattr(real_run.factory, "git_dirty", lambda: True)
@@ -390,7 +388,7 @@ def test_the_preregistration_refuses_a_bad_terminal_a_wrong_sentence_a_dirty_tre
     monkeypatch.setattr(real_run.factory, "git_dirty", lambda: False)
     monkeypatch.setattr(real_run.factory, "git_head", lambda: "unknown")
     assert refusal_code(create, tmp_path, namespace) == "GIT_HEAD_UNKNOWN"
-    assert refusal_code(prereg.build_content, git_head="unknown", model=real_model(), caps=Caps(), four_violations=FOUR,
+    assert refusal_code(prereg.build_content, git_head="unknown", model=real_model(), caps=Caps(),
                         master_seed=1, trial_id="t") == "GIT_HEAD_UNKNOWN"
     import argparse
 
@@ -559,6 +557,6 @@ def test_an_existing_preregistration_is_refused_before_the_human_is_asked_anythi
     monkeypatch.setattr(real_run.factory, "git_dirty", lambda: False)
     namespace = prereg_args(tmp_path, "pe", "--human-launch")
     create(tmp_path, namespace)
-    again = FakeTerminal(lines=list(FOUR))
+    again = FakeTerminal()
     assert refusal_code(create, tmp_path, namespace, again) == "PREREG_EXISTS"
-    assert again.prompts == [] and again.lines == FOUR
+    assert again.prompts == []

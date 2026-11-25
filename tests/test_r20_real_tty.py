@@ -30,12 +30,6 @@ if not sys.platform.startswith("linux"):  # pragma: no cover
     pytest.skip("needs Linux /dev/tty and /proc", allow_module_level=True)
 
 TIMEOUT = 40.0
-FOUR = [
-    "V1: authorized implies MATCH_SELF (D-R17), stated by the Human",
-    "HP-7 (a): a source change between claim and effect is accepted as a window",
-    "the R15 S1 / S2 trigger is the harness, not a product runtime",
-    "the ABANDON path does not exist (the H3 known limit)",
-]
 PROMPT_END = r"\r?\n> "
 SENTENCE = (PROMPT_END, r"(I AM THE HUMAN OPERATOR[^\r\n]*)\r?\n> ")
 
@@ -222,15 +216,14 @@ def prereg_argv(tmp: Path, revision: str) -> list[str]:
 def test_the_prereg_flow_runs_on_a_real_pty_and_records_the_preregistration(tmp_path: Path) -> None:
     source = make_source(tmp_path)
     revision = "0123456789abcdef0123456789abcdef01234567"
-    steps: list[tuple[str, str | bytes]] = [(rf"Known violation {index} of 4[^\r\n]*{PROMPT_END}", text) for index, text in enumerate(FOUR, 1)]
-    result = run_detached(prereg_argv(tmp_path, revision), tmp_path, mode="pty", steps=[*steps, (SENTENCE[1], "")],
+    result = run_detached(prereg_argv(tmp_path, revision), tmp_path, mode="pty", steps=[(SENTENCE[1], "")],
                           cwd=source, source=source)
     assert result.code == 0 and "Traceback" not in result.output, result.output
     base = tmp_path / "base"
     path = base / prereg.PREREG_NAME
     assert stat.S_IMODE(path.stat().st_mode) == 0o400
     content, digest = prereg.load(base)  # hash recorded and verified
-    assert content["known_violations"]["four_unlisted_known_violations"] == FOUR
+    assert "four_unlisted_known_violations" not in content["known_violations"]
     assert (base / prereg.HASH_NAME).read_text().strip() == digest
     assert digest in result.output and revision[:8] in result.output
 
@@ -245,7 +238,7 @@ def test_the_prereg_flow_refuses_cleanly_without_a_terminal_on_eof_and_on_ctrl_c
         work = tmp_path / name
         work.mkdir()
         argv = prereg_argv(work, revision)
-        result = run_detached(argv, work, mode="pty", steps=[(rf"Known violation 1 of 4[^\r\n]*{PROMPT_END}", key)],
+        result = run_detached(argv, work, mode="pty", steps=[(PROMPT_END, key)],
                               cwd=source, source=source)
         assert f"real_run refused: {code}" in result.output and result.code not in (0, None), result.output
         assert "Traceback" not in result.output and not (work / "base").exists()

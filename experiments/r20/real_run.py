@@ -4,7 +4,7 @@
 The Human's commands (on the lab host, in a real terminal; nothing here may be run by an agent):
 
     python -m experiments.r20.real_run prereg --base B --model-id ORG/NAME --hf-home H \
-        --model-revision <40-hex> --master-seed N --trial-id T --human-launch   # you type the four known violations
+        --model-revision <40-hex> --master-seed N --trial-id T --human-launch
     python -m experiments.r20.real_run run --base B --stage G1 --human-launch --ssh-host <ssh name of this host>
     python -m experiments.r20.real_run run --base B --stage S0 --human-launch --ssh-host <...>
     python -m experiments.r20.real_run run --base B --stage S1 --human-launch --ssh-host <...>
@@ -15,8 +15,8 @@ The Human's commands (on the lab host, in a real terminal; nothing here may be r
 
 Commands:
 
-* ``prereg``         create the immutable pre-registration: the same launch guard, the four known
-                     violations typed at the terminal, the whole content shown before you confirm;
+* ``prereg``         create the immutable pre-registration: the same launch guard, the whole content shown
+                     before you confirm;
 * ``run``            one stage (G1 / S0 / S1 / F1) with the real model: needs ``--human-launch``, a
                      terminal, the typed confirmation sentence, a free GPU, a pinned and cached model;
 * ``release-stage-b`` the Human's release of stage B (F1), same launch guard;
@@ -360,9 +360,8 @@ def release_stage_b(args: argparse.Namespace) -> Path:
 
 
 def _create_prereg(args: argparse.Namespace, *, attest: Attest) -> str:
-    """The pre-registration is the Human's act: ``--human-launch``, a terminal, the four known
-    violations typed at the terminal, the whole content shown, and a confirmation sentence that
-    carries the stage and the first 8 characters of the model revision."""
+    """The pre-registration is the Human's act: ``--human-launch``, a terminal, the whole content shown,
+    and a confirmation sentence that carries the stage and the first 8 characters of the model revision."""
 
     base = Path(args.base)
     check_not_production(base)  # BEFORE anything is created
@@ -378,23 +377,17 @@ def _create_prereg(args: argparse.Namespace, *, attest: Attest) -> str:
         hf_home=Path(args.hf_home), revision=args.model_revision,
     )
     assert model.revision is not None
-    typed: list[str] = []
-
-    def gather(terminal: Any) -> list[str]:
-        for index in range(1, 5):
-            typed.append(terminal.prompt(f"Known violation {index} of 4 (the Human's own words, one line)").strip())
-        prereg.check_four(typed)
+    def gather(_terminal: Any) -> list[str]:
         return [
             f"model id: {model.model_id}", f"hf_home: {model.hf_home}", f"revision: {model.revision}",
             f"git head: {head}", f"caps: {json.dumps(Caps().record(), sort_keys=True)}",
-            *[f"known violation {i}: {text}" for i, text in enumerate(typed, 1)],
         ]
 
     attest("PREREG", "NEW", human_flag=bool(args.human_launch), revision8=model.revision[:8], before_confirm=gather)
     base.mkdir(mode=0o700, parents=True, exist_ok=True)
     check_not_production(base)  # again, after the directory exists (a link planted meanwhile)
     content = prereg.build_content(
-        git_head=head, model=model, caps=Caps(), four_violations=typed, master_seed=args.master_seed, trial_id=args.trial_id,
+        git_head=head, model=model, caps=Caps(), master_seed=args.master_seed, trial_id=args.trial_id,
     )
     return prereg.create(base, content)
 

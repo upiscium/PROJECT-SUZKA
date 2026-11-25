@@ -14,19 +14,12 @@ from experiments.r20.model_config import ModelOverride, cache_dir_name
 
 REVISION = "0123456789abcdef0123456789abcdef01234567"
 MODEL_ID = "example-org/example-12b-it"
-FOUR = [
-    "V1: authorized implies MATCH_SELF (D-R17), stated by the Human",
-    "HP-7 (a): a source change between claim and effect is accepted as a window",
-    "the R15 S1 / S2 trigger is the harness, not a product runtime",
-    "the ABANDON path does not exist (the H3 known limit)",
-]
 
 
 class FakeTerminal:
     """A terminal that types ``answer`` (or the exact sentence)."""
 
-    def __init__(self, *, tty: bool = True, foreground: bool = True, answer: str | None = None, lines: list[str] | None = None):
-        self.lines = list(lines or [])
+    def __init__(self, *, tty: bool = True, foreground: bool = True, answer: str | None = None):
         self.tty = tty
         self.foreground = foreground
         self.answer = answer
@@ -40,8 +33,6 @@ class FakeTerminal:
 
     def prompt(self, text: str) -> str:
         self.prompts.append(text)
-        if text.startswith("Known violation"):
-            return self.lines.pop(0)
         if self.answer is not None:
             return self.answer
         # the Human reads the sentence off the screen and types it
@@ -78,7 +69,7 @@ def human_launch(stage: str = "S0", digest: str = "a" * 64) -> HumanLaunch:
 def make_prereg(base: Path, hf_home: Path, *, master_seed: int = 7) -> tuple[dict[str, object], str]:
     base.mkdir(mode=0o700, exist_ok=True)
     content = prereg.build_content(
-        git_head="a" * 40, model=real_model(hf_home), caps=Caps(), four_violations=FOUR, master_seed=master_seed,
+        git_head="a" * 40, model=real_model(hf_home), caps=Caps(), master_seed=master_seed,
         trial_id="trial-1",
     )
     digest = prereg.create(base, content)
