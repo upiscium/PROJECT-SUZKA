@@ -35,7 +35,7 @@ from experiments.r20.f1_table import (
 )
 from experiments.r20.guards import GuardRefusal, repo_root
 from experiments.r20.model_config import ModelOverride
-from experiments.r20.normalizing_provider import REPLY_ATTEMPTS_MAX
+from experiments.r20.normalizing_provider import E_ATTEMPTS_MAX, REPLY_ATTEMPTS_MAX
 from experiments.r20.provider import S0_TARGET
 
 PREREG_NAME = "preregistration.json"
@@ -87,9 +87,10 @@ NOT_CLAIMED = (
     "from the same request, up to 3 attempts in total (reply_attempts_max); the number of attempts per phase is reported "
     "(numbers only); the stored text is the first acceptable attempt (normalised as before), or the last attempt when "
     "none is acceptable (the P1 / R15 refusal then fires); no other repair is applied. "
-    "COMPROMISE (HD-23, E retry): the E reply is regenerated the same way (up to 3 attempts, no normalisation); the "
-    "stored original answer E is the first attempt whose prior-referent set is exactly one option, so this selects E, "
-    "and the effect of that selection on S1-versus-E comparisons is NOT claimed away; its attempts are reported. "
+    "COMPROMISE (HD-23, E retry): the E reply may be regenerated up to 6 times in total (e_reply_attempts_max), "
+    "S1/S2 up to 3 (reply_attempts_max); E gets no normalisation; the stored original answer E is the first attempt "
+    "whose prior-referent set is exactly one option, so this selects E; attempts per phase are reported (numbers "
+    "only); the effect of that selection on S1-versus-E comparisons is NOT claimed away. "
     "NOTE (HD-23, E2 target): the S0 case's announced referent (the E2 target) is fixed to A because the model's "
     "original choice was B in 6 of 6 observed real runs; a run whose original choice is A would be refused by the "
     "production gate (report does not differ from the original); this is a design adaptation to the model's "
@@ -101,7 +102,7 @@ STOP_RULES = (
 )
 REQUIRED_KEYS = (
     "schema", "created_utc", "git_head", "model", "config_template_sha256", "request_templates_sha256",
-    "fixtures", "s0", "s1", "f1", "caps", "stop_rules", "known_violations", "reply_attempts_max", "not_claimed",
+    "fixtures", "s0", "s1", "f1", "caps", "stop_rules", "known_violations", "reply_attempts_max", "e_reply_attempts_max", "not_claimed",
 )
 
 
@@ -234,7 +235,8 @@ def build_content(
         "caps": caps.record(),
         "stop_rules": STOP_RULES,
         "known_violations": known_violations_section(),
-        "reply_attempts_max": REPLY_ATTEMPTS_MAX,
+        "reply_attempts_max": REPLY_ATTEMPTS_MAX,  # S1 / S2 only
+        "e_reply_attempts_max": E_ATTEMPTS_MAX,  # E only
         "not_claimed": NOT_CLAIMED,
     }
 

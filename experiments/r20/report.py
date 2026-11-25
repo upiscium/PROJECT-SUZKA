@@ -28,6 +28,7 @@ from typing import Any
 
 from experiments.r20.caps import Ledger
 from experiments.r20.guards import GuardRefusal
+from experiments.r20.normalizing_provider import E_ATTEMPTS_MAX, REPLY_ATTEMPTS_MAX
 from experiments.r20.prereg import load
 
 AUTOMATIC = ("GATE_CONFORMANCE_DEFECT", "ENGINEERING_DEFECT")
@@ -122,7 +123,8 @@ def build_report(base: Path, ledger_path: Path | None = None) -> str:
             f"approval_actor={manifest.get('approval_actor')} admission_path={manifest.get('admission_path')} "
             f"prereg={str(manifest.get('preregistration_sha256'))[:12]} load_s={real.get('serving_after_s')} "
             f"reply_normalizations={json.dumps(real.get('reply_normalizations') or {}, sort_keys=True)} "
-            f"reply_attempts={json.dumps(real.get('reply_attempts') or {}, sort_keys=True)}"
+            f"reply_attempts={json.dumps(real.get('reply_attempts') or {}, sort_keys=True)} "
+            f"reply_attempts_max(S1/S2)={REPLY_ATTEMPTS_MAX} e_reply_attempts_max={E_ATTEMPTS_MAX}"
         )
     for result in results:
         stage = result.get("stage")

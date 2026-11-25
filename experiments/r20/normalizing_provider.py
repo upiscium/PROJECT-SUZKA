@@ -31,6 +31,8 @@ from experiments.r20.reply_normalizer import normalize_reply
 
 # HD-23 option (a): up to this many TOTAL attempts for one S1 / S2 request (COMPROMISE, preregistered).
 REPLY_ATTEMPTS_MAX = 3
+# HD-23 (E cap): the E reply (turn 2) alone may be regenerated up to this many TOTAL attempts (COMPROMISE, preregistered).
+E_ATTEMPTS_MAX = 6
 
 RAW_NAME = "p1.model_raw.jsonl"  # private: the model's literal text
 NAMES_NAME = "p1.model_names.jsonl"  # private too, but names only
@@ -135,13 +137,14 @@ class NormalizingProvider:
         return self._generate_chat if name == "generate_chat" else target
 
     def _finish(self, request_text: str, call: Callable[[], Any]) -> str:
-        """Call ``inner`` once, or (registered S1 / S2 / E only) up to ``REPLY_ATTEMPTS_MAX`` times."""
+        """Call ``inner`` once, or (registered S1 / S2 / E only) up to its cap times (E_ATTEMPTS_MAX for E)."""
 
         phase = registered_phase(request_text)
         if phase is None:
             return str(call())
         text, applied, accepted, attempts = "", [], False, 0
-        while attempts < REPLY_ATTEMPTS_MAX and not accepted:
+        cap = E_ATTEMPTS_MAX if phase == "E" else REPLY_ATTEMPTS_MAX  # E: 6, S1 / S2: 3
+        while attempts < cap and not accepted:
             attempts += 1
             raw = str(call())
             text, applied = (raw, []) if phase == "E" else normalize_reply(raw, phase)  # E: regenerate only
@@ -199,6 +202,6 @@ def read_attempts(private_dir: Path) -> dict[str, dict[str, Any]]:
 
 
 __all__ = [
-    "NAMES_NAME", "RAW_NAME", "REPLY_ATTEMPTS_MAX", "acceptable", "read_attempts", "S1_PREFIX", "S2_PREFIX", "NormalizingProvider", "read_names",
+    "E_ATTEMPTS_MAX", "NAMES_NAME", "RAW_NAME", "REPLY_ATTEMPTS_MAX", "acceptable", "read_attempts", "S1_PREFIX", "S2_PREFIX", "NormalizingProvider", "read_names",
     "registered_phase", "wrap_loader",
 ]

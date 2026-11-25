@@ -18,7 +18,7 @@ from experiments.r15_p0.pilot import Case
 from experiments.r20 import drivers
 from experiments.r20.guards import GuardRefusal
 from experiments.r20.normalizing_provider import (
-    E_REQUEST, NAMES_NAME, RAW_NAME, REPLY_ATTEMPTS_MAX, NormalizingProvider, acceptable, read_attempts, read_names,
+    E_ATTEMPTS_MAX, E_REQUEST, NAMES_NAME, RAW_NAME, REPLY_ATTEMPTS_MAX, NormalizingProvider, acceptable, read_attempts, read_names,
     registered_phase,
 )
 from suzka.persona.prompt_builder import CURRENT_MESSAGE_HEADING
@@ -66,8 +66,8 @@ def _rows(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-def test_the_attempt_limit_is_three() -> None:
-    assert REPLY_ATTEMPTS_MAX == 3
+def test_the_attempt_limits_are_three_for_s1_s2_and_six_for_e() -> None:
+    assert REPLY_ATTEMPTS_MAX == 3 and E_ATTEMPTS_MAX == 6
 
 
 def test_second_attempt_is_accepted_and_both_literal_texts_stay_private(tmp_path: Path) -> None:
@@ -117,7 +117,7 @@ def test_unregistered_requests_are_never_retried_nor_recorded(tmp_path: Path) ->
 
 
 def test_the_prereg_states_the_retry_compromise_in_words() -> None:
-    assert "up to 3 attempts in total" in NOT_CLAIMED and "number of attempts per phase" in NOT_CLAIMED
+    assert "up to 3 attempts in total (reply_attempts_max)" in NOT_CLAIMED and "number of attempts per phase" in NOT_CLAIMED
 
 
 # ---------------------------------------------- the harness check agrees with the production gate
@@ -227,12 +227,31 @@ def test_e_second_attempt_is_accepted_and_raw_is_private_only(tmp_path: Path) ->
     assert E_BOTH not in (tmp_path / NAMES_NAME).read_text()
 
 
-def test_e_all_three_bad_returns_the_last_unchanged(tmp_path: Path) -> None:
-    replies = [E_BOTH, "どちらも選びません", E_BOTH + "!"]
+def test_e_all_six_bad_returns_the_last_unchanged_with_no_seventh_call(tmp_path: Path) -> None:
+    replies = [E_BOTH, "どちらも選びません", E_BOTH + "!", E_BOTH + "?", "なし", E_BOTH + "。"]
     inner = _ScriptedChat(replies + [E_ONLY_B])
     text = NormalizingProvider(inner, tmp_path).generate_chat("system", E_REQUEST)
-    assert inner.calls == 3 and text == replies[-1]
-    assert read_attempts(tmp_path) == {"E": {"attempts": 3, "accepted": False}}
+    assert inner.calls == 6 and text == replies[-1]
+    assert read_attempts(tmp_path) == {"E": {"attempts": 6, "accepted": False}}
+    assert [row["attempt"] for row in _rows(tmp_path / RAW_NAME)] == [1, 2, 3, 4, 5, 6]
+
+
+def test_e_accepted_on_the_fifth_attempt_stores_attempts_five(tmp_path: Path) -> None:
+    inner = _Scripted([E_BOTH] * 4 + [E_ONLY_B, E_BOTH])
+    text = NormalizingProvider(inner, tmp_path).generate(E_REQUEST)
+    assert inner.calls == 5 and text == E_ONLY_B
+    assert read_attempts(tmp_path) == {"E": {"attempts": 5, "accepted": True}}
+
+
+def test_s1_s2_stop_at_three_even_though_e_allows_six(tmp_path: Path) -> None:
+    inner = _Scripted([_trailing_comma("S1", "B")] * 6)
+    NormalizingProvider(inner, tmp_path).generate(s1_request("q", "a"))
+    assert inner.calls == 3
+    other = tmp_path / "s2"
+    other.mkdir()
+    inner2 = _Scripted(["not json"] * 6)
+    NormalizingProvider(inner2, other).generate(s2_request(r15_answer("S1", "A"), "q", "a", e2_input="e"))
+    assert inner2.calls == 3
 
 
 def test_e_first_good_makes_one_call_and_other_turns_are_never_retried(tmp_path: Path) -> None:
@@ -249,6 +268,14 @@ def test_e_first_good_makes_one_call_and_other_turns_are_never_retried(tmp_path:
 
 def test_the_prereg_states_the_e_retry_compromise() -> None:
     assert "E retry" in NOT_CLAIMED and "exactly one option" in NOT_CLAIMED and "NOT claimed away" in NOT_CLAIMED
+    assert "up to 6 times in total (e_reply_attempts_max)" in NOT_CLAIMED
+    assert "S1/S2 up to 3 (reply_attempts_max)" in NOT_CLAIMED and "attempts per phase are reported" in NOT_CLAIMED
+
+
+def test_the_prereg_records_both_caps_and_requires_the_e_key() -> None:
+    from experiments.r20.prereg import REQUIRED_KEYS
+
+    assert "e_reply_attempts_max" in REQUIRED_KEYS and "reply_attempts_max" in REQUIRED_KEYS
 
 
 def test_end_to_end_a_first_e_reply_naming_a_and_b_is_regenerated_and_reviewed(r20_base: Path) -> None:
