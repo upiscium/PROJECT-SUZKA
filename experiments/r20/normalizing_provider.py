@@ -23,6 +23,9 @@ from typing import Any
 from suzka.persona.prompt_builder import CURRENT_MESSAGE_HEADING
 from suzka.r15.request_templates import s1_request, s2_request
 
+from suzka.r15.qualified_proposal import prior_referents  # PUBLIC: the production gate's own referent reader
+
+from experiments.r15_p0.pilot import Case
 from experiments.r15_p1.protocol import parse_candidate
 from experiments.r20.reply_normalizer import normalize_reply
 
@@ -51,16 +54,32 @@ S2_PREFIX = _common_prefix(
     s2_request("a", "b", "c", e2_input="d"), s2_request("e", "f", "g", e2_input="h")
 )
 _USER_TURN = "\nUser: "
+_COMPLETION_CUE = "\nAssistant:"
+# The P1 protocol's second prompt (the E turn), from the pilot's own builder.  Its text does not depend on the
+# case id / run id (only target / lane / variant / control), so the S0 case's E text is the registered one.
+E_REQUEST = Case("r20-e-detect", "B", "forced", 0, "normal").prompts()["E"]
+
+
+def _is_current_e(text: str) -> bool:
+    """Exact match of the CURRENT message with the E prompt (the last thing in ``text``)."""
+
+    body = text.removesuffix(_COMPLETION_CUE)  # the built prompt ends "User: <message>\nAssistant:"
+    if not body.endswith(E_REQUEST):
+        return False
+    before = body[: len(body) - len(E_REQUEST)]
+    return before == "" or before.endswith(("\n", ": "))
 
 
 def registered_phase(text: str) -> str | None:
-    """``"S1"`` / ``"S2"`` when the CURRENT message of ``text`` is a registered request.
+    """``"S1"`` / ``"S2"`` / ``"E"`` when the CURRENT message of ``text`` is a registered request.
 
     ``text`` is the built prompt (``generate``) or the user part (``generate_chat``); the current
     message is the last thing in it.  A registered request that only sits in an earlier memory line
     (before the current message) does not count.
     """
 
+    if _is_current_e(text):
+        return "E"
     best: tuple[int, str] | None = None
     for phase, prefix in (("S1", S1_PREFIX), ("S2", S2_PREFIX)):
         index = text.rfind(prefix)
@@ -82,6 +101,8 @@ def acceptable(text: str, phase: str) -> bool:
     ``tests/test_r20_reply_retry.py`` asserts that both agree on a sample set.
     """
 
+    if phase == "E":  # exactly one prior referent, read by the production gate's public function
+        return len(prior_referents(text)) == 1
     try:
         parse_candidate(text, phase=phase, has_reveal=phase == "S2")
     except ValueError:  # TrialRefused is a ValueError
@@ -114,7 +135,7 @@ class NormalizingProvider:
         return self._generate_chat if name == "generate_chat" else target
 
     def _finish(self, request_text: str, call: Callable[[], Any]) -> str:
-        """Call ``inner`` once, or (registered S1 / S2 only) up to ``REPLY_ATTEMPTS_MAX`` times."""
+        """Call ``inner`` once, or (registered S1 / S2 / E only) up to ``REPLY_ATTEMPTS_MAX`` times."""
 
         phase = registered_phase(request_text)
         if phase is None:
@@ -123,7 +144,7 @@ class NormalizingProvider:
         while attempts < REPLY_ATTEMPTS_MAX and not accepted:
             attempts += 1
             raw = str(call())
-            text, applied = normalize_reply(raw, phase)
+            text, applied = (raw, []) if phase == "E" else normalize_reply(raw, phase)  # E: regenerate only
             accepted = acceptable(text, phase)
             with self._lock:
                 _append(

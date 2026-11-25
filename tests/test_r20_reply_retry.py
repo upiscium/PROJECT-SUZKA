@@ -14,10 +14,14 @@ from typing import Any
 import pytest
 from test_r20_ip23a_drivers import scripted
 
+from experiments.r15_p0.pilot import Case
+from experiments.r20 import drivers
 from experiments.r20.guards import GuardRefusal
 from experiments.r20.normalizing_provider import (
-    NAMES_NAME, RAW_NAME, REPLY_ATTEMPTS_MAX, NormalizingProvider, acceptable, read_attempts, read_names,
+    E_REQUEST, NAMES_NAME, RAW_NAME, REPLY_ATTEMPTS_MAX, NormalizingProvider, acceptable, read_attempts, read_names,
+    registered_phase,
 )
+from suzka.persona.prompt_builder import CURRENT_MESSAGE_HEADING
 from experiments.r20.prereg import NOT_CLAIMED
 from experiments.r20.provider import r15_answer, r15_protocol_script
 from suzka.r15.qualified_proposal import QualifiedProposalUnavailable, _parse_candidate  # private; test-side only
@@ -167,12 +171,12 @@ def test_end_to_end_a_first_unparseable_s1_reply_is_regenerated_and_reviewed(r20
     finally:
         session.stop()
     assert reviews["S1"]["changed"] is True and reviews["S2"]["changed"] is True
-    assert session.reply_attempts == {"S1": {"attempts": 2, "accepted": True}, "S2": {"attempts": 1, "accepted": True}}
+    assert session.reply_attempts == {"E": {"attempts": 1, "accepted": True}, "S1": {"attempts": 2, "accepted": True}, "S2": {"attempts": 1, "accepted": True}}
     assert session.reply_normalizations["S1"] == ["fence_stripped", "evidence_steps_replaced"]
     private = session.subject.run_dir / "private"
     raw = _rows(private / RAW_NAME)
-    assert [(row["phase"], row["attempt"]) for row in raw] == [("S1", 1), ("S1", 2), ("S2", 1)]
-    assert raw[0]["raw"] == _retry_script()[2]
+    assert [(row["phase"], row["attempt"]) for row in raw] == [("E", 1), ("S1", 1), ("S1", 2), ("S2", 1)]
+    assert raw[1]["raw"] == _retry_script()[2]
     for path in session.subject.evidence_dir.rglob("*"):
         if path.is_file():
             assert "I looked at E" not in path.read_text(errors="ignore")
@@ -194,4 +198,76 @@ def test_end_to_end_three_unparseable_s1_replies_still_end_in_the_p1_refusal(r20
         session.stop()
     assert refused.value.code == "P1_PROTOCOL_REFUSED"
     assert session.reply_attempts["S1"] == {"attempts": 3, "accepted": False}
+
+
+# ---------------------------------------------- HD-23 E retry: the stored E has exactly one prior referent
+
+E_BOTH = "前の案（案A）を比較します。案Bを暫定的に選びました。"
+E_ONLY_B = "元の回答では案Bを暫定的に選びました"
+
+
+def test_the_e_request_does_not_depend_on_the_run_id() -> None:
+    assert Case("r20-other-run", "B", "forced", 0, "normal").prompts()["E"] == E_REQUEST
+    assert registered_phase(E_REQUEST) == "E"
+    assert registered_phase(f"memory\n\n{CURRENT_MESSAGE_HEADING}\n{E_REQUEST}") == "E"
+    assert registered_phase(f"User: {E_REQUEST}\nAssistant: x\n\n{CURRENT_MESSAGE_HEADING}\nhello") is None
+    assert registered_phase(E_REQUEST + " extra") is None
+    assert registered_phase(f"memory\n\nUser: {E_REQUEST}\nAssistant:") == "E"  # the built-prompt (generate) shape
+
+
+def test_e_second_attempt_is_accepted_and_raw_is_private_only(tmp_path: Path) -> None:
+    inner = _Scripted([E_BOTH, E_ONLY_B, E_BOTH])
+    text = NormalizingProvider(inner, tmp_path).generate(E_REQUEST)
+    assert inner.calls == 2 and text == E_ONLY_B
+    raw = _rows(tmp_path / RAW_NAME)
+    assert [(r["phase"], r["attempt"], r["raw"], r["accepted"]) for r in raw] == [
+        ("E", 1, E_BOTH, False), ("E", 2, E_ONLY_B, True)]
+    assert read_attempts(tmp_path) == {"E": {"attempts": 2, "accepted": True}}
+    assert read_names(tmp_path) == {"E": []}
+    assert E_BOTH not in (tmp_path / NAMES_NAME).read_text()
+
+
+def test_e_all_three_bad_returns_the_last_unchanged(tmp_path: Path) -> None:
+    replies = [E_BOTH, "どちらも選びません", E_BOTH + "!"]
+    inner = _ScriptedChat(replies + [E_ONLY_B])
+    text = NormalizingProvider(inner, tmp_path).generate_chat("system", E_REQUEST)
+    assert inner.calls == 3 and text == replies[-1]
+    assert read_attempts(tmp_path) == {"E": {"attempts": 3, "accepted": False}}
+
+
+def test_e_first_good_makes_one_call_and_other_turns_are_never_retried(tmp_path: Path) -> None:
+    inner = _Scripted([E_ONLY_B])
+    NormalizingProvider(inner, tmp_path).generate(E_REQUEST)
+    assert inner.calls == 1
+    other_dir = tmp_path / "x"
+    other_dir.mkdir()
+    other = _Scripted([E_BOTH, E_ONLY_B])
+    setup = Case("r20-x", "B", "forced", 0, "normal").prompts()["setup"]
+    assert NormalizingProvider(other, other_dir).generate(setup) == E_BOTH and other.calls == 1
+    assert not list(other_dir.iterdir())
+
+
+def test_the_prereg_states_the_e_retry_compromise() -> None:
+    assert "E retry" in NOT_CLAIMED and "exactly one option" in NOT_CLAIMED and "NOT claimed away" in NOT_CLAIMED
+
+
+def test_end_to_end_a_first_e_reply_naming_a_and_b_is_regenerated_and_reviewed(r20_base: Path) -> None:
+    base = r15_protocol_script()
+    script = (base[0], E_BOTH, base[1], base[2], base[3], base[4])
+    session = scripted(r20_base).new_session("S0", stage="G1", script=script)
+    try:
+        session.start()
+        session.activate()
+        reviews = session.run_r15_protocol()  # bridge.review -> production gate; used to die on "no single referent"
+    finally:
+        session.stop()
+    assert reviews["S1"]["changed"] is True
+    assert session.reply_attempts["E"] == {"attempts": 2, "accepted": True}
+    raw = _rows(session.subject.run_dir / "private" / RAW_NAME)
+    assert [(r["phase"], r["attempt"]) for r in raw if r["phase"] == "E"] == [("E", 1), ("E", 2)]
+    assert raw[0]["raw"] == E_BOTH
+    assert drivers.measurements(session)["reply_attempts"]["E"] == {"attempts": 2, "accepted": True}
+    for path in session.subject.evidence_dir.rglob("*"):
+        if path.is_file():
+            assert E_BOTH not in path.read_text(errors="ignore")
 
