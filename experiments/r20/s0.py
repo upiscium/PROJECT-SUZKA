@@ -41,7 +41,7 @@ from experiments.r20.manifest import Manifest
 from experiments.r20.model_config import ModelOverride
 from experiments.r20.polling import poll_until, short_read
 from experiments.r20.provider import r15_protocol_script
-from experiments.r20.reply_normalizer import PHASE_BY_ORDINAL, normalize_reply
+from experiments.r20.normalizing_provider import read_names
 from experiments.r20.supervisor import READY_TIMEOUT_S, ChildProcess
 
 # R19 timings of the T2 chain: the Feedback Wake is due at once, the tick and the
@@ -514,30 +514,27 @@ class S0Session:
                 reviews["S1"] = self.review("S1")
             data = self.chat(message)
             self.experience_ids.append(str(data["experience_id"]))
-            raw = str(data["response"])
-            ordinal = len(self.experience_ids)
-            phase = PHASE_BY_ORDINAL.get(ordinal)
-            # COMPROMISE (HD-23, a'): the S1 / S2 reply is normalised by the harness; see reply_normalizer.
-            text, applied = normalize_reply(raw, phase)
-            if phase is not None:
-                self.reply_normalizations[phase] = list(applied)
-            reply = {"episode_id": str(data["episode_id"]), "response": text}
-            if self.real:  # raw model text stays in the private directory, one line per turn, as it arrives
-                self._keep_turn(ordinal, message, raw, applied)
+            # COMPROMISE (HD-23, option 1): the S1 / S2 reply was ALREADY normalised at the model-call layer
+            # (``normalizing_provider``, inside the serve child); what the app returned is what the subject stored.
+            reply = {"episode_id": str(data["episode_id"]), "response": str(data["response"])}
+            if self.real:  # the stored text, one line per turn, as it arrives (the model's literal text is p1.model_raw.jsonl)
+                self._keep_turn(len(self.experience_ids), message, reply["response"])
             return reply
 
         try:
             run_trial(seal, capture, transport)
         except TrialRefused as refusal:  # the reason is coarse by contract (no transcript, path or id)
             raise GuardRefusal("P1_PROTOCOL_REFUSED", f"{refusal}; turns_answered={len(self.experience_ids)}") from refusal
+        finally:
+            self.reply_normalizations = read_names(artifacts.private_dir(self.subject.run_dir))
         reviews["S2"] = self.review("S2")
         return reviews
 
-    def _keep_turn(self, ordinal: int, request: str, response: str, normalizations: list[str] | None = None) -> None:
+    def _keep_turn(self, ordinal: int, request: str, response: str) -> None:
         path = self.capture_dir / "p1.turns.jsonl"
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"ordinal": ordinal, "request": request, "response": response, "normalizations": list(normalizations or [])}, ensure_ascii=False) + "\n")
+            handle.write(json.dumps({"ordinal": ordinal, "request": request, "response": response}, ensure_ascii=False) + "\n")
 
     def review(self, stage: str) -> dict[str, Any]:
         started = time.monotonic()

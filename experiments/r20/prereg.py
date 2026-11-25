@@ -78,10 +78,11 @@ NOT_CLAIMED = (
     "No I->S causality; no R20 Stage result (the Stage judgement is the Human's); a real-model transcript is not an "
     "independent replication; same-I controls measure provider nondeterminism only; the R15 S1 / S2 trigger is the "
     "harness (HARNESS_BRIDGE), not a product runtime. "
-    "COMPROMISE (HD-23, a'): S1/S2 model replies are normalised by the experiment harness (code-fence stripped; "
-    "evidence_steps replaced by the fixed expected list), so the model's own evidence enumeration is NOT measured; "
-    "assumed_referent / assessment / uncertainty / rationale are the model's own. Reports list which normalisations "
-    "were applied."
+    "COMPROMISE (HD-23, a'): S1/S2 model replies are normalised at the model-call layer BEFORE the subject stores "
+    "them (code-fence stripped; evidence_steps replaced by the fixed expected list); the subject's memory holds the "
+    "normalised text, and the model's literal text is kept only in a private 0600 file; the model's own evidence "
+    "enumeration is NOT measured; assumed_referent / assessment / uncertainty / rationale are the model's own. "
+    "Reports list which normalisations were applied (names only)."
 )
 STOP_RULES = (
     "free GPU below the minimum; a turn longer than the turn cap; 3 consecutive INFRA failures; a guard refusal; a "
