@@ -165,7 +165,7 @@ def test_the_r15_bridge_admits_s1_then_s2_through_the_apps_own_owner(r20_base: P
     subject = create_subject("NEG-r15", base=r20_base)
     provider = ScriptedProvider(r15_protocol_script())
     manifest, capture = subject.evidence_dir / "p1.manifest.json", subject.evidence_dir / "p1.capture.json"
-    seal_case(Case("r20-22a-bridge", "B", "forced", 0, "normal"), manifest)
+    seal_case(Case("r20-22a-bridge", "A", "forced", 0, "normal"), manifest)
     with T1Runtime(subject, provider) as runtime:
         client = runtime.client
         assert client is not None

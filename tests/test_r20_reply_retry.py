@@ -71,7 +71,7 @@ def test_the_attempt_limit_is_three() -> None:
 
 
 def test_second_attempt_is_accepted_and_both_literal_texts_stay_private(tmp_path: Path) -> None:
-    bad, good = _trailing_comma("S1", "A"), _valid("S1", "A")
+    bad, good = _trailing_comma("S1", "B"), _valid("S1", "A")
     inner = _Scripted([bad, good, good])
     text = NormalizingProvider(inner, tmp_path).generate(s1_request("q", "a"))
     assert inner.calls == 2
@@ -87,7 +87,7 @@ def test_second_attempt_is_accepted_and_both_literal_texts_stay_private(tmp_path
 
 
 def test_all_three_attempts_failing_returns_the_last_text_unchanged(tmp_path: Path) -> None:
-    replies = [_trailing_comma("S1", "A"), "not json", _trailing_comma("S1", "B")]
+    replies = [_trailing_comma("S1", "B"), "not json", _trailing_comma("S1", "B")]
     inner = _Scripted(replies + [_valid("S1", "A")])
     text = NormalizingProvider(inner, tmp_path).generate(s1_request("q", "a"))
     assert inner.calls == 3 and text == replies[-1]  # the LAST attempt, never fabricated, never a 4th call
@@ -104,7 +104,7 @@ def test_a_first_attempt_that_is_valid_makes_no_extra_call(tmp_path: Path) -> No
 
 
 def test_the_chat_path_retries_too(tmp_path: Path) -> None:
-    inner = _ScriptedChat([_trailing_comma("S1", "A"), _valid("S1", "A")])
+    inner = _ScriptedChat([_trailing_comma("S1", "B"), _valid("S1", "A")])
     text = NormalizingProvider(inner, tmp_path).generate_chat("system", s1_request("q", "a"))
     assert inner.calls == 2 and acceptable(text, "S1")
 
@@ -126,7 +126,7 @@ SAMPLES = {
     "S1": [
         r15_answer("S1", "A"),
         _valid("S1", "A"),
-        _trailing_comma("S1", "A"),
+        _trailing_comma("S1", "B"),
         "{}",
         "[]",
         "not json",
@@ -158,8 +158,8 @@ def test_acceptable_agrees_with_the_production_source_gate_parser(phase: str) ->
 def _retry_script() -> tuple[str, ...]:
     base = list(r15_protocol_script())
     # setup, E answer, S1 (trailing comma, fenced) -> regenerated S1 (fenced, free-text steps), E2 answer, S2
-    base[2] = _valid("S1", "A").replace('["E"]', '["I looked at E."]')
-    return (base[0], base[1], _trailing_comma("S1", "A"), base[2], base[3], base[4])
+    base[2] = _valid("S1", "B").replace('["E"]', '["I looked at E."]')
+    return (base[0], base[1], _trailing_comma("S1", "B"), base[2], base[3], base[4])
 
 
 def test_end_to_end_a_first_unparseable_s1_reply_is_regenerated_and_reviewed(r20_base: Path) -> None:
@@ -186,7 +186,7 @@ def test_end_to_end_a_first_unparseable_s1_reply_is_regenerated_and_reviewed(r20
 
 
 def test_end_to_end_three_unparseable_s1_replies_still_end_in_the_p1_refusal(r20_base: Path) -> None:
-    bad = _trailing_comma("S1", "A")
+    bad = _trailing_comma("S1", "B")
     script = (r15_protocol_script()[0], r15_protocol_script()[1], bad, bad, bad)
     session = scripted(r20_base).new_session("S0", stage="G1", script=script)
     try:
@@ -271,3 +271,43 @@ def test_end_to_end_a_first_e_reply_naming_a_and_b_is_regenerated_and_reviewed(r
         if path.is_file():
             assert E_BOTH not in path.read_text(errors="ignore")
 
+
+
+# ---------------------------------------------- HD-23: the S0 case target is fixed to A (E2 target != original B)
+
+
+def test_the_s0_case_target_is_a_and_the_e2_text_announces_a() -> None:
+    from experiments.r20.provider import S0_TARGET
+
+    assert S0_TARGET == "A"
+    case = Case("r20-any", S0_TARGET, "forced", 0, "normal")
+    assert case.target == "A"
+    assert "参照先は案Aです" in case.prompts()["reveal"]
+    assert "NOTE (HD-23, E2 target)" in NOT_CLAIMED and "6 of 6" in NOT_CLAIMED
+    assert "does not differ from the original" in NOT_CLAIMED
+
+
+def test_end_to_end_scripted_original_b_with_target_a_is_reviewed_at_s2(r20_base: Path) -> None:
+    session = scripted(r20_base).new_session("S0", stage="G1", script=r15_protocol_script())
+    try:
+        session.start()
+        session.activate()
+        reviews = session.run_r15_protocol()  # bridge.review S2 -> production gate: original B, target A
+    finally:
+        session.stop()
+    assert reviews["S2"]["changed"] is True
+
+
+def test_end_to_end_scripted_original_a_with_target_a_is_refused_with_the_diagnostic(r20_base: Path) -> None:
+    base = list(r15_protocol_script())
+    base[1] = "元の回答では案Aを暫定的に選びました"
+    base[2] = r15_answer("S1", "A")
+    session = scripted(r20_base).new_session("S0", stage="G1", script=tuple(base))
+    try:
+        session.start()
+        session.activate()
+        with pytest.raises(GuardRefusal) as refused:
+            session.run_r15_protocol()
+    finally:
+        session.stop()
+    assert "report does not differ from the original" in str(refused.value)

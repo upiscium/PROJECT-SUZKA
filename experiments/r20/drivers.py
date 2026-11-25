@@ -620,11 +620,12 @@ def s2_status_script(status: str) -> tuple[str, ...]:
 
     script = list(r15_protocol_script())
     answer = json.loads(script[4])
+    # the scripted original is B and the S0 target is A: adopting the report is A, keeping the original is B
     recipe = {
-        "PRESENT": ("B", "MAY_HAVE_MISREAD"),
-        "CONTESTED": ("B", "LIKELY_ALIGNED"),
+        "PRESENT": ("A", "MAY_HAVE_MISREAD"),
+        "CONTESTED": ("A", "LIKELY_ALIGNED"),
         "UNKNOWN": ("UNKNOWN", "UNKNOWN"),
-        "CONTRADICTORY": ("A", "LIKELY_ALIGNED"),
+        "CONTRADICTORY": ("B", "LIKELY_ALIGNED"),
     }
     if status not in recipe:
         raise GuardRefusal("F1_STATUS_UNKNOWN", status)

@@ -34,8 +34,8 @@ def _fenced(phase: str, selected: str) -> str:
 
 def _raw_script() -> tuple[str, ...]:
     script = list(r15_protocol_script())
-    script[2] = _fenced("S1", "A")
-    script[4] = _fenced("S2", "B")
+    script[2] = _fenced("S1", "B")
+    script[4] = _fenced("S2", "A")
     return tuple(script)
 
 

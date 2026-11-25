@@ -24,6 +24,9 @@ from experiments.r20.guards import GuardRefusal
 NON_NEUTRAL_LOSS = 10000.0
 HIDDEN_THOUGHT_MARKER = "R20-HIDDEN-THOUGHT-CANARY"
 DEFAULT_ANSWER = "synthetic visible answer (fixture only)"
+# The S0 case target: the referent announced in the E2 (reveal) turn.  Fixed (static, pre-registered) to A because
+# the real model's original choice was B in 6 of 6 observed runs; the production R15 gate needs target != original.
+S0_TARGET = "A"
 
 
 class ProviderMode(str, Enum):
@@ -88,11 +91,11 @@ def r15_protocol_script(*, no_reveal: bool = False) -> tuple[str, ...]:
 
     s2_index = 3 if no_reveal else 4
     answers = ["synthetic visible answer"] * (s2_index + 1)
-    answers[1] = "元の回答では案Aを暫定的に選びました"
-    answers[2] = r15_answer("S1", "A", no_reveal=no_reveal)
+    answers[1] = "元の回答では案Bを暫定的に選びました"
+    answers[2] = r15_answer("S1", "B", no_reveal=no_reveal)
     if not no_reveal:
-        answers[3] = "補足では案Bと言われました"
-    answers[s2_index] = r15_answer("S2", "A" if no_reveal else "B", no_reveal=no_reveal)
+        answers[3] = "補足では案Aと言われました"
+    answers[s2_index] = r15_answer("S2", "B" if no_reveal else "A", no_reveal=no_reveal)
     return tuple(answers)
 
 
@@ -147,6 +150,7 @@ __all__ = [
     "DEFAULT_ANSWER",
     "HIDDEN_THOUGHT_MARKER",
     "NON_NEUTRAL_LOSS",
+    "S0_TARGET",
     "ApprovalActor",
     "ProviderMode",
     "ScriptedProvider",
