@@ -41,6 +41,7 @@ from experiments.r20.manifest import Manifest
 from experiments.r20.model_config import ModelOverride
 from experiments.r20.polling import poll_until, short_read
 from experiments.r20.provider import r15_protocol_script
+from experiments.r20.reply_normalizer import PHASE_BY_ORDINAL, normalize_reply
 from experiments.r20.supervisor import READY_TIMEOUT_S, ChildProcess
 
 # R19 timings of the T2 chain: the Feedback Wake is due at once, the tick and the
@@ -330,6 +331,7 @@ class S0Session:
         self.step_timeout_s = REAL_STEP_TIMEOUT_S if self.real else STEP_TIMEOUT_S
         self.ticket_timeout_s = max(30.0, turn_cap_s) if self.real else 30.0
         self.turn_seconds: list[float] = []
+        self.reply_normalizations: dict[str, list[str]] = {}  # phase -> names only, never text
         self.subject = create_subject(
             profile,
             base=base,
@@ -512,9 +514,16 @@ class S0Session:
                 reviews["S1"] = self.review("S1")
             data = self.chat(message)
             self.experience_ids.append(str(data["experience_id"]))
-            reply = {"episode_id": str(data["episode_id"]), "response": str(data["response"])}
-            if self.real:  # model text stays in the private directory, one line per turn, as it arrives
-                self._keep_turn(len(self.experience_ids), message, reply["response"])
+            raw = str(data["response"])
+            ordinal = len(self.experience_ids)
+            phase = PHASE_BY_ORDINAL.get(ordinal)
+            # COMPROMISE (HD-23, a'): the S1 / S2 reply is normalised by the harness; see reply_normalizer.
+            text, applied = normalize_reply(raw, phase)
+            if phase is not None:
+                self.reply_normalizations[phase] = list(applied)
+            reply = {"episode_id": str(data["episode_id"]), "response": text}
+            if self.real:  # raw model text stays in the private directory, one line per turn, as it arrives
+                self._keep_turn(ordinal, message, raw, applied)
             return reply
 
         try:
@@ -524,11 +533,11 @@ class S0Session:
         reviews["S2"] = self.review("S2")
         return reviews
 
-    def _keep_turn(self, ordinal: int, request: str, response: str) -> None:
+    def _keep_turn(self, ordinal: int, request: str, response: str, normalizations: list[str] | None = None) -> None:
         path = self.capture_dir / "p1.turns.jsonl"
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"ordinal": ordinal, "request": request, "response": response}, ensure_ascii=False) + "\n")
+            handle.write(json.dumps({"ordinal": ordinal, "request": request, "response": response, "normalizations": list(normalizations or [])}, ensure_ascii=False) + "\n")
 
     def review(self, stage: str) -> dict[str, Any]:
         started = time.monotonic()
