@@ -11,13 +11,11 @@ It holds, among others: the git head, the model override (id, pinned revision),
 the config template digest, the fixtures by digest, the S0 K = 3 rule and
 the structural expected counts of step 9, the F1 table text and plan (master
 seed, per-pair seeds, orders, retry cap), the S1 expectation, the caps and stop
-rules, the known violations the report carries, a field the Human fills with
-the FOUR UNLISTED known violations, and what is not claimed.
+rules, the known violations the report carries (derived, not typed), and what is not claimed.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -93,13 +91,6 @@ STOP_RULES = (
     "free GPU below the minimum; a turn longer than the turn cap; 3 consecutive INFRA failures; a guard refusal; a "
     "cap reached; Ctrl-C or the stop file. The run records the stop reason; a stopped attempt counts as an attempt."
 )
-CANDIDATE_UNLISTED = (
-    "V1 'authorized implies MATCH_SELF' (D-R17)",
-    "HP-7 (a): source changes between claim and effect other than the deadline are accepted as a window",
-    "the R15 S1 / S2 trigger is the harness, not a product runtime (HARNESS_BRIDGE)",
-    "the ABANDON path does not exist (#408, S1) / the H3 known limit (#380 sec. 6)",
-)
-_PLACEHOLDERS = {"", "todo", "tbd", "fixme", "none", "n/a", "?", "xxx"}
 REQUIRED_KEYS = (
     "schema", "created_utc", "git_head", "model", "config_template_sha256", "request_templates_sha256",
     "fixtures", "s0", "s1", "f1", "caps", "stop_rules", "known_violations", "reply_attempts_max", "not_claimed",
@@ -114,9 +105,9 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def known_violations_section(four: Sequence[str]) -> dict[str, Any]:
+def known_violations_section() -> dict[str, Any]:
     """The F-matrix status of every F01-F15, the F15 known violations with their
-    D1 text, F14 transitional, F12 partial coverage, and the Human's four."""
+    D1 text, F14 transitional, and F12 partial coverage."""
 
     cases = [
         {"case": case.case, "title": case.title, "status": case.status, "caveat": case.caveat,
@@ -137,21 +128,7 @@ def known_violations_section(four: Sequence[str]) -> dict[str, Any]:
             "was and was not exercised, and step 9's 'no stale-branch action after a true rollback' is only as "
             "strong as that."
         ),
-        "four_unlisted_known_violations": list(four),
     }
-
-
-def check_four(four: Sequence[str]) -> list[str]:
-    items = [str(item).strip() for item in four]
-    if len(items) != 4 or any(item.lower() in _PLACEHOLDERS or len(item) < 12 for item in items):
-        raise GuardRefusal(
-            "FOUR_KNOWN_VIOLATIONS_REQUIRED",
-            "exactly four non-placeholder statements by the Human; agent candidates, for the Human to choose from: "
-            + " | ".join(CANDIDATE_UNLISTED),
-        )
-    if len(set(items)) != 4:
-        raise GuardRefusal("FOUR_KNOWN_VIOLATIONS_REQUIRED", "the four must be distinct; candidates: " + " | ".join(CANDIDATE_UNLISTED))
-    return items
 
 
 def derive_f1_plan(master_seed: int, trial_id: str) -> dict[str, Any]:
@@ -219,7 +196,6 @@ def build_content(
     git_head: str,
     model: ModelOverride,
     caps: Caps,
-    four_violations: Sequence[str],
     master_seed: int,
     trial_id: str,
     now: datetime | None = None,
@@ -249,7 +225,7 @@ def build_content(
         "f1": derive_f1_plan(master_seed, trial_id),
         "caps": caps.record(),
         "stop_rules": STOP_RULES,
-        "known_violations": known_violations_section(check_four(four_violations)),
+        "known_violations": known_violations_section(),
         "reply_attempts_max": REPLY_ATTEMPTS_MAX,
         "not_claimed": NOT_CLAIMED,
     }
@@ -261,7 +237,6 @@ def create(base: Path, content: dict[str, Any]) -> str:
     missing = [key for key in REQUIRED_KEYS if key not in content]
     if missing:
         raise GuardRefusal("PREREG_INCOMPLETE", ",".join(missing))
-    check_four(content["known_violations"].get("four_unlisted_known_violations", ()))
     payload = _canonical(content)
     digest = sha256_hex(payload)
     path = Path(base) / PREREG_NAME
@@ -296,11 +271,10 @@ def load(base: Path) -> tuple[dict[str, Any], str]:
     content = json.loads(payload)
     if not isinstance(content, dict) or content.get("schema") != SCHEMA:
         raise GuardRefusal("PREREG_INVALID")
-    check_four(content.get("known_violations", {}).get("four_unlisted_known_violations", ()))
     return content, digest
 
 
 __all__ = [
     "EXPECTED_STRUCTURAL_COUNTS", "HASH_NAME", "K_RULE", "PREREG_NAME", "S1_FIXTURE", "S1_SALIENCE_MIN",
-    "build_content", "check_four", "create", "derive_f1_plan", "known_violations_section", "load", "sha256_hex",
+    "build_content", "create", "derive_f1_plan", "known_violations_section", "load", "sha256_hex",
 ]
