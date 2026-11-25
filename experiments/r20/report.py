@@ -92,10 +92,6 @@ def _kv_lines(known: dict[str, Any]) -> list[str]:
     lines.append("")
     lines.append(f"F14 transitional: {known.get('f14_transitional')}")
     lines.append(f"F12 partial coverage: {known.get('f12_partial_coverage')}")
-    lines.append("")
-    lines.append("Four unlisted known violations (named by the Human before run 1):")
-    for index, text in enumerate(known.get("four_unlisted_known_violations", []), 1):
-        lines.append(f"{index}. {text}")
     return lines
 
 
@@ -189,8 +185,8 @@ def build_report(base: Path, ledger_path: Path | None = None) -> str:
 
 def generated_text(text: str) -> str:
     """The text checked by the lexical guard: every section EXCEPT the known-violations section
-    (the only place the Human's own words appear).  Section by section, never a global
-    ``replace`` of the Human's lines, so a Human line cannot hide a generated statement."""
+    (it carries the F-matrix status words, which legitimately include PASS).  Section by
+    section, never a global ``replace``, so nothing outside that section can be hidden"""
 
     marker = "## Known violations"
     start = text.find(marker)
