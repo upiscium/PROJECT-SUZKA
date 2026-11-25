@@ -23,7 +23,11 @@ from typing import Any
 from suzka.persona.prompt_builder import CURRENT_MESSAGE_HEADING
 from suzka.r15.request_templates import s1_request, s2_request
 
+from experiments.r15_p1.protocol import parse_candidate
 from experiments.r20.reply_normalizer import normalize_reply
+
+# HD-23 option (a): up to this many TOTAL attempts for one S1 / S2 request (COMPROMISE, preregistered).
+REPLY_ATTEMPTS_MAX = 3
 
 RAW_NAME = "p1.model_raw.jsonl"  # private: the model's literal text
 NAMES_NAME = "p1.model_names.jsonl"  # private too, but names only
@@ -70,6 +74,21 @@ def registered_phase(text: str) -> str | None:
     return best[1]
 
 
+def acceptable(text: str, phase: str) -> bool:
+    """True when the (already normalised) reply parses under the experiment's strict P1 parser.
+
+    The production source gate (``suzka.r15.qualified_proposal._parse_candidate``, private) applies
+    the same closed schema with the same duplicate-key / constant refusals; it is NOT imported here.
+    ``tests/test_r20_reply_retry.py`` asserts that both agree on a sample set.
+    """
+
+    try:
+        parse_candidate(text, phase=phase, has_reveal=phase == "S2")
+    except ValueError:  # TrialRefused is a ValueError
+        return False
+    return True
+
+
 def _append(path: Path, row: dict[str, Any]) -> None:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
@@ -94,21 +113,35 @@ class NormalizingProvider:
         target = getattr(self._inner, name)  # AttributeError when the inner has none: callers probe with getattr
         return self._generate_chat if name == "generate_chat" else target
 
-    def _finish(self, request_text: str, raw: str) -> str:
+    def _finish(self, request_text: str, call: Callable[[], Any]) -> str:
+        """Call ``inner`` once, or (registered S1 / S2 only) up to ``REPLY_ATTEMPTS_MAX`` times."""
+
         phase = registered_phase(request_text)
         if phase is None:
-            return raw
-        text, applied = normalize_reply(raw, phase)
-        with self._lock:
-            _append(self._raw_path, {"phase": phase, "raw": raw, "normalizations": list(applied)})
-            _append(self._names_path, {"phase": phase, "normalizations": list(applied)})
+            return str(call())
+        text, applied, accepted, attempts = "", [], False, 0
+        while attempts < REPLY_ATTEMPTS_MAX and not accepted:
+            attempts += 1
+            raw = str(call())
+            text, applied = normalize_reply(raw, phase)
+            accepted = acceptable(text, phase)
+            with self._lock:
+                _append(
+                    self._raw_path,
+                    {"phase": phase, "attempt": attempts, "raw": raw, "normalizations": list(applied), "accepted": accepted},
+                )
+        with self._lock:  # the LAST attempt's text is returned when none is acceptable (never fabricated)
+            _append(
+                self._names_path,
+                {"phase": phase, "normalizations": list(applied), "attempts": attempts, "accepted": accepted},
+            )
         return text
 
     def generate(self, prompt: str) -> str:
-        return self._finish(prompt, str(self._inner.generate(prompt)))
+        return self._finish(prompt, lambda: self._inner.generate(prompt))
 
     def _generate_chat(self, system_text: str, user_text: str) -> str:
-        return self._finish(user_text, str(self._inner.generate_chat(system_text, user_text)))
+        return self._finish(user_text, lambda: self._inner.generate_chat(system_text, user_text))
 
 
 def wrap_loader(loader: Callable[..., Any], private_dir: Path) -> Callable[..., Any]:
@@ -132,7 +165,19 @@ def read_names(private_dir: Path) -> dict[str, list[str]]:
     return names
 
 
+def read_attempts(private_dir: Path) -> dict[str, dict[str, Any]]:
+    """phase -> ``{"attempts": int, "accepted": bool}`` of the LAST registered request of that phase."""
+
+    path = Path(private_dir) / NAMES_NAME
+    found: dict[str, dict[str, Any]] = {}
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            found[str(row["phase"])] = {"attempts": int(row["attempts"]), "accepted": bool(row["accepted"])}
+    return found
+
+
 __all__ = [
-    "NAMES_NAME", "RAW_NAME", "S1_PREFIX", "S2_PREFIX", "NormalizingProvider", "read_names",
+    "NAMES_NAME", "RAW_NAME", "REPLY_ATTEMPTS_MAX", "acceptable", "read_attempts", "S1_PREFIX", "S2_PREFIX", "NormalizingProvider", "read_names",
     "registered_phase", "wrap_loader",
 ]

@@ -125,7 +125,8 @@ def build_report(base: Path, ledger_path: Path | None = None) -> str:
             f"- {manifest['run_id']} profile={manifest.get('profile')} fixture_only={manifest.get('fixture_only')} "
             f"approval_actor={manifest.get('approval_actor')} admission_path={manifest.get('admission_path')} "
             f"prereg={str(manifest.get('preregistration_sha256'))[:12]} load_s={real.get('serving_after_s')} "
-            f"reply_normalizations={json.dumps(real.get('reply_normalizations') or {}, sort_keys=True)}"
+            f"reply_normalizations={json.dumps(real.get('reply_normalizations') or {}, sort_keys=True)} "
+            f"reply_attempts={json.dumps(real.get('reply_attempts') or {}, sort_keys=True)}"
         )
     for result in results:
         stage = result.get("stage")
