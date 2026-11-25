@@ -110,8 +110,11 @@ def run_detached(argv: list[str], tmp: Path, *, mode: str, steps: list[tuple[str
         if master < 0:
             time.sleep(wait)
             return True
-        ready, _, _ = select.select([master], [], [], wait)
-        if not ready:
+        # poll(), not select(): select() raises on a descriptor >= 1024, and a long pytest
+        # process (other tests of the same shard leave descriptors open) can reach that.
+        poller = select.poll()
+        poller.register(master, select.POLLIN | select.POLLHUP)
+        if not poller.poll(wait * 1000):
             return True
         try:
             data = os.read(master, 65536)
