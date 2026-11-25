@@ -36,6 +36,7 @@ from experiments.r20.f1_table import (
 from experiments.r20.guards import GuardRefusal, repo_root
 from experiments.r20.model_config import ModelOverride
 from experiments.r20.normalizing_provider import REPLY_ATTEMPTS_MAX
+from experiments.r20.provider import S0_TARGET
 
 PREREG_NAME = "preregistration.json"
 HASH_NAME = "preregistration.sha256"
@@ -88,7 +89,11 @@ NOT_CLAIMED = (
     "none is acceptable (the P1 / R15 refusal then fires); no other repair is applied. "
     "COMPROMISE (HD-23, E retry): the E reply is regenerated the same way (up to 3 attempts, no normalisation); the "
     "stored original answer E is the first attempt whose prior-referent set is exactly one option, so this selects E, "
-    "and the effect of that selection on S1-versus-E comparisons is NOT claimed away; its attempts are reported."
+    "and the effect of that selection on S1-versus-E comparisons is NOT claimed away; its attempts are reported. "
+    "NOTE (HD-23, E2 target): the S0 case's announced referent (the E2 target) is fixed to A because the model's "
+    "original choice was B in 6 of 6 observed real runs; a run whose original choice is A would be refused by the "
+    "production gate (report does not differ from the original); this is a design adaptation to the model's "
+    "observed bias, not a measurement."
 )
 STOP_RULES = (
     "free GPU below the minimum; a turn longer than the turn cap; 3 consecutive INFRA failures; a guard refusal; a "
@@ -184,7 +189,7 @@ def code_digests() -> dict[str, str]:
 
 
 def fixtures_section() -> dict[str, Any]:
-    case = Case("r20-fixture", "B", "forced", 0, "normal")
+    case = Case("r20-fixture", S0_TARGET, "forced", 0, "normal")
     prompts = case.prompts()
     return {
         "x_and_e2_prompts_sha256": sha256_hex(json.dumps(prompts, sort_keys=True, ensure_ascii=False).encode()),

@@ -91,14 +91,14 @@ def test_f14_committed_revisions_are_never_rewritten_and_a_changed_interpretatio
     # the protocol answers, then a DIFFERENT later pair: the subject "changes its mind"
     later = (
         "a later supplement that points the other way",
-        r15_answer("S2", "A"),
         r15_answer("S2", "B"),
+        r15_answer("S2", "A"),
     )
     provider = ScriptedProvider(r15_protocol_script() + later)
     manifest = Manifest(subject.evidence_dir, subject.run_id, subject_root=subject.root)
     seal = subject.evidence_dir / "p1.manifest.json"
     capture = subject.evidence_dir / "p1.capture.json"
-    seal_case(Case("r20-22c-f14", "B", "forced", 0, "normal"), seal)
+    seal_case(Case("r20-22c-f14", "A", "forced", 0, "normal"), seal)
     runtime = T1Runtime(subject, provider)
     runtime.start()
     try:

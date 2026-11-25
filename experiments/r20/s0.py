@@ -40,7 +40,7 @@ from experiments.r20.launch import HumanLaunch
 from experiments.r20.manifest import Manifest
 from experiments.r20.model_config import ModelOverride
 from experiments.r20.polling import poll_until, short_read
-from experiments.r20.provider import r15_protocol_script
+from experiments.r20.provider import S0_TARGET, r15_protocol_script
 from experiments.r20.normalizing_provider import read_attempts, read_names
 from experiments.r20.supervisor import READY_TIMEOUT_S, ChildProcess
 
@@ -283,7 +283,7 @@ def _r15_script(contradictory: bool) -> tuple[str, ...]:
     script = list(r15_protocol_script())
     if contradictory:
         answer = json.loads(script[4])
-        answer["assumed_referent"] = "A"
+        answer["assumed_referent"] = "B"
         answer["assessment"] = "LIKELY_ALIGNED"
         script[4] = json.dumps(answer, separators=(",", ":"), sort_keys=True)
     return tuple(script)
@@ -508,7 +508,7 @@ class S0Session:
         reviews: dict[str, Any] = {}
         seal = self.subject.evidence_dir / "p1.manifest.json"  # the case parameters: no model text
         capture = self.capture_dir / "p1.capture.json"  # real runs: the private directory
-        seal_case(Case(f"r20-{self.subject.run_id}", "B", "forced", 0, "normal"), seal)
+        seal_case(Case(f"r20-{self.subject.run_id}", S0_TARGET, "forced", 0, "normal"), seal)
 
         def transport(message: str) -> dict[str, str]:
             if len(self.experience_ids) == 3:  # after E and the S1 request, BEFORE E2
