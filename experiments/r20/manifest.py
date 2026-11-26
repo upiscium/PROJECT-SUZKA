@@ -29,7 +29,7 @@ KEYS = (
     "approval_actor", "admission_path", "fixture_only", "timeline", "policy_inputs",
     "plan_hold_receipts", "logical_cycle_resolutions", "ablation", "kill_points",
     "restarts", "journal", "results", "recorder", "destination", "steps",
-    "preregistration_sha256", "real_run",
+    "model_digest_sha256", "real_run",
 )
 _LISTS = frozenset(
     {
@@ -68,11 +68,11 @@ class Manifest:
             raise KeyError(key)
         self._data[key].append(entry)
 
-    def stamp(self, preregistration_sha256: str | None, *, fixture_only: bool) -> None:
-        """The pre-registration hash every real-run manifest carries, and whether
+    def stamp(self, model_digest_sha256: str | None, *, fixture_only: bool) -> None:
+        """The model digest every real-run manifest carries, and whether
         the run was a fixture (scripted provider) or a real model."""
 
-        self._data["preregistration_sha256"] = preregistration_sha256
+        self._data["model_digest_sha256"] = model_digest_sha256
         self._data["fixture_only"] = fixture_only
 
     def result(self, check: str, label: str) -> None:

@@ -1,4 +1,4 @@
-"""The child-side GPU sampler of a real-model ``serve`` (IP-23 sec. 2).
+"""The child-side GPU sampler of a real-model ``serve``.
 
 A daemon thread appends one JSON line of NUMBERS ONLY (time, device-wide free /
 total, this process's reserved bytes) to ``evidence/gpu.jsonl`` before the

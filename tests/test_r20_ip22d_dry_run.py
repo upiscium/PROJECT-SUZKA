@@ -40,7 +40,7 @@ def test_a_step_is_done_only_with_evidence_and_no_problem(tmp_path: Path) -> Non
     assert set(labels.values()) <= set(STEP_LABELS)
     assert set(labels) == set(range(1, 16))
     by_step = {entry["step"]: entry for entry in manifest.to_dict()["steps"]}
-    assert by_step[13]["evidence"] == {"attempted": False} and "IP-23" in by_step[13]["note"]
+    assert by_step[13]["evidence"] == {"attempted": False} and "no driver" in by_step[13]["note"]
     assert by_step[2]["evidence"]["failed"] == ["b"]
 
 

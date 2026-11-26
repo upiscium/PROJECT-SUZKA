@@ -1,4 +1,4 @@
-"""The Human-launch guard of a real-model run (IP-23a; the central safety property).
+"""The Human-launch guard of a real-model smoke run (the central safety property).
 
 A real model starts ONLY when a Human, at a real terminal, types an explicit
 confirmation sentence.  The guard refuses (a closed ``GuardRefusal`` code):
@@ -11,7 +11,7 @@ confirmation sentence.  The guard refuses (a closed ``GuardRefusal`` code):
 * ``HARNESS_PARENT``: an ancestor process is an agent CLI or another harness
   entry point (``experiments.r20.*`` other than the launcher);
 * ``CONFIRMATION_MISMATCH``: the typed line is not the exact sentence, which
-  names the stage and the pre-registration hash.
+  names the stage and the model digest (model id, revision, 4-bit flag).
 
 The confirmation is read from ``/dev/tty``, never from stdin, so a pipe cannot
 supply it.  There is NO flag, environment variable or setting that turns a
@@ -49,19 +49,19 @@ from typing import Protocol
 
 from experiments.r20.guards import GuardRefusal
 
-LAUNCHER_MODULE = "experiments.r20.real_run"
+LAUNCHER_MODULE = "experiments.r20.smoke"
 AGENT_ENV_PREFIXES = ("CLAUDE",)
 AGENT_COMMANDS = ("claude",)
 UNREADABLE = "<unreadable>"
 _MINT = object()
 
 
-def confirmation_sentence(stage: str, prereg_sha256: str, revision8: str = "") -> str:
-    """Names the stage, the pre-registration hash and the first 8 characters of the model
+def confirmation_sentence(stage: str, model_digest: str, revision8: str = "") -> str:
+    """Names the stage, the model digest and the first 8 characters of the model
     revision, so the Human has to read what is on the screen."""
 
     tail = f", model revision {revision8}" if revision8 else ""
-    return f"I AM THE HUMAN OPERATOR AND I LAUNCH STAGE {stage} OF A REAL-MODEL RUN (pre-registration {prereg_sha256[:12]}{tail})"
+    return f"I AM THE HUMAN OPERATOR AND I LAUNCH STAGE {stage} OF A REAL-MODEL RUN (model digest {model_digest[:12]}{tail})"
 
 
 class Terminal(Protocol):
@@ -184,7 +184,7 @@ class HumanLaunch:
     """The attestation.  Construct only through ``attest_human_launch``."""
 
     stage: str
-    prereg_sha256: str
+    model_digest: str
     nonce: str
     pid: int
     at: float
@@ -203,7 +203,7 @@ class HumanLaunch:
 
 def attest_human_launch(
     stage: str,
-    prereg_sha256: str,
+    model_digest: str,
     *,
     human_flag: bool,
     revision8: str = "",
@@ -214,14 +214,14 @@ def attest_human_launch(
     and returns the summary lines shown above the confirmation sentence."""
 
     return _attest(
-        stage, prereg_sha256, human_flag=human_flag, terminal=RealTerminal(), environ=dict(os.environ),
+        stage, model_digest, human_flag=human_flag, terminal=RealTerminal(), environ=dict(os.environ),
         ancestors=ancestor_commands, revision8=revision8, before_confirm=before_confirm,
     )
 
 
 def _attest(
     stage: str,
-    prereg_sha256: str,
+    model_digest: str,
     *,
     human_flag: bool,
     terminal: Terminal,
@@ -246,19 +246,19 @@ def _attest(
     reasons = harness_ancestry(ancestors())
     if reasons:
         raise GuardRefusal("HARNESS_PARENT", "; ".join(sorted(set(reasons))))
-    expected = confirmation_sentence(stage, prereg_sha256, revision8)
+    expected = confirmation_sentence(stage, model_digest, revision8)
     summary = "\n".join(before_confirm(terminal)) + "\n" if before_confirm is not None else ""
     typed = terminal.prompt(f"{summary}Type exactly this line to launch (anything else aborts):\n  {expected}")
     if typed.strip() != expected:
         raise GuardRefusal("CONFIRMATION_MISMATCH")
-    return HumanLaunch(stage, prereg_sha256, secrets.token_hex(16), os.getpid(), time.time(), _MINT)
+    return HumanLaunch(stage, model_digest, secrets.token_hex(16), os.getpid(), time.time(), _MINT)
 
 
 def _binding(launch: HumanLaunch) -> dict[str, object]:
-    # What the record binds: this Human launch (its nonce digest, stage, pre-registration) and the
+    # What the record binds: this Human launch (its nonce digest, stage, model digest) and the
     # launcher process.  A restart of the SAME subject by the SAME launcher presents the same binding.
     return {"nonce_sha256": launch.nonce_sha256(), "launcher_pid": launch.pid, "stage": launch.stage,
-            "prereg_sha256": launch.prereg_sha256}
+            "model_digest": launch.model_digest}
 
 
 def write_launch_record(path: Path, launch: HumanLaunch) -> None:
