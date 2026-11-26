@@ -14,6 +14,7 @@ This module imports no ML library: package versions come from
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import importlib.metadata
@@ -121,6 +122,33 @@ class ModelOverride:
         }
 
 
+# The ONLY config keys a lab caller may override beyond the model section (an allow-list, never a
+# free-form mapping).  Every other value of the section stays the repository default.
+ALLOWED_CONFIG_OVERRIDES: dict[str, type] = {"conversation_trace.enabled": bool}
+
+
+def validate_config_overrides(overrides: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The overrides as a plain dict; any key outside the allow-list or any wrong type is refused."""
+
+    checked: dict[str, Any] = {}
+    for key, value in (overrides or {}).items():
+        wanted = ALLOWED_CONFIG_OVERRIDES.get(key)
+        if wanted is None:
+            raise GuardRefusal("CONFIG_OVERRIDE_NOT_ALLOWED", str(key))
+        if type(value) is not wanted:
+            raise GuardRefusal("CONFIG_OVERRIDE_TYPE", str(key))
+        checked[key] = value
+    return checked
+
+
+def apply_config_overrides(raw: dict[str, Any], overrides: Mapping[str, Any] | None) -> None:
+    """Apply validated overrides to a raw config (``a.b`` sets ``raw['a']['b']``)."""
+
+    for key, value in validate_config_overrides(overrides).items():
+        section, name = key.split(".")
+        raw.setdefault(section, {})[name] = value
+
+
 def cache_dir_name(model_id: str) -> str:
     return "models--" + model_id.replace("/", "--")
 
@@ -177,6 +205,9 @@ def package_versions() -> dict[str, str | None]:
 
 
 __all__ = [
+    "ALLOWED_CONFIG_OVERRIDES",
+    "apply_config_overrides",
+    "validate_config_overrides",
     "PROVIDERS",
     "ModelOverride",
     "cache_dir_name",

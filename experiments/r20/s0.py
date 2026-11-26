@@ -321,6 +321,7 @@ class S0Session:
         launch: HumanLaunch | None = None,
         turn_cap_s: float = 120.0,
         record_calls: bool = False,
+        config_overrides: Mapping[str, Any] | None = None,
     ) -> None:
         self.record_calls = record_calls
         self.real = model is not None and model.is_real
@@ -340,6 +341,7 @@ class S0Session:
             r19_overrides=dict(r19 if r19 is not None else (REAL_R19 if self.real else T2_R19)),
             degraded_continuation=None if dc is None else dict(dc),
             model=model,
+            **({"config_overrides": dict(config_overrides)} if config_overrides else {}),
         )
         self.supervised = dc is not None and dc.get("mode") == "continue"
         self.provider_config: dict[str, Any] = {"script": list(script if script is not None else _r15_script(contradictory))}
