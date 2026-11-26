@@ -34,6 +34,11 @@ _EPISODIC_HEADING = "Stored episodic evidence:"
 _SEMANTIC_HEADING = "Stored semantic evidence:"
 _TRACE_LINE = re.compile(r'^- .+ — User: ".*" / You: ', re.MULTILINE)
 _PREFIX_CHARS = 20
+_WM_EPISODIC_LINE = re.compile(r'^\{"source_kind":"episodic"', re.MULTILINE)
+
+
+def _present(needle: str, text: str) -> bool:
+    return needle in text or json.dumps(needle)[1:-1] in text
 
 
 def _sampling_of(inner: Any) -> dict[str, Any] | None:
@@ -152,7 +157,9 @@ def assembly_numbers(
     ``generate``: the prompt, which a chat-template provider wraps as one user message).
     ``prior_turn_messages`` is therefore 0 for both.  Earlier turns can only enter as TEXT inside the
     user part: ``trace_turns`` (ConversationTrace lines) and ``episodic_items`` / ``semantic_items``
-    (retrieved memory evidence lines).  ``previous_*_in_input`` are substring checks of the immediately
+    (retrieved memory evidence lines).  ``working_memory_episodic_items`` counts the episodic Working Memory evidence lines (earlier turns can
+    also arrive there, JSON-escaped; the trace skips turns Working Memory already shows).
+    ``previous_*_in_input`` are substring checks (plain or JSON-escaped) of the immediately
     preceding turn's request / the first 20 characters of its reply against the model input.
     """
 
@@ -172,10 +179,13 @@ def assembly_numbers(
         "trace_turns": len(_TRACE_LINE.findall(text)),
         "episodic_items": _count_block(text, _EPISODIC_HEADING),
         "semantic_items": _count_block(text, _SEMANTIC_HEADING),
-        "previous_request_in_input": None if previous_request is None else previous_request in text,
+        # Working Memory evidence lines are JSON (non-ASCII escaped), so a turn can be in the input
+        # either as plain text or as that escaped text; both count as present.
+        "working_memory_episodic_items": len(_WM_EPISODIC_LINE.findall(text)),
+        "previous_request_in_input": None if previous_request is None else _present(previous_request, text),
         "previous_reply_in_input": None
         if not previous_response
-        else previous_response[:_PREFIX_CHARS] in text,
+        else _present(previous_response[:_PREFIX_CHARS], text),
     }
     return found
 

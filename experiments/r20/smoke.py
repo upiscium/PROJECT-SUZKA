@@ -20,6 +20,11 @@ Diagnostic options (all observation only, all default off / unchanged):
   attestation.  The GPU free check runs before every subject; the loop stops at the first refusal
   or non-completed run and the completed runs are reported.  The results file lists every run and a
   table of counts / means over them.
+* ``--conversation-trace`` sets ``conversation_trace.enabled: true`` in the lab subject's generated config
+  (every other key of that section stays the repository default; the one-way AgentState V10 -> V11 move
+  happens on a throwaway genesis subject only).  The repository config has it off, so without the flag
+  the model input holds no earlier turn.  Results carry ``conversation_trace: {requested, config_applied}``
+  (``config_applied`` is read back from the subject's own config file) beside the prompt-assembly numbers.
 * ``--record-model-calls`` installs the lab-only ``recording_provider`` in the subject's serve
   child: the exact prompt / messages, the sampling parameters and the output of every model call go
   to the subject's PRIVATE directory (0600).  The results then carry, per turn, NUMBERS about how
@@ -50,6 +55,8 @@ from pathlib import Path
 import sys
 from typing import Any
 import uuid
+
+import yaml
 
 from experiments.r15_p0.pilot import Case
 from experiments.r20 import artifacts, gpu, measure
@@ -172,6 +179,7 @@ def _summary_lines(args: argparse.Namespace, model: ModelOverride | None) -> lis
         f"model id: {model.model_id}", f"revision: {model.revision}", f"hf_home: {model.hf_home}",
         f"4-bit: {model.load_in_4bit}", f"base: {args.base}", f"chat turns: up to {args.turns}",
         f"temperature: {'config value' if model.temperature is None else model.temperature}",
+        f"conversation trace enabled in the subject config: {bool(args.conversation_trace)}",
         f"fresh subjects (repeats): {args.repeats}; model calls recorded privately: {bool(args.record_model_calls)}",
         "a fresh throwaway subject is created per repeat; no production state is touched; observations only",
     ]
@@ -190,6 +198,23 @@ def _model(args: argparse.Namespace) -> ModelOverride | None:
         max_new_tokens=args.max_new_tokens, hf_home=Path(args.hf_home), revision=args.model_revision,
         temperature=args.temperature,
     )
+
+
+def _overrides(args: argparse.Namespace) -> dict[str, Any] | None:
+    return {"conversation_trace.enabled": True} if args.conversation_trace else None
+
+
+def _trace_record(args: argparse.Namespace, config_path: Path | None) -> dict[str, bool]:
+    """Labels only: was it asked for, and does the subject's OWN config file say it is enabled?"""
+
+    applied = False
+    if config_path is not None:
+        try:
+            section = (yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}).get("conversation_trace")
+            applied = isinstance(section, dict) and section.get("enabled") is True
+        except (OSError, yaml.YAMLError):
+            applied = False
+    return {"requested": bool(args.conversation_trace), "config_applied": applied}
 
 
 def _check_arguments(args: argparse.Namespace) -> None:
@@ -211,6 +236,7 @@ def _one_run(
         base, profile="S0", model=model, launch=launch, turn_cap_s=TURN_CAP_S,
         script=_SCRIPTED if model is None else None, default_answer=_SCRIPTED_DEFAULT if model is None else None,
         record_calls=bool(args.record_model_calls),
+        config_overrides=_overrides(args),
     )
     fixture = model is None
     label = "FIXTURE ONLY (scripted provider, no model, no GPU)" if fixture else f"REAL MODEL {model.model_id if model else ''}"
@@ -271,6 +297,7 @@ def _one_run(
         "ended": ended,
         "serving_after_s": None if session.serving_after_s is None else round(session.serving_after_s, 3),
         "gpu": {"free_at_launch_bytes": None if reading is None else reading.free_bytes, **measure.summarize(gpu_rows)},
+        "conversation_trace": _trace_record(args, session.subject.config_path),
         "turns": turns,
         "private_file": str(private_file),
         "model_calls_file": str(private_directory / "model_calls.jsonl") if args.record_model_calls else None,
@@ -364,6 +391,10 @@ def _smoke(args: argparse.Namespace, *, attest: Attest, gpu_runner: Callable[[],
             "do_sample_override": None if args.temperature is None else args.temperature != 0.0,
             "config_value_kept": args.temperature is None,
         },
+        "conversation_trace": {
+            "requested": bool(args.conversation_trace),
+            "config_applied": bool(runs) and all(run.get("conversation_trace", {}).get("config_applied") is True for run in runs),
+        },
         "runs": runs,
         "completed_runs": len(completed),
         "stopped": stopped,
@@ -397,6 +428,8 @@ def parser() -> argparse.ArgumentParser:
     top.add_argument("--repeats", type=int, default=1, help=f"sequential fresh subjects under one attestation, 1..{MAX_REPEATS}")
     top.add_argument("--record-model-calls", action="store_true",
                      help="lab diagnostics: record every model call privately and report prompt-assembly numbers")
+    top.add_argument("--conversation-trace", action="store_true",
+                     help="lab diagnostics: enable conversation_trace in the throwaway subject's config (default off)")
     top.add_argument("--human-launch", action="store_true")
     top.add_argument("--ssh-host", help="ssh name of this host, for the printed tunnel line")
     top.add_argument("--scripted", action="store_true", help="FIXTURE ONLY: scripted provider, no GPU, no model")
