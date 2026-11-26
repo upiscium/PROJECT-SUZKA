@@ -18,9 +18,9 @@ Subjects (each is a NEW genesis subject; none is reused):
   2b plan-hold receipt (written once; IP-14b-3 is merged);
 * ``E`` the same without the receipt switch (the eve shape): writes none.
 
-Items 13 (S1) and 14 (K = 3 pre-registration) are NOT run here: item 13 needs the
-S1 profile with the self-goal activation (a separate subject type, IP-23's S1),
-item 14 is the order / template the Human pre-registers before the first real run.
+Items 13 (S1) and 14 (K = 3 pre-registration) are NOT run here: the pre-registered real-model
+experiments (IP-23) were retired, so neither has a driver; R20 is judged by real use on the
+eve host.
 They are reported as such, never as passed.  T2 runs on the real wall clock:
 the provider is deterministic, the kill window is not; nothing here is a T1
 "covered" claim.  The F12-r tail of item 10 (no stale-branch action after a true

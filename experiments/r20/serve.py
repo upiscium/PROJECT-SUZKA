@@ -18,8 +18,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from experiments.r20 import artifacts, bridge, guards
-from experiments.r20.normalizing_provider import NormalizingProvider, wrap_loader
+from experiments.r20 import bridge, guards
 from experiments.r20.control import ControlError, ControlServer
 from experiments.r20.guards import GuardRefusal
 from experiments.r20.launch import check_launch_record
@@ -84,7 +83,7 @@ def prepare(args: argparse.Namespace) -> tuple[Path, Any, ProviderMode]:
         human_launch=bool(args.human_launch) and sys.stdin.isatty(),
     )
     if mode is ProviderMode.REAL:
-        # The launcher (``real_run``) is this child's parent and holds the Human's attestation.
+        # The launcher (the Human-launch entry) is this child's parent and holds the Human's attestation.
         check_launch_record(root.parent / "control" / "launch.json", args.launch_nonce, os.getppid())
     return root, load_provider(mode, Path(args.provider_config) if args.provider_config else None), mode
 
@@ -114,19 +113,9 @@ def main(argv: list[str] | None = None) -> int:
     if mode is ProviderMode.REAL:
         sampler = GpuSampler(root.parent / "evidence" / "gpu.jsonl")
         sampler.start()  # numbers only: free / total / reserved, before the load and then every few seconds
-    # COMPROMISE (HD-23, option 1): the S1 / S2 reply is normalised at the MODEL-CALL layer, so the
-    # subject stores the normalised text (see ``normalizing_provider``).  The private files live
-    # next to the subject root: <run dir>/private (0700).
-    from suzka.api import server as app_server
-
-    private = artifacts.private_dir(root.parent)
-    if mode is ProviderMode.REAL:
-        # The model is built lazily in the app's lifespan, once per DC cycle, through this module-level
-        # name.  Replacing it wraps every provider a cycle builds (a restart cycle included).
-        app_server.load_model_provider = wrap_loader(app_server.load_model_provider, private)
     app = create_app(settings)
     if provider is not None:
-        app.state.model_provider = NormalizingProvider(provider, private)
+        app.state.model_provider = provider
         # Mode "continue": the supervisor drops every ``app.state`` key added after
         # ``create_app`` before a new cycle.  The injected scripted provider is the
         # harness's, not the cycle's: part of the baseline, so a restart cycle in

@@ -1,6 +1,5 @@
-"""R20 real terminal: the REAL ``RealTerminal`` and the REAL ``real_run prereg`` entry on a REAL
-pseudo-terminal that is the controlling terminal of the child.  No fake terminal, no seam, no GPU,
-no model (the prereg flow never loads one).
+"""R20 real terminal: the REAL ``launch.RealTerminal`` prompt on a REAL pseudo-terminal that is the
+controlling terminal of the child.  No fake terminal, no seam, no GPU, no model.
 
 The child is started by a double fork (the middle process exits at once), so it is not a
 descendant of the test process: the launcher refuses an agent CLI among its ancestors, and a test
@@ -13,17 +12,13 @@ import os
 from pathlib import Path
 import re
 import select
-import shutil
 import signal
-import stat
-import subprocess
 import sys
 import termios
 import time
 
 import pytest
 
-from experiments.r20 import prereg
 from experiments.r20.guards import repo_root
 
 if not sys.platform.startswith("linux"):  # pragma: no cover
@@ -31,7 +26,6 @@ if not sys.platform.startswith("linux"):  # pragma: no cover
 
 TIMEOUT = 40.0
 PROMPT_END = r"\r?\n> "
-SENTENCE = (PROMPT_END, r"(I AM THE HUMAN OPERATOR[^\r\n]*)\r?\n> ")
 
 
 class Result:
@@ -185,60 +179,3 @@ def test_prompt_without_a_controlling_terminal_is_a_clean_refusal(tmp_path: Path
     result = run_detached(python(PROMPT_SCRIPT), tmp_path, mode=mode)
     seen = result.text + result.output
     assert "REFUSED NO_TTY" in seen and result.code == 3 and "Traceback" not in seen
-
-
-def make_source(tmp: Path) -> Path:
-    """A throw-away git checkout of the code (a clean tree, a head), so the pre-registration
-    preflight is satisfied without touching the real checkout."""
-
-    root = repo_root()
-    target = tmp / "src"
-    ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
-    shutil.copytree(root / "experiments", target / "experiments", ignore=ignore)
-    shutil.copytree(root / "suzka", target / "suzka", ignore=ignore)
-    shutil.copy(root / "config.yaml", target / "config.yaml")
-    git = ["git", "-C", str(target), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
-    for command in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "snapshot"]):
-        subprocess.run([*git, *command], check=True, capture_output=True)
-    return target
-
-
-def prereg_argv(tmp: Path, revision: str) -> list[str]:
-    hf = tmp / "hf"
-    refs = hf / "hub" / "models--google--gemma-4-12B-it" / "refs"
-    refs.mkdir(parents=True)
-    (refs / "main").write_text(revision + "\n")
-    return [sys.executable, "-m", "experiments.r20.real_run", "prereg", "--base", str(tmp / "base"),
-            "--model-id", "google/gemma-4-12B-it", "--hf-home", str(hf), "--model-revision", revision,
-            "--master-seed", "1", "--trial-id", "t", "--human-launch"]
-
-
-def test_the_prereg_flow_runs_on_a_real_pty_and_records_the_preregistration(tmp_path: Path) -> None:
-    source = make_source(tmp_path)
-    revision = "0123456789abcdef0123456789abcdef01234567"
-    result = run_detached(prereg_argv(tmp_path, revision), tmp_path, mode="pty", steps=[(SENTENCE[1], "")],
-                          cwd=source, source=source)
-    assert result.code == 0 and "Traceback" not in result.output, result.output
-    base = tmp_path / "base"
-    path = base / prereg.PREREG_NAME
-    assert stat.S_IMODE(path.stat().st_mode) == 0o400
-    content, digest = prereg.load(base)  # hash recorded and verified
-    assert "four_unlisted_known_violations" not in content["known_violations"]
-    assert (base / prereg.HASH_NAME).read_text().strip() == digest
-    assert digest in result.output and revision[:8] in result.output
-
-
-def test_the_prereg_flow_refuses_cleanly_without_a_terminal_on_eof_and_on_ctrl_c(tmp_path: Path) -> None:
-    source = make_source(tmp_path)
-    revision = "0123456789abcdef0123456789abcdef01234567"
-    argv = prereg_argv(tmp_path, revision)
-    none = run_detached(argv, tmp_path, mode="none", cwd=source, source=source)
-    assert "real_run refused: NO_TTY" in none.text and none.code not in (0, None) and "Traceback" not in none.text
-    for name, key, code in (("eof", b"\x04", "CONFIRMATION_EOF"), ("intr", b"\x03", "CONFIRMATION_INTERRUPTED")):
-        work = tmp_path / name
-        work.mkdir()
-        argv = prereg_argv(work, revision)
-        result = run_detached(argv, work, mode="pty", steps=[(PROMPT_END, key)],
-                              cwd=source, source=source)
-        assert f"real_run refused: {code}" in result.output and result.code not in (0, None), result.output
-        assert "Traceback" not in result.output and not (work / "base").exists()

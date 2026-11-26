@@ -41,7 +41,6 @@ from experiments.r20.manifest import Manifest
 from experiments.r20.model_config import ModelOverride
 from experiments.r20.polling import poll_until, short_read
 from experiments.r20.provider import S0_TARGET, r15_protocol_script
-from experiments.r20.normalizing_provider import read_attempts, read_names
 from experiments.r20.supervisor import READY_TIMEOUT_S, ChildProcess
 
 # R19 timings of the T2 chain: the Feedback Wake is due at once, the tick and the
@@ -331,8 +330,6 @@ class S0Session:
         self.step_timeout_s = REAL_STEP_TIMEOUT_S if self.real else STEP_TIMEOUT_S
         self.ticket_timeout_s = max(30.0, turn_cap_s) if self.real else 30.0
         self.turn_seconds: list[float] = []
-        self.reply_normalizations: dict[str, list[str]] = {}  # phase -> names only, never text
-        self.reply_attempts: dict[str, dict[str, Any]] = {}  # phase -> {attempts, accepted}: numbers only
         self.subject = create_subject(
             profile,
             base=base,
@@ -515,8 +512,6 @@ class S0Session:
                 reviews["S1"] = self.review("S1")
             data = self.chat(message)
             self.experience_ids.append(str(data["experience_id"]))
-            # COMPROMISE (HD-23, option 1): the S1 / S2 reply was ALREADY normalised at the model-call layer
-            # (``normalizing_provider``, inside the serve child); what the app returned is what the subject stored.
             reply = {"episode_id": str(data["episode_id"]), "response": str(data["response"])}
             if self.real:  # the stored text, one line per turn, as it arrives (the model's literal text is p1.model_raw.jsonl)
                 self._keep_turn(len(self.experience_ids), message, reply["response"])
@@ -526,9 +521,6 @@ class S0Session:
             run_trial(seal, capture, transport)
         except TrialRefused as refusal:  # the reason is coarse by contract (no transcript, path or id)
             raise GuardRefusal("P1_PROTOCOL_REFUSED", f"{refusal}; turns_answered={len(self.experience_ids)}") from refusal
-        finally:
-            self.reply_normalizations = read_names(artifacts.private_dir(self.subject.run_dir))
-            self.reply_attempts = read_attempts(artifacts.private_dir(self.subject.run_dir))
         reviews["S2"] = self.review("S2")
         return reviews
 

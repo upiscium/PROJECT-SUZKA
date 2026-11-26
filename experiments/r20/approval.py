@@ -18,13 +18,19 @@ refused with a real provider (HD-22-3); ``HUMAN`` only announces the URL.
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
-from typing import Any, Protocol
+import time
+from typing import TYPE_CHECKING, Any, Protocol
 
 from experiments.r20.guards import GuardRefusal
 from experiments.r20.provider import ApprovalActor, ProviderMode, check_modes
+
+if TYPE_CHECKING:
+    from experiments.r20.s0 import S0Session
 
 CHALLENGE_DOMAIN = "PROJECT-SUZKA:R18:APPROVAL-CHALLENGE:V1\0"
 CODE_DOMAIN = "PROJECT-SUZKA:R18:CONFIRMATION-CODE:V1\0"
@@ -210,14 +216,58 @@ class ApprovalOperator:
         return self.confirm(intent_id, checked.nonce, checked.code)
 
 
+def ssh_line(port: int, host: str) -> str:
+    """The exact tunnel the Human opens: the browser then sees ``localhost:<port>``,
+    which the lab's approval origin requires."""
+
+    return f"ssh -L {port}:127.0.0.1:{port} {host}"
+
+
+class HumanApprover:
+    """The Human, personally, through an ssh tunnel to the lab port.  It SENDS
+    NOTHING: it prints the URL and the exact tunnel line, then waits until the
+    claim row appears (the Human confirmed in the browser) or the window ends."""
+
+    actor = ApprovalActor.HUMAN
+
+    def __init__(self, announce: Callable[[str], None], ssh_host: str, *, poll_s: float = 2.0) -> None:
+        self._announce = announce
+        self.ssh_host = ssh_host
+        self.poll_s = poll_s
+
+    def instructions(self, port: int, approval: dict[str, Any]) -> str:
+        return (
+            "APPROVAL NEEDED, by you personally.\n"
+            f"  1. on your workstation:  {ssh_line(port, self.ssh_host)}\n"
+            f"  2. open:                 {ApprovalOperator.url_for(port)}\n"
+            f"  3. read the challenge, type the displayed confirmation code, confirm.\n"
+            f"  intent: {approval.get('intent_id')}   window ends (UTC): {approval.get('window_end_utc')}\n"
+            "  This is the lab subject's approval only; production's approval page is not involved."
+        )
+
+    def waiter(self, session: S0Session, approval: dict[str, Any]) -> Callable[[], Any]:
+        def run() -> Any:
+            self._announce(self.instructions(session.subject.port, approval))
+            end = datetime.strptime(str(approval["window_end_utc"]), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            while datetime.now(timezone.utc) <= end:
+                if session.evidence.finalized("R18_EXECUTION_CLAIM") >= 1:
+                    return {"claimed": True}
+                time.sleep(self.poll_s)
+            return {"claimed": session.evidence.finalized("R18_EXECUTION_CLAIM") >= 1}
+
+        return run
+
+
 __all__ = [
     "ARTIFACT_DOMAIN",
     "CHALLENGE_DOMAIN",
     "CODE_DOMAIN",
     "INTENT_DOMAIN",
     "ApprovalOperator",
+    "HumanApprover",
     "Recomputed",
     "canon",
     "code_from",
     "recompute",
+    "ssh_line",
 ]

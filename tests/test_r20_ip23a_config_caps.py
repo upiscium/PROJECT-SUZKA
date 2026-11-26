@@ -1,29 +1,17 @@
-"""IP-23a: the model-configuration override, the caps and the ledger, the GPU
+"""IP-23a: the model-configuration override, the GPU
 probe (no NVML), ports, artifacts.  No model, no GPU, no process."""
 
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 import stat
-import time
 
 import pytest
 import yaml
 from r20_ip23_helpers import MODEL_ID, REVISION, make_cache, real_model, refusal_code
 
 from experiments.r20 import artifacts, factory, gpu, guards
-from experiments.r20.caps import (
-    HARD_MAX_SUBJECTS,
-    HARD_SESSION_SECONDS,
-    HARD_TOTAL_SECONDS,
-    HARD_TURN_SECONDS,
-    STAGE_LIMITS,
-    Caps,
-    Ledger,
-    Session,
-)
 from experiments.r20.factory import Tier, create_subject
 from experiments.r20.guards import GuardRefusal
 from experiments.r20.model_config import ModelOverride, cached_revision, check_pinned_revision
@@ -80,60 +68,6 @@ def test_the_record_carries_identifiers_only() -> None:
     record = real_model().record()
     assert record["mode"] == "real" and record["model_id"] == MODEL_ID and record["revision_pinned"] == REVISION
     assert record["fixture_only"] is False and ModelOverride().record()["fixture_only"] is True
-
-
-# -------------------------------------------------------------------- caps
-
-
-def test_the_caps_are_the_humans_and_a_value_can_only_lower_them() -> None:
-    caps = Caps()
-    assert (caps.max_subjects, caps.total_seconds, caps.session_seconds, caps.turn_seconds, caps.min_free_bytes) == (
-        42, 10 * 3600, 2.5 * 3600, 120.0, 14 * 1024**3,
-    )
-    assert sum(STAGE_LIMITS.values()) == HARD_MAX_SUBJECTS == 42
-    assert Caps(max_subjects=5, turn_seconds=60.0).max_subjects == 5
-    for bad in ({"max_subjects": 43}, {"total_seconds": HARD_TOTAL_SECONDS + 1}, {"session_seconds": HARD_SESSION_SECONDS + 1},
-                {"turn_seconds": HARD_TURN_SECONDS + 1}, {"min_free_bytes": 1}, {"max_subjects": 0}):
-        assert refusal_code(Caps, **bad) == "CAP_ABOVE_LIMIT"
-
-
-def test_the_ledger_counts_subjects_and_hours_across_launches(tmp_path: Path) -> None:
-    clock = [0.0]
-    ledger = Ledger(tmp_path / "l.jsonl")
-    caps = Caps(max_subjects=3)
-    first = Session(ledger, caps, "L1", "S0", clock=lambda: clock[0])
-    first.begin_subject("a")
-    first.begin_subject("b")
-    clock[0] = 100.0
-    first.end("completed")
-    second = Session(ledger, caps, "L2", "S0", clock=lambda: clock[0])
-    second.begin_subject("c")
-    assert ledger.subjects_used() == 3 and ledger.subjects_used("S0") == 3
-    assert refusal_code(second.begin_subject, "d") == "CAP_MAX_SUBJECTS"
-    assert stat.S_IMODE(ledger.path.stat().st_mode) == 0o600
-
-
-def test_per_stage_limits_the_session_cap_and_the_total_cap(tmp_path: Path) -> None:
-    clock = [0.0]
-    ledger = Ledger(tmp_path / "l.jsonl")
-    session = Session(ledger, Caps(), "L1", "G1", clock=lambda: clock[0])
-    session.begin_subject("g1a")
-    assert refusal_code(session.begin_subject, "g1b") == "CAP_STAGE_SUBJECTS"  # G1 is one subject
-    clock[0] = HARD_SESSION_SECONDS + 1
-    assert refusal_code(session.check) == "CAP_SESSION_HOURS"
-    assert refusal_code(session.begin_subject, "x", stage="S0") == "CAP_SESSION_HOURS"
-    # hours of earlier launches count toward the total
-    ledger.append(kind="end", launch="OLD1", elapsed_s=HARD_SESSION_SECONDS)
-    ledger.append(kind="end", launch="OLD2", elapsed_s=HARD_SESSION_SECONDS)
-    ledger.append(kind="end", launch="OLD3", elapsed_s=HARD_SESSION_SECONDS)
-    ledger.append(kind="end", launch="OLD4", elapsed_s=HARD_SESSION_SECONDS)
-    fresh_clock = [0.0]
-    late = Session(ledger, Caps(), "L9", "S0", clock=lambda: fresh_clock[0])
-    assert refusal_code(late.check) == "CAP_TOTAL_HOURS"
-
-
-def test_an_unknown_stage_is_refused(tmp_path: Path) -> None:
-    assert refusal_code(Session, Ledger(tmp_path / "l.jsonl"), Caps(), "L", "NOPE") == "STAGE_UNKNOWN"
 
 
 # --------------------------------------------------------------- the GPU probe
@@ -203,176 +137,8 @@ def test_raw_transcripts_live_in_a_private_directory_with_a_retention_note(tmp_p
     assert stat.S_IMODE(private.stat().st_mode) == 0o700
     note = private / "RETENTION.txt"
     assert stat.S_IMODE(note.stat().st_mode) == 0o600
-    assert "14 days" in note.read_text() and "erase" in note.read_text()
+    assert "14 days" in note.read_text()
     transcript = artifacts.write_private(private / "p1.capture.json", b"raw")
     assert stat.S_IMODE(transcript.stat().st_mode) == 0o600
     with pytest.raises(FileExistsError):
         artifacts.write_private(transcript, b"again")
-    assert artifacts.private_problems(tmp_path) == []
-    os.chmod(transcript, 0o644)
-    assert artifacts.private_problems(tmp_path)
-
-
-def _real_base(tmp_path: Path) -> Path:
-    base = tmp_path / "base"
-    base.mkdir(mode=0o700)
-    artifacts.mark_base(base, "d" * 64)
-    return base
-
-
-def _run_dir(base: Path, name: str, *, age_days: float = 0) -> Path:
-    run = base / name
-    (run / "subject").mkdir(parents=True)
-    (run / "subject" / guards.MARKER_NAME).write_text("{}")
-    (run / "evidence").mkdir()
-    (run / "evidence" / "manifest.json").write_text("{}")
-    artifacts.private_dir(run)
-    (run / "serve.log").write_text("log")
-    (run / "home").mkdir()
-    if age_days:
-        old = time.time() - age_days * 86400
-        os.utime(run / "evidence", (old, old))
-    return run
-
-
-def test_erase_needs_confirmation_a_real_run_base_and_keeps_the_evidence(tmp_path: Path) -> None:
-    base = _real_base(tmp_path)
-    run = _run_dir(base, "r1")
-    assert refusal_code(artifacts.erase, base, confirmed=False) == "ERASE_NOT_CONFIRMED"
-    plain = tmp_path / "plain"
-    plain.mkdir()
-    assert refusal_code(artifacts.erase, plain, confirmed=True) == "ERASE_NOT_A_REAL_RUN_BASE"
-    erased = artifacts.erase(base, confirmed=True)
-    assert [item.run_id for item in erased] == ["r1"]
-    assert not (run / "subject").exists() and not (run / "private").exists() and not (run / "serve.log").exists()
-    assert (run / "evidence" / "manifest.json").exists()  # the closed-key manifest is not raw
-
-
-def test_erase_by_age_and_by_name(tmp_path: Path) -> None:
-    base = _real_base(tmp_path)
-    old = _run_dir(base, "old", age_days=20)
-    new = _run_dir(base, "new", age_days=1)
-    erased = artifacts.erase(base, older_than_days=14, confirmed=True)
-    assert [item.run_id for item in erased] == ["old"] and (new / "subject").exists() and not (old / "subject").exists()
-    assert artifacts.erase(base, run_ids=["absent"], confirmed=True) == []
-    assert [item.run_id for item in artifacts.erase(base, run_ids=["new"], confirmed=True)] == ["new"]
-
-
-def test_erase_refuses_a_symlinked_part(tmp_path: Path) -> None:
-    base = _real_base(tmp_path)
-    run = _run_dir(base, "r2")
-    keep = tmp_path / "elsewhere"
-    keep.mkdir()
-    (keep / "x").write_text("x")
-    import shutil
-
-    shutil.rmtree(run / "home")
-    (run / "home").symlink_to(keep)
-    assert refusal_code(artifacts.erase, base, confirmed=True) == "ERASE_SYMLINK"
-    assert (keep / "x").exists()
-
-
-def test_erase_refuses_a_production_base_first(tmp_path: Path) -> None:
-    for place in ("/etc", "/var/lib/suzka", "/opt/project-suzka"):
-        assert refusal_code(artifacts.erase, Path(place), confirmed=True) == "PRODUCTION_PATH"
-
-
-def test_the_locks_are_opened_without_following_links_and_private(tmp_path: Path) -> None:
-    from experiments.r20 import real_run
-
-    target = tmp_path / "victim"
-    target.write_text("x")
-    link = tmp_path / "real.lock"
-    link.symlink_to(target)
-    with pytest.raises(OSError):
-        real_run._open_lock(link)  # noqa: SLF001
-    handle = real_run._open_lock(tmp_path / "fresh.lock")  # noqa: SLF001
-    handle.close()
-    assert stat.S_IMODE((tmp_path / "fresh.lock").stat().st_mode) == 0o600
-    assert real_run.default_global_lock().parent == real_run.default_ledger_path().parent
-
-
-# ------------------------------------------------ review round 3 (IP-23a)
-
-
-def _git_repo(path: Path) -> Path:
-    import subprocess
-
-    path.mkdir()
-    def run(*arguments: str) -> None:
-        subprocess.run(["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@t", *arguments], check=True, capture_output=True)
-
-    run("init", "-q")
-    (path / "code.py").write_text("x = 1\n")
-    (path / ".gitignore").write_text("ignored.py\n.venv/\n__pycache__/\n")
-    run("add", ".")
-    run("commit", "-q", "-m", "c")
-    return path
-
-
-def test_the_tree_check_sees_every_way_to_change_what_runs(tmp_path: Path) -> None:
-    import subprocess
-
-    repo = _git_repo(tmp_path / "r")
-    assert factory.git_dirty(repo) is False
-    (repo / "__pycache__").mkdir()
-    (repo / "__pycache__" / "code.cpython-313.pyc").write_bytes(b"x")  # a pyc is allowed
-    (repo / ".venv").mkdir()
-    (repo / ".venv" / "lib.py").write_text("x")  # the interpreter environment is allowed
-    assert factory.git_dirty(repo) is False
-    (repo / "ignored.py").write_text("print('planted')")  # an IGNORED module is code that would run
-    assert factory.git_dirty(repo) is True
-    (repo / "ignored.py").unlink()
-    (repo / "sitecustomize.py").write_text("print('x')")
-    assert factory.git_dirty(repo) is True  # untracked
-    (repo / "sitecustomize.py").unlink()
-    (repo / "code.py").write_text("x = 2\n")
-    assert factory.git_dirty(repo) is True  # modified
-    subprocess.run(["git", "-C", str(repo), "update-index", "--assume-unchanged", "code.py"], check=True)
-    assert factory.git_dirty(repo) is True  # hidden from `git status`, but refused
-    subprocess.run(["git", "-C", str(repo), "update-index", "--no-assume-unchanged", "code.py"], check=True)
-    subprocess.run(["git", "-C", str(repo), "checkout", "--", "code.py"], check=True)
-    assert factory.git_dirty(repo) is False
-    subprocess.run(["git", "-C", str(repo), "update-index", "--skip-worktree", "code.py"], check=True)
-    assert factory.git_dirty(repo) is True
-    assert factory.git_dirty(tmp_path / "not-a-repo-at-all") is None
-
-
-def test_the_state_directory_comes_from_the_account_database_not_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from types import SimpleNamespace
-
-    from experiments.r20 import real_run
-
-    account = tmp_path / "account"
-    account.mkdir()
-    monkeypatch.setattr(real_run.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(account)))
-    monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))  # HOME=/tmp/x must not move the ledger
-    directory = real_run.user_state_dir()
-    assert directory == account / ".local" / "state" / "suzka-r20" and not (tmp_path / "elsewhere").exists()
-    assert real_run.default_ledger_path().parent == directory == real_run.default_global_lock().parent
-    os.chmod(directory, 0o755)
-    assert refusal_code(real_run.user_state_dir) == "STATE_DIR_MODE" and stat.S_IMODE(directory.stat().st_mode) == 0o755  # not chmod-ed
-    os.chmod(directory, 0o700)
-    monkeypatch.setattr(real_run.os, "getuid", lambda: os.geteuid() + 1)
-    assert refusal_code(real_run.user_state_dir) == "STATE_DIR_NOT_OURS"
-
-
-def test_a_ledger_that_cannot_be_read_is_not_empty_and_is_never_written_through_a_link(tmp_path: Path) -> None:
-    ledger = Ledger(tmp_path / "l.jsonl")
-    assert ledger.rows() == [] and ledger.subjects_used() == 0  # only a MISSING file is empty
-    ledger.append(kind="subject", launch="L", stage="G1", run_id="a", elapsed_s=1.0)
-    (tmp_path / "dir.jsonl").mkdir()
-    assert refusal_code(Ledger(tmp_path / "dir.jsonl").rows) == "LEDGER_UNREADABLE"
-    if os.geteuid() != 0:
-        os.chmod(ledger.path, 0)
-        try:
-            assert refusal_code(ledger.rows) == "LEDGER_UNREADABLE"
-        finally:
-            os.chmod(ledger.path, 0o600)
-    target = tmp_path / "victim.txt"
-    target.write_text("keep")
-    link = tmp_path / "link.jsonl"
-    link.symlink_to(target)
-    with pytest.raises(OSError):
-        Ledger(link).append(kind="x")
-    assert target.read_text() == "keep"
