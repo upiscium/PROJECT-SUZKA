@@ -136,6 +136,7 @@ class ChildProcess:
         actor: ApprovalActor = ApprovalActor.SCRIPTED,
         provider_config: dict[str, Any] | None = None,
         log_path: Path | None = None,
+        record_calls: bool = False,
     ) -> ChildProcess:
         check_modes(provider, actor, human_launch=False)  # before any child exists
         if subject.tier is not Tier.T2:
@@ -146,6 +147,8 @@ class ChildProcess:
             "--run-id", subject.run_id, "--provider", provider.value,
             "--approval-actor", actor.value,
         ]
+        if record_calls:  # lab diagnostics, opt-in: the command is unchanged without it
+            command.append("--record-calls")
         if provider_config is not None:
             subject.provider_config.write_text(json.dumps(provider_config), encoding="utf-8")
             os.chmod(subject.provider_config, 0o600)
@@ -176,6 +179,7 @@ class ChildProcess:
         hf_home: Path | None,
         turn_cap_s: float,
         log_path: Path | None = None,
+        record_calls: bool = False,
     ) -> ChildProcess:
         """The ONLY way a real-model child starts: it needs the attestation of THIS
         process's Human launch (``attest_human_launch``).  ``spawn`` still refuses a
@@ -198,6 +202,8 @@ class ChildProcess:
             "--approval-actor", ApprovalActor.HUMAN.value, "--human-launch",
             "--launch-nonce", launch.nonce, "--turn-cap-s", str(turn_cap_s),
         ]
+        if record_calls:  # lab diagnostics, opt-in: the command is unchanged without it
+            command.append("--record-calls")
         child_home(subject).mkdir(mode=0o700, exist_ok=True)
         log = open(log_path or subject.run_dir / "serve.log", "ab")
         try:

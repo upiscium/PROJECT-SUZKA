@@ -29,6 +29,7 @@ from experiments.r20.guards import GuardRefusal
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
 _REVISION = re.compile(r"[0-9a-f]{40}")
 PROVIDERS = ("dummy", "transformers")
+MAX_TEMPERATURE = 1.5
 VERSIONED_PACKAGES = ("torch", "transformers", "bitsandbytes", "accelerate", "peft")
 
 
@@ -49,10 +50,14 @@ class ModelOverride:
     dtype: str = "auto"
     hf_home: Path | None = None
     revision: str | None = None
+    # Lab override of generation.temperature; 0.0 means greedy (do_sample false); None keeps the config.
+    temperature: float | None = None
 
     def __post_init__(self) -> None:
         if self.provider not in PROVIDERS:
             raise GuardRefusal("MODEL_PROVIDER_UNKNOWN", self.provider)
+        if self.temperature is not None and not 0.0 <= self.temperature <= MAX_TEMPERATURE:
+            raise GuardRefusal("MODEL_TEMPERATURE", f"0.0..{MAX_TEMPERATURE}")
         if self.max_new_tokens is not None and not 1 <= self.max_new_tokens <= 4096:
             raise GuardRefusal("MODEL_MAX_NEW_TOKENS", str(self.max_new_tokens))
         if self.provider == "dummy":
@@ -89,6 +94,13 @@ class ModelOverride:
         )
         if self.max_new_tokens is not None:
             raw.setdefault("generation", {})["max_new_tokens"] = self.max_new_tokens
+        if self.temperature is not None:
+            generation = raw.setdefault("generation", {})
+            if self.temperature == 0.0:
+                generation["do_sample"] = False  # greedy; the provider then passes no temperature / top_p
+            else:
+                generation["do_sample"] = True
+                generation["temperature"] = self.temperature
 
     def record(self) -> dict[str, object]:
         """Identifiers only (the manifest / identity ``provider`` entry)."""
@@ -102,6 +114,8 @@ class ModelOverride:
             "device": self.device,
             "dtype": self.dtype,
             "max_new_tokens": self.max_new_tokens,
+            "temperature_override": self.temperature,  # None = the config's own value
+            "do_sample_override": None if self.temperature is None else self.temperature != 0.0,
             "hf_home": None if self.hf_home is None else str(self.hf_home),
             "fixture_only": not self.is_real,
         }

@@ -48,8 +48,10 @@ def test_the_scripted_smoke_runs_end_to_end_and_reports_observations(
     out = capsys.readouterr().out
     assert code == 0  # the scripted E reply names TWO options: an observation, not a failure
     assert "FIXTURE ONLY" in out and "observations, not a verdict" in out and "RAW REAL-MODEL OUTPUT" in out
-    data = results_of(r20_base)
-    assert data["fixture_only"] is True and data["verdict"] is None and data["ended"] == "completed"
+    top = results_of(r20_base)
+    assert top["fixture_only"] is True and top["verdict"] is None and top["completed_runs"] == 1 and top["stopped"] is None
+    data = top["runs"][0]
+    assert data["ended"] == "completed"
     assert [turn["label"] for turn in data["turns"]] == ["setup", "E", "identity", "factual"]
     naming = data["turns"][1]["option_naming"]
     assert naming == {"kind": "observed", "options_named": 2, "names_exactly_one": False}
@@ -64,7 +66,7 @@ def test_results_and_output_hold_no_model_text_and_the_private_file_is_0600(
     assert smoke.main(["--base", str(r20_base), "--scripted", "--turns", "2"]) == 0
     out = capsys.readouterr().out
     (results,) = r20_base.glob("results-smoke-*.json")
-    data = json.loads(results.read_text(encoding="utf-8"))
+    data = json.loads(results.read_text(encoding="utf-8"))["runs"][0]
     private = Path(data["private_file"])
     assert private.is_file() and stat.S_IMODE(private.stat().st_mode) == 0o600
     assert stat.S_IMODE(private.parent.stat().st_mode) == 0o700 and (private.parent / "RETENTION.txt").is_file()
@@ -75,7 +77,9 @@ def test_results_and_output_hold_no_model_text_and_the_private_file_is_0600(
         assert row["response"] not in out
         assert row["request"] not in results.read_text(encoding="utf-8")
     for turn in data["turns"]:
-        assert set(turn) == {"ordinal", "label", "seconds", "response_chars", "option_naming"}
+        assert set(turn) == {"ordinal", "label", "seconds", "response_chars", "option_naming", "observed_labels",
+                             "model_calls", "sampling", "prompt_assembly"}
+        assert turn["model_calls"] is None and turn["sampling"] is None and turn["prompt_assembly"] is None
 
 
 # ----------------------------------------------------------------------- guards
@@ -132,7 +136,12 @@ def test_argument_combinations_are_refused(r20_base: Path) -> None:
     seam = {"attest": lambda *a, **k: human_launch("SMOKE"), "gpu_runner": None}
     assert refusal_code(run, args_for(r20_base), **seam) == "MODEL_ARGUMENTS_REQUIRED"
     assert refusal_code(run, args_for(r20_base, "--scripted", "--model-id", MODEL_ID), **seam) == "SCRIPTED_WITH_MODEL_ARGUMENTS"
-    assert refusal_code(run, args_for(r20_base, "--scripted", "--turns", "7"), **seam) == "TURNS_OUT_OF_RANGE"
+    assert refusal_code(run, args_for(r20_base, "--scripted", "--turns", "8"), **seam) == "TURNS_OUT_OF_RANGE"
+    for bad in ("0", "6", "-1"):
+        assert refusal_code(run, args_for(r20_base, "--scripted", "--repeats", bad), **seam) == "REPEATS_OUT_OF_RANGE"
+    for bad in ("-0.1", "1.6", "nan"):
+        assert refusal_code(run, args_for(r20_base, "--scripted", "--temperature", bad), **seam) == "TEMPERATURE_OUT_OF_RANGE"
+    assert not list(r20_base.iterdir())  # every refusal came before anything was created
     assert refusal_code(run, args_for(r20_base, "--scripted", "--turns", "0"), **seam) == "TURNS_OUT_OF_RANGE"
 
 

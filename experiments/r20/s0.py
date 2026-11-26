@@ -320,7 +320,9 @@ class S0Session:
         model: ModelOverride | None = None,
         launch: HumanLaunch | None = None,
         turn_cap_s: float = 120.0,
+        record_calls: bool = False,
     ) -> None:
+        self.record_calls = record_calls
         self.real = model is not None and model.is_real
         if self.real and (launch is None or not isinstance(launch, HumanLaunch) or not launch.valid_here()):
             raise GuardRefusal("REAL_PROVIDER_WITHOUT_HUMAN_LAUNCH")
@@ -359,9 +361,12 @@ class S0Session:
         if self.real:
             assert self.launch is not None and self.model is not None
             return ChildProcess.spawn_real(
-                self.subject, self.launch, hf_home=self.model.hf_home, turn_cap_s=self.turn_cap_s
+                self.subject, self.launch, hf_home=self.model.hf_home, turn_cap_s=self.turn_cap_s,
+                **({"record_calls": True} if self.record_calls else {}),
             )
-        return ChildProcess.spawn(self.subject, provider_config=self.provider_config)
+        return ChildProcess.spawn(
+            self.subject, provider_config=self.provider_config, **({"record_calls": True} if self.record_calls else {})
+        )
 
     def provider_identity(self) -> dict[str, object]:
         if self.real:

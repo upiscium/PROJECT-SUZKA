@@ -61,6 +61,8 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--human-launch", action="store_true")
     parser.add_argument("--launch-nonce")
     parser.add_argument("--turn-cap-s", type=float, default=float(bridge.TIMEOUT_S))
+    # Lab diagnostics, OPT-IN (the smoke sets it): record every model call to the private directory.
+    parser.add_argument("--record-calls", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -113,9 +115,21 @@ def main(argv: list[str] | None = None) -> int:
     if mode is ProviderMode.REAL:
         sampler = GpuSampler(root.parent / "evidence" / "gpu.jsonl")
         sampler.start()  # numbers only: free / total / reserved, before the load and then every few seconds
+    record = bool(args.record_calls)
+    if record:
+        # Lab diagnostics only (``recording_provider``): raw prompts / outputs go to <run dir>/private (0700, 0600 file).
+        from experiments.r20 import artifacts
+        from experiments.r20.recording_provider import RecordingProvider, wrap_loader
+        from suzka.api import server as app_server
+
+        private = artifacts.private_dir(root.parent)
+        if mode is ProviderMode.REAL:
+            # The model is built lazily in the app's lifespan, once per DC cycle, through this module-level
+            # name.  Replacing it wraps every provider a cycle builds (a restart cycle included).
+            app_server.load_model_provider = wrap_loader(app_server.load_model_provider, private)
     app = create_app(settings)
     if provider is not None:
-        app.state.model_provider = provider
+        app.state.model_provider = RecordingProvider(provider, private) if record else provider
         # Mode "continue": the supervisor drops every ``app.state`` key added after
         # ``create_app`` before a new cycle.  The injected scripted provider is the
         # harness's, not the cycle's: part of the baseline, so a restart cycle in
