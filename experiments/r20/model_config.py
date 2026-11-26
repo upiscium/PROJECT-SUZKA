@@ -1,4 +1,4 @@
-"""The model-configuration override of a lab subject (IP-23a, HD-23-8).
+"""The model-configuration override of a lab subject (HD-23-8).
 
 The factory's default stays ``provider: dummy`` (the repository config).  A real
 run names its model EXPLICITLY: the model id is an argument of the Human's
@@ -15,7 +15,9 @@ This module imports no ML library: package versions come from
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import importlib.metadata
+import json
 import os
 from pathlib import Path
 import re
@@ -140,6 +142,16 @@ def check_pinned_revision(model: ModelOverride) -> str:
     return found
 
 
+def model_digest(model: ModelOverride) -> str:
+    """The digest a Human launch binds: model id, pinned revision and the 4-bit flag (identifiers only)."""
+
+    payload = json.dumps(
+        {"model_id": model.model_id, "revision": model.revision, "load_in_4bit": model.load_in_4bit},
+        sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def package_versions() -> dict[str, str | None]:
     versions: dict[str, str | None] = {}
     for name in VERSIONED_PACKAGES:
@@ -156,5 +168,6 @@ __all__ = [
     "cache_dir_name",
     "cached_revision",
     "check_pinned_revision",
+    "model_digest",
     "package_versions",
 ]

@@ -33,8 +33,8 @@ def attest(**changes: object) -> HumanLaunch:
 def test_a_human_at_a_terminal_who_types_the_sentence_is_attested() -> None:
     terminal = FakeTerminal()
     launched = attest(terminal=terminal)
-    assert launched.valid_here() and launched.stage == "S0" and launched.prereg_sha256 == DIGEST
-    assert sentence("S0", DIGEST) in terminal.prompts[0]  # names the stage and the pre-registration hash
+    assert launched.valid_here() and launched.stage == "S0" and launched.model_digest == DIGEST
+    assert sentence("S0", DIGEST) in terminal.prompts[0]  # names the stage and the model digest
 
 
 def test_every_refusal_of_the_guard() -> None:
@@ -52,7 +52,7 @@ def test_every_refusal_of_the_guard() -> None:
 def test_another_harness_entry_point_as_the_parent_is_refused_but_the_launcher_is_not() -> None:
     dry = [("python", [sys.executable, "-m", "experiments.r20.dry_run"])]
     serve = [("python", ["python", "-m", "experiments.r20.serve", "/x"])]
-    own = [("python", ["python", "-m", "experiments.r20.real_run", "run"])]
+    own = [("python", ["python", "-m", "experiments.r20.smoke", "run"])]
     assert harness_ancestry(dry) and harness_ancestry(serve)
     assert harness_ancestry(own) == []
     assert refusal_code(attest, ancestors=lambda: dry) == "HARNESS_PARENT"
@@ -158,7 +158,7 @@ def test_a_launch_record_must_match_the_nonce_the_parent_and_the_launcher(tmp_pa
     assert refusal_code(launch.check_launch_record, record, None, os.getppid()) == "LAUNCH_NONCE_MISSING"
     assert refusal_code(launch.check_launch_record, record, "wrong", os.getpid()) == "LAUNCH_RECORD_MISMATCH"
     assert refusal_code(launch.check_launch_record, record, launched.nonce, os.getppid()) == "LAUNCH_PARENT_MISMATCH"
-    # this very process is pytest, not ``-m experiments.r20.real_run``
+    # this very process is pytest, not ``-m experiments.r20.smoke``
     assert refusal_code(launch.check_launch_record, record, launched.nonce, os.getpid()) == "LAUNCH_PARENT_NOT_THE_LAUNCHER"
     assert refusal_code(launch.check_launch_record, tmp_path / "absent.json", launched.nonce, os.getpid()) == "LAUNCH_RECORD_MISSING"
 
@@ -188,7 +188,7 @@ def test_the_public_attestation_takes_no_seam_and_production_never_imports_the_p
     import inspect
 
     assert set(inspect.signature(launch.attest_human_launch).parameters) == {
-        "stage", "prereg_sha256", "human_flag", "revision8", "before_confirm"}
+        "stage", "model_digest", "human_flag", "revision8", "before_confirm"}
     private = {"_attest", "_MINT"}
     owners = {"_attest": "launch.py", "_MINT": "launch.py"}
     offenders: list[str] = []

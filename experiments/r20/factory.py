@@ -282,7 +282,7 @@ def build_config(
     model: ModelOverride | None = None,
 ) -> dict[str, Any]:
     """The raw config dict of one subject (the repository config, overridden).
-    ``model`` (IP-23a) overrides the model / generation sections; ``None`` keeps
+    ``model`` overrides the model / generation sections; ``None`` keeps
     the repository's ``dummy`` provider."""
 
     raw = _raw_config(guards.repo_root() / "config.yaml")

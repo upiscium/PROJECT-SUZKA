@@ -18,9 +18,9 @@ Subjects (each is a NEW genesis subject; none is reused):
   2b plan-hold receipt (written once; IP-14b-3 is merged);
 * ``E`` the same without the receipt switch (the eve shape): writes none.
 
-Items 13 (S1) and 14 (K = 3 pre-registration) are NOT run here: the pre-registered real-model
-experiments (IP-23) were retired, so neither has a driver; R20 is judged by real use on the
-eve host.
+Items 13 (S1) and 14 (K = 3) are NOT run here: the pre-registered real-model
+experiments were retired, so neither has a driver; R20 is judged by real use on the
+eve host (``experiments.r20.smoke`` only reports observations of plain chat turns).
 They are reported as such, never as passed.  T2 runs on the real wall clock:
 the provider is deterministic, the kill window is not; nothing here is a T1
 "covered" claim.  The F12-r tail of item 10 (no stale-branch action after a true
@@ -74,7 +74,7 @@ STEP_NAMES = {
     11: "timing (#373 A4-4)",
     12: "Journal budget",
     13: "S1 (self-goal subject)",
-    14: "K = 3 pre-registration and report",
+    14: "K = 3 real-model experiment (retired)",
     15: "2b plan-hold receipt (IP-14b-3)",
 }
 
@@ -507,9 +507,9 @@ def _sealed_from_receipt(receipt: dict[str, Any]) -> SuccessorPolicyInputV2:
 
 
 NOT_RUN_NOTES = {
-    "13": "NOT RUN in IP-22d: the S1 profile (self-goal activation) is a separate subject type of IP-23; nothing was driven",
-    "14": "PENDING: the order of up to three runs and the fixed template are pre-registered by the Human before the "
-          "first real run (IP-23); there is no real run to report",
+    "13": "NOT RUN in the dry run: the S1 profile (self-goal activation) has no driver; nothing was driven",
+    "14": "PENDING: there is no K = 3 real-model experiment; the real-model smoke (experiments.r20.smoke) only "
+          "reports observations and is not this item",
 }
 
 

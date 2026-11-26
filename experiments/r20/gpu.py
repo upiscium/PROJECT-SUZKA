@@ -1,4 +1,4 @@
-"""GPU observation without NVML (IP-23 sec. 2 "GPU probe").
+"""GPU observation without NVML (the "GPU probe").
 
 ``nvidia-smi`` is never used (NVML is broken on the target host).  Free and
 total device memory come from ``torch.cuda.mem_get_info()`` (the CUDA runtime),
