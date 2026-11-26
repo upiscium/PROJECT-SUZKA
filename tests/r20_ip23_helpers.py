@@ -1,13 +1,10 @@
-"""Shared helpers of the IP-23a tests (no test here).  Nothing here starts a real
+"""Shared helpers of the launch / model-config tests (no test here).  Nothing here starts a real
 model: the terminal, the GPU probe and the HF cache are fakes."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-from experiments.r20 import prereg
-from experiments.r20.caps import Caps
 from experiments.r20.guards import GuardRefusal
 from experiments.r20.launch import HumanLaunch, _attest, confirmation_sentence
 from experiments.r20.model_config import ModelOverride, cache_dir_name
@@ -66,16 +63,6 @@ def human_launch(stage: str = "S0", digest: str = "a" * 64) -> HumanLaunch:
     return _attest(stage, digest, human_flag=True, terminal=FakeTerminal(), environ={}, ancestors=lambda: [])
 
 
-def make_prereg(base: Path, hf_home: Path, *, master_seed: int = 7) -> tuple[dict[str, object], str]:
-    base.mkdir(mode=0o700, exist_ok=True)
-    content = prereg.build_content(
-        git_head="a" * 40, model=real_model(hf_home), caps=Caps(), master_seed=master_seed,
-        trial_id="trial-1",
-    )
-    digest = prereg.create(base, content)
-    return content, digest
-
-
 def refusal_code(function: object, *args: object, **kwargs: object) -> str:
     try:
         function(*args, **kwargs)  # type: ignore[operator]
@@ -86,7 +73,3 @@ def refusal_code(function: object, *args: object, **kwargs: object) -> str:
 
 def sentence(stage: str, digest: str, revision8: str = "") -> str:
     return confirmation_sentence(stage, digest, revision8)
-
-
-def write_json(path: Path, data: object) -> None:
-    path.write_text(json.dumps(data), encoding="utf-8")

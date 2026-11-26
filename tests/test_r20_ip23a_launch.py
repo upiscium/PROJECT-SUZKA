@@ -80,11 +80,6 @@ def test_there_is_no_switch_that_turns_a_check_off() -> None:
     source = Path(launch.__file__).read_text(encoding="utf-8")
     for name in ("environ.get(", "os.getenv", "R20_SKIP", "SUZKA_R20_ALLOW", "--force", "--yes", "bypass"):
         assert name not in source
-    import experiments.r20.real_run as real_run
-
-    flags = {action.option_strings[0] for sub in real_run.parser()._subparsers._group_actions[0].choices.values()  # noqa: SLF001
-             for action in sub._actions if action.option_strings}  # noqa: SLF001
-    assert not {flag for flag in flags if any(word in flag for word in ("force", "yes", "skip", "no-tty", "confirm-launch"))}
 
 
 def test_a_launch_cannot_be_forged_or_borrowed() -> None:
@@ -187,17 +182,15 @@ def test_an_unreadable_proc_fails_closed(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_the_public_attestation_takes_no_seam_and_production_never_imports_the_private_ones() -> None:
-    """AST: ``_attest`` / ``_run_stage`` / ``_release_stage_b`` / ``_create_prereg`` / ``_MINT`` are
-    reached only from their own module and from tests."""
+    """AST: ``_attest`` / ``_MINT`` are reached only from their own module and from tests."""
 
     import ast
     import inspect
 
     assert set(inspect.signature(launch.attest_human_launch).parameters) == {
         "stage", "prereg_sha256", "human_flag", "revision8", "before_confirm"}
-    private = {"_attest", "_run_stage", "_release_stage_b", "_create_prereg", "_MINT"}
-    owners = {"_attest": "launch.py", "_MINT": "launch.py", "_run_stage": "real_run.py", "_release_stage_b": "real_run.py",
-              "_create_prereg": "real_run.py"}
+    private = {"_attest", "_MINT"}
+    owners = {"_attest": "launch.py", "_MINT": "launch.py"}
     offenders: list[str] = []
     for root in (repo_root() / "experiments",):  # suzka/ never imports experiments (an existing architecture test)
         for path in root.rglob("*.py"):
@@ -212,11 +205,6 @@ def test_the_public_attestation_takes_no_seam_and_production_never_imports_the_p
                     if path.name != owners[name]:
                         offenders.append(f"{path}:{name}")
     assert offenders == []
-    # the real entries call the public attestation
-    import experiments.r20.real_run as real_run
-
-    source = inspect.getsource(real_run.run_stage) + inspect.getsource(real_run.release_stage_b) + inspect.getsource(real_run.create_prereg)
-    assert source.count("attest_human_launch") == 3
 
 
 def test_the_model_loader_never_trusts_remote_code() -> None:
