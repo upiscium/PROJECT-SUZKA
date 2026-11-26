@@ -321,9 +321,11 @@ class S0Session:
         launch: HumanLaunch | None = None,
         turn_cap_s: float = 120.0,
         record_calls: bool = False,
+        chat_roles: bool = False,
         config_overrides: Mapping[str, Any] | None = None,
     ) -> None:
         self.record_calls = record_calls
+        self.chat_roles = chat_roles
         self.real = model is not None and model.is_real
         if self.real and (launch is None or not isinstance(launch, HumanLaunch) or not launch.valid_here()):
             raise GuardRefusal("REAL_PROVIDER_WITHOUT_HUMAN_LAUNCH")
@@ -365,9 +367,11 @@ class S0Session:
             return ChildProcess.spawn_real(
                 self.subject, self.launch, hf_home=self.model.hf_home, turn_cap_s=self.turn_cap_s,
                 **({"record_calls": True} if self.record_calls else {}),
+                **({"chat_roles": True} if self.chat_roles else {}),
             )
         return ChildProcess.spawn(
-            self.subject, provider_config=self.provider_config, **({"record_calls": True} if self.record_calls else {})
+            self.subject, provider_config=self.provider_config, **({"record_calls": True} if self.record_calls else {}),
+            **({"chat_roles": True} if self.chat_roles else {}),
         )
 
     def provider_identity(self) -> dict[str, object]:

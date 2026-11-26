@@ -25,6 +25,11 @@ Diagnostic options (all observation only, all default off / unchanged):
   happens on a throwaway genesis subject only).  The repository config has it off, so without the flag
   the model input holds no earlier turn.  Results carry ``conversation_trace: {requested, config_applied}``
   (``config_applied`` is read back from the subject's own config file) beside the prompt-assembly numbers.
+* ``--chat-roles`` (needs ``--conversation-trace`` and ``--record-model-calls``) installs the lab-only
+  ``chat_role_adapter`` in the subject's serve child: the recent conversation is sent to the model as real
+  alternating chat roles (system, user / assistant pairs, final user) instead of text inside ONE user message.
+  Results carry ``chat_roles: {requested, applied, ...}`` and, per turn, numbers only (pairs moved, user
+  characters before / after, skipped-reason labels); the model text and the messages sent stay private.
 * ``--record-model-calls`` installs the lab-only ``recording_provider`` in the subject's serve
   child: the exact prompt / messages, the sampling parameters and the output of every model call go
   to the subject's PRIVATE directory (0600).  The results then carry, per turn, NUMBERS about how
@@ -59,7 +64,7 @@ import uuid
 import yaml
 
 from experiments.r15_p0.pilot import Case
-from experiments.r20 import artifacts, gpu, measure
+from experiments.r20 import artifacts, chat_role_adapter, gpu, measure
 from experiments.r20.guards import GuardRefusal, check_not_production
 from experiments.r20.launch import HumanLaunch, Terminal, attest_human_launch
 from experiments.r20.model_config import MAX_TEMPERATURE, ModelOverride, check_pinned_revision, model_digest
@@ -139,6 +144,12 @@ def aggregate(runs: list[dict[str, Any]]) -> dict[str, Any]:
                 table[name] = {"mean": round(sum(values) / len(values), 3), "of": len(values)}
         return table
 
+    def fold_roles(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        table = fold([{key: value for key, value in row.items() if key != "adapter_skipped"} for row in rows])
+        reasons = sorted({row["adapter_skipped"] for row in rows if row.get("adapter_skipped")})
+        table["adapter_skipped"] = {reason: sum(1 for row in rows if row.get("adapter_skipped") == reason) for reason in reasons}
+        return table
+
     labels = [label for label, _text in TURNS]
     per_label: dict[str, Any] = {}
     for label in labels:
@@ -147,12 +158,14 @@ def aggregate(runs: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         observed = [turn["option_naming"] or turn["observed_labels"] for turn in turns]
         assembly = [turn["prompt_assembly"] for turn in turns if turn["prompt_assembly"] is not None]
+        roles = [turn["chat_roles"] for turn in turns if turn.get("chat_roles") is not None]
         per_label[label] = {
             "turns": len(turns),
             "mean_seconds": round(sum(turn["seconds"] for turn in turns) / len(turns), 3),
             "mean_response_chars": round(sum(turn["response_chars"] for turn in turns) / len(turns), 3),
             "observed": fold([row for row in observed if row is not None]) if any(observed) else None,
             "prompt_assembly": fold(assembly) if assembly else None,
+            "chat_roles": fold_roles(roles) if roles else None,
         }
     return {"kind": "observed", "runs": len(runs), "per_label": per_label}
 
@@ -180,6 +193,7 @@ def _summary_lines(args: argparse.Namespace, model: ModelOverride | None) -> lis
         f"4-bit: {model.load_in_4bit}", f"base: {args.base}", f"chat turns: up to {args.turns}",
         f"temperature: {'config value' if model.temperature is None else model.temperature}",
         f"conversation trace enabled in the subject config: {bool(args.conversation_trace)}",
+        f"recent conversation sent as chat roles (lab adapter): {bool(getattr(args, 'chat_roles', False))}",
         f"fresh subjects (repeats): {args.repeats}; model calls recorded privately: {bool(args.record_model_calls)}",
         "a fresh throwaway subject is created per repeat; no production state is touched; observations only",
     ]
@@ -217,6 +231,18 @@ def _trace_record(args: argparse.Namespace, config_path: Path | None) -> dict[st
     return {"requested": bool(args.conversation_trace), "config_applied": applied}
 
 
+def _roles_record(args: argparse.Namespace, turns: list[dict[str, Any]]) -> dict[str, Any]:
+    """Labels and counts only.  `applied`: the adapter was in the model path (it reported on a call)."""
+
+    seen = [turn["chat_roles"] for turn in turns if turn.get("chat_roles") is not None]
+    return {
+        "requested": bool(getattr(args, "chat_roles", False)),
+        "applied": bool(seen),
+        "turns_restructured": sum(1 for row in seen if row.get("applied") is True),
+        "turns_passed_through": sum(1 for row in seen if row.get("applied") is not True),
+    }
+
+
 def _check_arguments(args: argparse.Namespace) -> None:
     if not 1 <= args.turns <= MAX_TURNS:
         raise GuardRefusal("TURNS_OUT_OF_RANGE", f"1..{MAX_TURNS}")
@@ -224,6 +250,11 @@ def _check_arguments(args: argparse.Namespace) -> None:
         raise GuardRefusal("REPEATS_OUT_OF_RANGE", f"1..{MAX_REPEATS}")
     if args.temperature is not None and not 0.0 <= args.temperature <= MAX_TEMPERATURE:  # NaN fails too
         raise GuardRefusal("TEMPERATURE_OUT_OF_RANGE", f"0.0..{MAX_TEMPERATURE}")
+    if getattr(args, "chat_roles", False):
+        if not args.conversation_trace:
+            raise GuardRefusal("CHAT_ROLES_NEEDS_CONVERSATION_TRACE", "--chat-roles needs --conversation-trace")
+        if not args.record_model_calls:
+            raise GuardRefusal("CHAT_ROLES_NEEDS_RECORD_MODEL_CALLS", "--chat-roles needs --record-model-calls")
 
 
 def _one_run(
@@ -236,6 +267,7 @@ def _one_run(
         base, profile="S0", model=model, launch=launch, turn_cap_s=TURN_CAP_S,
         script=_SCRIPTED if model is None else None, default_answer=_SCRIPTED_DEFAULT if model is None else None,
         record_calls=bool(args.record_model_calls),
+        chat_roles=bool(getattr(args, "chat_roles", False)),
         config_overrides=_overrides(args),
     )
     fixture = model is None
@@ -263,6 +295,7 @@ def _one_run(
             calls: int | None = None
             sampling: dict[str, Any] | None = None
             assembly: dict[str, Any] | None = None
+            roles: dict[str, Any] | None = None
             if args.record_model_calls:
                 rows = read_calls(private_directory)[seen:]
                 calls = len(rows)
@@ -270,6 +303,7 @@ def _one_run(
                 carrier = next((row for row in reversed(rows) if text in model_input_text(row)), None)
                 if carrier is not None:
                     sampling = carrier.get("sampling")
+                    roles = chat_role_adapter.numbers(carrier)
                     assembly = assembly_numbers(
                         carrier,
                         previous_request=None if previous is None else previous[0],
@@ -280,7 +314,7 @@ def _one_run(
                 "ordinal": turn_ordinal, "label": turn_label, "seconds": session.turn_seconds[-1],
                 "response_chars": len(response), "option_naming": observe_option_naming(turn_label, response),
                 "observed_labels": observe_reply(turn_label, response),
-                "model_calls": calls, "sampling": sampling, "prompt_assembly": assembly,
+                "model_calls": calls, "sampling": sampling, "prompt_assembly": assembly, "chat_roles": roles,
             })
     except GuardRefusal as refusal:  # a guard / infrastructure refusal (a turn timeout is one)
         ended, detail, code = refusal.code, refusal.detail, EXIT_REFUSED
@@ -298,6 +332,7 @@ def _one_run(
         "serving_after_s": None if session.serving_after_s is None else round(session.serving_after_s, 3),
         "gpu": {"free_at_launch_bytes": None if reading is None else reading.free_bytes, **measure.summarize(gpu_rows)},
         "conversation_trace": _trace_record(args, session.subject.config_path),
+        "chat_roles": _roles_record(args, turns),
         "turns": turns,
         "private_file": str(private_file),
         "model_calls_file": str(private_directory / "model_calls.jsonl") if args.record_model_calls else None,
@@ -323,6 +358,9 @@ def _print_run(run: dict[str, Any], reading: gpu.GpuReading | None) -> None:
             note += "  observed: " + ", ".join(f"{key}={value}" for key, value in extra.items() if key != "kind")
         assembly = item["prompt_assembly"]
         if assembly is not None:
+            roles = item.get("chat_roles")
+            if roles is not None:
+                note += f"  chat roles: pairs moved {roles['pairs_moved']}, skipped {roles['adapter_skipped']}"
             note += (f"  input: {assembly['messages']} msg, {assembly['prompt_chars']} chars, "
                      f"trace turns {assembly['trace_turns']}, episodic items {assembly['episodic_items']}")
         print(f"turn {item['ordinal']} [{item['label']}]: {item['seconds']:.1f} s, {item['response_chars']} chars{note}")
@@ -395,6 +433,12 @@ def _smoke(args: argparse.Namespace, *, attest: Attest, gpu_runner: Callable[[],
             "requested": bool(args.conversation_trace),
             "config_applied": bool(runs) and all(run.get("conversation_trace", {}).get("config_applied") is True for run in runs),
         },
+        "chat_roles": {
+            "requested": bool(getattr(args, "chat_roles", False)),
+            "applied": bool(completed) and all(run.get("chat_roles", {}).get("applied") is True for run in completed),
+            "turns_restructured": sum(run.get("chat_roles", {}).get("turns_restructured", 0) for run in runs),
+            "turns_passed_through": sum(run.get("chat_roles", {}).get("turns_passed_through", 0) for run in runs),
+        },
         "runs": runs,
         "completed_runs": len(completed),
         "stopped": stopped,
@@ -430,6 +474,8 @@ def parser() -> argparse.ArgumentParser:
                      help="lab diagnostics: record every model call privately and report prompt-assembly numbers")
     top.add_argument("--conversation-trace", action="store_true",
                      help="lab diagnostics: enable conversation_trace in the throwaway subject's config (default off)")
+    top.add_argument("--chat-roles", action="store_true",
+                     help="lab diagnostics: send the recent conversation as real chat roles (needs --conversation-trace and --record-model-calls)")
     top.add_argument("--human-launch", action="store_true")
     top.add_argument("--ssh-host", help="ssh name of this host, for the printed tunnel line")
     top.add_argument("--scripted", action="store_true", help="FIXTURE ONLY: scripted provider, no GPU, no model")

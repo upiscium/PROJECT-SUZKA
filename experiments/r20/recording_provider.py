@@ -94,10 +94,17 @@ class RecordingProvider:
         try:
             output = str(call())
         except BaseException as error:
-            self._write({**row, "sampling": sampling, "output": None, "error": type(error).__name__})
+            self._write({**row, **self._extra(), "sampling": sampling, "output": None, "error": type(error).__name__})
             raise
-        self._write({**row, "sampling": sampling, "output": output})
+        self._write({**row, **self._extra(), "sampling": sampling, "output": output})
         return output
+
+    def _extra(self) -> dict[str, Any]:
+        """The report of a lab adapter inside this wrapper (`chat_role_adapter`), if any, as `{"chat_roles": ...}`."""
+
+        take = getattr(self._inner, "take_record_extra", None)
+        report = take() if callable(take) else None
+        return {} if report is None else {"chat_roles": report}
 
     def _write(self, row: dict[str, Any]) -> None:
         with self._lock:
