@@ -78,8 +78,9 @@ def test_results_and_output_hold_no_model_text_and_the_private_file_is_0600(
         assert row["request"] not in results.read_text(encoding="utf-8")
     for turn in data["turns"]:
         assert set(turn) == {"ordinal", "label", "seconds", "response_chars", "option_naming", "observed_labels",
-                             "model_calls", "sampling", "prompt_assembly"}
+                             "model_calls", "sampling", "prompt_assembly", "chat_roles"}
         assert turn["model_calls"] is None and turn["sampling"] is None and turn["prompt_assembly"] is None
+        assert turn["chat_roles"] is None
 
 
 # ----------------------------------------------------------------------- guards

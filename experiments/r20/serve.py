@@ -63,6 +63,8 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--turn-cap-s", type=float, default=float(bridge.TIMEOUT_S))
     # Lab diagnostics, OPT-IN (the smoke sets it): record every model call to the private directory.
     parser.add_argument("--record-calls", action="store_true")
+    # Lab diagnostics, OPT-IN (the smoke sets it): send the recent conversation as real chat roles.
+    parser.add_argument("--chat-roles", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -116,6 +118,14 @@ def main(argv: list[str] | None = None) -> int:
         sampler = GpuSampler(root.parent / "evidence" / "gpu.jsonl")
         sampler.start()  # numbers only: free / total / reserved, before the load and then every few seconds
     record = bool(args.record_calls)
+    chat_roles = bool(args.chat_roles)
+    if chat_roles:
+        # Lab diagnostics only (`chat_role_adapter`): inside the recorder, so the recorded call is the one sent.
+        from experiments.r20.chat_role_adapter import ChatRoleAdapter, wrap_loader as wrap_adapter_loader
+        from suzka.api import server as app_server
+
+        if mode is ProviderMode.REAL:
+            app_server.load_model_provider = wrap_adapter_loader(app_server.load_model_provider)
     if record:
         # Lab diagnostics only (``recording_provider``): raw prompts / outputs go to <run dir>/private (0700, 0600 file).
         from experiments.r20 import artifacts
@@ -129,6 +139,8 @@ def main(argv: list[str] | None = None) -> int:
             app_server.load_model_provider = wrap_loader(app_server.load_model_provider, private)
     app = create_app(settings)
     if provider is not None:
+        if chat_roles:
+            provider = ChatRoleAdapter(provider)
         app.state.model_provider = RecordingProvider(provider, private) if record else provider
         # Mode "continue": the supervisor drops every ``app.state`` key added after
         # ``create_app`` before a new cycle.  The injected scripted provider is the

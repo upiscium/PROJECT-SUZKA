@@ -137,6 +137,7 @@ class ChildProcess:
         provider_config: dict[str, Any] | None = None,
         log_path: Path | None = None,
         record_calls: bool = False,
+        chat_roles: bool = False,
     ) -> ChildProcess:
         check_modes(provider, actor, human_launch=False)  # before any child exists
         if subject.tier is not Tier.T2:
@@ -149,6 +150,8 @@ class ChildProcess:
         ]
         if record_calls:  # lab diagnostics, opt-in: the command is unchanged without it
             command.append("--record-calls")
+        if chat_roles:  # lab diagnostics, opt-in: the command is unchanged without it
+            command.append("--chat-roles")
         if provider_config is not None:
             subject.provider_config.write_text(json.dumps(provider_config), encoding="utf-8")
             os.chmod(subject.provider_config, 0o600)
@@ -180,6 +183,7 @@ class ChildProcess:
         turn_cap_s: float,
         log_path: Path | None = None,
         record_calls: bool = False,
+        chat_roles: bool = False,
     ) -> ChildProcess:
         """The ONLY way a real-model child starts: it needs the attestation of THIS
         process's Human launch (``attest_human_launch``).  ``spawn`` still refuses a
@@ -204,6 +208,8 @@ class ChildProcess:
         ]
         if record_calls:  # lab diagnostics, opt-in: the command is unchanged without it
             command.append("--record-calls")
+        if chat_roles:  # lab diagnostics, opt-in: the command is unchanged without it
+            command.append("--chat-roles")
         child_home(subject).mkdir(mode=0o700, exist_ok=True)
         log = open(log_path or subject.run_dir / "serve.log", "ab")
         try:
