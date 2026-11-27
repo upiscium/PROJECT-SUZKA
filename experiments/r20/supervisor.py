@@ -143,6 +143,8 @@ class ChildProcess:
         restore_placement: str = "system",
         history_window: int | None = None,
         state_block_max_bytes: int | None = None,
+        evidence_top_k: int | None = None,
+        evidence_item_max_chars: int | None = None,
     ) -> ChildProcess:
         check_modes(provider, actor, human_launch=False)  # before any child exists
         if subject.tier is not Tier.T2:
@@ -165,6 +167,10 @@ class ChildProcess:
             command += ["--history-window", str(history_window)]
         if state_block_max_bytes is not None:
             command += ["--state-block-max-bytes", str(state_block_max_bytes)]
+        if evidence_top_k is not None:
+            command += ["--evidence-top-k", str(evidence_top_k)]
+        if evidence_item_max_chars is not None:
+            command += ["--evidence-item-max-chars", str(evidence_item_max_chars)]
         if provider_config is not None:
             subject.provider_config.write_text(json.dumps(provider_config), encoding="utf-8")
             os.chmod(subject.provider_config, 0o600)
@@ -202,6 +208,8 @@ class ChildProcess:
         restore_placement: str = "system",
         history_window: int | None = None,
         state_block_max_bytes: int | None = None,
+        evidence_top_k: int | None = None,
+        evidence_item_max_chars: int | None = None,
     ) -> ChildProcess:
         """The ONLY way a real-model child starts: it needs the attestation of THIS
         process's Human launch (``attest_human_launch``).  ``spawn`` still refuses a
@@ -236,6 +244,10 @@ class ChildProcess:
             command += ["--history-window", str(history_window)]
         if state_block_max_bytes is not None:
             command += ["--state-block-max-bytes", str(state_block_max_bytes)]
+        if evidence_top_k is not None:
+            command += ["--evidence-top-k", str(evidence_top_k)]
+        if evidence_item_max_chars is not None:
+            command += ["--evidence-item-max-chars", str(evidence_item_max_chars)]
         child_home(subject).mkdir(mode=0o700, exist_ok=True)
         log = open(log_path or subject.run_dir / "serve.log", "ab")
         try:

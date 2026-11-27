@@ -327,6 +327,8 @@ class S0Session:
         restore_placement: str = "system",
         history_window: int | None = None,
         state_block_max_bytes: int | None = None,
+        evidence_top_k: int | None = None,
+        evidence_item_max_chars: int | None = None,
         config_overrides: Mapping[str, Any] | None = None,
     ) -> None:
         self.record_calls = record_calls
@@ -336,6 +338,8 @@ class S0Session:
         self.restore_placement = restore_placement
         self.history_window = history_window
         self.state_block_max_bytes = state_block_max_bytes
+        self.evidence_top_k = evidence_top_k
+        self.evidence_item_max_chars = evidence_item_max_chars
         self.real = model is not None and model.is_real
         if self.real and (launch is None or not isinstance(launch, HumanLaunch) or not launch.valid_here()):
             raise GuardRefusal("REAL_PROVIDER_WITHOUT_HUMAN_LAUNCH")
@@ -396,6 +400,10 @@ class S0Session:
             found["history_window"] = self.history_window
         if self.state_block_max_bytes is not None:
             found["state_block_max_bytes"] = self.state_block_max_bytes
+        if self.evidence_top_k is not None:
+            found["evidence_top_k"] = self.evidence_top_k
+        if self.evidence_item_max_chars is not None:
+            found["evidence_item_max_chars"] = self.evidence_item_max_chars
         return found
 
     def provider_identity(self) -> dict[str, object]:
