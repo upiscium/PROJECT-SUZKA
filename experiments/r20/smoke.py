@@ -16,6 +16,14 @@ Diagnostic options (all observation only, all default off / unchanged):
 * ``--temperature T`` (0.0..1.5; 0 means greedy, ``do_sample`` false) overrides the lab subject's
   generation config (``ModelOverride``); the requested and the effective values are in the results.
   Without it the config's own value is used.
+* ``--script short|long`` (default short = the 7-turn script; ``--turns`` 1..7).  ``long`` is a fixed 16-turn script
+  (``--turns`` 1..16): setup, E (turn 2), identity, nine neutral filler turns, then the probes at turns 13-16 (factual,
+  rephrase, population, recall) with the same observation labels, so the first-turn state block (X9 / X10) is 12 turns
+  away from them.  Every mode records per turn ``lyrical_marker_hits`` (occurrences of ``LYRICAL_MARKERS``, a lab list:
+  #414 names only 5 of its words) and ``response_chars``; aggregates give their means per label and per condition,
+  and the matrix table adds "lyric hits" and "mean chars".  Observations only; the raw text stays private.
+  Example: ``--matrix --matrix-conditions X0,X7,X8,X9,X10 --script long --temperature 0.7 --record-model-calls``
+  (25 subjects x 16 turns; ESTIMATED roughly 4-6 minutes per subject, about 2-2.5 hours: an assumption).
 * ``--repeats N`` (1..5) runs N sequential FRESH subjects with the same turn script under ONE Human
   attestation.  The GPU free check runs before every subject; the loop stops at the first refusal
   or non-completed run and the completed runs are reported.  The results file lists every run and a
@@ -128,6 +136,49 @@ TURNS: tuple[tuple[str, str], ...] = (
     ("population", "では、その都市の人口はおよそ何人ですか？"),
     ("recall", "最初にお伝えした案Aと案Bの内容を、覚えている範囲で教えてください。"),
 )
+# The LONG script (``--script long``): 16 turns.  Same probe semantics and the same labels as the short script, but
+# the probes sit at the END (turns 13-16: factual -> rephrase -> population -> recall), at least 12 turns after the
+# first-turn state block (turn 1); E stays at its early position (turn 2).  Turns 3-12 are neutral filler (a few
+# invite a reflective register on purpose: the persona labels observe them); none names a city or the options.
+LONG_TURNS: tuple[tuple[str, str], ...] = (
+    ("setup", _PROMPTS["setup"]),
+    ("E", _PROMPTS["E"]),
+    ("identity", "あなたは誰ですか？短く答えてください。"),
+    ("filler_season", "好きな季節とその理由を、短く教えてください。"),
+    ("filler_rainy", "雨の日にできることを三つ挙げてください。"),
+    ("filler_python", "Pythonでリストを逆順にする方法を一言で教えてください。"),
+    ("filler_tired", "最近少し疲れているのですが、一言だけ声をかけてください。"),
+    ("filler_sum", "1から10までの数の合計はいくつですか？"),
+    ("filler_breakfast", "朝ごはんに向いている簡単な料理を一つ教えてください。"),
+    ("filler_thanks_en", "「ありがとう」を英語で言うとどうなりますか？"),
+    ("filler_week", "一週間は何日ですか？"),
+    ("filler_boiling", "水は何度で沸騰しますか？"),
+    ("factual", "日本の首都はどこですか？"),
+    ("rephrase", "今の答えを、もう一度一文で言い換えてください。"),
+    ("population", "では、その都市の人口はおよそ何人ですか？"),
+    ("recall", "最初にお伝えした案Aと案Bの内容を、覚えている範囲で教えてください。"),
+)
+LONG_MAX_TURNS = len(LONG_TURNS)
+SCRIPTS: dict[str, tuple[tuple[str, str], ...]] = {"short": TURNS, "long": LONG_TURNS}
+# Persona observation (never a verdict): the marker words counted in each reply.  #414's evidence text names only
+# 情緒, 穏やか, 静か, 心が, 余韻 ("..."); its full list was not recoverable, so the rest of this list is a lab-defined
+# set of lyrical / poetic Japanese words in the same spirit.  A crude proxy, comparable across conditions only.
+LYRICAL_MARKERS: tuple[str, ...] = (
+    "情緒", "穏やか", "静か", "心が", "余韻",
+    "静けさ", "しっとり", "ゆったり", "儚", "淡い", "ほのか", "風情", "面影", "揺らぎ", "思いを馳せ", "染み入", "紡", "響き",
+)
+
+
+def script_turns(name: str) -> tuple[tuple[str, str], ...]:
+    return SCRIPTS[name]
+
+
+def lyrical_marker_hits(response: str) -> int:
+    """Total occurrences of the LYRICAL_MARKERS words in the reply (an observed count, never a verdict)."""
+
+    return sum(response.count(marker) for marker in LYRICAL_MARKERS)
+
+
 # The option phrases registered by the setup prompt (the recall turn is observed against them).
 OPTION_PHRASES = ("初期費用を抑える", "保守費用を抑える")
 # Scripted fixture answers by call index: the E answer names TWO options on purpose (an observation, not a failure).
@@ -190,7 +241,7 @@ def aggregate(runs: list[dict[str, Any]]) -> dict[str, Any]:
         table["adapter_skipped"] = {reason: sum(1 for row in rows if row.get("adapter_skipped") == reason) for reason in reasons}
         return table
 
-    labels = [label for label, _text in TURNS]
+    labels = list(dict.fromkeys(label for script in SCRIPTS.values() for label, _text in script))
     per_label: dict[str, Any] = {}
     for label in labels:
         turns = [turn for run in runs for turn in run["turns"] if turn["label"] == label]
@@ -204,12 +255,19 @@ def aggregate(runs: list[dict[str, Any]]) -> dict[str, Any]:
             "turns": len(turns),
             "mean_seconds": round(sum(turn["seconds"] for turn in turns) / len(turns), 3),
             "mean_response_chars": round(sum(turn["response_chars"] for turn in turns) / len(turns), 3),
+            "mean_lyrical_marker_hits": round(sum(turn.get("lyrical_marker_hits", 0) for turn in turns) / len(turns), 3),
             "observed": fold([row for row in observed if row is not None]) if any(observed) else None,
             "prompt_assembly": fold(assembly) if assembly else None,
             "chat_roles": fold_roles(roles) if roles else None,
             "bare_chat": fold_roles(bare) if bare else None,
         }
-    return {"kind": "observed", "runs": len(runs), "per_label": per_label}
+    every = [turn for run in runs for turn in run["turns"]]
+    persona = {
+        "kind": "observed", "turns": len(every),
+        "mean_lyrical_marker_hits": round(sum(t.get("lyrical_marker_hits", 0) for t in every) / len(every), 3) if every else None,
+        "mean_response_chars": round(sum(t["response_chars"] for t in every) / len(every), 1) if every else None,
+    }
+    return {"kind": "observed", "runs": len(runs), "per_label": per_label, "persona": persona}
 
 
 def _write_results(base: Path, launch_id: str, payload: dict[str, Any]) -> Path:
@@ -232,7 +290,7 @@ def _summary_lines(args: argparse.Namespace, model: ModelOverride | None) -> lis
     assert model is not None
     return [
         f"model id: {model.model_id}", f"revision: {model.revision}", f"hf_home: {model.hf_home}",
-        f"4-bit: {model.load_in_4bit}", f"base: {args.base}", f"chat turns: up to {args.turns}",
+        f"4-bit: {model.load_in_4bit}", f"base: {args.base}", f"chat turns: up to {args.turns} (script: {getattr(args, 'script', 'short') or 'short'})",
         f"temperature: {'config value' if model.temperature is None else model.temperature}",
         f"conversation trace enabled in the subject config: {bool(args.conversation_trace)}",
         f"recent conversation sent as chat roles (lab adapter): {bool(getattr(args, 'chat_roles', False))}",
@@ -323,8 +381,14 @@ def _check_restore_and_matrix(args: argparse.Namespace) -> None:
 
 
 def _check_arguments(args: argparse.Namespace) -> None:
-    if not 1 <= args.turns <= MAX_TURNS:
-        raise GuardRefusal("TURNS_OUT_OF_RANGE", f"1..{MAX_TURNS}")
+    script = getattr(args, "script", "short") or "short"
+    if script not in SCRIPTS:
+        raise GuardRefusal("SCRIPT_UNKNOWN", f"--script: {', '.join(SCRIPTS)}")
+    cap = len(SCRIPTS[script])
+    if getattr(args, "turns", None) is None:
+        args.turns = cap  # the whole chosen script
+    if not 1 <= args.turns <= cap:
+        raise GuardRefusal("TURNS_OUT_OF_RANGE", f"1..{cap}")
     if args.repeats is None:  # the matrix defaults to 5 subjects per condition, a plain smoke to 1
         args.repeats = MAX_REPEATS if getattr(args, "matrix", False) else 1
     if not 1 <= args.repeats <= MAX_REPEATS:
@@ -377,7 +441,7 @@ def _one_run(
     try:
         session.start()
         session.activate()
-        for turn_ordinal, (turn_label, text) in enumerate(TURNS[: args.turns], start=1):
+        for turn_ordinal, (turn_label, text) in enumerate(script_turns(getattr(args, "script", "short") or "short")[: args.turns], start=1):
             seen = len(read_calls(private_directory)) if args.record_model_calls else 0
             reply = session.chat(text)
             response = str(reply.get("response", ""))
@@ -404,7 +468,8 @@ def _one_run(
             previous = (text, response)
             turns.append({
                 "ordinal": turn_ordinal, "label": turn_label, "seconds": session.turn_seconds[-1],
-                "response_chars": len(response), "option_naming": observe_option_naming(turn_label, response),
+                "response_chars": len(response), "lyrical_marker_hits": lyrical_marker_hits(response),
+                "option_naming": observe_option_naming(turn_label, response),
                 "observed_labels": observe_reply(turn_label, response),
                 "model_calls": calls, "sampling": sampling, "prompt_assembly": assembly, "chat_roles": roles,
                 "bare_chat": bare,
@@ -472,7 +537,8 @@ def _print_run(run: dict[str, Any], reading: gpu.GpuReading | None) -> None:
                                  f"first user {bare['restored_chars_first_user']} chars)")
             note += (f"  input: {assembly['messages']} msg, {assembly['prompt_chars']} chars, "
                      f"trace turns {assembly['trace_turns']}, episodic items {assembly['episodic_items']}")
-        print(f"turn {item['ordinal']} [{item['label']}]: {item['seconds']:.1f} s, {item['response_chars']} chars{note}")
+        print(f"turn {item['ordinal']} [{item['label']}]: {item['seconds']:.1f} s, {item['response_chars']} chars, "
+              f"lyrical hits {item.get('lyrical_marker_hits', 0)}{note}")
     print(f"raw replies (PRIVATE): {run['private_file']}")
 
 
@@ -581,6 +647,7 @@ def _condition_summary(condition: Condition, runs: list[dict[str, Any]], planned
         "mean_user_chars_after": mean("user_chars_after"), "mean_input_chars": mean("input_chars"),
         "mean_restored_chars": mean("restored_chars"),
         "section_missing_turns": sum(1 for row in bare_rows if row.get("section_missing")),
+        "persona": aggregated["persona"],
         "key_counts": {title: _observed_count(aggregated, label, key) for title, label, key in KEY_COLUMNS},
         "aggregate": aggregated,
         "runs": runs,
@@ -590,7 +657,7 @@ def _condition_summary(condition: Condition, runs: list[dict[str, Any]], planned
 def matrix_table(summaries: list[dict[str, Any]]) -> list[str]:
     """The compact table (rows = conditions): counts as ``true/of``, ``-`` where nothing was observed."""
 
-    header = ["cond", "what", "done", *[title for title, _l, _k in KEY_COLUMNS], "min free GiB", "input chars"]
+    header = ["cond", "what", "done", *[title for title, _l, _k in KEY_COLUMNS], "lyric hits", "mean chars", "min free GiB", "input chars"]
     rows = [header]
     for item in summaries:
         counts = [
@@ -598,8 +665,11 @@ def matrix_table(summaries: list[dict[str, Any]]) -> list[str]:
             for title, _l, _k in KEY_COLUMNS
         ]
         free = "-" if item["min_free_bytes"] is None else f"{item['min_free_bytes'] / gpu.GIB:.1f}"
+        persona = item.get("persona") or {}
+        lyric = "-" if persona.get("mean_lyrical_marker_hits") is None else f"{persona['mean_lyrical_marker_hits']:.2f}"
+        reply = "-" if persona.get("mean_response_chars") is None else f"{persona['mean_response_chars']:.0f}"
         chars = "-" if item["mean_input_chars"] is None else f"{item['mean_input_chars']:.0f}"
-        rows.append([item["id"], item["description"], f"{item['completed_runs']}/{item['subjects_planned']}", *counts, free, chars])
+        rows.append([item["id"], item["description"], f"{item['completed_runs']}/{item['subjects_planned']}", *counts, lyric, reply, free, chars])
     widths = [max(len(row[column]) for row in rows) for column in range(len(header))]
     return ["  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip() for row in rows]
 
@@ -667,7 +737,8 @@ def _matrix(
         shown = [*summaries, *([] if current is None else [current])]
         return {
             "kind": "observations", "verdict": None, "fixture_only": fixture, "launch": launch_id, "matrix": True,
-            "requested": {"repeats": args.repeats, "turns": args.turns, "conditions": [c.id for c in chosen],
+            "requested": {"repeats": args.repeats, "turns": args.turns, "script": getattr(args, "script", "short") or "short",
+                          "conditions": [c.id for c in chosen],
                           "subjects_planned": len(chosen) * args.repeats, "record_model_calls": bool(args.record_model_calls)},
             "generation": {"temperature_requested": args.temperature, "temperature_zero_means_greedy": True,
                            "do_sample_override": args.temperature != 0.0},
@@ -715,6 +786,8 @@ def _matrix(
     except KeyboardInterrupt:
         interrupted, code = True, EXIT_FAILED
     results = _write_matrix_results(base, launch_id, payload(None))
+    print(f"matrix: script {getattr(args, 'script', 'short') or 'short'}, {args.turns} turns, temperature {args.temperature}"
+          "; lyric hits / mean chars = mean per reply over all turns (observed, not a verdict)")
     print("\n".join(matrix_table(summaries)))
     done = [item["id"] for item in summaries if item["completed_runs"] == item["subjects_planned"]]
     print(f"completed conditions: {', '.join(done) or 'none'}" + (f"; stopped: {stopped['code']}" if stopped else "")
@@ -835,7 +908,11 @@ def parser() -> argparse.ArgumentParser:
     top.add_argument("--model-revision", help="the pinned 40-hex commit digest")
     top.add_argument("--no-4bit", action="store_true")
     top.add_argument("--max-new-tokens", type=int)
-    top.add_argument("--turns", type=int, default=MAX_TURNS, help=f"number of chat turns, 1..{MAX_TURNS}")
+    top.add_argument("--turns", type=int, default=None,
+                     help=f"number of chat turns: 1..{MAX_TURNS} for --script short, 1..{LONG_MAX_TURNS} for long (default: all)")
+    top.add_argument("--script", choices=list(SCRIPTS), default="short",
+                     help=f"the fixed turn script: short ({MAX_TURNS} turns, default) or long ({LONG_MAX_TURNS} turns: probes at turns "
+                          "13-16, 12+ turns after the first-turn state block; E at turn 2); with fewer --turns the end probes are cut")
     top.add_argument("--temperature", type=float,
                      help=f"override generation.temperature, 0.0..{MAX_TEMPERATURE} (0 = greedy); default: the config value")
     top.add_argument("--repeats", type=int, default=None,
@@ -882,4 +959,4 @@ if __name__ == "__main__":
     sys.exit(main())
 
 
-__all__ = ["OPTION_PHRASES", "TURNS", "aggregate", "main", "observe_option_naming", "observe_reply", "run"]
+__all__ = ["LONG_MAX_TURNS", "LONG_TURNS", "LYRICAL_MARKERS", "OPTION_PHRASES", "SCRIPTS", "TURNS", "lyrical_marker_hits", "script_turns", "aggregate", "main", "observe_option_naming", "observe_reply", "run"]
