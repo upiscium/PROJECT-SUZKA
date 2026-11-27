@@ -30,6 +30,12 @@ Diagnostic options (all observation only, all default off / unchanged):
   alternating chat roles (system, user / assistant pairs, final user) instead of text inside ONE user message.
   Results carry ``chat_roles: {requested, applied, ...}`` and, per turn, numbers only (pairs moved, user
   characters before / after, skipped-reason labels); the model text and the messages sent stay private.
+* ``--bare-chat`` (needs ``--record-model-calls``; not with ``--chat-roles``; ``--conversation-trace`` not needed)
+  installs the lab-only ``bare_chat_adapter`` in the subject's serve child: a CONTROL.  The model receives only
+  a fixed neutral system text, the adapter's own (user message, model output) history and the current user
+  message; nothing of SUZKA's prompt (values, goals, evidence, trace).  The SUZKA runtime runs normally around it.
+  Results carry ``bare_chat: {requested, applied, ...}`` and, per turn, numbers only (messages sent, user
+  characters before / after, history pairs, skipped-reason labels); the messages stay in the private file.
 * ``--record-model-calls`` installs the lab-only ``recording_provider`` in the subject's serve
   child: the exact prompt / messages, the sampling parameters and the output of every model call go
   to the subject's PRIVATE directory (0600).  The results then carry, per turn, NUMBERS about how
@@ -64,7 +70,7 @@ import uuid
 import yaml
 
 from experiments.r15_p0.pilot import Case
-from experiments.r20 import artifacts, chat_role_adapter, gpu, measure
+from experiments.r20 import artifacts, bare_chat_adapter, chat_role_adapter, gpu, measure
 from experiments.r20.guards import GuardRefusal, check_not_production
 from experiments.r20.launch import HumanLaunch, Terminal, attest_human_launch
 from experiments.r20.model_config import MAX_TEMPERATURE, ModelOverride, check_pinned_revision, model_digest
@@ -116,7 +122,8 @@ def observe_reply(label: str, response: str) -> dict[str, Any] | None:
 
     recall: does the reply contain the exact option phrases the setup prompt registered?
     rephrase: does it mention 東京 (the immediately preceding answer) / 案 or 比較 (the earlier comparison)?
-    population: does it mention 東京 / 都市?
+    population: does it mention 東京 / 都市, does it contain a number (a digit or 万), does it ask which city
+    (都市名 / どの都市 / 指定)?  rephrase also: does it mention the capital answer (東京 or 首都)?
     """
 
     if label == "recall":
@@ -125,9 +132,12 @@ def observe_reply(label: str, response: str) -> dict[str, Any] | None:
                 "has_both_phrases": first and second}
     if label == "rephrase":
         return {"kind": "observed", "mentions_tokyo": "東京" in response,
-                "mentions_plan_or_comparison": "案" in response or "比較" in response}
+                "mentions_plan_or_comparison": "案" in response or "比較" in response,
+                "mentions_capital_answer": "東京" in response or "首都" in response}
     if label == "population":
-        return {"kind": "observed", "mentions_tokyo": "東京" in response, "mentions_city_word": "都市" in response}
+        return {"kind": "observed", "mentions_tokyo": "東京" in response, "mentions_city_word": "都市" in response,
+                "answers_with_number": any(character.isdigit() for character in response) or "万" in response,
+                "asks_which_city": any(phrase in response for phrase in ("都市名", "どの都市", "指定"))}
     return None
 
 
@@ -159,6 +169,7 @@ def aggregate(runs: list[dict[str, Any]]) -> dict[str, Any]:
         observed = [turn["option_naming"] or turn["observed_labels"] for turn in turns]
         assembly = [turn["prompt_assembly"] for turn in turns if turn["prompt_assembly"] is not None]
         roles = [turn["chat_roles"] for turn in turns if turn.get("chat_roles") is not None]
+        bare = [turn["bare_chat"] for turn in turns if turn.get("bare_chat") is not None]
         per_label[label] = {
             "turns": len(turns),
             "mean_seconds": round(sum(turn["seconds"] for turn in turns) / len(turns), 3),
@@ -166,6 +177,7 @@ def aggregate(runs: list[dict[str, Any]]) -> dict[str, Any]:
             "observed": fold([row for row in observed if row is not None]) if any(observed) else None,
             "prompt_assembly": fold(assembly) if assembly else None,
             "chat_roles": fold_roles(roles) if roles else None,
+            "bare_chat": fold_roles(bare) if bare else None,
         }
     return {"kind": "observed", "runs": len(runs), "per_label": per_label}
 
@@ -194,6 +206,7 @@ def _summary_lines(args: argparse.Namespace, model: ModelOverride | None) -> lis
         f"temperature: {'config value' if model.temperature is None else model.temperature}",
         f"conversation trace enabled in the subject config: {bool(args.conversation_trace)}",
         f"recent conversation sent as chat roles (lab adapter): {bool(getattr(args, 'chat_roles', False))}",
+        f"bare chat, no SUZKA prompt (lab control adapter): {bool(getattr(args, 'bare_chat', False))}",
         f"fresh subjects (repeats): {args.repeats}; model calls recorded privately: {bool(args.record_model_calls)}",
         "a fresh throwaway subject is created per repeat; no production state is touched; observations only",
     ]
@@ -243,6 +256,18 @@ def _roles_record(args: argparse.Namespace, turns: list[dict[str, Any]]) -> dict
     }
 
 
+def _bare_record(args: argparse.Namespace, turns: list[dict[str, Any]]) -> dict[str, Any]:
+    """Labels and counts only.  `applied`: the adapter was in the model path (it reported on a call)."""
+
+    seen = [turn["bare_chat"] for turn in turns if turn.get("bare_chat") is not None]
+    return {
+        "requested": bool(getattr(args, "bare_chat", False)),
+        "applied": bool(seen),
+        "turns_bare": sum(1 for row in seen if row.get("applied") is True),
+        "turns_passed_through": sum(1 for row in seen if row.get("applied") is not True),
+    }
+
+
 def _check_arguments(args: argparse.Namespace) -> None:
     if not 1 <= args.turns <= MAX_TURNS:
         raise GuardRefusal("TURNS_OUT_OF_RANGE", f"1..{MAX_TURNS}")
@@ -250,6 +275,11 @@ def _check_arguments(args: argparse.Namespace) -> None:
         raise GuardRefusal("REPEATS_OUT_OF_RANGE", f"1..{MAX_REPEATS}")
     if args.temperature is not None and not 0.0 <= args.temperature <= MAX_TEMPERATURE:  # NaN fails too
         raise GuardRefusal("TEMPERATURE_OUT_OF_RANGE", f"0.0..{MAX_TEMPERATURE}")
+    if getattr(args, "bare_chat", False):
+        if getattr(args, "chat_roles", False):
+            raise GuardRefusal("BARE_CHAT_EXCLUDES_CHAT_ROLES", "--bare-chat and --chat-roles are mutually exclusive")
+        if not args.record_model_calls:
+            raise GuardRefusal("BARE_CHAT_NEEDS_RECORD_MODEL_CALLS", "--bare-chat needs --record-model-calls")
     if getattr(args, "chat_roles", False):
         if not args.conversation_trace:
             raise GuardRefusal("CHAT_ROLES_NEEDS_CONVERSATION_TRACE", "--chat-roles needs --conversation-trace")
@@ -268,6 +298,7 @@ def _one_run(
         script=_SCRIPTED if model is None else None, default_answer=_SCRIPTED_DEFAULT if model is None else None,
         record_calls=bool(args.record_model_calls),
         chat_roles=bool(getattr(args, "chat_roles", False)),
+        bare_chat=bool(getattr(args, "bare_chat", False)),
         config_overrides=_overrides(args),
     )
     fixture = model is None
@@ -296,6 +327,7 @@ def _one_run(
             sampling: dict[str, Any] | None = None
             assembly: dict[str, Any] | None = None
             roles: dict[str, Any] | None = None
+            bare: dict[str, Any] | None = None
             if args.record_model_calls:
                 rows = read_calls(private_directory)[seen:]
                 calls = len(rows)
@@ -304,6 +336,7 @@ def _one_run(
                 if carrier is not None:
                     sampling = carrier.get("sampling")
                     roles = chat_role_adapter.numbers(carrier)
+                    bare = bare_chat_adapter.numbers(carrier)
                     assembly = assembly_numbers(
                         carrier,
                         previous_request=None if previous is None else previous[0],
@@ -315,6 +348,7 @@ def _one_run(
                 "response_chars": len(response), "option_naming": observe_option_naming(turn_label, response),
                 "observed_labels": observe_reply(turn_label, response),
                 "model_calls": calls, "sampling": sampling, "prompt_assembly": assembly, "chat_roles": roles,
+                "bare_chat": bare,
             })
     except GuardRefusal as refusal:  # a guard / infrastructure refusal (a turn timeout is one)
         ended, detail, code = refusal.code, refusal.detail, EXIT_REFUSED
@@ -333,6 +367,7 @@ def _one_run(
         "gpu": {"free_at_launch_bytes": None if reading is None else reading.free_bytes, **measure.summarize(gpu_rows)},
         "conversation_trace": _trace_record(args, session.subject.config_path),
         "chat_roles": _roles_record(args, turns),
+        "bare_chat": _bare_record(args, turns),
         "turns": turns,
         "private_file": str(private_file),
         "model_calls_file": str(private_directory / "model_calls.jsonl") if args.record_model_calls else None,
@@ -361,6 +396,10 @@ def _print_run(run: dict[str, Any], reading: gpu.GpuReading | None) -> None:
             roles = item.get("chat_roles")
             if roles is not None:
                 note += f"  chat roles: pairs moved {roles['pairs_moved']}, skipped {roles['adapter_skipped']}"
+            bare = item.get("bare_chat")
+            if bare is not None:
+                note += (f"  bare chat: {bare['messages_sent_count']} msg sent, history pairs {bare['history_pairs']}, "
+                         f"skipped {bare['adapter_skipped']}")
             note += (f"  input: {assembly['messages']} msg, {assembly['prompt_chars']} chars, "
                      f"trace turns {assembly['trace_turns']}, episodic items {assembly['episodic_items']}")
         print(f"turn {item['ordinal']} [{item['label']}]: {item['seconds']:.1f} s, {item['response_chars']} chars{note}")
@@ -439,6 +478,12 @@ def _smoke(args: argparse.Namespace, *, attest: Attest, gpu_runner: Callable[[],
             "turns_restructured": sum(run.get("chat_roles", {}).get("turns_restructured", 0) for run in runs),
             "turns_passed_through": sum(run.get("chat_roles", {}).get("turns_passed_through", 0) for run in runs),
         },
+        "bare_chat": {
+            "requested": bool(getattr(args, "bare_chat", False)),
+            "applied": bool(completed) and all(run.get("bare_chat", {}).get("applied") is True for run in completed),
+            "turns_bare": sum(run.get("bare_chat", {}).get("turns_bare", 0) for run in runs),
+            "turns_passed_through": sum(run.get("bare_chat", {}).get("turns_passed_through", 0) for run in runs),
+        },
         "runs": runs,
         "completed_runs": len(completed),
         "stopped": stopped,
@@ -474,6 +519,8 @@ def parser() -> argparse.ArgumentParser:
                      help="lab diagnostics: record every model call privately and report prompt-assembly numbers")
     top.add_argument("--conversation-trace", action="store_true",
                      help="lab diagnostics: enable conversation_trace in the throwaway subject's config (default off)")
+    top.add_argument("--bare-chat", action="store_true",
+                     help="lab diagnostics control: the model sees only a neutral system text, its own history and the current message (needs --record-model-calls; not with --chat-roles)")
     top.add_argument("--chat-roles", action="store_true",
                      help="lab diagnostics: send the recent conversation as real chat roles (needs --conversation-trace and --record-model-calls)")
     top.add_argument("--human-launch", action="store_true")

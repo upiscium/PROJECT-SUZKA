@@ -65,6 +65,8 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--record-calls", action="store_true")
     # Lab diagnostics, OPT-IN (the smoke sets it): send the recent conversation as real chat roles.
     parser.add_argument("--chat-roles", action="store_true")
+    # Lab diagnostics, OPT-IN (the smoke sets it): the model sees a bare chat (no SUZKA prompt); not with --chat-roles.
+    parser.add_argument("--bare-chat", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -119,6 +121,17 @@ def main(argv: list[str] | None = None) -> int:
         sampler.start()  # numbers only: free / total / reserved, before the load and then every few seconds
     record = bool(args.record_calls)
     chat_roles = bool(args.chat_roles)
+    bare_chat = bool(args.bare_chat)
+    if chat_roles and bare_chat:
+        print("serve refused: CHAT_ROLES_AND_BARE_CHAT", file=sys.stderr)  # the smoke refuses this earlier
+        return 2
+    if bare_chat:
+        # Lab diagnostics only (`bare_chat_adapter`): inside the recorder, like the chat-role adapter.
+        from experiments.r20.bare_chat_adapter import BareChatAdapter, wrap_loader as wrap_bare_loader
+        from suzka.api import server as app_server
+
+        if mode is ProviderMode.REAL:
+            app_server.load_model_provider = wrap_bare_loader(app_server.load_model_provider)
     if chat_roles:
         # Lab diagnostics only (`chat_role_adapter`): inside the recorder, so the recorded call is the one sent.
         from experiments.r20.chat_role_adapter import ChatRoleAdapter, wrap_loader as wrap_adapter_loader
@@ -141,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
     if provider is not None:
         if chat_roles:
             provider = ChatRoleAdapter(provider)
+        if bare_chat:
+            provider = BareChatAdapter(provider)
         app.state.model_provider = RecordingProvider(provider, private) if record else provider
         # Mode "continue": the supervisor drops every ``app.state`` key added after
         # ``create_app`` before a new cycle.  The injected scripted provider is the

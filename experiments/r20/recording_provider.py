@@ -100,11 +100,12 @@ class RecordingProvider:
         return output
 
     def _extra(self) -> dict[str, Any]:
-        """The report of a lab adapter inside this wrapper (`chat_role_adapter`), if any, as `{"chat_roles": ...}`."""
+        """The report of a lab adapter inside this wrapper, if any, under the adapter's key (`chat_roles` by default)."""
 
         take = getattr(self._inner, "take_record_extra", None)
         report = take() if callable(take) else None
-        return {} if report is None else {"chat_roles": report}
+        key = getattr(self._inner, "record_extra_key", "chat_roles")
+        return {} if report is None else {key: report}
 
     def _write(self, row: dict[str, Any]) -> None:
         with self._lock:
