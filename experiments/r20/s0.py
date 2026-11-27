@@ -323,11 +323,15 @@ class S0Session:
         record_calls: bool = False,
         chat_roles: bool = False,
         bare_chat: bool = False,
+        bare_restore: str | None = None,
+        restore_placement: str = "system",
         config_overrides: Mapping[str, Any] | None = None,
     ) -> None:
         self.record_calls = record_calls
         self.chat_roles = chat_roles
         self.bare_chat = bare_chat
+        self.bare_restore = bare_restore
+        self.restore_placement = restore_placement
         self.real = model is not None and model.is_real
         if self.real and (launch is None or not isinstance(launch, HumanLaunch) or not launch.valid_here()):
             raise GuardRefusal("REAL_PROVIDER_WITHOUT_HUMAN_LAUNCH")
@@ -371,12 +375,19 @@ class S0Session:
                 **({"record_calls": True} if self.record_calls else {}),
                 **({"chat_roles": True} if self.chat_roles else {}),
                 **({"bare_chat": True} if self.bare_chat else {}),
+                **self._restore_arguments(),
             )
         return ChildProcess.spawn(
             self.subject, provider_config=self.provider_config, **({"record_calls": True} if self.record_calls else {}),
             **({"chat_roles": True} if self.chat_roles else {}),
             **({"bare_chat": True} if self.bare_chat else {}),
+            **self._restore_arguments(),
         )
+
+    def _restore_arguments(self) -> dict[str, str]:
+        if not self.bare_restore:
+            return {}
+        return {"bare_restore": self.bare_restore, "restore_placement": self.restore_placement}
 
     def provider_identity(self) -> dict[str, object]:
         if self.real:

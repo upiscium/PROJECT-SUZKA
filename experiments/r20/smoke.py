@@ -36,6 +36,25 @@ Diagnostic options (all observation only, all default off / unchanged):
   message; nothing of SUZKA's prompt (values, goals, evidence, trace).  The SUZKA runtime runs normally around it.
   Results carry ``bare_chat: {requested, applied, ...}`` and, per turn, numbers only (messages sent, user
   characters before / after, history pairs, skipped-reason labels); the messages stay in the private file.
+* ``--bare-restore LIST`` (needs ``--bare-chat``; LIST is a comma list of header, context, values, wm_evidence,
+  motivations_goals, emotion, or ``all``) restores those sections of the REAL prompt of each call, VERBATIM, into
+  the bare chat (the isolation experiment: which section pulls the model off a simple instruction).
+  ``--restore-placement system|user`` (default system): ``system`` appends them to the bare system text
+  (deliberately ignoring the #414 rule that no stored text goes into the system role: this is a lab experiment
+  on a throwaway subject); ``user`` prepends them inside the final user message (production-like).  The history
+  holds only the plain (message, output) pairs, never the restored text.  A section that cannot be located
+  exactly is recorded as ``section_missing:<name>`` for that call.  The restored text goes ONLY to the model and
+  to the private ``model_calls.jsonl``; results and stdout carry the section names and character counts.
+* ``--matrix`` (implies the bare chat with restores; excludes ``--bare-chat``, ``--bare-restore``,
+  ``--restore-placement`` and ``--chat-roles``; needs ``--record-model-calls``; greedy unless ``--temperature``
+  is given) runs ONE Human launch over the fixed conditions X0 bare, X1 header, X2 emotion, X3 values,
+  X4 wm_evidence, X5 motivations_goals, X6 context, X7 all (system placement), X8 all (user placement,
+  production-like), sequentially, ``--repeats`` fresh subjects each (default 5).  Total subjects are capped at
+  60 (9 conditions x 5 = 45).  The GPU check runs before every subject; the loop stops at the first refusal or
+  non-completed run and the completed conditions are reported.  ``results-smoke-matrix-<launch>.json`` (numbers
+  and labels only) is rewritten after every subject, so Ctrl-C keeps what was done.  ESTIMATED duration (an
+  assumption, not a measurement): about 3-6 minutes per subject (model load plus 7 turns), so a full matrix
+  of 45 subjects takes roughly 2.5-4.5 hours.
 * ``--record-model-calls`` installs the lab-only ``recording_provider`` in the subject's serve
   child: the exact prompt / messages, the sampling parameters and the output of every model call go
   to the subject's PRIVATE directory (0600).  The results then carry, per turn, NUMBERS about how
@@ -60,6 +79,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -82,6 +102,7 @@ STAGE = "SMOKE"
 TURN_CAP_S = 120.0  # one chat turn (the per-turn timeout of the child and of the client)
 MAX_TURNS = 7
 MAX_REPEATS = 5
+MATRIX_MAX_SUBJECTS = 60
 EXIT_REFUSED = 2
 EXIT_FAILED = 1
 Attest = Callable[..., HumanLaunch]
@@ -268,13 +289,37 @@ def _bare_record(args: argparse.Namespace, turns: list[dict[str, Any]]) -> dict[
     }
 
 
+def _check_restore_and_matrix(args: argparse.Namespace) -> None:
+    restore = getattr(args, "bare_restore", None)
+    placement = getattr(args, "restore_placement", None)
+    if getattr(args, "matrix", False):
+        for flag, code in (("bare_chat", "MATRIX_EXCLUDES_BARE_CHAT"), ("bare_restore", "MATRIX_EXCLUDES_BARE_RESTORE"),
+                           ("restore_placement", "MATRIX_EXCLUDES_RESTORE_PLACEMENT"), ("chat_roles", "MATRIX_EXCLUDES_CHAT_ROLES")):
+            if getattr(args, flag, None):
+                raise GuardRefusal(code, f"--matrix and --{flag.replace('_', '-')} are mutually exclusive")
+        if not args.record_model_calls:
+            raise GuardRefusal("MATRIX_NEEDS_RECORD_MODEL_CALLS", "--matrix needs --record-model-calls")
+    if restore is not None:
+        if not getattr(args, "bare_chat", False):
+            raise GuardRefusal("BARE_RESTORE_NEEDS_BARE_CHAT", "--bare-restore needs --bare-chat")
+        try:
+            bare_chat_adapter.parse_restore_list(restore)
+        except ValueError as error:
+            raise GuardRefusal("BARE_RESTORE_INVALID", str(error)) from error
+    elif placement is not None and not getattr(args, "matrix", False):
+        raise GuardRefusal("RESTORE_PLACEMENT_NEEDS_BARE_RESTORE", "--restore-placement needs --bare-restore")
+
+
 def _check_arguments(args: argparse.Namespace) -> None:
     if not 1 <= args.turns <= MAX_TURNS:
         raise GuardRefusal("TURNS_OUT_OF_RANGE", f"1..{MAX_TURNS}")
+    if args.repeats is None:  # the matrix defaults to 5 subjects per condition, a plain smoke to 1
+        args.repeats = MAX_REPEATS if getattr(args, "matrix", False) else 1
     if not 1 <= args.repeats <= MAX_REPEATS:
         raise GuardRefusal("REPEATS_OUT_OF_RANGE", f"1..{MAX_REPEATS}")
     if args.temperature is not None and not 0.0 <= args.temperature <= MAX_TEMPERATURE:  # NaN fails too
         raise GuardRefusal("TEMPERATURE_OUT_OF_RANGE", f"0.0..{MAX_TEMPERATURE}")
+    _check_restore_and_matrix(args)
     if getattr(args, "bare_chat", False):
         if getattr(args, "chat_roles", False):
             raise GuardRefusal("BARE_CHAT_EXCLUDES_CHAT_ROLES", "--bare-chat and --chat-roles are mutually exclusive")
@@ -299,6 +344,8 @@ def _one_run(
         record_calls=bool(args.record_model_calls),
         chat_roles=bool(getattr(args, "chat_roles", False)),
         bare_chat=bool(getattr(args, "bare_chat", False)),
+        bare_restore=getattr(args, "bare_restore", None),
+        restore_placement=getattr(args, "restore_placement", None) or "system",
         config_overrides=_overrides(args),
     )
     fixture = model is None
@@ -372,6 +419,11 @@ def _one_run(
         "private_file": str(private_file),
         "model_calls_file": str(private_directory / "model_calls.jsonl") if args.record_model_calls else None,
     }
+    if getattr(args, "bare_restore", None):  # present only when restores were asked for
+        run["restore"] = {
+            "sections": list(bare_chat_adapter.parse_restore_list(args.bare_restore)),
+            "placement": getattr(args, "restore_placement", None) or "system",
+        }
     if detail:
         run["detail"] = detail
     return run, code
@@ -400,17 +452,245 @@ def _print_run(run: dict[str, Any], reading: gpu.GpuReading | None) -> None:
             if bare is not None:
                 note += (f"  bare chat: {bare['messages_sent_count']} msg sent, history pairs {bare['history_pairs']}, "
                          f"skipped {bare['adapter_skipped']}")
+                if "restored_chars" in bare:
+                    note += (f", restored {bare['restored_sections']} ({bare['restored_chars']} chars)"
+                             + (f", {bare['section_missing']}" if bare["section_missing"] else ""))
             note += (f"  input: {assembly['messages']} msg, {assembly['prompt_chars']} chars, "
                      f"trace turns {assembly['trace_turns']}, episodic items {assembly['episodic_items']}")
         print(f"turn {item['ordinal']} [{item['label']}]: {item['seconds']:.1f} s, {item['response_chars']} chars{note}")
     print(f"raw replies (PRIVATE): {run['private_file']}")
 
 
-def _smoke(args: argparse.Namespace, *, attest: Attest, gpu_runner: Callable[[], str] | None) -> int:
+# ------------------------------------------------------------------------------------------ the matrix
+
+
+@dataclass(frozen=True, slots=True)
+class Condition:
+    """One matrix condition: a bare chat plus ``restore`` (a comma list or ``None``) at ``placement``."""
+
+    id: str
+    description: str
+    restore: str | None
+    placement: str = "system"
+
+
+CONDITIONS: tuple[Condition, ...] = (
+    Condition("X0", "bare", None),
+    Condition("X1", "header", "header"),
+    Condition("X2", "emotion", "emotion"),
+    Condition("X3", "values", "values"),
+    Condition("X4", "wm_evidence", "wm_evidence"),
+    Condition("X5", "motivations_goals", "motivations_goals"),
+    Condition("X6", "context", "context"),
+    Condition("X7", "all (system)", "all", "system"),
+    Condition("X8", "all (user, production-like)", "all", "user"),
+)
+# (column title, turn label, observed key): the counts the table prints
+KEY_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("E one", "E", "names_exactly_one"),
+    ("reph tokyo", "rephrase", "mentions_tokyo"),
+    ("pop number", "population", "answers_with_number"),
+    ("recall both", "recall", "has_both_phrases"),
+)
+
+
+def check_conditions(conditions: tuple[Condition, ...], repeats: int) -> None:
+    """The fixed list must be well formed and the total number of subjects within the cap."""
+
+    ids = [condition.id for condition in conditions]
+    if not conditions or len(set(ids)) != len(ids):
+        raise GuardRefusal("MATRIX_CONDITIONS_INVALID", "empty or duplicate condition ids")
+    for condition in conditions:
+        if condition.placement not in bare_chat_adapter.PLACEMENTS:
+            raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{condition.id}: placement")
+        if condition.restore is not None:
+            try:
+                bare_chat_adapter.parse_restore_list(condition.restore)
+            except ValueError as error:
+                raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{condition.id}: {error}") from error
+    if len(conditions) * repeats > MATRIX_MAX_SUBJECTS:
+        raise GuardRefusal("MATRIX_TOO_MANY_SUBJECTS", f"{len(conditions)} x {repeats} > {MATRIX_MAX_SUBJECTS}")
+
+
+def _observed_count(aggregated: dict[str, Any], label: str, key: str) -> dict[str, int] | None:
+    observed = (aggregated.get("per_label", {}).get(label) or {}).get("observed") or {}
+    count = observed.get(key)
+    return count if isinstance(count, dict) and "true" in count else None
+
+
+def _condition_summary(condition: Condition, runs: list[dict[str, Any]], planned: int) -> dict[str, Any]:
+    completed = [run for run in runs if run["ended"] == "completed"]
+    aggregated = aggregate(completed)
+    free = [int(run["gpu"]["min_free"]) for run in runs if run.get("gpu", {}).get("min_free") is not None]
+    bare_rows = [turn["bare_chat"] for run in completed for turn in run["turns"] if turn.get("bare_chat")]
+
+    def mean(name: str) -> float | None:
+        values = [row[name] for row in bare_rows if isinstance(row.get(name), (int, float))]
+        return round(sum(values) / len(values), 1) if values else None
+
+    return {
+        "id": condition.id, "description": condition.description, "restore": condition.restore,
+        "placement": condition.placement if condition.restore else None,
+        "subjects_planned": planned, "subjects_started": len(runs), "completed_runs": len(completed),
+        "ended": [run["ended"] for run in runs],
+        "min_free_bytes": min(free) if free else None,
+        "mean_user_chars_after": mean("user_chars_after"), "mean_input_chars": mean("input_chars"),
+        "mean_restored_chars": mean("restored_chars"),
+        "section_missing_turns": sum(1 for row in bare_rows if row.get("section_missing")),
+        "key_counts": {title: _observed_count(aggregated, label, key) for title, label, key in KEY_COLUMNS},
+        "aggregate": aggregated,
+        "runs": runs,
+    }
+
+
+def matrix_table(summaries: list[dict[str, Any]]) -> list[str]:
+    """The compact table (rows = conditions): counts as ``true/of``, ``-`` where nothing was observed."""
+
+    header = ["cond", "what", "done", *[title for title, _l, _k in KEY_COLUMNS], "min free GiB", "input chars"]
+    rows = [header]
+    for item in summaries:
+        counts = [
+            "-" if item["key_counts"][title] is None else f"{item['key_counts'][title]['true']}/{item['key_counts'][title]['of']}"
+            for title, _l, _k in KEY_COLUMNS
+        ]
+        free = "-" if item["min_free_bytes"] is None else f"{item['min_free_bytes'] / gpu.GIB:.1f}"
+        chars = "-" if item["mean_input_chars"] is None else f"{item['mean_input_chars']:.0f}"
+        rows.append([item["id"], item["description"], f"{item['completed_runs']}/{item['subjects_planned']}", *counts, free, chars])
+    widths = [max(len(row[column]) for row in rows) for column in range(len(header))]
+    return ["  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip() for row in rows]
+
+
+def _write_matrix_results(base: Path, launch_id: str, payload: dict[str, Any]) -> Path:
+    """Rewrite the matrix results atomically (0600); called after every subject so an interrupt keeps the rest."""
+
+    path = Path(base) / f"results-smoke-matrix-{launch_id}.json"
+    temporary = path.with_name(path.name + ".tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True, indent=1, default=str)
+    os.replace(temporary, path)
+    return path
+
+
+def _matrix_summary_lines(args: argparse.Namespace, model: ModelOverride | None, conditions: tuple[Condition, ...]) -> list[str]:
+    return [
+        *_summary_lines(args, model),
+        f"MATRIX: {len(conditions)} conditions x {args.repeats} subjects = {len(conditions) * args.repeats} fresh subjects "
+        f"(cap {MATRIX_MAX_SUBJECTS}), sequential, bare chat with restored sections: "
+        + ", ".join(f"{c.id}={c.description}" for c in conditions),
+        "restored sections go only to the model and the private model_calls.jsonl; results hold numbers and labels only",
+    ]
+
+
+def _matrix(
+    args: argparse.Namespace, *, attest: Attest, gpu_runner: Callable[[], str] | None,
+    conditions: tuple[Condition, ...] | None, gate: Callable[[], None] | None,
+) -> int:
+    """The condition matrix under ONE Human attestation.  ``conditions`` / ``gate`` are test seams only."""
+
+    chosen = CONDITIONS if conditions is None else conditions
+    check_conditions(chosen, args.repeats)
+    args = argparse.Namespace(**vars(args))
+    args.bare_chat = True  # the matrix IS the bare chat with restores
+    if args.temperature is None:
+        args.temperature = 0.0  # greedy unless the Human asked for a temperature
+    base = Path(args.base)
+    check_not_production(base)  # BEFORE anything is created
+    model = _model(args)
+    launch: HumanLaunch | None = None
+    reading: gpu.GpuReading | None = None
+    revision = ""
+    if model is not None:
+        revision = check_pinned_revision(model)
+        assert model.revision is not None
+
+        def before(_terminal: Terminal) -> list[str]:
+            return _matrix_summary_lines(args, model, chosen)
+
+        launch = attest(
+            STAGE, model_digest(model), human_flag=bool(args.human_launch), revision8=model.revision[:8],
+            before_confirm=before,
+        )
+        reading = gpu.check_free(runner=gpu_runner)
+    launch_id = uuid.uuid4().hex[:10]
+    fixture = model is None
+    summaries: list[dict[str, Any]] = []
+    stopped: dict[str, Any] | None = None
+    code = 0
+    interrupted = False
+
+    def payload(current: dict[str, Any] | None) -> dict[str, Any]:
+        shown = [*summaries, *([] if current is None else [current])]
+        return {
+            "kind": "observations", "verdict": None, "fixture_only": fixture, "launch": launch_id, "matrix": True,
+            "requested": {"repeats": args.repeats, "turns": args.turns, "conditions": [c.id for c in chosen],
+                          "subjects_planned": len(chosen) * args.repeats, "record_model_calls": bool(args.record_model_calls)},
+            "generation": {"temperature_requested": args.temperature, "temperature_zero_means_greedy": True,
+                           "do_sample_override": args.temperature != 0.0},
+            "conditions": shown,
+            "completed_conditions": [item["id"] for item in shown if item["completed_runs"] == item["subjects_planned"]],
+            "stopped": stopped, "interrupted": interrupted,
+        }
+
+    started = 0
+    try:
+        for condition in chosen:
+            runs: list[dict[str, Any]] = []
+            subject_args = argparse.Namespace(**vars(args))
+            subject_args.bare_restore = condition.restore
+            subject_args.restore_placement = condition.placement if condition.restore else None
+            print(f"--- condition {condition.id}: {condition.description} ---")
+            for ordinal in range(1, args.repeats + 1):
+                started += 1
+                if started > 1:  # the first subject follows the launch check
+                    try:
+                        if gate is not None:
+                            gate()
+                        elif model is not None:
+                            reading = gpu.check_free(runner=gpu_runner)  # before EVERY subject
+                    except GuardRefusal as refusal:
+                        stopped = {"condition": condition.id, "before_run": ordinal, "code": refusal.code, "detail": refusal.detail}
+                        code = EXIT_REFUSED
+                        print(f"stopped before {condition.id} run {ordinal}: {refusal.code} {refusal.detail}".rstrip())
+                        break
+                run, run_code = _one_run(
+                    subject_args, base, launch_id, ordinal, model=model, launch=launch, reading=reading, revision=revision,
+                )
+                runs.append(run)
+                _print_run(run, reading)
+                _write_matrix_results(base, launch_id, payload(_condition_summary(condition, runs, args.repeats)))
+                if run_code:
+                    code = run_code
+                    stopped = {"condition": condition.id, "before_run": ordinal + 1, "code": run["ended"],
+                               "detail": "the previous run did not complete"}
+                    break
+            if runs:
+                summaries.append(_condition_summary(condition, runs, args.repeats))
+            if stopped is not None:
+                break
+    except KeyboardInterrupt:
+        interrupted, code = True, EXIT_FAILED
+    results = _write_matrix_results(base, launch_id, payload(None))
+    print("\n".join(matrix_table(summaries)))
+    done = [item["id"] for item in summaries if item["completed_runs"] == item["subjects_planned"]]
+    print(f"completed conditions: {', '.join(done) or 'none'}" + (f"; stopped: {stopped['code']}" if stopped else "")
+          + ("; interrupted" if interrupted else ""))
+    print(f"results (numbers and labels only): {results}")
+    print(artifacts.RETENTION_NOTE.strip())
+    print("These are observations, not a verdict on the model.")
+    return code
+
+
+def _smoke(
+    args: argparse.Namespace, *, attest: Attest, gpu_runner: Callable[[], str] | None,
+    conditions: tuple[Condition, ...] | None = None, gate: Callable[[], None] | None = None,
+) -> int:
     """The smoke.  PRIVATE seam version (``attest`` / ``gpu_runner``): only tests pass anything else;
     ``run`` below is hard-wired to the real terminal and the real GPU probe."""
 
     _check_arguments(args)
+    if getattr(args, "matrix", False):
+        return _matrix(args, attest=attest, gpu_runner=gpu_runner, conditions=conditions, gate=gate)
     base = Path(args.base)
     check_not_production(base)  # BEFORE anything is created
     model = _model(args)
@@ -514,13 +794,23 @@ def parser() -> argparse.ArgumentParser:
     top.add_argument("--turns", type=int, default=MAX_TURNS, help=f"number of chat turns, 1..{MAX_TURNS}")
     top.add_argument("--temperature", type=float,
                      help=f"override generation.temperature, 0.0..{MAX_TEMPERATURE} (0 = greedy); default: the config value")
-    top.add_argument("--repeats", type=int, default=1, help=f"sequential fresh subjects under one attestation, 1..{MAX_REPEATS}")
+    top.add_argument("--repeats", type=int, default=None,
+                     help=f"sequential fresh subjects under one attestation, 1..{MAX_REPEATS} (default 1; with --matrix: 5 per condition)")
     top.add_argument("--record-model-calls", action="store_true",
                      help="lab diagnostics: record every model call privately and report prompt-assembly numbers")
     top.add_argument("--conversation-trace", action="store_true",
                      help="lab diagnostics: enable conversation_trace in the throwaway subject's config (default off)")
     top.add_argument("--bare-chat", action="store_true",
                      help="lab diagnostics control: the model sees only a neutral system text, its own history and the current message (needs --record-model-calls; not with --chat-roles)")
+    top.add_argument("--bare-restore", metavar="LIST",
+                     help="lab diagnostics: restore these sections of the real prompt into the bare chat, verbatim "
+                          f"(comma list of {', '.join(bare_chat_adapter.RESTORE_NAMES)}, or all; needs --bare-chat)")
+    top.add_argument("--restore-placement", choices=list(bare_chat_adapter.PLACEMENTS),
+                     help="where restored sections go: system (appended to the bare system text; default) or user (prepended inside the final user message)")
+    top.add_argument("--matrix", action="store_true",
+                     help="lab diagnostics: run the fixed condition matrix X0..X8 (bare + restores) in ONE launch, "
+                          f"--repeats subjects each; total subjects <= {MATRIX_MAX_SUBJECTS}; greedy unless --temperature; "
+                          "needs --record-model-calls; estimated 2.5-4.5 h for 45 subjects (assumption, not measured)")
     top.add_argument("--chat-roles", action="store_true",
                      help="lab diagnostics: send the recent conversation as real chat roles (needs --conversation-trace and --record-model-calls)")
     top.add_argument("--human-launch", action="store_true")

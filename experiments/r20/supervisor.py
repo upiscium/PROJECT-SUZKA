@@ -139,6 +139,8 @@ class ChildProcess:
         record_calls: bool = False,
         chat_roles: bool = False,
         bare_chat: bool = False,
+        bare_restore: str | None = None,
+        restore_placement: str = "system",
     ) -> ChildProcess:
         check_modes(provider, actor, human_launch=False)  # before any child exists
         if subject.tier is not Tier.T2:
@@ -155,6 +157,8 @@ class ChildProcess:
             command.append("--chat-roles")
         if bare_chat:  # lab diagnostics, opt-in: the command is unchanged without it
             command.append("--bare-chat")
+        if bare_restore:  # lab diagnostics, opt-in: the command is unchanged without it
+            command += ["--bare-restore", bare_restore, "--restore-placement", restore_placement]
         if provider_config is not None:
             subject.provider_config.write_text(json.dumps(provider_config), encoding="utf-8")
             os.chmod(subject.provider_config, 0o600)
@@ -188,6 +192,8 @@ class ChildProcess:
         record_calls: bool = False,
         chat_roles: bool = False,
         bare_chat: bool = False,
+        bare_restore: str | None = None,
+        restore_placement: str = "system",
     ) -> ChildProcess:
         """The ONLY way a real-model child starts: it needs the attestation of THIS
         process's Human launch (``attest_human_launch``).  ``spawn`` still refuses a
@@ -216,6 +222,8 @@ class ChildProcess:
             command.append("--chat-roles")
         if bare_chat:  # lab diagnostics, opt-in: the command is unchanged without it
             command.append("--bare-chat")
+        if bare_restore:  # lab diagnostics, opt-in: the command is unchanged without it
+            command += ["--bare-restore", bare_restore, "--restore-placement", restore_placement]
         child_home(subject).mkdir(mode=0o700, exist_ok=True)
         log = open(log_path or subject.run_dir / "serve.log", "ab")
         try:

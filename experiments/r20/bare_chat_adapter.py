@@ -35,13 +35,125 @@ from typing import Any
 from experiments.r20.chat_role_adapter import (
     NO_CHAT_TEMPLATE, NO_PRIVATE_PATH, NOT_A_CHAT_CALL, _has_private_path, build_messages,
 )
-from suzka.persona.prompt_builder import CURRENT_MESSAGE_HEADING
+from suzka.attention.policy import ATTENTION_PROMPT_SECTION_HEADERS
+from suzka.persona.prompt_builder import CURRENT_MESSAGE_HEADING, RUNTIME_DATA_HEADING
 
 BARE_SYSTEM_TEXT = "あなたは親切なAIアシスタントです。日本語で簡潔に答えてください。"
 RECORD_KEY = "bare_chat"
 _MARK = f"\n\n{CURRENT_MESSAGE_HEADING}\n"
 
 NO_USER_MESSAGE = "no_user_message"
+
+# --- restore sections (lab isolation experiment): sections of the REAL prompt of the call, sent verbatim ---
+RESTORE_NAMES = ("header", "context", "values", "wm_evidence", "motivations_goals", "emotion")  # prompt order
+RESTORE_ALIAS_ALL = "all"
+PLACEMENTS = ("system", "user")
+_HEADINGS = {kind.name: heading.rstrip("\n") for kind, heading in ATTENTION_PROMPT_SECTION_HEADERS}
+_WM_HEADING = _HEADINGS["WORKING_MEMORY"]  # "WorkingMemory evidence:"
+_MOTIVATIONS_HEADING = _HEADINGS["MOTIVATION"]  # "Current Motivations:"
+_CONTEXT_HEADING = "Current Context:"
+_VALUES_HEADING = "Active Values:"
+_EMOTION_HEADING = "Emotion:"
+_EMOTION_LINES = ("- valence:", "- arousal:", "- optimal_loss:")
+_KNOWN_HEADINGS = frozenset(
+    {_CONTEXT_HEADING, _VALUES_HEADING, _EMOTION_HEADING, _WM_HEADING, *_HEADINGS.values()}
+)
+
+
+def parse_restore_list(text: str) -> tuple[str, ...]:
+    """A comma list of section names (or ``all``) -> the names in prompt order, without duplicates.
+
+    Raises ``ValueError`` (the smoke turns it into a refusal) for an empty list or an unknown name.
+    """
+
+    names = [part.strip() for part in text.split(",")]
+    if not text.strip() or any(not name for name in names):
+        raise ValueError("empty restore list")
+    chosen: set[str] = set()
+    for name in names:
+        if name == RESTORE_ALIAS_ALL:
+            chosen.update(RESTORE_NAMES)
+        elif name in RESTORE_NAMES:
+            chosen.add(name)
+        else:
+            raise ValueError(f"unknown restore section: {name}")
+    return tuple(name for name in RESTORE_NAMES if name in chosen)
+
+
+def _block(lines: list[str], heading: str, *, stop_at_headings: bool = True) -> str | None:
+    """The heading line and the lines after it up to a blank line (or another known heading), verbatim.
+
+    ``None`` unless the heading occurs as a whole line EXACTLY once (an ambiguous or absent section is
+    never guessed).  The builder separates its sections by blank lines and every stored row is a single
+    line, so a blank line ends a section.
+    """
+
+    starts = [index for index, line in enumerate(lines) if line == heading]
+    if len(starts) != 1:
+        return None
+    end = starts[0] + 1
+    while end < len(lines) and lines[end] != "" and not (stop_at_headings and lines[end] in _KNOWN_HEADINGS):
+        end += 1
+    return "\n".join(lines[starts[0]:end])
+
+
+def _emotion_block(lines: list[str]) -> str | None:
+    starts = [index for index, line in enumerate(lines) if line == _EMOTION_HEADING]
+    if len(starts) != 1:
+        return None
+    body = lines[starts[0] + 1:starts[0] + 4]
+    if len(body) != 3 or not all(line.startswith(prefix) for line, prefix in zip(body, _EMOTION_LINES)):
+        return None
+    return "\n".join(lines[starts[0]:starts[0] + 4])
+
+
+def parse_sections(system_text: str, user_text: str) -> tuple[dict[str, str], list[str]]:
+    """Locate the restorable sections of ONE real call.  Returns (found name -> verbatim text, missing names).
+
+    ``header`` is the whole real system text.  Everything else comes from the runtime data of the user text
+    (the part before the builder's ``User message:`` marker, which must occur exactly once): Current Context,
+    Active Values, the WorkingMemory evidence block of the Attention payload (its heading line and rows, not
+    its fixed authority sentence), Current Motivations + Adopted Goals + Active Commitments (one block) and
+    the three Emotion lines.  A section that is absent or ambiguous is reported as missing, never guessed.
+    """
+
+    found: dict[str, str] = {}
+    if system_text.strip():
+        found["header"] = system_text
+    if user_text.count(_MARK) == 1:
+        lines = user_text.partition(_MARK)[0].split("\n")
+        if lines and lines[0] == RUNTIME_DATA_HEADING:
+            for name, text in (
+                ("context", _block(lines, _CONTEXT_HEADING)),
+                ("values", _block(lines, _VALUES_HEADING)),
+                ("wm_evidence", _block(lines, _WM_HEADING)),
+                ("motivations_goals", _block(lines, _MOTIVATIONS_HEADING, stop_at_headings=False)),
+                ("emotion", _emotion_block(lines)),
+            ):
+                if text is not None:
+                    found[name] = text
+    return found, [name for name in RESTORE_NAMES if name not in found]
+
+
+def compose_restored(
+    restore: tuple[str, ...], found: dict[str, str], placement: str, message: str,
+) -> tuple[str, str, list[str]]:
+    """(system text, final user text, restored names) for the bare chat plus the restored sections.
+
+    ``system``: the sections follow ``BARE_SYSTEM_TEXT`` as one block.  ``user``: they are prepended inside
+    the final user message in the builder's own shape (the header first, then the runtime-data heading, the
+    other sections, a blank line, ``User message:`` and the message).  The history never holds them.
+    """
+
+    names = [name for name in restore if name in found]
+    if not names:
+        return BARE_SYSTEM_TEXT, message, []
+    if placement == "system":
+        return BARE_SYSTEM_TEXT + "\n\n" + "\n\n".join(found[name] for name in names), message, names
+    head = [found["header"]] if "header" in names else []
+    data = [found[name] for name in names if name != "header"]
+    parts = [*head, *([RUNTIME_DATA_HEADING + "\n" + "\n\n".join(data)] if data else [])]
+    return BARE_SYSTEM_TEXT, "\n\n".join(parts) + f"{_MARK}{message}", names
 
 
 def extract_user_message(user_text: str) -> str | None:
@@ -66,14 +178,18 @@ class BareChatAdapter:
 
     record_extra_key = RECORD_KEY
 
-    def __init__(self, inner: Any) -> None:
+    def __init__(self, inner: Any, restore: tuple[str, ...] = (), placement: str = "system") -> None:
+        if placement not in PLACEMENTS or any(name not in RESTORE_NAMES for name in restore):
+            raise ValueError("invalid restore request")
+        self._restore = tuple(restore)
+        self._placement = placement
         self._inner = inner
         self._local = threading.local()
         self._history: list[tuple[str, str]] = []
         self._lock = threading.Lock()
 
     def __getattr__(self, name: str) -> Any:  # only called for names not found on the wrapper
-        if name in {"_inner", "_local", "_history", "_lock"}:
+        if name in {"_inner", "_local", "_history", "_lock", "_restore", "_placement"}:
             raise AttributeError(name)
         target = getattr(self._inner, name)
         return self._generate_chat if name == "generate_chat" else target
@@ -83,12 +199,18 @@ class BareChatAdapter:
         self._local.report = None
         return report
 
-    @staticmethod
-    def _report(chars: int, reason: str | None) -> dict[str, Any]:
-        return {
+    def _report(self, chars: int, reason: str | None) -> dict[str, Any]:
+        report: dict[str, Any] = {
             "kind": "observed", "applied": False, "adapter_skipped": reason, "messages_sent_count": 0,
             "user_chars_before": chars, "user_chars_after": chars, "history_pairs": 0,
         }
+        if self._restore:  # these keys exist only when restores were asked for (flag off: the report is unchanged)
+            report.update(
+                restore_requested=list(self._restore), restore_placement=self._placement,
+                restored_sections=[], restored_count=0, restored_chars=0, section_missing=[],
+                section_missing_count=0,
+            )
+        return report
 
     def generate(self, prompt: str) -> str:
         self._local.report = self._report(len(prompt), NOT_A_CHAT_CALL)
@@ -113,9 +235,22 @@ class BareChatAdapter:
             return inner.generate_chat(system_text, user_text)  # unchanged, exactly as without the adapter
         with self._lock:
             history = list(self._history)
-        messages = build_messages(BARE_SYSTEM_TEXT, history, message)
+        system, final = BARE_SYSTEM_TEXT, message
+        if self._restore:
+            found, missing = parse_sections(system_text, user_text)
+            wanted_missing = [name for name in self._restore if name in missing]
+            system, final, restored = compose_restored(self._restore, found, self._placement, message)
+            report.update(
+                restored_sections=restored, restored_count=len(restored),
+                restored_chars=sum(len(found[name]) for name in restored),
+                section_missing=[f"section_missing:{name}" for name in wanted_missing],
+                section_missing_count=len(wanted_missing),
+            )
+        messages = build_messages(system, history, final)
+        if self._restore:
+            report["input_chars"] = sum(len(part["text"]) for item in messages for part in item["content"])
         report.update(
-            applied=True, messages_sent_count=len(messages), user_chars_after=len(message),
+            applied=True, messages_sent_count=len(messages), user_chars_after=len(final),
             history_pairs=len(history),
             messages_sent=messages,  # RAW text: private file only
         )
@@ -125,11 +260,13 @@ class BareChatAdapter:
         return output
 
 
-def wrap_loader(loader: Callable[..., Any]) -> Callable[..., Any]:
+def wrap_loader(
+    loader: Callable[..., Any], restore: tuple[str, ...] = (), placement: str = "system",
+) -> Callable[..., Any]:
     """A drop-in for ``load_model_provider``: every provider it builds is wrapped (one history per provider)."""
 
     def load(*arguments: Any, **keywords: Any) -> BareChatAdapter:
-        return BareChatAdapter(loader(*arguments, **keywords))
+        return BareChatAdapter(loader(*arguments, **keywords), restore, placement)
 
     return load
 
@@ -143,4 +280,7 @@ def numbers(row: dict[str, Any]) -> dict[str, Any] | None:
     return {key: value for key, value in report.items() if key != "messages_sent"}
 
 
-__all__ = ["BARE_SYSTEM_TEXT", "BareChatAdapter", "extract_user_message", "numbers", "wrap_loader"]
+__all__ = [
+    "BARE_SYSTEM_TEXT", "BareChatAdapter", "PLACEMENTS", "RESTORE_NAMES", "compose_restored", "extract_user_message",
+    "numbers", "parse_restore_list", "parse_sections", "wrap_loader",
+]
