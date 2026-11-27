@@ -330,7 +330,11 @@ class S0Session:
         evidence_top_k: int | None = None,
         evidence_item_max_chars: int | None = None,
         config_overrides: Mapping[str, Any] | None = None,
+        alloc_conf: str | None = None,
+        empty_cache: str | None = None,
     ) -> None:
+        self.alloc_conf = alloc_conf  # lab allocator test (opt-in): child env only
+        self.empty_cache = empty_cache
         self.record_calls = record_calls
         self.chat_roles = chat_roles
         self.bare_chat = bare_chat
@@ -404,6 +408,10 @@ class S0Session:
             found["evidence_top_k"] = self.evidence_top_k
         if self.evidence_item_max_chars is not None:
             found["evidence_item_max_chars"] = self.evidence_item_max_chars
+        if self.alloc_conf is not None:
+            found["alloc_conf"] = self.alloc_conf
+        if self.empty_cache is not None:
+            found["empty_cache"] = self.empty_cache
         return found
 
     def provider_identity(self) -> dict[str, object]:

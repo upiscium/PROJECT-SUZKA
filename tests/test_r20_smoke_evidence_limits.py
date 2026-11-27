@@ -420,3 +420,24 @@ def test_the_condition_summary_has_mean_items_kept_dropped_and_effective_chars()
     table = smoke.matrix_table([summary])
     assert "ev kept/dropped" in table[0] and table[1].split()[-2:] == ["1.7/1.0", "280"]
     assert all(isinstance(value, (int, float, str, type(None), list, dict)) for value in summary.values())
+
+
+def test_evidence_suffix_and_allocator_flags_work_together_in_the_scripted_matrix(
+    r20_base: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from experiments.r20 import alloc_probe
+
+    conf = list(alloc_probe.ALLOWED_ALLOC_CONF)[0]
+    args = _matrix_args(
+        r20_base, "--alloc-conf", conf, "--empty-cache", "per-turn", "--matrix-conditions", "X10:w1:e3x200,X0",
+    )
+    code = smoke._smoke(args, attest=lambda *a, **k: pytest.fail("no attestation"), gpu_runner=None)  # noqa: SLF001
+    assert code == 0
+    top = matrix_results(r20_base)
+    assert top["allocator"] == {"alloc_conf_requested": conf, "empty_cache_mode": "per-turn"}
+    limited, bare = top["conditions"]
+    assert (limited["evidence_top_k"], limited["evidence_item_max_chars"]) == (3, 200)
+    assert limited["allocator"]["alloc_conf_requested"] == conf and bare["allocator"]["alloc_conf_requested"] == conf
+    header = next(line for line in capsys.readouterr().out.splitlines() if line.startswith("cond"))
+    assert "ev kept/dropped" in header and "reserved after load GiB" in header and "max reserved GiB" in header
+    assert header.index("ev chars") < header.index("reserved after load GiB")

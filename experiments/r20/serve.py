@@ -76,6 +76,9 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     # Lab diagnostics, OPT-IN (need --bare-restore): per-item limits of the restored evidence rows.
     parser.add_argument("--evidence-top-k", type=int)
     parser.add_argument("--evidence-item-max-chars", type=int)
+    # Lab allocator test, OPT-IN (REAL path only): reserved/free readings after the load and after every call;
+    # after-load / per-turn also call torch.cuda.empty_cache().  Absent: nothing is imported or installed.
+    parser.add_argument("--empty-cache", choices=["none", "after-load", "per-turn"])
     return parser.parse_args(argv)
 
 
@@ -184,6 +187,14 @@ def main(argv: list[str] | None = None) -> int:
             # The model is built lazily in the app's lifespan, once per DC cycle, through this module-level
             # name.  Replacing it wraps every provider a cycle builds (a restart cycle included).
             app_server.load_model_provider = wrap_loader(app_server.load_model_provider, private)
+    if args.empty_cache is not None and mode is ProviderMode.REAL:
+        # Lab allocator test only (`alloc_probe`): OUTERMOST, so the call's own peak / reserved numbers are read first.
+        from experiments.r20 import alloc_probe, artifacts
+        from suzka.api import server as app_server
+
+        app_server.load_model_provider = alloc_probe.wrap_loader(
+            app_server.load_model_provider, str(args.empty_cache), artifacts.private_dir(root.parent),
+        )
     app = create_app(settings)
     if provider is not None:
         if chat_roles:
