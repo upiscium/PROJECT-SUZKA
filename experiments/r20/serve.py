@@ -69,7 +69,7 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--bare-chat", action="store_true")
     # Lab diagnostics, OPT-IN (needs --bare-chat): restore these sections of the real prompt into the bare chat.
     parser.add_argument("--bare-restore")
-    parser.add_argument("--restore-placement", choices=["system", "user"], default="system")
+    parser.add_argument("--restore-placement", choices=["system", "user", "first-user", "split-safe"], default="system")
     return parser.parse_args(argv)
 
 

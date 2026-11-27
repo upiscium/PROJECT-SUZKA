@@ -45,6 +45,15 @@ Diagnostic options (all observation only, all default off / unchanged):
   holds only the plain (message, output) pairs, never the restored text.  A section that cannot be located
   exactly is recorded as ``section_missing:<name>`` for that call.  The restored text goes ONLY to the model and
   to the private ``model_calls.jsonl``; results and stdout carry the section names and character counts.
+  Two further placements keep stored / model-originated text out of the system role (#414) and keep the final user
+  message the user's text only: ``first-user`` puts ALL restored sections, as the real labelled runtime-data block
+  (heading ``RUNTIME_DATA_HEADING``), in front of the FIRST user turn of the conversation, and ``split-safe`` sends
+  only the code-generated sections (header, emotion, context) in the system text and the rest (values,
+  wm_evidence, motivations_goals) in that first-user block.  The block is rebuilt from the CURRENT call's restored
+  text and re-attached to the first user turn on every call; the stored history pairs stay raw.  Per turn the
+  results add ``restored_chars_system`` / ``restored_chars_first_user`` (numbers only) for these placements.
+  ``--matrix-conditions X0,X7,X9,X10`` selects (and orders) matrix conditions; X9 = all first-user, X10 = all
+  split-safe exist only through it (the default matrix stays X0..X8); needs ``--matrix``; the 60-subject cap applies.
 * ``--matrix`` (implies the bare chat with restores; excludes ``--bare-chat``, ``--bare-restore``,
   ``--restore-placement`` and ``--chat-roles``; needs ``--record-model-calls``; greedy unless ``--temperature``
   is given) runs ONE Human launch over the fixed conditions X0 bare, X1 header, X2 emotion, X3 values,
@@ -299,6 +308,9 @@ def _check_restore_and_matrix(args: argparse.Namespace) -> None:
                 raise GuardRefusal(code, f"--matrix and --{flag.replace('_', '-')} are mutually exclusive")
         if not args.record_model_calls:
             raise GuardRefusal("MATRIX_NEEDS_RECORD_MODEL_CALLS", "--matrix needs --record-model-calls")
+        check_conditions(resolve_conditions(getattr(args, "matrix_conditions", None)), args.repeats)  # before anything exists
+    elif getattr(args, "matrix_conditions", None) is not None:
+        raise GuardRefusal("MATRIX_CONDITIONS_NEEDS_MATRIX", "--matrix-conditions needs --matrix")
     if restore is not None:
         if not getattr(args, "bare_chat", False):
             raise GuardRefusal("BARE_RESTORE_NEEDS_BARE_CHAT", "--bare-restore needs --bare-chat")
@@ -455,6 +467,9 @@ def _print_run(run: dict[str, Any], reading: gpu.GpuReading | None) -> None:
                 if "restored_chars" in bare:
                     note += (f", restored {bare['restored_sections']} ({bare['restored_chars']} chars)"
                              + (f", {bare['section_missing']}" if bare["section_missing"] else ""))
+                    if "restored_chars_system" in bare:
+                        note += (f", placement {bare['restore_placement']} (system {bare['restored_chars_system']} chars, "
+                                 f"first user {bare['restored_chars_first_user']} chars)")
             note += (f"  input: {assembly['messages']} msg, {assembly['prompt_chars']} chars, "
                      f"trace turns {assembly['trace_turns']}, episodic items {assembly['episodic_items']}")
         print(f"turn {item['ordinal']} [{item['label']}]: {item['seconds']:.1f} s, {item['response_chars']} chars{note}")
@@ -485,6 +500,29 @@ CONDITIONS: tuple[Condition, ...] = (
     Condition("X7", "all (system)", "all", "system"),
     Condition("X8", "all (user, production-like)", "all", "user"),
 )
+# Opt-in only (``--matrix-conditions``): the #414-compliant placements.  The default matrix stays X0..X8.
+EXTRA_CONDITIONS: tuple[Condition, ...] = (
+    Condition("X9", "all (first-user)", "all", "first-user"),
+    Condition("X10", "all (split-safe)", "all", "split-safe"),
+)
+
+
+def resolve_conditions(text: str | None) -> tuple[Condition, ...]:
+    """``--matrix-conditions`` (a comma list of ids, run in the given order) -> the conditions.
+
+    ``None`` is the default list X0..X8.  An unknown id, an empty item or a duplicate is refused.
+    """
+
+    if text is None:
+        return CONDITIONS
+    known = {condition.id: condition for condition in (*CONDITIONS, *EXTRA_CONDITIONS)}
+    ids = [part.strip() for part in text.split(",")]
+    if any(not name for name in ids) or len(set(ids)) != len(ids):
+        raise GuardRefusal("MATRIX_CONDITIONS_INVALID", "empty or duplicate condition id")
+    unknown = [name for name in ids if name not in known]
+    if unknown:
+        raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"unknown condition id: {', '.join(unknown)}")
+    return tuple(known[name] for name in ids)
 # (column title, turn label, observed key): the counts the table prints
 KEY_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("E one", "E", "names_exactly_one"),
@@ -528,7 +566,13 @@ def _condition_summary(condition: Condition, runs: list[dict[str, Any]], planned
         values = [row[name] for row in bare_rows if isinstance(row.get(name), (int, float))]
         return round(sum(values) / len(values), 1) if values else None
 
+    split = {}
+    if condition.restore and condition.placement in bare_chat_adapter.FIRST_USER_PLACEMENTS:
+        # numbers per destination (system vs first user turn); present only for these placements
+        split = {"mean_restored_chars_system": mean("restored_chars_system"),
+                 "mean_restored_chars_first_user": mean("restored_chars_first_user")}
     return {
+        **split,
         "id": condition.id, "description": condition.description, "restore": condition.restore,
         "placement": condition.placement if condition.restore else None,
         "subjects_planned": planned, "subjects_started": len(runs), "completed_runs": len(completed),
@@ -588,7 +632,7 @@ def _matrix(
 ) -> int:
     """The condition matrix under ONE Human attestation.  ``conditions`` / ``gate`` are test seams only."""
 
-    chosen = CONDITIONS if conditions is None else conditions
+    chosen = resolve_conditions(getattr(args, "matrix_conditions", None)) if conditions is None else conditions
     check_conditions(chosen, args.repeats)
     args = argparse.Namespace(**vars(args))
     args.bare_chat = True  # the matrix IS the bare chat with restores
@@ -806,7 +850,13 @@ def parser() -> argparse.ArgumentParser:
                      help="lab diagnostics: restore these sections of the real prompt into the bare chat, verbatim "
                           f"(comma list of {', '.join(bare_chat_adapter.RESTORE_NAMES)}, or all; needs --bare-chat)")
     top.add_argument("--restore-placement", choices=list(bare_chat_adapter.PLACEMENTS),
-                     help="where restored sections go: system (appended to the bare system text; default) or user (prepended inside the final user message)")
+                     help="where restored sections go: system (appended to the bare system text; default), user (prepended inside the "
+                          "final user message), first-user (a labelled data block in the FIRST user turn of the conversation, "
+                          "re-attached every call; the final user message is the user's text only) or split-safe (code-generated "
+                          "sections header/emotion/context in the system text, values/wm_evidence/motivations_goals in the first user turn; #414)")
+    top.add_argument("--matrix-conditions", metavar="IDS",
+                     help="with --matrix: a comma list of condition ids to run, in this order (default X0..X8; "
+                          "X9 = all first-user, X10 = all split-safe are available only here), e.g. X0,X7,X9,X10")
     top.add_argument("--matrix", action="store_true",
                      help="lab diagnostics: run the fixed condition matrix X0..X8 (bare + restores) in ONE launch, "
                           f"--repeats subjects each; total subjects <= {MATRIX_MAX_SUBJECTS}; greedy unless --temperature; "
