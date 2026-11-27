@@ -113,7 +113,7 @@ import uuid
 import yaml
 
 from experiments.r15_p0.pilot import Case
-from experiments.r20 import artifacts, bare_chat_adapter, chat_role_adapter, gpu, measure
+from experiments.r20 import alloc_probe, artifacts, bare_chat_adapter, chat_role_adapter, gpu, measure
 from experiments.r20.guards import GuardRefusal, check_not_production
 from experiments.r20.launch import HumanLaunch, Terminal, attest_human_launch
 from experiments.r20.model_config import MAX_TEMPERATURE, ModelOverride, check_pinned_revision, model_digest
@@ -303,6 +303,10 @@ def _summary_lines(args: argparse.Namespace, model: ModelOverride | None) -> lis
         f"recent conversation sent as chat roles (lab adapter): {bool(getattr(args, 'chat_roles', False))}",
         f"bare chat, no SUZKA prompt (lab control adapter): {bool(getattr(args, 'bare_chat', False))}",
         f"fresh subjects (repeats): {args.repeats}; model calls recorded privately: {bool(args.record_model_calls)}",
+        *([] if (header := _allocator_header(args)) is None else [
+            f"allocator test (lab, child only): PYTORCH_CUDA_ALLOC_CONF={header['alloc_conf_requested'] or 'not set'}; "
+            f"empty_cache mode: {header['empty_cache_mode']}"
+        ]),
         "a fresh throwaway subject is created per repeat; no production state is touched; observations only",
     ]
 
@@ -399,8 +403,39 @@ def _check_restore_and_matrix(args: argparse.Namespace) -> None:
         raise GuardRefusal("RESTORE_PLACEMENT_NEEDS_BARE_RESTORE", "--restore-placement needs --bare-restore")
 
 
+def _alloc_request(args: argparse.Namespace) -> tuple[str | None, str] | None:
+    """(alloc_conf, empty-cache mode) when the allocator test was asked for, else ``None``; refuses a bad value."""
+
+    conf = alloc_probe.check_alloc_conf(getattr(args, "alloc_conf", None))
+    mode = alloc_probe.check_empty_cache(getattr(args, "empty_cache", None))
+    return None if conf is None and mode == "none" else (conf, mode)
+
+
+def _allocator_header(args: argparse.Namespace) -> dict[str, Any] | None:
+    request = _alloc_request(args)
+    return None if request is None else {"alloc_conf_requested": request[0], "empty_cache_mode": request[1]}
+
+
+def _allocator_record(args: argparse.Namespace, private_directory: Path, gpu_summary: dict[str, Any]) -> dict[str, Any] | None:
+    """One run's allocator numbers (numbers and labels only); ``None`` when the test was not asked for."""
+
+    header = _allocator_header(args)
+    if header is None:
+        return None
+    found = alloc_probe.summarize(alloc_probe.read_rows(private_directory))
+    free = [value for value in (gpu_summary.get("min_free"), found.pop("probe_min_free_bytes")) if isinstance(value, int)]
+    sampled = gpu_summary.get("peak_reserved")
+    reserved = [value for value in (sampled, found.pop("probe_max_reserved_bytes")) if isinstance(value, int)]
+    return {
+        **header, **found,
+        "max_reserved_bytes": max(reserved) if reserved else None,
+        "min_free_bytes": min(free) if free else None,
+    }
+
+
 def _check_arguments(args: argparse.Namespace) -> None:
-    script = getattr(args, "script", "short") or "short"
+    _alloc_request(args)  # allow-list, before anything exists
+    script =getattr(args, "script", "short") or "short"
     if script not in SCRIPTS:
         raise GuardRefusal("SCRIPT_UNKNOWN", f"--script: {', '.join(SCRIPTS)}")
     cap = len(SCRIPTS[script])
@@ -433,6 +468,7 @@ def _one_run(
 ) -> tuple[dict[str, Any], int]:
     """ONE fresh subject, the whole turn script.  Returns (the run's numbers and labels, exit code)."""
 
+    alloc = _alloc_request(args)
     session = S0Session(
         base, profile="S0", model=model, launch=launch, turn_cap_s=TURN_CAP_S,
         script=_SCRIPTED if model is None else None, default_answer=_SCRIPTED_DEFAULT if model is None else None,
@@ -444,6 +480,7 @@ def _one_run(
         history_window=getattr(args, "history_window", None),
         state_block_max_bytes=getattr(args, "state_block_max_bytes", None),
         config_overrides=_overrides(args),
+        **({} if alloc is None else {"alloc_conf": alloc[0], "empty_cache": alloc[1]}),
     )
     fixture = model is None
     label = "FIXTURE ONLY (scripted provider, no model, no GPU)" if fixture else f"REAL MODEL {model.model_id if model else ''}"
@@ -527,6 +564,9 @@ def _one_run(
             "history_window": getattr(args, "history_window", None),
             "state_block_max_bytes": getattr(args, "state_block_max_bytes", None),
         }
+    allocator = _allocator_record(args, private_directory, run["gpu"])
+    if allocator is not None:  # present only when the allocator test was asked for
+        run["allocator"] = allocator
     if detail:
         run["detail"] = detail
     return run, code
@@ -540,6 +580,14 @@ def _print_run(run: dict[str, Any], reading: gpu.GpuReading | None) -> None:
         summary = run["gpu"]
         print(f"GPU free at launch: {reading.free_bytes / gpu.GIB:.1f} GiB of {reading.total_bytes / gpu.GIB:.1f} GiB"
               f"; peak reserved: {int(summary.get('peak_reserved', 0)) / gpu.GIB:.1f} GiB")
+    allocator = run.get("allocator")
+    if allocator is not None:
+        def gib(name: str) -> str:
+            return "-" if allocator.get(name) is None else f"{allocator[name] / gpu.GIB:.2f} GiB"
+
+        print(f"allocator: conf {allocator['alloc_conf_requested'] or 'not set'}, empty_cache {allocator['empty_cache_mode']} "
+              f"({allocator['empty_cache_calls']} calls, {allocator['empty_cache_errors']} errors); reserved after load "
+              f"{gib('reserved_after_load_bytes')}, max reserved {gib('max_reserved_bytes')}, min free {gib('min_free_bytes')}")
     for item in run["turns"]:
         naming = item["option_naming"]
         note = "" if naming is None else f"  observed: options named {naming['options_named']}"
@@ -720,8 +768,20 @@ def _condition_summary(condition: Condition, runs: list[dict[str, Any]], planned
         # numbers per destination (system vs first user turn); present only for these placements
         split = {"mean_restored_chars_system": mean("restored_chars_system"),
                  "mean_restored_chars_first_user": mean("restored_chars_first_user")}
+    allocs = [run["allocator"] for run in runs if run.get("allocator")]
+
+    def bound(name: str, pick: Callable[..., Any]) -> int | None:
+        values = [item[name] for item in allocs if isinstance(item.get(name), int)]
+        return pick(values) if values else None
+
     return {
         **split,
+        **({"allocator": {  # present only when the allocator test was asked for
+            "alloc_conf_requested": allocs[0]["alloc_conf_requested"], "empty_cache_mode": allocs[0]["empty_cache_mode"],
+            "empty_cache_calls": sum(int(item.get("empty_cache_calls") or 0) for item in allocs),
+            "reserved_after_load_bytes": bound("reserved_after_load_bytes", max),
+            "max_reserved_bytes": bound("max_reserved_bytes", max), "min_free_bytes": bound("min_free_bytes", min),
+        }} if allocs else {}),
         "id": condition.id, "description": condition.description, "restore": condition.restore,
         "placement": condition.placement if condition.restore else None,
         "subjects_planned": planned, "subjects_started": len(runs), "completed_runs": len(completed),
@@ -746,6 +806,9 @@ def matrix_table(summaries: list[dict[str, Any]]) -> list[str]:
     """The compact table (rows = conditions): counts as ``true/of``, ``-`` where nothing was observed."""
 
     header = ["cond", "what", "done", *[title for title, _l, _k in KEY_COLUMNS], "lyric hits", "mean chars", "min free GiB", "peak alloc GiB", "max input tokens", "input chars"]
+    with_allocator = any(item.get("allocator") for item in summaries)
+    if with_allocator:  # two columns only when the allocator test was asked for
+        header = [*header, "reserved after load GiB", "max reserved GiB"]
     rows = [header]
     for item in summaries:
         counts = [
@@ -759,7 +822,12 @@ def matrix_table(summaries: list[dict[str, Any]]) -> list[str]:
         lyric = "-" if persona.get("mean_lyrical_marker_hits") is None else f"{persona['mean_lyrical_marker_hits']:.2f}"
         reply = "-" if persona.get("mean_response_chars") is None else f"{persona['mean_response_chars']:.0f}"
         chars = "-" if item["mean_input_chars"] is None else f"{item['mean_input_chars']:.0f}"
-        rows.append([item["id"], item["description"], f"{item['completed_runs']}/{item['subjects_planned']}", *counts, lyric, reply, free, allocated, tokens, chars])
+        cells = [item["id"], item["description"], f"{item['completed_runs']}/{item['subjects_planned']}", *counts, lyric, reply, free, allocated, tokens, chars]
+        if with_allocator:
+            found = item.get("allocator") or {}
+            cells += ["-" if found.get(name) is None else f"{found[name] / gpu.GIB:.1f}"
+                      for name in ("reserved_after_load_bytes", "max_reserved_bytes")]
+        rows.append(cells)
     widths = [max(len(row[column]) for row in rows) for column in range(len(header))]
     return ["  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip() for row in rows]
 
@@ -832,6 +900,7 @@ def _matrix(
                           "subjects_planned": len(chosen) * args.repeats, "record_model_calls": bool(args.record_model_calls)},
             "generation": {"temperature_requested": args.temperature, "temperature_zero_means_greedy": True,
                            "do_sample_override": args.temperature != 0.0},
+            **({} if (header := _allocator_header(args)) is None else {"allocator": header}),  # global, once
             "conditions": shown,
             "completed_conditions": [item["id"] for item in shown if item["completed_runs"] == item["subjects_planned"]],
             "stopped": stopped, "interrupted": interrupted,
@@ -950,6 +1019,7 @@ def _smoke(
         "fixture_only": fixture,
         "launch": launch_id,
         "requested": {"repeats": args.repeats, "turns": args.turns, "record_model_calls": bool(args.record_model_calls)},
+        **({} if (header := _allocator_header(args)) is None else {"allocator": header}),  # present only when asked for
         "generation": {
             "temperature_requested": args.temperature,
             "temperature_zero_means_greedy": True,
@@ -1040,6 +1110,12 @@ def parser() -> argparse.ArgumentParser:
                           "needs --record-model-calls; estimated 2.5-4.5 h for 45 subjects (assumption, not measured)")
     top.add_argument("--chat-roles", action="store_true",
                      help="lab diagnostics: send the recent conversation as real chat roles (needs --conversation-trace and --record-model-calls)")
+    top.add_argument("--alloc-conf", metavar="VALUE",
+                     help="lab allocator test: PYTORCH_CUDA_ALLOC_CONF for the CHILD only; exactly one of: "
+                          + " | ".join(alloc_probe.ALLOWED_ALLOC_CONF) + " (anything else is refused; with --matrix: global)")
+    top.add_argument("--empty-cache", choices=list(alloc_probe.EMPTY_CACHE_MODES), default="none",
+                     help="lab allocator test (real model): call torch.cuda.empty_cache() after the model load (after-load) and "
+                          "also after every model call (per-turn); default none; reserved / free numbers are recorded")
     top.add_argument("--human-launch", action="store_true")
     top.add_argument("--ssh-host", help="ssh name of this host, for the printed tunnel line")
     top.add_argument("--scripted", action="store_true", help="FIXTURE ONLY: scripted provider, no GPU, no model")
