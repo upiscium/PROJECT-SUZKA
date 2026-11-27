@@ -99,8 +99,9 @@ class PromptSection:
     """One runtime-data section of a built prompt, tagged with where its text comes from.
 
     ``origin`` is ``"code"`` only when the builder produced the whole text itself from fixed
-    vocabulary and validated numbers/identifiers inside ``PromptBuilder.build_sections``;
-    otherwise ``"stored"`` (it can carry user-, model- or stored-originated text). The tag is set
+    labels and exact floats inside ``PromptBuilder.build_sections``;
+    otherwise ``"stored"`` (it can carry user-, model- or stored-originated text; this includes
+    Context ids, which are caller-chosen). The tag is set
     by the builder at render time and is never derived by reading the text later. ``lead`` is
     the newline run that precedes the section in the legacy prompt layout.
     """
@@ -325,31 +326,10 @@ def _add_context(add: Callable[..., None], context_view: ContextPromptView | Non
             f"- source_session_id: {session}",
             f"- participant_refs: {participants}",
         ],
-        "code" if _context_is_identifiers_only(context_view) else "stored",
+        # Stored: ids, session id and participant refs are caller-chosen (a client can influence
+        # them); the identifier grammar only removes whitespace, not instruction-like words.
+        "stored",
     )
-
-
-def _context_is_identifiers_only(context_view: ContextPromptView) -> bool:
-    """True when every rendered field passes the identifier grammar (no whitespace or newlines).
-
-    An exact ``ContextPromptView`` validates in ``__post_init__``; this re-checks the values that
-    are actually rendered, so a subclass or a view whose fields were replaced after construction
-    is tagged ``stored`` instead of reaching the system role.
-    """
-
-    if type(context_view) is not ContextPromptView:
-        return False
-    try:
-        ContextPromptView(
-            context_id=context_view.context_id,
-            context_type=context_view.context_type,
-            source_channel=context_view.source_channel,
-            source_session_id=context_view.source_session_id,
-            participant_refs=context_view.participant_refs,
-        )
-    except Exception:
-        return False
-    return True
 
 
 def _add_values(add: Callable[..., None], value_view: ValuePromptView | None) -> None:
