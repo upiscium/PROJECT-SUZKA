@@ -188,6 +188,59 @@ def compose_first_user(
     )
 
 
+def apply_state_cap(
+    restore: tuple[str, ...], found: dict[str, str], max_bytes: int | None,
+) -> tuple[tuple[str, ...], list[str], int, int]:
+    """(kept names, dropped names, UTF-8 bytes before, bytes after) of the restored state block.
+
+    Whole sections are dropped from the END of the prompt order until the block fits ``max_bytes``
+    (``None``: nothing is dropped; a section is never cut in the middle).  The bytes are those of the
+    restored section texts themselves, summed over every destination.
+    """
+
+    names = [name for name in restore if name in found]
+    sizes = {name: len(found[name].encode("utf-8")) for name in names}
+    before = sum(sizes.values())
+    kept = list(names)
+    if max_bytes is not None:
+        while kept and sum(sizes[name] for name in kept) > max_bytes:
+            kept.pop()
+    dropped = [name for name in names if name not in kept]
+    return tuple(kept), dropped, before, sum(sizes[name] for name in kept)
+
+
+def _token_count(inputs: Any) -> int | None:
+    """Number of input tokens of the final chat-template input (a number; ``None`` when it cannot be read)."""
+
+    try:
+        return int(inputs["input_ids"].shape[-1])
+    except Exception:  # noqa: BLE001 - a fixture or an unexpected shape is a recorded gap, never a crash
+        return None
+
+
+def cuda_reset_peak() -> None:  # pragma: no cover - needs a GPU
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:  # noqa: BLE001
+        return
+
+
+def cuda_peak_stats() -> tuple[int, int] | None:  # pragma: no cover - needs a GPU
+    """(peak allocated bytes since the last reset, reserved bytes) of this process, or ``None``."""
+
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return int(torch.cuda.max_memory_allocated()), int(torch.cuda.memory_reserved())
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def extract_user_message(user_text: str) -> str | None:
     """The current user message: the text after the builder's marker; ``None`` unless the marker occurs exactly once.
 
@@ -210,9 +263,21 @@ class BareChatAdapter:
 
     record_extra_key = RECORD_KEY
 
-    def __init__(self, inner: Any, restore: tuple[str, ...] = (), placement: str = "system") -> None:
+    def __init__(
+        self, inner: Any, restore: tuple[str, ...] = (), placement: str = "system", *,
+        history_window: int | None = None, state_block_max_bytes: int | None = None,
+        reset_peak: Callable[[], None] = cuda_reset_peak,
+        read_peak: Callable[[], tuple[int, int] | None] = cuda_peak_stats,
+    ) -> None:
         if placement not in PLACEMENTS or any(name not in RESTORE_NAMES for name in restore):
             raise ValueError("invalid restore request")
+        for cap in (history_window, state_block_max_bytes):
+            if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or cap < 0):
+                raise ValueError("invalid input cap")
+        self._history_window = history_window
+        self._state_cap = state_block_max_bytes
+        self._reset_peak = reset_peak
+        self._read_peak = read_peak
         self._restore = tuple(restore)
         self._placement = placement
         self._inner = inner
@@ -221,7 +286,7 @@ class BareChatAdapter:
         self._lock = threading.Lock()
 
     def __getattr__(self, name: str) -> Any:  # only called for names not found on the wrapper
-        if name in {"_inner", "_local", "_history", "_lock", "_restore", "_placement"}:
+        if name in {"_inner", "_local", "_history", "_lock", "_restore", "_placement", "_history_window", "_state_cap", "_reset_peak", "_read_peak"}:
             raise AttributeError(name)
         target = getattr(self._inner, name)
         return self._generate_chat if name == "generate_chat" else target
@@ -244,6 +309,10 @@ class BareChatAdapter:
             )
             if self._placement in FIRST_USER_PLACEMENTS:  # numbers per destination, only for these placements
                 report.update(restored_chars_system=0, restored_chars_first_user=0)
+        if self._history_window is not None:
+            report["history_window_requested"] = self._history_window
+        if self._state_cap is not None:
+            report["state_block_max_bytes_requested"] = self._state_cap
         return report
 
     def generate(self, prompt: str) -> str:
@@ -271,12 +340,21 @@ class BareChatAdapter:
             history = list(self._history)
         system, final = BARE_SYSTEM_TEXT, message
         pairs = history
+        if self._history_window is not None:  # the most recent N exchanges; the stored history stays whole
+            pairs = history[-self._history_window:] if self._history_window else []
+            report.update(history_pairs_sent=len(pairs), exchanges_dropped=len(history) - len(pairs))
         if self._restore:
             found, missing = parse_sections(system_text, user_text)
             wanted_missing = [name for name in self._restore if name in missing]
+            restore, dropped, bytes_before, bytes_after = apply_state_cap(self._restore, found, self._state_cap)
+            if self._state_cap is not None:
+                report.update(
+                    state_bytes_before=bytes_before, state_bytes_effective=bytes_after,
+                    sections_dropped=len(dropped), sections_dropped_names=dropped,
+                )
             if self._placement in FIRST_USER_PLACEMENTS:
                 system, block, restored, chars_system, chars_first = compose_first_user(
-                    self._restore, found, self._placement,
+                    restore, found, self._placement,
                 )
                 if block and pairs:  # re-attached on EVERY call to the first user turn; the stored pair stays raw
                     pairs = [(block + _MARK + pairs[0][0], pairs[0][1]), *pairs[1:]]
@@ -284,7 +362,7 @@ class BareChatAdapter:
                     final = block + _MARK + message
                 report.update(restored_chars_system=chars_system, restored_chars_first_user=chars_first)
             else:
-                system, final, restored = compose_restored(self._restore, found, self._placement, message)
+                system, final, restored = compose_restored(restore, found, self._placement, message)
             report.update(
                 restored_sections=restored, restored_count=len(restored),
                 restored_chars=sum(len(found[name]) for name in restored),
@@ -299,19 +377,35 @@ class BareChatAdapter:
             history_pairs=len(history),
             messages_sent=messages,  # RAW text: private file only
         )
-        output = inner._generate_from(inner._chat_inputs(messages))
+        inputs = inner._chat_inputs(messages)
+        report["input_tokens"] = _token_count(inputs)  # numbers only
+        try:
+            self._reset_peak()
+        except Exception:  # noqa: BLE001 - a failed hook is a gap, never a crash
+            pass
+        output = inner._generate_from(inputs)
+        try:
+            peak = self._read_peak()
+        except Exception:  # noqa: BLE001
+            peak = None
+        if peak is not None:
+            report.update(peak_allocated_bytes=int(peak[0]), reserved_bytes=int(peak[1]))
         with self._lock:
             self._history.append((message, str(output)))
         return output
 
 
 def wrap_loader(
-    loader: Callable[..., Any], restore: tuple[str, ...] = (), placement: str = "system",
+    loader: Callable[..., Any], restore: tuple[str, ...] = (), placement: str = "system", *,
+    history_window: int | None = None, state_block_max_bytes: int | None = None,
 ) -> Callable[..., Any]:
     """A drop-in for ``load_model_provider``: every provider it builds is wrapped (one history per provider)."""
 
     def load(*arguments: Any, **keywords: Any) -> BareChatAdapter:
-        return BareChatAdapter(loader(*arguments, **keywords), restore, placement)
+        return BareChatAdapter(
+            loader(*arguments, **keywords), restore, placement,
+            history_window=history_window, state_block_max_bytes=state_block_max_bytes,
+        )
 
     return load
 
@@ -326,7 +420,7 @@ def numbers(row: dict[str, Any]) -> dict[str, Any] | None:
 
 
 __all__ = [
-    "BARE_SYSTEM_TEXT", "BareChatAdapter", "FIRST_USER_PLACEMENTS", "PLACEMENTS", "RESTORE_NAMES",
+    "BARE_SYSTEM_TEXT", "BareChatAdapter", "apply_state_cap", "FIRST_USER_PLACEMENTS", "PLACEMENTS", "RESTORE_NAMES",
     "SYSTEM_SAFE_SECTIONS", "compose_first_user", "compose_restored", "extract_user_message",
     "numbers", "parse_restore_list", "parse_sections", "wrap_loader",
 ]

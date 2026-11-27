@@ -1,7 +1,7 @@
 """The child-side GPU sampler of a real-model ``serve``.
 
 A daemon thread appends one JSON line of NUMBERS ONLY (time, device-wide free /
-total, this process's reserved bytes) to ``evidence/gpu.jsonl`` before the
+total, this process's reserved / allocated / peak-allocated bytes) to ``evidence/gpu.jsonl`` before the
 server starts and then every ``INTERVAL_S`` seconds, so the model load, every
 turn and any supervisor cycle show in the log.  It never touches the model.
 """
@@ -16,14 +16,18 @@ import threading
 import time
 
 INTERVAL_S = 5.0
-Reader = Callable[[], tuple[int, int, int]]
+# (free, total, reserved) or (free, total, reserved, allocated, max_allocated)
+Reader = Callable[[], tuple[int, ...]]
 
 
-def torch_reader() -> tuple[int, int, int]:  # pragma: no cover - needs a GPU
+def torch_reader() -> tuple[int, ...]:  # pragma: no cover - needs a GPU
     import torch
 
     free, total = torch.cuda.mem_get_info()
-    return int(free), int(total), int(torch.cuda.memory_reserved())
+    return (
+        int(free), int(total), int(torch.cuda.memory_reserved()),
+        int(torch.cuda.memory_allocated()), int(torch.cuda.max_memory_allocated()),
+    )
 
 
 class GpuSampler:
@@ -36,8 +40,10 @@ class GpuSampler:
 
     def sample(self, label: str) -> None:
         try:
-            free, total, reserved = self._reader()
-            row: dict[str, object] = {"free": free, "total": total, "reserved": reserved}
+            values = self._reader()
+            row: dict[str, object] = {"free": values[0], "total": values[1], "reserved": values[2]}
+            if len(values) >= 5:  # allocated now / peak allocated since the last peak reset (the adapter resets per call)
+                row.update(allocated=values[3], max_allocated=values[4])
         except Exception as error:  # a failed read is a recorded gap, never a crash
             row = {"error": type(error).__name__}
         row.update({"t": round(time.time(), 3), "pid": os.getpid(), "label": label})
@@ -82,7 +88,9 @@ def summarize(rows: list[dict[str, object]]) -> dict[str, object]:
     if not good:
         return {"samples": len(rows), "readable": 0}
     first = good[0]
+    peaks = [int(str(row["max_allocated"])) for row in good if "max_allocated" in row]
     return {
+        **({"peak_allocated": max(peaks)} if peaks else {}),
         "samples": len(rows),
         "readable": len(good),
         "free_before_load": first["free"],
