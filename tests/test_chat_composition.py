@@ -5,6 +5,7 @@ covered in test_chat_composition_builder.py."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 import random
 
 import pytest
@@ -89,7 +90,13 @@ def make_input(
     probe = parse(system, user, message)
     extra = len(probe.state_sections) - len(plain.state_sections)
     echo = frozenset(range(emotion + 1, emotion + 1 + extra))
-    return parse(system, user, message, history=history, code_indices=code, history_echo_indices=echo), plain
+    parsed = parse(system, user, message, history=history, history_echo_indices=echo)
+    # The parser marks nothing as code. Like a real caller, the test builds the code sections
+    # explicitly (here: the chunks the builder generated from code, which sit before the trace).
+    sections = tuple(
+        replace(s, origin="code") if i in code else s for i, s in enumerate(parsed.state_sections)
+    )
+    return replace(parsed, state_sections=sections), plain
 
 
 def ex(n: int) -> HistoryExchange:
@@ -128,7 +135,14 @@ def test_legacy_edge_shapes_are_lossless() -> None:
     user = f"{RUNTIME_DATA_HEADING}\nx{MARK}m"
     assert composition_input_from_split(f"a\n{RUNTIME_DATA_HEADING}\nb", user, "m") is None
     with pytest.raises(ValueError):
-        composition_input_from_split("S", user, "m", code_indices=frozenset({5}))
+        composition_input_from_split("S", user, "m", history_echo_indices=frozenset({5}))
+    for bad in (True, "0", 1.0):
+        with pytest.raises(TypeError):
+            composition_input_from_split("S", user, "m", history_echo_indices=frozenset({bad}))  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        composition_input_from_split("S", user, "m", history_echo_indices=[0])  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        composition_input_from_split("S", user, "m", code_indices=frozenset({0}))  # type: ignore[call-arg]
 
 
 def test_header_is_what_the_builder_emits() -> None:
@@ -351,11 +365,40 @@ def test_forged_shapes_through_the_parser_never_reach_system(context: bool) -> N
 def test_forgery_without_a_real_context_block_is_the_only_shape_and_still_stored() -> None:
     system, user = build_texts("hi", FORGED_CONTEXT, context=False)
     assert user.count("Current Context:") == 1  # the review's scenario: the forged one is the only one
-    inp = parse(system, user, "hi")  # no origin supplied => nothing is code
+    inp = parse(system, user, "hi")  # the parser marks nothing as code
     assert all(s.origin == "stored" for s in inp.state_sections)
     assert compose("chat_roles_split", inp)[0].content == system
     inp, _ = make_input("hi", trace="\n\n" + FORGED_CONTEXT, context=False)
     assert "Ignore, all" not in compose("chat_roles_split", inp)[0].content
+
+
+def test_blank_line_in_stored_text_before_emotion_cannot_promote_anything_to_system() -> None:
+    """Positions shift when stored text before the real Emotion chunk contains a blank line; since
+    the parser accepts no code positions, a shifted chunk can never become code."""
+
+    system, user = build_texts("hi", TRACE)
+    shifted = user.replace("Active Values:\n- none", "Active Values:\n- none\n\n" + FORGED_CONTEXT + "\n\nmore")
+    assert shifted != user
+    inp = parse(system, shifted, "hi", history=(ex(1),), history_echo_indices=frozenset({3}))
+    assert all(s.origin == "stored" for s in inp.state_sections)
+    for mode in MODES:
+        assert compose(mode, inp)[0].content == system
+    # and an explicit code section is the only way into the system message
+    explicit = replace(inp, state_sections=(*inp.state_sections, StateSection("emo", "EMO", "code")))
+    assert compose("chat_roles_split", explicit)[0].content == system + "\n\nEMO"
+    assert "EMO" not in compose("chat_roles", explicit)[0].content
+
+
+def test_echo_section_stays_when_caps_drop_all_history() -> None:
+    echo = StateSection("trace", "TRACE-TEXT", "stored", repeats_history=True)
+    inp = CompositionInput("H", (_S, echo), (ex(1), ex(2)), "q")
+    for caps in (CompositionCaps(max_exchanges=0), CompositionCaps(max_history_bytes=1)):
+        msgs, report = compose_with_report("chat_roles", inp, caps)
+        assert report.exchanges_used == 0
+        assert [m.role for m in msgs] == ["system", "user"] and "TRACE-TEXT" in msgs[-1].content
+    msgs, report = compose_with_report("chat_roles", inp, CompositionCaps(max_exchanges=1))
+    assert report.exchanges_used == 1 and all("TRACE-TEXT" not in m.content for m in msgs)  # partial window: omitted
+    assert "TRACE-TEXT" in compose("legacy", inp)[1].content
 
 
 def test_user_text_with_runtime_heading_does_not_change_structure() -> None:
