@@ -60,6 +60,11 @@ Diagnostic options (all observation only, all default off / unchanged):
   wm_evidence, motivations_goals) in that first-user block.  The block is rebuilt from the CURRENT call's restored
   text and re-attached to the first user turn on every call; the stored history pairs stay raw.  Per turn the
   results add ``restored_chars_system`` / ``restored_chars_first_user`` (numbers only) for these placements.
+  ``--history-window N`` / ``--state-block-max-bytes B`` (lab input caps, need ``--bare-chat``; B needs
+  ``--bare-restore``) keep only the most recent N exchanges of the adapter's own history and drop whole restored sections
+  from the END until the state block fits B UTF-8 bytes; the user text and assistant text are never truncated.  In the
+  matrix a condition id takes the suffixes ``:w<N>`` and/or ``:b<bytes>`` (``X10:w4:b2048``); the global flags are refused
+  there.  Results carry requested / effective numbers, the model-call input token count and the peak allocated VRAM.
   ``--matrix-conditions X0,X7,X9,X10`` selects (and orders) matrix conditions; X9 = all first-user, X10 = all
   split-safe exist only through it (the default matrix stays X0..X8); needs ``--matrix``; the 60-subject cap applies.
 * ``--matrix`` (implies the bare chat with restores; excludes ``--bare-chat``, ``--bare-restore``,
@@ -100,6 +105,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any
 import uuid
@@ -120,6 +126,7 @@ TURN_CAP_S = 120.0  # one chat turn (the per-turn timeout of the child and of th
 MAX_TURNS = 7
 MAX_REPEATS = 5
 MATRIX_MAX_SUBJECTS = 60
+MAX_CAP = 10_000_000  # sanity bound of --history-window / --state-block-max-bytes
 EXIT_REFUSED = 2
 EXIT_FAILED = 1
 Attest = Callable[..., HumanLaunch]
@@ -361,14 +368,26 @@ def _check_restore_and_matrix(args: argparse.Namespace) -> None:
     placement = getattr(args, "restore_placement", None)
     if getattr(args, "matrix", False):
         for flag, code in (("bare_chat", "MATRIX_EXCLUDES_BARE_CHAT"), ("bare_restore", "MATRIX_EXCLUDES_BARE_RESTORE"),
-                           ("restore_placement", "MATRIX_EXCLUDES_RESTORE_PLACEMENT"), ("chat_roles", "MATRIX_EXCLUDES_CHAT_ROLES")):
-            if getattr(args, flag, None):
+                           ("restore_placement", "MATRIX_EXCLUDES_RESTORE_PLACEMENT"), ("chat_roles", "MATRIX_EXCLUDES_CHAT_ROLES"),
+                           ("history_window", "MATRIX_EXCLUDES_HISTORY_WINDOW"),
+                           ("state_block_max_bytes", "MATRIX_EXCLUDES_STATE_BLOCK_MAX_BYTES")):
+            if getattr(args, flag, None) is not None and getattr(args, flag, None) is not False:
                 raise GuardRefusal(code, f"--matrix and --{flag.replace('_', '-')} are mutually exclusive")
         if not args.record_model_calls:
             raise GuardRefusal("MATRIX_NEEDS_RECORD_MODEL_CALLS", "--matrix needs --record-model-calls")
         check_conditions(resolve_conditions(getattr(args, "matrix_conditions", None)), args.repeats)  # before anything exists
     elif getattr(args, "matrix_conditions", None) is not None:
         raise GuardRefusal("MATRIX_CONDITIONS_NEEDS_MATRIX", "--matrix-conditions needs --matrix")
+    window = getattr(args, "history_window", None)
+    state_cap = getattr(args, "state_block_max_bytes", None)
+    for flag, value in (("history-window", window), ("state-block-max-bytes", state_cap)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_CAP):
+            raise GuardRefusal("INPUT_CAP_OUT_OF_RANGE", f"--{flag}: 0..{MAX_CAP}")
+    if not getattr(args, "matrix", False):
+        if (window is not None or state_cap is not None) and not getattr(args, "bare_chat", False):
+            raise GuardRefusal("INPUT_CAPS_NEED_BARE_CHAT", "--history-window / --state-block-max-bytes need --bare-chat")
+        if state_cap is not None and restore is None:
+            raise GuardRefusal("STATE_CAP_NEEDS_BARE_RESTORE", "--state-block-max-bytes needs --bare-restore")
     if restore is not None:
         if not getattr(args, "bare_chat", False):
             raise GuardRefusal("BARE_RESTORE_NEEDS_BARE_CHAT", "--bare-restore needs --bare-chat")
@@ -422,6 +441,8 @@ def _one_run(
         bare_chat=bool(getattr(args, "bare_chat", False)),
         bare_restore=getattr(args, "bare_restore", None),
         restore_placement=getattr(args, "restore_placement", None) or "system",
+        history_window=getattr(args, "history_window", None),
+        state_block_max_bytes=getattr(args, "state_block_max_bytes", None),
         config_overrides=_overrides(args),
     )
     fixture = model is None
@@ -501,6 +522,11 @@ def _one_run(
             "sections": list(bare_chat_adapter.parse_restore_list(args.bare_restore)),
             "placement": getattr(args, "restore_placement", None) or "system",
         }
+    if getattr(args, "history_window", None) is not None or getattr(args, "state_block_max_bytes", None) is not None:
+        run["caps"] = {  # requested; the effective numbers are per turn in bare_chat
+            "history_window": getattr(args, "history_window", None),
+            "state_block_max_bytes": getattr(args, "state_block_max_bytes", None),
+        }
     if detail:
         run["detail"] = detail
     return run, code
@@ -535,6 +561,10 @@ def _print_run(run: dict[str, Any], reading: gpu.GpuReading | None) -> None:
                     if "restored_chars_system" in bare:
                         note += (f", placement {bare['restore_placement']} (system {bare['restored_chars_system']} chars, "
                                  f"first user {bare['restored_chars_first_user']} chars)")
+            if bare is not None and bare.get("input_tokens") is not None:
+                note += f"  input tokens {bare['input_tokens']}"
+                if bare.get("peak_allocated_bytes") is not None:
+                    note += f", peak allocated {bare['peak_allocated_bytes'] / gpu.GIB:.2f} GiB"
             note += (f"  input: {assembly['messages']} msg, {assembly['prompt_chars']} chars, "
                      f"trace turns {assembly['trace_turns']}, episodic items {assembly['episodic_items']}")
         print(f"turn {item['ordinal']} [{item['label']}]: {item['seconds']:.1f} s, {item['response_chars']} chars, "
@@ -553,6 +583,8 @@ class Condition:
     description: str
     restore: str | None
     placement: str = "system"
+    history_window: int | None = None  # input caps (lab); None = no cap
+    state_block_max_bytes: int | None = None
 
 
 CONDITIONS: tuple[Condition, ...] = (
@@ -573,22 +605,61 @@ EXTRA_CONDITIONS: tuple[Condition, ...] = (
 )
 
 
+_SPEC = re.compile(r"(X[0-9]+)((?::[wb][0-9]+)*)")
+
+
+def parse_condition(spec: str, known: dict[str, Condition]) -> Condition:
+    """``X10`` / ``X10:w4`` / ``X10:b2048`` / ``X10:w4:b2048`` -> the condition with its input caps.
+
+    The base id must be known; each suffix (``w`` = history window, ``b`` = state block bytes, digits only) may occur
+    at most once, in either order; ``b`` needs a base that restores something (not X0).  The result's id is the
+    canonical spec (``w`` before ``b``).  Anything else is refused.
+    """
+
+    match = _SPEC.fullmatch(spec)
+    if match is None:
+        raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"malformed condition spec: {spec!r}")
+    base = known.get(match.group(1))
+    if base is None:
+        raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"unknown condition id: {match.group(1)}")
+    caps: dict[str, int] = {}
+    for part in [piece for piece in match.group(2).split(":") if piece]:
+        if part[0] in caps:
+            raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{spec}: duplicate :{part[0]} suffix")
+        caps[part[0]] = int(part[1:])
+    if any(value > MAX_CAP for value in caps.values()):
+        raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{spec}: cap above {MAX_CAP}")
+    if "b" in caps and base.restore is None:
+        raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{spec}: :b needs a condition that restores sections")
+    if not caps:
+        return base
+    canonical = base.id + (f":w{caps['w']}" if "w" in caps else "") + (f":b{caps['b']}" if "b" in caps else "")
+    notes = ([f"window {caps['w']}"] if "w" in caps else []) + ([f"state <= {caps['b']} B"] if "b" in caps else [])
+    return Condition(
+        canonical, f"{base.description} [{', '.join(notes)}]", base.restore, base.placement,
+        caps.get("w"), caps.get("b"),
+    )
+
+
 def resolve_conditions(text: str | None) -> tuple[Condition, ...]:
     """``--matrix-conditions`` (a comma list of ids, run in the given order) -> the conditions.
 
-    ``None`` is the default list X0..X8.  An unknown id, an empty item or a duplicate is refused.
+    ``None`` is the default list X0..X8.  A condition id may carry the input-cap suffixes ``:w<N>`` / ``:b<bytes>``
+    (see ``parse_condition``).  An unknown id, a malformed spec, an empty item or a duplicate is refused.
     """
 
     if text is None:
         return CONDITIONS
     known = {condition.id: condition for condition in (*CONDITIONS, *EXTRA_CONDITIONS)}
-    ids = [part.strip() for part in text.split(",")]
-    if any(not name for name in ids) or len(set(ids)) != len(ids):
+    specs = [part.strip() for part in text.split(",")]
+    if any(not name for name in specs):
         raise GuardRefusal("MATRIX_CONDITIONS_INVALID", "empty or duplicate condition id")
-    unknown = [name for name in ids if name not in known]
-    if unknown:
-        raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"unknown condition id: {', '.join(unknown)}")
-    return tuple(known[name] for name in ids)
+    conditions = tuple(parse_condition(spec, known) for spec in specs)
+    if len({condition.id for condition in conditions}) != len(conditions):
+        raise GuardRefusal("MATRIX_CONDITIONS_INVALID", "empty or duplicate condition id")
+    return conditions
+
+
 # (column title, turn label, observed key): the counts the table prints
 KEY_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("E one", "E", "names_exactly_one"),
@@ -607,6 +678,11 @@ def check_conditions(conditions: tuple[Condition, ...], repeats: int) -> None:
     for condition in conditions:
         if condition.placement not in bare_chat_adapter.PLACEMENTS:
             raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{condition.id}: placement")
+        for cap in (condition.history_window, condition.state_block_max_bytes):
+            if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or not 0 <= cap <= MAX_CAP):
+                raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{condition.id}: input cap")
+        if condition.state_block_max_bytes is not None and condition.restore is None:
+            raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{condition.id}: state cap without restore")
         if condition.restore is not None:
             try:
                 bare_chat_adapter.parse_restore_list(condition.restore)
@@ -632,6 +708,13 @@ def _condition_summary(condition: Condition, runs: list[dict[str, Any]], planned
         values = [row[name] for row in bare_rows if isinstance(row.get(name), (int, float))]
         return round(sum(values) / len(values), 1) if values else None
 
+    def peak(name: str) -> int | None:
+        values = [row[name] for row in bare_rows if isinstance(row.get(name), int)]
+        return max(values) if values else None
+
+    gpu_peaks = [int(run["gpu"]["peak_allocated"]) for run in runs if run.get("gpu", {}).get("peak_allocated") is not None]
+    turn_peaks = peak("peak_allocated_bytes")
+    peak_allocated = max([*gpu_peaks, *([] if turn_peaks is None else [turn_peaks])], default=None)
     split = {}
     if condition.restore and condition.placement in bare_chat_adapter.FIRST_USER_PLACEMENTS:
         # numbers per destination (system vs first user turn); present only for these placements
@@ -644,6 +727,11 @@ def _condition_summary(condition: Condition, runs: list[dict[str, Any]], planned
         "subjects_planned": planned, "subjects_started": len(runs), "completed_runs": len(completed),
         "ended": [run["ended"] for run in runs],
         "min_free_bytes": min(free) if free else None,
+        "history_window": condition.history_window, "state_block_max_bytes": condition.state_block_max_bytes,
+        "max_input_tokens": peak("input_tokens"), "peak_allocated_bytes": peak_allocated,
+        "max_reserved_bytes": peak("reserved_bytes"),
+        "mean_input_tokens": mean("input_tokens"), "mean_exchanges_dropped": mean("exchanges_dropped"),
+        "mean_sections_dropped": mean("sections_dropped"), "mean_state_bytes_effective": mean("state_bytes_effective"),
         "mean_user_chars_after": mean("user_chars_after"), "mean_input_chars": mean("input_chars"),
         "mean_restored_chars": mean("restored_chars"),
         "section_missing_turns": sum(1 for row in bare_rows if row.get("section_missing")),
@@ -657,7 +745,7 @@ def _condition_summary(condition: Condition, runs: list[dict[str, Any]], planned
 def matrix_table(summaries: list[dict[str, Any]]) -> list[str]:
     """The compact table (rows = conditions): counts as ``true/of``, ``-`` where nothing was observed."""
 
-    header = ["cond", "what", "done", *[title for title, _l, _k in KEY_COLUMNS], "lyric hits", "mean chars", "min free GiB", "input chars"]
+    header = ["cond", "what", "done", *[title for title, _l, _k in KEY_COLUMNS], "lyric hits", "mean chars", "min free GiB", "peak alloc GiB", "max input tokens", "input chars"]
     rows = [header]
     for item in summaries:
         counts = [
@@ -665,11 +753,13 @@ def matrix_table(summaries: list[dict[str, Any]]) -> list[str]:
             for title, _l, _k in KEY_COLUMNS
         ]
         free = "-" if item["min_free_bytes"] is None else f"{item['min_free_bytes'] / gpu.GIB:.1f}"
+        allocated = "-" if item.get("peak_allocated_bytes") is None else f"{item['peak_allocated_bytes'] / gpu.GIB:.1f}"
+        tokens = "-" if item.get("max_input_tokens") is None else str(item["max_input_tokens"])
         persona = item.get("persona") or {}
         lyric = "-" if persona.get("mean_lyrical_marker_hits") is None else f"{persona['mean_lyrical_marker_hits']:.2f}"
         reply = "-" if persona.get("mean_response_chars") is None else f"{persona['mean_response_chars']:.0f}"
         chars = "-" if item["mean_input_chars"] is None else f"{item['mean_input_chars']:.0f}"
-        rows.append([item["id"], item["description"], f"{item['completed_runs']}/{item['subjects_planned']}", *counts, lyric, reply, free, chars])
+        rows.append([item["id"], item["description"], f"{item['completed_runs']}/{item['subjects_planned']}", *counts, lyric, reply, free, allocated, tokens, chars])
     widths = [max(len(row[column]) for row in rows) for column in range(len(header))]
     return ["  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip() for row in rows]
 
@@ -754,6 +844,8 @@ def _matrix(
             subject_args = argparse.Namespace(**vars(args))
             subject_args.bare_restore = condition.restore
             subject_args.restore_placement = condition.placement if condition.restore else None
+            subject_args.history_window = condition.history_window
+            subject_args.state_block_max_bytes = condition.state_block_max_bytes
             print(f"--- condition {condition.id}: {condition.description} ---")
             for ordinal in range(1, args.repeats + 1):
                 started += 1
@@ -931,9 +1023,17 @@ def parser() -> argparse.ArgumentParser:
                           "final user message), first-user (a labelled data block in the FIRST user turn of the conversation, "
                           "re-attached every call; the final user message is the user's text only) or split-safe (code-generated "
                           "sections header/emotion/context in the system text, values/wm_evidence/motivations_goals in the first user turn; #414)")
+    top.add_argument("--history-window", type=int, metavar="N",
+                     help="lab input cap (needs --bare-chat): send only the most recent N exchanges of the adapter's own history "
+                          "(N >= 0; default: all); the user text and assistant text are never truncated")
+    top.add_argument("--state-block-max-bytes", type=int, metavar="B",
+                     help="lab input cap (needs --bare-restore): drop whole restored sections from the END until the state block "
+                          "is at most B UTF-8 bytes (default: no cap)")
     top.add_argument("--matrix-conditions", metavar="IDS",
                      help="with --matrix: a comma list of condition ids to run, in this order (default X0..X8; "
-                          "X9 = all first-user, X10 = all split-safe are available only here), e.g. X0,X7,X9,X10")
+                          "X9 = all first-user, X10 = all split-safe are available only here), e.g. X0,X7,X9,X10; an id may "
+                          "carry input-cap suffixes :w<N> (history window) and/or :b<bytes> (state block cap), "
+                          "e.g. X10:w4:b2048")
     top.add_argument("--matrix", action="store_true",
                      help="lab diagnostics: run the fixed condition matrix X0..X8 (bare + restores) in ONE launch, "
                           f"--repeats subjects each; total subjects <= {MATRIX_MAX_SUBJECTS}; greedy unless --temperature; "

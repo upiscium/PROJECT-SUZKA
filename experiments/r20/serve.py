@@ -70,6 +70,9 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     # Lab diagnostics, OPT-IN (needs --bare-chat): restore these sections of the real prompt into the bare chat.
     parser.add_argument("--bare-restore")
     parser.add_argument("--restore-placement", choices=["system", "user", "first-user", "split-safe"], default="system")
+    # Lab diagnostics, OPT-IN (need --bare-chat): input caps of the bare chat (observation only).
+    parser.add_argument("--history-window", type=int)
+    parser.add_argument("--state-block-max-bytes", type=int)
     return parser.parse_args(argv)
 
 
@@ -141,13 +144,20 @@ def main(argv: list[str] | None = None) -> int:
             print("serve refused: BARE_RESTORE_NEEDS_BARE_CHAT", file=sys.stderr)
             return 2
     placement = str(args.restore_placement)
+    caps = {"history_window": args.history_window, "state_block_max_bytes": args.state_block_max_bytes}
+    if any(value is not None and value < 0 for value in caps.values()):
+        print("serve refused: INPUT_CAP_INVALID", file=sys.stderr)  # the smoke refuses this earlier
+        return 2
+    if any(value is not None for value in caps.values()) and not bare_chat:
+        print("serve refused: INPUT_CAPS_NEED_BARE_CHAT", file=sys.stderr)
+        return 2
     if bare_chat:
         # Lab diagnostics only (`bare_chat_adapter`): inside the recorder, like the chat-role adapter.
         from experiments.r20.bare_chat_adapter import BareChatAdapter, wrap_loader as wrap_bare_loader
         from suzka.api import server as app_server
 
         if mode is ProviderMode.REAL:
-            app_server.load_model_provider = wrap_bare_loader(app_server.load_model_provider, restore, placement)
+            app_server.load_model_provider = wrap_bare_loader(app_server.load_model_provider, restore, placement, **caps)
     if chat_roles:
         # Lab diagnostics only (`chat_role_adapter`): inside the recorder, so the recorded call is the one sent.
         from experiments.r20.chat_role_adapter import ChatRoleAdapter, wrap_loader as wrap_adapter_loader
@@ -171,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
         if chat_roles:
             provider = ChatRoleAdapter(provider)
         if bare_chat:
-            provider = BareChatAdapter(provider, restore, placement)
+            provider = BareChatAdapter(provider, restore, placement, **caps)
         app.state.model_provider = RecordingProvider(provider, private) if record else provider
         # Mode "continue": the supervisor drops every ``app.state`` key added after
         # ``create_app`` before a new cycle.  The injected scripted provider is the

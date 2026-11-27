@@ -339,7 +339,7 @@ def test_the_table_prints_counts_and_dashes() -> None:
     ]
     lines = smoke.matrix_table(summaries)
     assert lines[0].split()[:3] == ["cond", "what", "done"] and "recall both" in lines[0]
-    assert lines[1].split() == ["X0", "bare", "5/5", "5/5", "4/5", "-", "0/5", "-", "-", "3.0", "321"]  # no persona numbers: dashes
+    assert lines[1].split() == ["X0", "bare", "5/5", "5/5", "4/5", "-", "0/5", "-", "-", "3.0", "-", "-", "321"]  # no persona numbers: dashes
 
 
 def _matrix_args(base: Path, *extra: str) -> Any:

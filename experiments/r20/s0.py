@@ -325,6 +325,8 @@ class S0Session:
         bare_chat: bool = False,
         bare_restore: str | None = None,
         restore_placement: str = "system",
+        history_window: int | None = None,
+        state_block_max_bytes: int | None = None,
         config_overrides: Mapping[str, Any] | None = None,
     ) -> None:
         self.record_calls = record_calls
@@ -332,6 +334,8 @@ class S0Session:
         self.bare_chat = bare_chat
         self.bare_restore = bare_restore
         self.restore_placement = restore_placement
+        self.history_window = history_window
+        self.state_block_max_bytes = state_block_max_bytes
         self.real = model is not None and model.is_real
         if self.real and (launch is None or not isinstance(launch, HumanLaunch) or not launch.valid_here()):
             raise GuardRefusal("REAL_PROVIDER_WITHOUT_HUMAN_LAUNCH")
@@ -384,10 +388,15 @@ class S0Session:
             **self._restore_arguments(),
         )
 
-    def _restore_arguments(self) -> dict[str, str]:
-        if not self.bare_restore:
-            return {}
-        return {"bare_restore": self.bare_restore, "restore_placement": self.restore_placement}
+    def _restore_arguments(self) -> dict[str, Any]:
+        found: dict[str, Any] = {}
+        if self.bare_restore:
+            found.update(bare_restore=self.bare_restore, restore_placement=self.restore_placement)
+        if self.history_window is not None:
+            found["history_window"] = self.history_window
+        if self.state_block_max_bytes is not None:
+            found["state_block_max_bytes"] = self.state_block_max_bytes
+        return found
 
     def provider_identity(self) -> dict[str, object]:
         if self.real:
