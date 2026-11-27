@@ -20,6 +20,7 @@ import time
 from typing import Any, ClassVar
 
 from experiments.r20 import guards
+from experiments.r20.alloc_probe import ALLOC_CONF_ENV, check_alloc_conf, check_empty_cache
 from experiments.r20.control import send
 from experiments.r20.factory import GenesisSubject, Tier
 from experiments.r20.guards import GuardRefusal
@@ -44,6 +45,7 @@ def child_environment(
     *,
     hf_home: Path | None = None,
     gpu: bool = False,
+    alloc_conf: str | None = None,
 ) -> dict[str, str]:
     """An allow-list environment: the parent's ``SUZKA_*`` variables are not
     inherited (as the lab script's ``env -i``).  HOME and the XDG directories
@@ -70,6 +72,8 @@ def child_environment(
         env.update({key: source[key] for key in _GPU_PASSTHROUGH if key in source})
     if hf_home is not None:
         env["HF_HOME"] = str(hf_home)
+    if alloc_conf is not None:  # lab allocator test, opt-in: one allow-listed value, child only
+        env[ALLOC_CONF_ENV] = str(check_alloc_conf(alloc_conf))
     return env
 
 
@@ -143,6 +147,8 @@ class ChildProcess:
         restore_placement: str = "system",
         history_window: int | None = None,
         state_block_max_bytes: int | None = None,
+        alloc_conf: str | None = None,
+        empty_cache: str | None = None,
     ) -> ChildProcess:
         check_modes(provider, actor, human_launch=False)  # before any child exists
         if subject.tier is not Tier.T2:
@@ -165,6 +171,9 @@ class ChildProcess:
             command += ["--history-window", str(history_window)]
         if state_block_max_bytes is not None:
             command += ["--state-block-max-bytes", str(state_block_max_bytes)]
+        check_alloc_conf(alloc_conf)  # before any child exists
+        if empty_cache is not None:  # lab allocator test, opt-in: the command is unchanged without it
+            command += ["--empty-cache", check_empty_cache(empty_cache)]
         if provider_config is not None:
             subject.provider_config.write_text(json.dumps(provider_config), encoding="utf-8")
             os.chmod(subject.provider_config, 0o600)
@@ -175,7 +184,7 @@ class ChildProcess:
             process = subprocess.Popen(
                 command,
                 cwd=subject.root,
-                env=child_environment(subject),
+                env=child_environment(subject, alloc_conf=alloc_conf),
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=subprocess.STDOUT,
@@ -202,6 +211,8 @@ class ChildProcess:
         restore_placement: str = "system",
         history_window: int | None = None,
         state_block_max_bytes: int | None = None,
+        alloc_conf: str | None = None,
+        empty_cache: str | None = None,
     ) -> ChildProcess:
         """The ONLY way a real-model child starts: it needs the attestation of THIS
         process's Human launch (``attest_human_launch``).  ``spawn`` still refuses a
@@ -236,13 +247,16 @@ class ChildProcess:
             command += ["--history-window", str(history_window)]
         if state_block_max_bytes is not None:
             command += ["--state-block-max-bytes", str(state_block_max_bytes)]
+        check_alloc_conf(alloc_conf)  # before any child exists
+        if empty_cache is not None:  # lab allocator test, opt-in: the command is unchanged without it
+            command += ["--empty-cache", check_empty_cache(empty_cache)]
         child_home(subject).mkdir(mode=0o700, exist_ok=True)
         log = open(log_path or subject.run_dir / "serve.log", "ab")
         try:
             process = subprocess.Popen(
                 command,
                 cwd=subject.root,
-                env=child_environment(subject, hf_home=hf_home, gpu=True),
+                env=child_environment(subject, hf_home=hf_home, gpu=True, alloc_conf=alloc_conf),
                 stdin=None,  # the Human's terminal, inherited: the child checks it is a tty
                 stdout=log,
                 stderr=subprocess.STDOUT,

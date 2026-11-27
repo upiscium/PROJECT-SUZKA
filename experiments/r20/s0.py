@@ -328,7 +328,11 @@ class S0Session:
         history_window: int | None = None,
         state_block_max_bytes: int | None = None,
         config_overrides: Mapping[str, Any] | None = None,
+        alloc_conf: str | None = None,
+        empty_cache: str | None = None,
     ) -> None:
+        self.alloc_conf = alloc_conf  # lab allocator test (opt-in): child env only
+        self.empty_cache = empty_cache
         self.record_calls = record_calls
         self.chat_roles = chat_roles
         self.bare_chat = bare_chat
@@ -396,6 +400,10 @@ class S0Session:
             found["history_window"] = self.history_window
         if self.state_block_max_bytes is not None:
             found["state_block_max_bytes"] = self.state_block_max_bytes
+        if self.alloc_conf is not None:
+            found["alloc_conf"] = self.alloc_conf
+        if self.empty_cache is not None:
+            found["empty_cache"] = self.empty_cache
         return found
 
     def provider_identity(self) -> dict[str, object]:
