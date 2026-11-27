@@ -51,7 +51,12 @@ from enum import Enum
 import re
 from typing import Literal
 
-from suzka.persona.prompt_builder import CURRENT_MESSAGE_HEADING, RUNTIME_DATA_HEADING
+from suzka.persona.prompt_builder import (
+    CURRENT_MESSAGE_HEADING,
+    RUNTIME_DATA_HEADING,
+    PromptSection,
+    PromptSections,
+)
 
 # DEFAULTS the Human has not fixed yet (#500 "What a human must decide").
 DEFAULT_MAX_EXCHANGES = 6
@@ -345,3 +350,41 @@ def composition_input_from_split(
             )
         )
     return CompositionInput(system_text, tuple(sections), history, user_input)
+
+
+def composition_input_from_sections(
+    sections: PromptSections,
+    history: tuple[HistoryExchange, ...] = (),
+    user_text: str | None = None,
+    *,
+    system_prefix: str = "",
+) -> CompositionInput:
+    """Map the builder's origin-tagged sections to a ``CompositionInput`` with NO text inspection.
+
+    Each ``StateSection`` takes its name, text, ``lead``, ``repeats_history`` and ``origin`` from the
+    ``PromptSection`` the builder produced; nothing here reads the text to decide anything. The
+    system header is ``system_prefix`` followed by ``sections.header``. ``system_prefix`` is for
+    fixed text the CALLER owns (e.g. the main loop's fixed prepends); it goes to the system role
+    in every mode, so it must never carry stored or user text. ``user_text`` defaults to the
+    message the sections were built for. The caller must pass the ``PromptSections`` it got from
+    ``PromptBuilder.build_sections``: the tags are trusted, not re-derived. For ``legacy`` the result composes to exactly the pair
+    ``split_chat_prompt`` gives for the same built prompt.
+    """
+
+    if type(sections) is not PromptSections:
+        raise TypeError("sections must be a PromptSections")
+    if type(system_prefix) is not str:
+        raise TypeError("system_prefix must be a str")
+    converted = []
+    for item in sections.sections:
+        if type(item) is not PromptSection:
+            raise TypeError("sections must contain PromptSection items")
+        converted.append(
+            StateSection(item.name, item.text, item.origin, item.lead, item.repeats_history)
+        )
+    return CompositionInput(
+        system_prefix + sections.header,
+        tuple(converted),
+        history,
+        sections.user_text if user_text is None else user_text,
+    )
