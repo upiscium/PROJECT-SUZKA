@@ -16,12 +16,15 @@ Modes (names are DEFAULTS, not yet fixed by the Human):
     ``[system(header only), (user, assistant) * N oldest -> newest, final user]``. All state
     sections form ONE labelled quoted-data block (``RUNTIME_DATA_HEADING`` line, then the sections
     separated by blank lines) attached to the FIRST user turn as
-    ``block + "\\n\\nUser message:\\n" + text``, mirroring ``experiments/r20/bare_chat_adapter.compose_first_user``. With history the block is
-    on the oldest kept exchange's user turn and the final user message is the user's text only;
-    without history the block is on the only user turn (the final one), as in the lab adapter.
-    Deviation from the lab: the lab sent a short bare system line and put the real header inside
-    the block; here the real header is the system message, as the Issue's proposal says. That exact
-    variant has NOT been run in the lab.
+    ``block + "\\n\\nUser message:\\n" + text``, following the attachment rule of the lab adapter
+    (``experiments/r20/bare_chat_adapter``). With history the block is on the oldest KEPT
+    exchange's user turn and the final user message is the user's text only. Without history, or
+    when the caps drop ALL history, the block is on the only user turn, which is the final one: an
+    exception to "final user message = user text only".
+    NOT lab-verified in this exact form: the lab sent a short bare system line and put the real
+    header inside the block; here the real header is the system message. The block also keeps every
+    legacy byte of the runtime data (e.g. the fixed Attention authority sentence the lab parser
+    drops).
 
 ``chat_roles_split`` (lab X10)
     Like ``chat_roles`` but sections with origin ``code`` follow the header in the system message
@@ -29,11 +32,13 @@ Modes (names are DEFAULTS, not yet fixed by the Human):
 
 Invariant (#414): the system message is built only from ``system_header`` and ``code``-origin
 sections (the latter only in ``chat_roles_split``). Stored sections, history and the user text are
-never routed to it; there is no code path from them to the system role.
+never routed to it; there is no code path from them to the system role. Origin is never inferred
+from text: it is supplied explicitly by the caller (``StateSection.origin``).
 
 Caps drop whole units and never truncate: oldest exchanges first (also beyond
 ``max_exchanges``), and, if the state block exceeds ``max_state_block_bytes``, whole sections from
-the END of the block. An assistant text is never shortened. The user's own text is never capped.
+the END of the block (a provisional policy choice, not decided by the Human: with the builder's
+order this drops Emotion first in ``chat_roles``). An assistant text is never shortened. The user's own text is never capped.
 Caps are not applied in ``legacy`` (exact reproduction).
 """
 
@@ -93,12 +98,16 @@ class ChatMessage:
 class StateSection:
     """One runtime-state section. ``origin`` says whether code generated the text or it may carry
     user- or model-originated stored text. ``lead`` is the newline run that precedes the section
-    in the legacy layout (only ``legacy`` uses it; chat modes join sections with a blank line)."""
+    in the legacy layout (only ``legacy`` uses it; chat modes join sections with a blank line).
+    ``repeats_history`` marks a section that repeats the explicit history (the legacy
+    ``conversation_trace`` block): chat modes omit it when ``CompositionInput.history`` is not
+    empty, so history is not sent twice; ``legacy`` keeps it."""
 
     name: str
     text: str
     origin: _Origin
     lead: str = "\n\n"
+    repeats_history: bool = False
 
     def __post_init__(self) -> None:
         if not _require_str(self.name, "name"):
@@ -236,8 +245,9 @@ def compose_with_report(
 
     split = selected is CompositionMode.CHAT_ROLES_SPLIT
     # The only inputs that can reach the system role: the header and (split mode) code-origin sections.
-    system_sections = [s for s in inp.state_sections if split and s.origin == "code"]
-    block_sections = [s for s in inp.state_sections if not (split and s.origin == "code")]
+    sections = [s for s in inp.state_sections if not (inp.history and s.repeats_history)]
+    system_sections = [s for s in sections if split and s.origin == "code"]
+    block_sections = [s for s in sections if not (split and s.origin == "code")]
     system_text = inp.system_header + "".join("\n\n" + s.text for s in system_sections if s.text)
     block, sections_dropped = _block(block_sections, bounds)
     window = _window(inp.history, bounds)
@@ -271,39 +281,7 @@ def compose(
 
 # --------------------------------------------------------------------------- from a built prompt
 
-_ID = r"[A-Za-z0-9_.:\-]+"
-_CONTEXT_SHAPE = re.compile(
-    rf"Current Context:\n- context_id: {_ID}\n- context_type: {_ID}\n- source_channel: {_ID}\n"
-    rf"- source_session_id: {_ID}\n- participant_refs: {_ID}(?:, {_ID})*",
-    re.ASCII,
-)
-_NUM = r"-?[0-9]+\.[0-9]{6}"
-_EMOTION_SHAPE = re.compile(
-    rf"Emotion:\n- valence: {_NUM}\n- arousal: {_NUM}\n- optimal_loss: {_NUM}", re.ASCII,
-)
 _NEWLINE_RUN = re.compile(r"(\n{2,})")
-
-
-def _shape(chunk: str) -> str | None:
-    if _CONTEXT_SHAPE.fullmatch(chunk):
-        return "context"
-    if _EMOTION_SHAPE.fullmatch(chunk):
-        return "emotion"
-    return None
-
-
-def _classify(chunk: str, index: int, unique_shapes: frozenset[str]) -> tuple[str, _Origin]:
-    """Name and origin of one runtime-data chunk. Shape alone cannot prove that code generated a
-    chunk (a stored trace line can imitate it), so ``code`` needs a strict character-level shape AND
-    that exactly one chunk in the whole runtime data has that shape; a duplicated shape makes every
-    copy ``stored``. Anything else is ``stored`` (conservative)."""
-
-    shape = _shape(chunk)
-    if shape is not None and shape in unique_shapes:
-        return shape, "code"
-    if chunk.split("\n", 1)[0] == "Active Values:":
-        return "values", "stored"
-    return f"section_{index}", "stored"
 
 
 def composition_input_from_split(
@@ -311,35 +289,45 @@ def composition_input_from_split(
     user_part: str,
     user_input: str,
     history: tuple[HistoryExchange, ...] = (),
+    *,
+    code_indices: frozenset[int] = frozenset(),
+    history_echo_indices: frozenset[int] = frozenset(),
 ) -> CompositionInput | None:
     """Rebuild a ``CompositionInput`` from the ``(system, user)`` pair of ``split_chat_prompt``.
 
     Lossless for ``legacy``: ``compose("legacy", ...)`` returns exactly that pair. Returns None if
     ``user_part`` is not ``RUNTIME_DATA_HEADING``, runtime data and the ``User message:`` suffix for
-    ``user_input`` or ``system_text`` contains the heading. Runtime data is cut at blank lines
-    into sections; a Context or Emotion chunk is ``code`` origin only with the strict builder shape
-    and only if exactly one chunk has that shape (a forged copy in stored text makes both ``stored``).
+    ``user_input``, or if ``system_text`` contains the heading.
+
+    The runtime data is cut at blank lines into sections named ``section_<i>``. This function NEVER
+    infers origin from text: every section is ``stored`` unless its index is in ``code_indices``,
+    which only the caller (who knows what code generated) may supply; wiring (slice 3) should get
+    structured sections from the builder instead of positions. ``history_echo_indices`` marks the
+    sections that repeat the history (the ``conversation_trace`` block); chat modes omit them when
+    explicit history is supplied. Out-of-range indices raise ``ValueError``.
     """
 
     suffix = _USER_MESSAGE_MARK + user_input
     prefix = RUNTIME_DATA_HEADING + "\n"
     if not (user_part.startswith(prefix) and user_part.endswith(suffix)):
         return None
-    if len(user_part) < len(prefix) + len(suffix):
+    if len(user_part) < len(prefix) + len(suffix) or RUNTIME_DATA_HEADING in system_text:
         return None
     rest = user_part[len(prefix) : len(user_part) - len(suffix)]
     leading = len(rest) - len(rest.lstrip("\n"))
     parts = [rest[:leading], *_NEWLINE_RUN.split(rest[leading:])]
     # parts: lead0, chunk0, sep1, chunk1, sep2, ...
-    chunks = [parts[position] for position in range(1, len(parts), 2)]
-    shapes = [shape for shape in map(_shape, chunks) if shape is not None]
-    unique = frozenset(shape for shape in shapes if shapes.count(shape) == 1)
+    count = len(parts) // 2
+    if any(not 0 <= i < count for i in (*code_indices, *history_echo_indices)):
+        raise ValueError("section index out of range")
     sections: list[StateSection] = []
-    for position in range(1, len(parts), 2):
-        chunk = parts[position]
-        lead = parts[0] if position == 1 else parts[position - 1]
-        name, origin = _classify(chunk, len(sections), unique)
-        sections.append(StateSection(name, chunk, origin, lead))
-    if RUNTIME_DATA_HEADING in system_text:
-        return None
+    for index in range(count):
+        position = 1 + 2 * index
+        lead = parts[0] if index == 0 else parts[position - 1]
+        sections.append(
+            StateSection(
+                f"section_{index}", parts[position], "code" if index in code_indices else "stored",
+                lead, index in history_echo_indices,
+            )
+        )
     return CompositionInput(system_text, tuple(sections), history, user_input)
