@@ -29,6 +29,7 @@ text (``messages_sent``) goes only to the private 0600 file.
 from __future__ import annotations
 
 from collections.abc import Callable
+import json
 import threading
 from typing import Any
 
@@ -209,6 +210,96 @@ def apply_state_cap(
     return tuple(kept), dropped, before, sum(sizes[name] for name in kept)
 
 
+# --- per-item evidence limits (lab; applied to the evidence rows of ``wm_evidence`` BEFORE the whole-section byte cap) ---
+ELLIPSIS = "…"  # the fixed marker; it is counted in the item's character limit
+EVIDENCE_TOP_K_RANGE = (1, 50)
+EVIDENCE_ITEM_CHARS_RANGE = (20, 2000)
+# The ONLY evidence-bearing restore section of the real (Attention) prompt.  ``Stored episodic evidence:`` /
+# ``Stored semantic evidence:`` are separate sections only in the legacy builder path WITHOUT an Attention payload;
+# they are not restore sections of this adapter, so they are not touched.
+EVIDENCE_LIMIT_SECTIONS = ("wm_evidence",)
+_WM_ROW_KEYS = {"source_kind", "text"}
+
+
+def _wm_row_line(row: dict[str, Any]) -> str:
+    """One row exactly as the real renderer writes it (``suzka.attention.common.canonical_json``): ASCII JSON,
+    sorted keys, compact separators."""
+
+    return json.dumps(row, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"))
+
+
+def _parse_wm_rows(block: str) -> tuple[list[dict[str, Any]], str | None]:
+    """(the rows of a ``wm_evidence`` block in the builder's order, ``None``) or (``[]``, the skip reason).
+
+    Strict: the first line is the heading, every other line must be ONE JSON object with exactly the keys
+    ``source_kind`` and ``text`` (both strings) that re-serialises to the SAME line.  Anything else is a doubt.
+    """
+
+    lines = block.split("\n")
+    if lines[0] != _WM_HEADING:
+        return [], "wm_evidence_heading"
+    rows: list[dict[str, Any]] = []
+    for line in lines[1:]:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            return [], "wm_evidence_row_not_json"
+        if (
+            not isinstance(row, dict) or set(row) != _WM_ROW_KEYS
+            or not all(isinstance(value, str) for value in row.values())
+        ):
+            return [], "wm_evidence_row_shape"
+        try:
+            canonical = _wm_row_line(row) == line
+        except ValueError:
+            canonical = False
+        if not canonical:
+            return [], "wm_evidence_row_not_canonical"
+        rows.append(row)
+    return rows, None
+
+
+def apply_evidence_limit(
+    found: dict[str, str], restore: tuple[str, ...], top_k: int | None, item_max_chars: int | None,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """(the sections with the evidence limited, numbers); never mutates ``found``.
+
+    Only ``wm_evidence`` (when restored and found) is touched: keep the FIRST ``top_k`` rows as rendered (no
+    re-ranking), and cut the ``text`` value of each kept row to at most ``item_max_chars`` characters (code
+    points; the marker ``ELLIPSIS`` is counted in them).  A cut row is re-serialised in the renderer's own
+    form, so it is always one valid JSON line (no JSON escape is ever split).  The limit is on the decoded
+    ``text``, NOT on the escaped line.  On any parse doubt the section stays unchanged and the numbers carry
+    ``evidence_limit_skipped``.  Numbers: items / chars before and after, sections affected.
+    """
+
+    info: dict[str, Any] = {
+        "evidence_items_before": 0, "evidence_items_after": 0, "evidence_chars_before": 0,
+        "evidence_chars_after": 0, "evidence_sections_affected": 0, "evidence_limit_skipped": [],
+    }
+    if (top_k is None and item_max_chars is None) or "wm_evidence" not in restore or "wm_evidence" not in found:
+        return found, info
+    block = found["wm_evidence"]
+    rows, reason = _parse_wm_rows(block)
+    info["evidence_chars_before"] = info["evidence_chars_after"] = len(block)
+    if reason is not None:
+        info["evidence_limit_skipped"].append(f"evidence_limit_skipped:{reason}")
+        return found, info
+    info["evidence_items_before"] = info["evidence_items_after"] = len(rows)
+    kept = rows if top_k is None else rows[:top_k]
+    if item_max_chars is not None:
+        kept = [
+            row if len(row["text"]) <= item_max_chars
+            else {**row, "text": row["text"][:item_max_chars - 1] + ELLIPSIS}
+            for row in kept
+        ]
+    text = "\n".join([_WM_HEADING, *(_wm_row_line(row) for row in kept)])
+    info.update(
+        evidence_items_after=len(kept), evidence_chars_after=len(text),
+        evidence_sections_affected=int(text != block),
+    )
+    return {**found, "wm_evidence": text}, info
+
+
 def _token_count(inputs: Any) -> int | None:
     """Number of input tokens of the final chat-template input (a number; ``None`` when it cannot be read)."""
 
@@ -266,6 +357,7 @@ class BareChatAdapter:
     def __init__(
         self, inner: Any, restore: tuple[str, ...] = (), placement: str = "system", *,
         history_window: int | None = None, state_block_max_bytes: int | None = None,
+        evidence_top_k: int | None = None, evidence_item_max_chars: int | None = None,
         reset_peak: Callable[[], None] = cuda_reset_peak,
         read_peak: Callable[[], tuple[int, int] | None] = cuda_peak_stats,
     ) -> None:
@@ -274,6 +366,13 @@ class BareChatAdapter:
         for cap in (history_window, state_block_max_bytes):
             if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or cap < 0):
                 raise ValueError("invalid input cap")
+        for value, (low, high) in ((evidence_top_k, EVIDENCE_TOP_K_RANGE), (evidence_item_max_chars, EVIDENCE_ITEM_CHARS_RANGE)):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high):
+                raise ValueError("invalid evidence limit")
+        if (evidence_top_k is not None or evidence_item_max_chars is not None) and not restore:
+            raise ValueError("evidence limits need restored sections")
+        self._evidence_top_k = evidence_top_k
+        self._evidence_chars = evidence_item_max_chars
         self._history_window = history_window
         self._state_cap = state_block_max_bytes
         self._reset_peak = reset_peak
@@ -286,7 +385,7 @@ class BareChatAdapter:
         self._lock = threading.Lock()
 
     def __getattr__(self, name: str) -> Any:  # only called for names not found on the wrapper
-        if name in {"_inner", "_local", "_history", "_lock", "_restore", "_placement", "_history_window", "_state_cap", "_reset_peak", "_read_peak"}:
+        if name in {"_inner", "_local", "_history", "_lock", "_restore", "_placement", "_history_window", "_state_cap", "_evidence_top_k", "_evidence_chars", "_reset_peak", "_read_peak"}:
             raise AttributeError(name)
         target = getattr(self._inner, name)
         return self._generate_chat if name == "generate_chat" else target
@@ -313,6 +412,10 @@ class BareChatAdapter:
             report["history_window_requested"] = self._history_window
         if self._state_cap is not None:
             report["state_block_max_bytes_requested"] = self._state_cap
+        if self._evidence_top_k is not None:
+            report["evidence_top_k_requested"] = self._evidence_top_k
+        if self._evidence_chars is not None:
+            report["evidence_item_max_chars_requested"] = self._evidence_chars
         return report
 
     def generate(self, prompt: str) -> str:
@@ -346,6 +449,10 @@ class BareChatAdapter:
         if self._restore:
             found, missing = parse_sections(system_text, user_text)
             wanted_missing = [name for name in self._restore if name in missing]
+            # order: evidence limits first (rows of wm_evidence), then the whole-section byte cap (sections)
+            found, evidence = apply_evidence_limit(found, self._restore, self._evidence_top_k, self._evidence_chars)
+            if self._evidence_top_k is not None or self._evidence_chars is not None:
+                report.update(evidence)
             restore, dropped, bytes_before, bytes_after = apply_state_cap(self._restore, found, self._state_cap)
             if self._state_cap is not None:
                 report.update(
@@ -398,6 +505,7 @@ class BareChatAdapter:
 def wrap_loader(
     loader: Callable[..., Any], restore: tuple[str, ...] = (), placement: str = "system", *,
     history_window: int | None = None, state_block_max_bytes: int | None = None,
+    evidence_top_k: int | None = None, evidence_item_max_chars: int | None = None,
 ) -> Callable[..., Any]:
     """A drop-in for ``load_model_provider``: every provider it builds is wrapped (one history per provider)."""
 
@@ -405,6 +513,7 @@ def wrap_loader(
         return BareChatAdapter(
             loader(*arguments, **keywords), restore, placement,
             history_window=history_window, state_block_max_bytes=state_block_max_bytes,
+            evidence_top_k=evidence_top_k, evidence_item_max_chars=evidence_item_max_chars,
         )
 
     return load
@@ -420,7 +529,7 @@ def numbers(row: dict[str, Any]) -> dict[str, Any] | None:
 
 
 __all__ = [
-    "BARE_SYSTEM_TEXT", "BareChatAdapter", "apply_state_cap", "FIRST_USER_PLACEMENTS", "PLACEMENTS", "RESTORE_NAMES",
+    "BARE_SYSTEM_TEXT", "BareChatAdapter", "apply_evidence_limit", "apply_state_cap", "ELLIPSIS", "FIRST_USER_PLACEMENTS", "PLACEMENTS", "RESTORE_NAMES",
     "SYSTEM_SAFE_SECTIONS", "compose_first_user", "compose_restored", "extract_user_message",
     "numbers", "parse_restore_list", "parse_sections", "wrap_loader",
 ]

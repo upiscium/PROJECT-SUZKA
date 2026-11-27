@@ -147,6 +147,8 @@ class ChildProcess:
         restore_placement: str = "system",
         history_window: int | None = None,
         state_block_max_bytes: int | None = None,
+        evidence_top_k: int | None = None,
+        evidence_item_max_chars: int | None = None,
         alloc_conf: str | None = None,
         empty_cache: str | None = None,
     ) -> ChildProcess:
@@ -171,6 +173,10 @@ class ChildProcess:
             command += ["--history-window", str(history_window)]
         if state_block_max_bytes is not None:
             command += ["--state-block-max-bytes", str(state_block_max_bytes)]
+        if evidence_top_k is not None:
+            command += ["--evidence-top-k", str(evidence_top_k)]
+        if evidence_item_max_chars is not None:
+            command += ["--evidence-item-max-chars", str(evidence_item_max_chars)]
         check_alloc_conf(alloc_conf)  # before any child exists
         if empty_cache is not None:  # lab allocator test, opt-in: the command is unchanged without it
             command += ["--empty-cache", check_empty_cache(empty_cache)]
@@ -211,6 +217,8 @@ class ChildProcess:
         restore_placement: str = "system",
         history_window: int | None = None,
         state_block_max_bytes: int | None = None,
+        evidence_top_k: int | None = None,
+        evidence_item_max_chars: int | None = None,
         alloc_conf: str | None = None,
         empty_cache: str | None = None,
     ) -> ChildProcess:
@@ -247,6 +255,10 @@ class ChildProcess:
             command += ["--history-window", str(history_window)]
         if state_block_max_bytes is not None:
             command += ["--state-block-max-bytes", str(state_block_max_bytes)]
+        if evidence_top_k is not None:
+            command += ["--evidence-top-k", str(evidence_top_k)]
+        if evidence_item_max_chars is not None:
+            command += ["--evidence-item-max-chars", str(evidence_item_max_chars)]
         check_alloc_conf(alloc_conf)  # before any child exists
         if empty_cache is not None:  # lab allocator test, opt-in: the command is unchanged without it
             command += ["--empty-cache", check_empty_cache(empty_cache)]

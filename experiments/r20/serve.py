@@ -73,6 +73,9 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     # Lab diagnostics, OPT-IN (need --bare-chat): input caps of the bare chat (observation only).
     parser.add_argument("--history-window", type=int)
     parser.add_argument("--state-block-max-bytes", type=int)
+    # Lab diagnostics, OPT-IN (need --bare-restore): per-item limits of the restored evidence rows.
+    parser.add_argument("--evidence-top-k", type=int)
+    parser.add_argument("--evidence-item-max-chars", type=int)
     # Lab allocator test, OPT-IN (REAL path only): reserved/free readings after the load and after every call;
     # after-load / per-turn also call torch.cuda.empty_cache().  Absent: nothing is imported or installed.
     parser.add_argument("--empty-cache", choices=["none", "after-load", "per-turn"])
@@ -154,6 +157,11 @@ def main(argv: list[str] | None = None) -> int:
     if any(value is not None for value in caps.values()) and not bare_chat:
         print("serve refused: INPUT_CAPS_NEED_BARE_CHAT", file=sys.stderr)
         return 2
+    evidence = {"evidence_top_k": args.evidence_top_k, "evidence_item_max_chars": args.evidence_item_max_chars}
+    if any(value is not None for value in evidence.values()) and not restore:
+        print("serve refused: EVIDENCE_LIMIT_NEEDS_BARE_RESTORE", file=sys.stderr)  # the smoke refuses this earlier
+        return 2
+    caps.update(evidence)
     if bare_chat:
         # Lab diagnostics only (`bare_chat_adapter`): inside the recorder, like the chat-role adapter.
         from experiments.r20.bare_chat_adapter import BareChatAdapter, wrap_loader as wrap_bare_loader

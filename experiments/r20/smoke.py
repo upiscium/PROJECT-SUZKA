@@ -65,6 +65,13 @@ Diagnostic options (all observation only, all default off / unchanged):
   from the END until the state block fits B UTF-8 bytes; the user text and assistant text are never truncated.  In the
   matrix a condition id takes the suffixes ``:w<N>`` and/or ``:b<bytes>`` (``X10:w4:b2048``); the global flags are refused
   there.  Results carry requested / effective numbers, the model-call input token count and the peak allocated VRAM.
+  ``--evidence-top-k K`` (1..50) / ``--evidence-item-max-chars C`` (20..2000) (lab, need ``--bare-restore`` with
+  ``wm_evidence``) limit the evidence ROWS of the restored ``wm_evidence`` section instead of dropping whole sections: the
+  first K rows as the builder rendered them (no re-ranking), each row's ``text`` cut to at most C characters (the marker
+  ``…`` is counted in C; the row stays one valid JSON line).  A row that cannot be parsed strictly leaves the section
+  unchanged (``evidence_limit_skipped:<reason>``).  In the matrix: the suffix ``:e<K>x<C>`` (canonical order
+  ``X10:w6:e3x200:b2048``, w / e / b in any input order).  ORDER of application: evidence limits first, then the
+  whole-section byte cap ``:b``.  Results: items / chars before and after, sections affected (numbers only).
   ``--matrix-conditions X0,X7,X9,X10`` selects (and orders) matrix conditions; X9 = all first-user, X10 = all
   split-safe exist only through it (the default matrix stays X0..X8); needs ``--matrix``; the 60-subject cap applies.
 * ``--matrix`` (implies the bare chat with restores; excludes ``--bare-chat``, ``--bare-restore``,
@@ -374,7 +381,9 @@ def _check_restore_and_matrix(args: argparse.Namespace) -> None:
         for flag, code in (("bare_chat", "MATRIX_EXCLUDES_BARE_CHAT"), ("bare_restore", "MATRIX_EXCLUDES_BARE_RESTORE"),
                            ("restore_placement", "MATRIX_EXCLUDES_RESTORE_PLACEMENT"), ("chat_roles", "MATRIX_EXCLUDES_CHAT_ROLES"),
                            ("history_window", "MATRIX_EXCLUDES_HISTORY_WINDOW"),
-                           ("state_block_max_bytes", "MATRIX_EXCLUDES_STATE_BLOCK_MAX_BYTES")):
+                           ("state_block_max_bytes", "MATRIX_EXCLUDES_STATE_BLOCK_MAX_BYTES"),
+                           ("evidence_top_k", "MATRIX_EXCLUDES_EVIDENCE_TOP_K"),
+                           ("evidence_item_max_chars", "MATRIX_EXCLUDES_EVIDENCE_ITEM_MAX_CHARS")):
             if getattr(args, flag, None) is not None and getattr(args, flag, None) is not False:
                 raise GuardRefusal(code, f"--matrix and --{flag.replace('_', '-')} are mutually exclusive")
         if not args.record_model_calls:
@@ -392,6 +401,20 @@ def _check_restore_and_matrix(args: argparse.Namespace) -> None:
             raise GuardRefusal("INPUT_CAPS_NEED_BARE_CHAT", "--history-window / --state-block-max-bytes need --bare-chat")
         if state_cap is not None and restore is None:
             raise GuardRefusal("STATE_CAP_NEEDS_BARE_RESTORE", "--state-block-max-bytes needs --bare-restore")
+    evidence = (("evidence-top-k", getattr(args, "evidence_top_k", None), bare_chat_adapter.EVIDENCE_TOP_K_RANGE),
+                ("evidence-item-max-chars", getattr(args, "evidence_item_max_chars", None), bare_chat_adapter.EVIDENCE_ITEM_CHARS_RANGE))
+    for flag, value, (low, high) in evidence:
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high):
+            raise GuardRefusal("EVIDENCE_LIMIT_OUT_OF_RANGE", f"--{flag}: {low}..{high}")
+    if not getattr(args, "matrix", False) and any(value is not None for _f, value, _r in evidence):
+        if restore is None:
+            raise GuardRefusal("EVIDENCE_LIMIT_NEEDS_BARE_RESTORE", "--evidence-top-k / --evidence-item-max-chars need --bare-restore")
+        try:
+            wanted = bare_chat_adapter.parse_restore_list(restore)
+        except ValueError:
+            wanted = ()  # refused as BARE_RESTORE_INVALID below
+        if wanted and "wm_evidence" not in wanted:
+            raise GuardRefusal("EVIDENCE_LIMIT_NEEDS_WM_EVIDENCE", "the evidence limits need wm_evidence in --bare-restore")
     if restore is not None:
         if not getattr(args, "bare_chat", False):
             raise GuardRefusal("BARE_RESTORE_NEEDS_BARE_CHAT", "--bare-restore needs --bare-chat")
@@ -479,6 +502,8 @@ def _one_run(
         restore_placement=getattr(args, "restore_placement", None) or "system",
         history_window=getattr(args, "history_window", None),
         state_block_max_bytes=getattr(args, "state_block_max_bytes", None),
+        evidence_top_k=getattr(args, "evidence_top_k", None),
+        evidence_item_max_chars=getattr(args, "evidence_item_max_chars", None),
         config_overrides=_overrides(args),
         **({} if alloc is None else {"alloc_conf": alloc[0], "empty_cache": alloc[1]}),
     )
@@ -564,6 +589,11 @@ def _one_run(
             "history_window": getattr(args, "history_window", None),
             "state_block_max_bytes": getattr(args, "state_block_max_bytes", None),
         }
+    if getattr(args, "evidence_top_k", None) is not None or getattr(args, "evidence_item_max_chars", None) is not None:
+        run["evidence_limits"] = {  # requested; the effective numbers are per turn in bare_chat
+            "evidence_top_k": getattr(args, "evidence_top_k", None),
+            "evidence_item_max_chars": getattr(args, "evidence_item_max_chars", None),
+        }
     allocator = _allocator_record(args, private_directory, run["gpu"])
     if allocator is not None:  # present only when the allocator test was asked for
         run["allocator"] = allocator
@@ -633,6 +663,8 @@ class Condition:
     placement: str = "system"
     history_window: int | None = None  # input caps (lab); None = no cap
     state_block_max_bytes: int | None = None
+    evidence_top_k: int | None = None  # per-item evidence limits (lab; both set by the ``:e<K>x<C>`` suffix)
+    evidence_item_max_chars: int | None = None
 
 
 CONDITIONS: tuple[Condition, ...] = (
@@ -653,15 +685,17 @@ EXTRA_CONDITIONS: tuple[Condition, ...] = (
 )
 
 
-_SPEC = re.compile(r"(X[0-9]+)((?::[wb][0-9]+)*)")
+_SPEC = re.compile(r"(X[0-9]+)((?::(?:[wb][0-9]+|e[0-9]+x[0-9]+))*)")
 
 
 def parse_condition(spec: str, known: dict[str, Condition]) -> Condition:
-    """``X10`` / ``X10:w4`` / ``X10:b2048`` / ``X10:w4:b2048`` -> the condition with its input caps.
+    """``X10`` / ``X10:w4`` / ``X10:b2048`` / ``X10:e3x200`` / ``X10:w6:e3x200:b2048`` -> the condition with its caps.
 
-    The base id must be known; each suffix (``w`` = history window, ``b`` = state block bytes, digits only) may occur
-    at most once, in either order; ``b`` needs a base that restores something (not X0).  The result's id is the
-    canonical spec (``w`` before ``b``).  Anything else is refused.
+    The base id must be known; each suffix (``w`` = history window, ``b`` = state block bytes, ``e<K>x<C>`` = keep K
+    evidence rows of at most C characters; digits only) may occur at most once, in any order; ``b`` needs a base that
+    restores something (not X0), ``e`` a base that restores ``wm_evidence``; K in 1..50, C in 20..2000.  The result's id
+    is the canonical spec (``w``, ``e``, ``b``; the evidence limits are applied BEFORE the byte cap).  Anything else is
+    refused.
     """
 
     match = _SPEC.fullmatch(spec)
@@ -671,21 +705,39 @@ def parse_condition(spec: str, known: dict[str, Condition]) -> Condition:
     if base is None:
         raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"unknown condition id: {match.group(1)}")
     caps: dict[str, int] = {}
+    evidence: tuple[int, int] | None = None
     for part in [piece for piece in match.group(2).split(":") if piece]:
-        if part[0] in caps:
+        if part[0] in caps or (part[0] == "e" and evidence is not None):
             raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{spec}: duplicate :{part[0]} suffix")
-        caps[part[0]] = int(part[1:])
+        if part[0] == "e":
+            top_k, _x, chars = part[1:].partition("x")
+            evidence = (int(top_k), int(chars))
+        else:
+            caps[part[0]] = int(part[1:])
     if any(value > MAX_CAP for value in caps.values()):
         raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{spec}: cap above {MAX_CAP}")
     if "b" in caps and base.restore is None:
         raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{spec}: :b needs a condition that restores sections")
-    if not caps:
+    if evidence is not None:
+        (k_low, k_high), (c_low, c_high) = bare_chat_adapter.EVIDENCE_TOP_K_RANGE, bare_chat_adapter.EVIDENCE_ITEM_CHARS_RANGE
+        if not (k_low <= evidence[0] <= k_high and c_low <= evidence[1] <= c_high):
+            raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{spec}: :e<K>x<C> needs K in {k_low}..{k_high} and C in {c_low}..{c_high}")
+        if base.restore is None or "wm_evidence" not in bare_chat_adapter.parse_restore_list(base.restore):
+            raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{spec}: :e needs a condition that restores wm_evidence")
+    if not caps and evidence is None:
         return base
-    canonical = base.id + (f":w{caps['w']}" if "w" in caps else "") + (f":b{caps['b']}" if "b" in caps else "")
-    notes = ([f"window {caps['w']}"] if "w" in caps else []) + ([f"state <= {caps['b']} B"] if "b" in caps else [])
+    canonical = (
+        base.id + (f":w{caps['w']}" if "w" in caps else "")
+        + (f":e{evidence[0]}x{evidence[1]}" if evidence else "") + (f":b{caps['b']}" if "b" in caps else "")
+    )
+    notes = (
+        ([f"window {caps['w']}"] if "w" in caps else [])
+        + ([f"evidence {evidence[0]} x {evidence[1]} chars"] if evidence else [])
+        + ([f"state <= {caps['b']} B"] if "b" in caps else [])
+    )
     return Condition(
         canonical, f"{base.description} [{', '.join(notes)}]", base.restore, base.placement,
-        caps.get("w"), caps.get("b"),
+        caps.get("w"), caps.get("b"), evidence[0] if evidence else None, evidence[1] if evidence else None,
     )
 
 
@@ -731,6 +783,14 @@ def check_conditions(conditions: tuple[Condition, ...], repeats: int) -> None:
                 raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{condition.id}: input cap")
         if condition.state_block_max_bytes is not None and condition.restore is None:
             raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{condition.id}: state cap without restore")
+        for limit, (low, high) in ((condition.evidence_top_k, bare_chat_adapter.EVIDENCE_TOP_K_RANGE),
+                                   (condition.evidence_item_max_chars, bare_chat_adapter.EVIDENCE_ITEM_CHARS_RANGE)):
+            if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or not low <= limit <= high):
+                raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{condition.id}: evidence limit")
+        if (condition.evidence_top_k is not None or condition.evidence_item_max_chars is not None) and (
+            condition.restore is None or "wm_evidence" not in bare_chat_adapter.parse_restore_list(condition.restore)
+        ):
+            raise GuardRefusal("MATRIX_CONDITIONS_INVALID", f"{condition.id}: evidence limit without wm_evidence")
         if condition.restore is not None:
             try:
                 bare_chat_adapter.parse_restore_list(condition.restore)
@@ -763,6 +823,10 @@ def _condition_summary(condition: Condition, runs: list[dict[str, Any]], planned
     gpu_peaks = [int(run["gpu"]["peak_allocated"]) for run in runs if run.get("gpu", {}).get("peak_allocated") is not None]
     turn_peaks = peak("peak_allocated_bytes")
     peak_allocated = max([*gpu_peaks, *([] if turn_peaks is None else [turn_peaks])], default=None)
+    dropped_items = [
+        row["evidence_items_before"] - row["evidence_items_after"] for row in bare_rows
+        if isinstance(row.get("evidence_items_before"), int) and isinstance(row.get("evidence_items_after"), int)
+    ]
     split = {}
     if condition.restore and condition.placement in bare_chat_adapter.FIRST_USER_PLACEMENTS:
         # numbers per destination (system vs first user turn); present only for these placements
@@ -788,6 +852,14 @@ def _condition_summary(condition: Condition, runs: list[dict[str, Any]], planned
         "ended": [run["ended"] for run in runs],
         "min_free_bytes": min(free) if free else None,
         "history_window": condition.history_window, "state_block_max_bytes": condition.state_block_max_bytes,
+        "evidence_top_k": condition.evidence_top_k, "evidence_item_max_chars": condition.evidence_item_max_chars,
+        "mean_evidence_items_before": mean("evidence_items_before"),
+        "mean_evidence_items_kept": mean("evidence_items_after"),
+        "mean_evidence_items_dropped": round(sum(dropped_items) / len(dropped_items), 1) if dropped_items else None,
+        "mean_evidence_chars_before": mean("evidence_chars_before"),
+        "mean_evidence_chars_effective": mean("evidence_chars_after"),
+        "mean_evidence_sections_affected": mean("evidence_sections_affected"),
+        "evidence_limit_skipped_turns": sum(1 for row in bare_rows if row.get("evidence_limit_skipped")),
         "max_input_tokens": peak("input_tokens"), "peak_allocated_bytes": peak_allocated,
         "max_reserved_bytes": peak("reserved_bytes"),
         "mean_input_tokens": mean("input_tokens"), "mean_exchanges_dropped": mean("exchanges_dropped"),
@@ -806,6 +878,9 @@ def matrix_table(summaries: list[dict[str, Any]]) -> list[str]:
     """The compact table (rows = conditions): counts as ``true/of``, ``-`` where nothing was observed."""
 
     header = ["cond", "what", "done", *[title for title, _l, _k in KEY_COLUMNS], "lyric hits", "mean chars", "min free GiB", "peak alloc GiB", "max input tokens", "input chars"]
+    with_evidence = any(item.get("evidence_top_k") is not None or item.get("evidence_item_max_chars") is not None for item in summaries)
+    if with_evidence:  # only when a condition limits evidence: the default table is unchanged
+        header += ["ev kept/dropped", "ev chars"]
     with_allocator = any(item.get("allocator") for item in summaries)
     if with_allocator:  # two columns only when the allocator test was asked for
         header = [*header, "reserved after load GiB", "max reserved GiB"]
@@ -823,6 +898,10 @@ def matrix_table(summaries: list[dict[str, Any]]) -> list[str]:
         reply = "-" if persona.get("mean_response_chars") is None else f"{persona['mean_response_chars']:.0f}"
         chars = "-" if item["mean_input_chars"] is None else f"{item['mean_input_chars']:.0f}"
         cells = [item["id"], item["description"], f"{item['completed_runs']}/{item['subjects_planned']}", *counts, lyric, reply, free, allocated, tokens, chars]
+        if with_evidence:
+            kept, dropped = item.get("mean_evidence_items_kept"), item.get("mean_evidence_items_dropped")
+            effective = item.get("mean_evidence_chars_effective")
+            cells += ["-" if kept is None or dropped is None else f"{kept:.1f}/{dropped:.1f}", "-" if effective is None else f"{effective:.0f}"]
         if with_allocator:
             found = item.get("allocator") or {}
             cells += ["-" if found.get(name) is None else f"{found[name] / gpu.GIB:.1f}"
@@ -915,6 +994,8 @@ def _matrix(
             subject_args.restore_placement = condition.placement if condition.restore else None
             subject_args.history_window = condition.history_window
             subject_args.state_block_max_bytes = condition.state_block_max_bytes
+            subject_args.evidence_top_k = condition.evidence_top_k
+            subject_args.evidence_item_max_chars = condition.evidence_item_max_chars
             print(f"--- condition {condition.id}: {condition.description} ---")
             for ordinal in range(1, args.repeats + 1):
                 started += 1
@@ -1099,11 +1180,18 @@ def parser() -> argparse.ArgumentParser:
     top.add_argument("--state-block-max-bytes", type=int, metavar="B",
                      help="lab input cap (needs --bare-restore): drop whole restored sections from the END until the state block "
                           "is at most B UTF-8 bytes (default: no cap)")
+    top.add_argument("--evidence-top-k", type=int, metavar="K",
+                     help="lab evidence limit (needs --bare-restore with wm_evidence): keep the first K evidence rows as rendered "
+                          f"({bare_chat_adapter.EVIDENCE_TOP_K_RANGE[0]}..{bare_chat_adapter.EVIDENCE_TOP_K_RANGE[1]}; default: all)")
+    top.add_argument("--evidence-item-max-chars", type=int, metavar="C",
+                     help="lab evidence limit (needs --bare-restore with wm_evidence): cut each evidence row's text to at most C "
+                          f"characters incl. the marker ({bare_chat_adapter.EVIDENCE_ITEM_CHARS_RANGE[0]}..{bare_chat_adapter.EVIDENCE_ITEM_CHARS_RANGE[1]}; default: no cut)")
     top.add_argument("--matrix-conditions", metavar="IDS",
                      help="with --matrix: a comma list of condition ids to run, in this order (default X0..X8; "
                           "X9 = all first-user, X10 = all split-safe are available only here), e.g. X0,X7,X9,X10; an id may "
-                          "carry input-cap suffixes :w<N> (history window) and/or :b<bytes> (state block cap), "
-                          "e.g. X10:w4:b2048")
+                          "carry input-cap suffixes :w<N> (history window), :e<K>x<C> (evidence: first K rows, each at most C "
+                          "characters; needs wm_evidence) and/or :b<bytes> (state block cap, applied after the evidence "
+                          "limits), e.g. X10:w6:e3x200:b2048")
     top.add_argument("--matrix", action="store_true",
                      help="lab diagnostics: run the fixed condition matrix X0..X8 (bare + restores) in ONE launch, "
                           f"--repeats subjects each; total subjects <= {MATRIX_MAX_SUBJECTS}; greedy unless --temperature; "
