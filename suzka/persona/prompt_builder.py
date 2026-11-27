@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Literal
 
 from suzka.body import EmotionState
 from suzka.identity import ValuePromptEntry, ValuePromptView
@@ -88,6 +89,66 @@ class ContextPromptView:
                 raise ValueError("invalid Context prompt projection") from None
 
 
+_Origin = Literal["code", "stored"]
+_SECTION_LEAD = "\n\n"
+_FIRST_SECTION_LEAD = "\n"
+
+
+@dataclass(frozen=True, slots=True)
+class PromptSection:
+    """One runtime-data section of a built prompt, tagged with where its text comes from.
+
+    ``origin`` is ``"code"`` only when the builder produced the whole text itself from fixed
+    vocabulary and validated numbers/identifiers inside ``PromptBuilder.build_sections``;
+    otherwise ``"stored"`` (it can carry user-, model- or stored-originated text). The tag is set
+    by the builder at render time and is never derived by reading the text later. ``lead`` is
+    the newline run that precedes the section in the legacy prompt layout.
+    """
+
+    name: str
+    text: str
+    origin: _Origin
+    lead: str = _SECTION_LEAD
+    repeats_history: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.name) is not str or not self.name:
+            raise ValueError("name must be a non-empty str")
+        if type(self.text) is not str:
+            raise TypeError("text must be a str")
+        if self.origin not in ("code", "stored"):
+            raise ValueError("origin must be code or stored")
+        if type(self.lead) is not str or self.lead.strip("\n"):
+            raise ValueError("lead must consist of newlines only")
+
+
+@dataclass(frozen=True, slots=True)
+class PromptSections:
+    """Structured form of a built prompt: ``PromptSections.render()`` is the legacy prompt.
+
+    ``header`` is the fixed ``PROMPT_HEADER`` text (always code). ``sections`` are in prompt order.
+    ``user_text`` is the current message; the final ``User:``/``Assistant:`` tail is derived from it.
+    """
+
+    header: str
+    sections: tuple[PromptSection, ...]
+    user_text: str
+
+    @property
+    def tail(self) -> str:
+        return f"\n\nUser: {self.user_text}\nAssistant:"
+
+    def render(self) -> str:
+        return (
+            self.header
+            + "\n"
+            + RUNTIME_DATA_HEADING
+            + "\n"
+            + "".join(section.lead + section.text for section in self.sections)
+            + self.tail
+        )
+
+
 class PromptBuilder:
     """Build prompts from input, emotion, and stored-memory evidence."""
 
@@ -103,33 +164,49 @@ class PromptBuilder:
         attention_payload: AttentionPromptPayload | None = None,
         conversation_trace_text: str = "",
     ) -> str:
+        return self.build_sections(
+            user_input,
+            emotion_state,
+            working_memory_view,
+            context_view,
+            value_view,
+            r13_view,
+            attention_payload=attention_payload,
+            conversation_trace_text=conversation_trace_text,
+        ).render()
+
+    def build_sections(
+        self,
+        user_input: str,
+        emotion_state: EmotionState,
+        working_memory_view: WorkingMemoryView,
+        context_view: ContextPromptView | None = None,
+        value_view: ValuePromptView | None = None,
+        r13_view: R13PromptView | None = None,
+        *,
+        attention_payload: AttentionPromptPayload | None = None,
+        conversation_trace_text: str = "",
+    ) -> PromptSections:
+        """Same inputs as ``build``; returns the origin-tagged sections (``build`` renders them)."""
+
+        header = "\n".join(PROMPT_HEADER)
+        sections: list[PromptSection] = []
+
+        def add(name: str, lines: list[str], origin: _Origin, *, echo: bool = False) -> None:
+            lead = _SECTION_LEAD if sections else _FIRST_SECTION_LEAD
+            sections.append(PromptSection(name, "\n".join(lines), origin, lead, echo))
+
         if attention_payload is not None:
             if type(attention_payload) is not AttentionPromptPayload:
                 raise TypeError("attention_payload must be an exact AttentionPromptPayload")
             if r13_view is not None:
                 raise ValueError("r13_view cannot be combined with an Attention prompt payload")
-            context_lines = _context_lines(context_view)
-            value_lines = _value_lines(value_view)
-            attention_text = attention_payload.validated_copy().rendered_text
-            return "\n".join(
-                [
-                    *PROMPT_HEADER,
-                    RUNTIME_DATA_HEADING,
-                    *context_lines,
-                    *value_lines,
-                    "",
-                    attention_text,
-                    "",
-                    *_trace_lines(conversation_trace_text),
-                    "Emotion:",
-                    f"- valence: {emotion_state.valence:.6f}",
-                    f"- arousal: {emotion_state.arousal:.6f}",
-                    f"- optimal_loss: {emotion_state.optimal_loss:.6f}",
-                    "",
-                    f"User: {user_input}",
-                    "Assistant:",
-                ]
-            )
+            _add_context(add, context_view)
+            _add_values(add, value_view)
+            add("attention", [attention_payload.validated_copy().rendered_text], "stored")
+            _add_trace(add, conversation_trace_text)
+            _add_emotion(add, emotion_state)
+            return PromptSections(header, tuple(sections), f"{user_input}")
 
         episodic_lines = [
             _memory_line(selection)
@@ -141,35 +218,26 @@ class PromptBuilder:
             for selection in working_memory_view.selected
             if selection.source_kind.value == "semantic"
         ]
-        context_lines = _context_lines(context_view)
-        value_lines = _value_lines(value_view)
+        _add_context(add, context_view)
+        _add_values(add, value_view)
         if r13_view is not None and type(r13_view) is not R13PromptView:
             raise TypeError("r13_view must be an exact R13PromptView")
-        r13_lines = [] if r13_view is None else ["", r13_view.render()]
-        return "\n".join(
-            [
-                *PROMPT_HEADER,
-                RUNTIME_DATA_HEADING,
-                *context_lines,
-                *value_lines,
-                *r13_lines,
-                "",
-                "Emotion:",
-                f"- valence: {emotion_state.valence:.6f}",
-                f"- arousal: {emotion_state.arousal:.6f}",
-                f"- optimal_loss: {emotion_state.optimal_loss:.6f}",
-                "",
-                *_trace_lines(conversation_trace_text),
-                "Stored episodic evidence:",
-                *(episodic_lines or ["- none"]),
-                "",
-                "Stored semantic evidence:",
-                *(semantic_lines or ["- none"]),
-                "",
-                f"User: {user_input}",
-                "Assistant:",
-            ]
+        if r13_view is not None:
+            # Stored: motivation/goal/commitment descriptions are free text.
+            add("r13", [r13_view.render()], "stored")
+        _add_emotion(add, emotion_state)
+        _add_trace(add, conversation_trace_text)
+        add(
+            "stored_episodic_evidence",
+            ["Stored episodic evidence:", *(episodic_lines or ["- none"])],
+            "stored",
         )
+        add(
+            "stored_semantic_evidence",
+            ["Stored semantic evidence:", *(semantic_lines or ["- none"])],
+            "stored",
+        )
+        return PromptSections(header, tuple(sections), f"{user_input}")
 
 
 def split_chat_prompt(prompt: str, user_input: str) -> tuple[str, str] | None:
@@ -199,14 +267,33 @@ def split_chat_prompt(prompt: str, user_input: str) -> tuple[str, str] | None:
     return system_text, f"{runtime_data}\n\n{CURRENT_MESSAGE_HEADING}\n{user_input}"
 
 
-def _trace_lines(conversation_trace_text: str) -> list[str]:
-    """The rendered ConversationTrace block and a blank line, or nothing (#417 D1 §5)."""
+def _add_trace(add: Callable[..., None], conversation_trace_text: str) -> None:
+    """The rendered ConversationTrace block, or nothing (#417 D1 section 5).
+
+    Stored: it quotes past user and assistant turns.
+    """
 
     if type(conversation_trace_text) is not str:
         raise TypeError("conversation_trace_text must be a string")
-    if not conversation_trace_text:
-        return []
-    return [conversation_trace_text, ""]
+    if conversation_trace_text:
+        add("conversation_trace", [conversation_trace_text], "stored", echo=True)
+
+
+def _add_emotion(add: Callable[..., None], emotion_state: EmotionState) -> None:
+    # Code only when every number is a plain float: the text is then fixed labels plus ``.6f``
+    # digits. Anything else (e.g. a subclass with its own __format__) is not trusted.
+    numbers = (emotion_state.valence, emotion_state.arousal, emotion_state.optimal_loss)
+    origin: _Origin = "code" if all(type(value) is float for value in numbers) else "stored"
+    add(
+        "emotion",
+        [
+            "Emotion:",
+            f"- valence: {emotion_state.valence:.6f}",
+            f"- arousal: {emotion_state.arousal:.6f}",
+            f"- optimal_loss: {emotion_state.optimal_loss:.6f}",
+        ],
+        origin,
+    )
 
 
 def _memory_line(selection: WorkingMemorySelection) -> str:
@@ -223,30 +310,57 @@ def _memory_line(selection: WorkingMemorySelection) -> str:
     return line
 
 
-def _context_lines(context_view: ContextPromptView | None) -> list[str]:
+def _add_context(add: Callable[..., None], context_view: ContextPromptView | None) -> None:
     if context_view is None:
-        return []
+        return
     session = context_view.source_session_id or "none"
     participants = ", ".join(context_view.participant_refs) or "none"
-    return [
-        "",
-        "Current Context:",
-        f"- context_id: {context_view.context_id}",
-        f"- context_type: {context_view.context_type}",
-        f"- source_channel: {context_view.source_channel}",
-        f"- source_session_id: {session}",
-        f"- participant_refs: {participants}",
-    ]
+    add(
+        "context",
+        [
+            "Current Context:",
+            f"- context_id: {context_view.context_id}",
+            f"- context_type: {context_view.context_type}",
+            f"- source_channel: {context_view.source_channel}",
+            f"- source_session_id: {session}",
+            f"- participant_refs: {participants}",
+        ],
+        "code" if _context_is_identifiers_only(context_view) else "stored",
+    )
 
 
-def _value_lines(value_view: ValuePromptView | None) -> list[str]:
+def _context_is_identifiers_only(context_view: ContextPromptView) -> bool:
+    """True when every rendered field passes the identifier grammar (no whitespace or newlines).
+
+    An exact ``ContextPromptView`` validates in ``__post_init__``; this re-checks the values that
+    are actually rendered, so a subclass or a view whose fields were replaced after construction
+    is tagged ``stored`` instead of reaching the system role.
+    """
+
+    if type(context_view) is not ContextPromptView:
+        return False
+    try:
+        ContextPromptView(
+            context_id=context_view.context_id,
+            context_type=context_view.context_type,
+            source_channel=context_view.source_channel,
+            source_session_id=context_view.source_session_id,
+            participant_refs=context_view.participant_refs,
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _add_values(add: Callable[..., None], value_view: ValuePromptView | None) -> None:
     if value_view is None:
-        return []
-    return [
-        "",
-        "Active Values:",
-        *([_value_line(entry) for entry in value_view.entries] or ["- none"]),
-    ]
+        return
+    # Stored: the Value ``name`` and ``concept`` are free text that may be user- or model-derived.
+    add(
+        "values",
+        ["Active Values:", *([_value_line(entry) for entry in value_view.entries] or ["- none"])],
+        "stored",
+    )
 
 
 def _value_line(entry: ValuePromptEntry) -> str:
