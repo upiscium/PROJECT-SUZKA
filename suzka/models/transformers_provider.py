@@ -1,6 +1,7 @@
 """Hugging Face Transformers-backed model provider."""
 
 from pathlib import Path
+from collections.abc import Mapping, Sequence
 from typing import Any
 import json
 
@@ -52,16 +53,38 @@ class TransformersProvider:
         and send them the built completion prompt through ``generate``.
         """
 
+        return self._generate_chat_parts(
+            [
+                {"role": "system", "content": [{"type": "text", "text": system_text}]},
+                {"role": "user", "content": [{"type": "text", "text": user_text}]},
+            ]
+        )
+
+    def generate_messages(self, messages: Sequence[Mapping[str, str]]) -> str:
+        """Generate a reply to a multi-message conversation.
+
+        ``messages`` are plain ``{"role", "content"}`` mappings: an optional
+        single ``system`` message first, then strictly alternating ``user`` /
+        ``assistant`` messages, the last one ``user``. Contents must be
+        non-empty strings. Raises ``ValueError`` for any other shape or when
+        the checkpoint has no chat template (callers check ``uses_chat_roles``).
+        """
+
         if not self._uses_chat_template():
             raise ValueError("this checkpoint has no chat template; use generate()")
-        return self._generate_from(
-            self._chat_inputs(
-                [
-                    {"role": "system", "content": [{"type": "text", "text": system_text}]},
-                    {"role": "user", "content": [{"type": "text", "text": user_text}]},
-                ]
-            )
+        _validate_messages(messages)
+        return self._generate_chat_parts(
+            [
+                {"role": m["role"], "content": [{"type": "text", "text": m["content"]}]}
+                for m in messages
+            ]
         )
+
+    def _generate_chat_parts(self, parts: list[dict[str, Any]]) -> str:
+        # Shared by generate_chat (which never validated content) and generate_messages.
+        if not self._uses_chat_template():
+            raise ValueError("this checkpoint has no chat template; use generate()")
+        return self._generate_from(self._chat_inputs(parts))
 
     def _generate_from(self, inputs: dict[str, torch.Tensor]) -> str:
         inputs = self._move_inputs_to_model_device(inputs)
@@ -245,6 +268,27 @@ def _iter_registry_entries(registry_data: Any) -> list[dict[str, Any]]:
             if isinstance(path, str) and isinstance(state, str)
         ]
     return []
+
+
+def _validate_messages(messages: Sequence[Mapping[str, str]]) -> None:
+    if isinstance(messages, (str, bytes)) or not isinstance(messages, Sequence) or not messages:
+        raise ValueError("messages must be a non-empty sequence")
+    for message in messages:
+        if not isinstance(message, Mapping):
+            raise ValueError("each message must be a mapping with role and content")
+        if message.get("role") not in ("system", "user", "assistant"):
+            raise ValueError("message role must be system, user or assistant")
+        content = message.get("content")
+        if not isinstance(content, str) or not content:
+            raise ValueError("message content must be a non-empty string")
+    turns = messages[1:] if messages[0]["role"] == "system" else messages
+    if not turns:
+        raise ValueError("messages need at least one user message")
+    for index, message in enumerate(turns):
+        if message["role"] != ("user" if index % 2 == 0 else "assistant"):
+            raise ValueError("messages must alternate user/assistant after an optional leading system message")
+    if turns[-1]["role"] != "user":
+        raise ValueError("the last message must be from the user")
 
 
 def _strip_channel_name(thought: str) -> str:
