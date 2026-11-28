@@ -131,3 +131,68 @@ def test_debug_chat_history_is_read_only(tmp_path: Path) -> None:
         assert first["episode_id"] in [e.episode_id for e in view.history(6)]
         assert writes == []
         assert trace.state == before
+
+
+def test_legacy_rendered_trace_is_pinned_to_literal_text() -> None:
+    """Golden: literals captured from the unchanged render_trace (#500 3b-3 review)."""
+
+    from datetime import datetime, timedelta, timezone
+
+    from suzka.runtime.conversation_trace import (
+        RecalledTurn,
+        TraceItem,
+        TraceParameters,
+        TraceTurnKind,
+        recent_history,
+    )
+
+    t0 = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)
+
+    def turn(n: int, minutes: int, kind: TraceTurnKind, retention: float, user: str, reply: str):  # type: ignore[no-untyped-def]
+        at = t0 + timedelta(minutes=minutes)
+        item = TraceItem(
+            episode_id=f"episode-g-{n:04d}", turn_kind=kind, requested_at=at, event_sequence=n,
+            surprise=0.0, surprise_measured=True, stability_hours=1.0,
+            last_reinforced_at=at, last_reinforced_event_sequence=n,
+        )
+        return RecalledTurn(item, retention, user, reply)
+
+    faint = turn(1, 0, TraceTurnKind.CHAT, 0.2,
+                 "my cat is called Mochi and she likes the window in the afternoon sun a lot",
+                 "Mochi sounds lovely, I will remember that she likes the window seat")
+    command = turn(2, 10, TraceTurnKind.COMMAND, 0.9, "REVIEW", "x")
+    in_wm = turn(3, 20, TraceTurnKind.CHAT, 0.9, "what is\nthe weather", "it is sunny")
+    now = t0 + timedelta(minutes=30)
+
+    # Episode 3 is shown through Working Memory, so the legacy trace omits it.
+    rendered = render_trace([faint, command], now, TraceParameters())
+    assert rendered.text == (
+        "Recent conversation (as you remember it; faint items are shortened):\n"
+        '- about 30 min ago (faint) — User: "my cat is called Mochi and she likes the window'
+        ' in the after…" / You: "Mochi sounds lovely, I will remember that she likes the'
+        ' wind…"\n'
+        "- about 20 min ago — (the user asked to review an earlier turn)"
+    )
+    assert rendered.shown_episode_ids == ("episode-g-0001", "episode-g-0002")
+    assert rendered.faint_episode_ids == ("episode-g-0001",)
+    # The history still holds the WM-shown episode, with raw text.
+    history = recent_history([faint, command, in_wm], 6)
+    assert [(e.episode_id, e.user_text, e.assistant_text) for e in history] == [
+        ("episode-g-0001", faint.user_text, faint.response_text),
+        ("episode-g-0003", "what is\nthe weather", "it is sunny"),
+    ]
+
+
+def test_legacy_diagnostics_are_pinned_to_literal_values(tmp_path: Path) -> None:
+    with _client(tmp_path, settings=_one_retrieval(tmp_path)) as client:
+        _chat(client, "remember this")
+        _chat(client, "and this as well")
+        response = client.post(
+            "/api/chat/debug", json={"message": "debug", "attachments": [], "debug": True}
+        )
+        items = response.json()["conversation_trace"]["items"]
+    assert response.json()["conversation_trace"]["state"] == "enabled"
+    assert sorted((i["display"], i["read_status"], i["double_recall"]) for i in items) == [
+        ("in_working_memory", "resolved", True),
+        ("shown", "resolved", False),
+    ]

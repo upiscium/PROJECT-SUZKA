@@ -224,7 +224,11 @@ class _TraceTurnView:
     readable_turns: tuple[RecalledTurn, ...] = ()
 
     def history(self, limit: int) -> tuple[HistoryEntry, ...]:
-        """Chronological raw-text history of the latest chat turns (#500 3b-3)."""
+        """Chronological raw-text history of the latest chat turns (#500 3b-3).
+
+        The window is bounded by ``trace.candidates()`` (retention >= forget_below and
+        the per-Context item cap), so N is effectively capped by trace retention.
+        """
 
         return recent_history(self.readable_turns, limit)
 
