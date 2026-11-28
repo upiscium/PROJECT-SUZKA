@@ -100,10 +100,12 @@ from suzka.runtime.session_participant import (
 from suzka.runtime.session_state import SessionState
 from suzka.runtime.conversation_trace import (
     ConversationTrace,
+    HistoryEntry,
     RecalledTurn,
     RenderedTrace,
     TraceParameters,
     TraceTurnKind,
+    recent_history,
     render_trace,
 )
 from suzka.r16.commands import parse_command
@@ -217,6 +219,18 @@ class _TraceTurnView:
     double_recall_ids: frozenset[str]
     in_working_memory_ids: frozenset[str]
     diagnostics: ConversationTraceDiagnostics
+    # Every readable turn of this Context, including those Working Memory
+    # already shows (the rendered trace omits those). Index for history only.
+    readable_turns: tuple[RecalledTurn, ...] = ()
+
+    def history(self, limit: int) -> tuple[HistoryEntry, ...]:
+        """Chronological raw-text history of the latest chat turns (#500 3b-3).
+
+        The window is bounded by ``trace.candidates()`` (retention >= forget_below and
+        the per-Context item cap), so N is effectively capped by trace retention.
+        """
+
+        return recent_history(self.readable_turns, limit)
 
 
 @dataclass(frozen=True)
@@ -1944,6 +1958,7 @@ class SuzkaMainLoop:
             working_memory_view, attention_payload
         )
         recalled: list[RecalledTurn] = []
+        readable: list[RecalledTurn] = []
         seen: list[tuple[str, float, float, str, str]] = []
         for item, retention in trace.candidates(context_id, now):
             status, record = self._read_trace_episode(item.episode_id)
@@ -1962,12 +1977,14 @@ class SuzkaMainLoop:
                     )
                 seen.append((item.episode_id, retention, item.stability_hours, "unreadable", status))
                 continue
+            turn = RecalledTurn(item, retention, record.user_input, record.response)
+            readable.append(turn)
             if item.episode_id in in_working_memory:
                 seen.append(
                     (item.episode_id, retention, item.stability_hours, "in_working_memory", status)
                 )
                 continue
-            recalled.append(RecalledTurn(item, retention, record.user_input, record.response))
+            recalled.append(turn)
             seen.append((item.episode_id, retention, item.stability_hours, "", status))
         rendered = render_trace(recalled, now, trace.parameters)
         shown = set(rendered.shown_episode_ids)
@@ -2002,6 +2019,7 @@ class SuzkaMainLoop:
             double_recall_ids=frozenset(double_recall_ids),
             in_working_memory_ids=visible_in_wm,
             diagnostics=ConversationTraceDiagnostics("enabled", tuple(items)),
+            readable_turns=tuple(readable),
         )
 
     def _builder_shows_trace(self, attention_payload: AttentionPromptPayload | None) -> bool:

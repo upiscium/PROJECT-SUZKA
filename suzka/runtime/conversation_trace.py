@@ -276,6 +276,15 @@ class RecalledTurn:
 
 
 @dataclass(frozen=True, slots=True)
+class HistoryEntry:
+    """One past exchange with its raw stored texts, for a chronological history."""
+
+    episode_id: str
+    user_text: str
+    assistant_text: str
+
+
+@dataclass(frozen=True, slots=True)
 class RenderedTrace:
     text: str
     shown_episode_ids: tuple[str, ...]
@@ -623,6 +632,31 @@ def render_trace(
             for turn, _line in chosen
             if turn.retention < parameters.verbatim_above
         ),
+    )
+
+
+def recent_history(recalled: Sequence[RecalledTurn], limit: int) -> tuple[HistoryEntry, ...]:
+    """The most recent ``limit`` readable chat turns, oldest first.
+
+    Order is ``(requested_at, event_sequence)`` (episode id breaks a remaining
+    tie so the result is deterministic). COMMAND turns are left out. Texts are
+    the raw stored texts: never the faint excerpt, never shortened. The
+    caller decides which turns are readable; this function only orders,
+    filters and cuts. Entry ``episode_id`` values give the episodes in the
+    same order.
+    """
+
+    if type(limit) is not int or limit < 0:
+        raise ValueError("limit must be a non-negative int")
+    if limit == 0:
+        return ()
+    chat = [turn for turn in recalled if turn.item.turn_kind is TraceTurnKind.CHAT]
+    chat.sort(
+        key=lambda turn: (turn.item.requested_at, turn.item.event_sequence, turn.item.episode_id)
+    )
+    return tuple(
+        HistoryEntry(turn.item.episode_id, turn.user_text, turn.response_text)
+        for turn in chat[-limit:]
     )
 
 
