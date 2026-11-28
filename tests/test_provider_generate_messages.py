@@ -128,6 +128,13 @@ S = {"role": "system", "content": "S"}
         [{"content": "x"}],
         ["user: hi"],
         "hello",
+        [{"role": "user", "content": "u", "name": "x"}],
+        [{"role": "user", "content": None}],
+        [{"role": "user", "content": True}],
+        [{"role": ["user"], "content": "u"}],
+        [{"role": {"a": 1}, "content": "u"}],
+        [{"role": "user", "content": "   \n\t"}],
+        [S, U, {"role": "assistant", "content": " "}, U],
     ],
 )
 def test_generate_messages_rejects_invalid_shapes(messages) -> None:
@@ -209,6 +216,43 @@ def test_conscious_agent_generate_messages_forwards_plain_messages() -> None:
 
     assert ConsciousAgent(provider).generate_messages(messages) == "ok"
     assert provider.calls == [messages]
+
+
+def test_generate_messages_converts_str_subclasses_to_plain_str() -> None:
+    class Text(str):
+        pass
+
+    provider, processor, _ = _chat_provider()
+
+    provider.generate_messages([{"role": Text("user"), "content": Text("hey")}])
+
+    part = processor.chat_calls[0][0][0]
+    assert part["role"] == "user" and type(part["role"]) is str
+    assert part["content"][0]["text"] == "hey" and type(part["content"][0]["text"]) is str
+
+
+def test_generate_messages_uses_only_the_validated_copy() -> None:
+    class Flipping(dict):
+        reads = 0
+
+        def __getitem__(self, key):
+            Flipping.reads += 1
+            value = super().__getitem__(key)
+            return value if Flipping.reads <= 2 else ""
+
+    provider, processor, _ = _chat_provider()
+
+    provider.generate_messages([Flipping(role="user", content="hi")])
+
+    assert processor.chat_calls[0][0] == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+
+
+def test_generate_messages_accepts_whitespace_only_system_text() -> None:
+    provider, processor, _ = _chat_provider()
+
+    provider.generate_messages([{"role": "system", "content": " "}, U])
+
+    assert processor.chat_calls[0][0][0]["content"] == [{"type": "text", "text": " "}]
 
 
 def test_conscious_agent_generate_messages_refuses_without_capability() -> None:

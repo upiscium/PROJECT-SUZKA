@@ -52,7 +52,12 @@ class ConsciousAgent:
         return callable(generate_messages) and (not callable(uses_roles) or bool(uses_roles()))
 
     def generate_messages(self, messages: Sequence[Mapping[str, str]]) -> str:
-        """Send plain role/content messages to the provider; callers check ``supports_messages``."""
+        """Send plain role/content messages to the provider; callers check ``supports_messages``.
+
+        Callers must only put code-generated text in a system message (#414:
+        no user, model or stored text in the system role); this cannot be
+        enforced here.
+        """
 
         generate_messages = getattr(self.provider, "generate_messages", None)
         if not callable(generate_messages) or not self.supports_messages():

@@ -65,18 +65,26 @@ class TransformersProvider:
 
         ``messages`` are plain ``{"role", "content"}`` mappings: an optional
         single ``system`` message first, then strictly alternating ``user`` /
-        ``assistant`` messages, the last one ``user``. Contents must be
-        non-empty strings. Raises ``ValueError`` for any other shape or when
-        the checkpoint has no chat template (callers check ``uses_chat_roles``).
+        ``assistant`` messages, the last one ``user``. Each mapping must have
+        exactly the keys ``role`` and ``content`` (unknown keys are rejected).
+        Contents must be non-empty ``str``; user and assistant contents must
+        also not be whitespace-only. Raises ``ValueError`` for any other shape
+        or when the checkpoint has no chat template (callers check
+        ``uses_chat_roles``). The input is validated once and only a
+        normalised copy is used afterwards.
+
+        Callers must only put code-generated text in a system message (#414:
+        no user, model or stored text in the system role); the API cannot
+        enforce this.
         """
 
         if not self._uses_chat_template():
             raise ValueError("this checkpoint has no chat template; use generate()")
-        _validate_messages(messages)
+        checked = _validate_messages(messages)
         return self._generate_chat_parts(
             [
                 {"role": m["role"], "content": [{"type": "text", "text": m["content"]}]}
-                for m in messages
+                for m in checked
             ]
         )
 
@@ -270,18 +278,29 @@ def _iter_registry_entries(registry_data: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _validate_messages(messages: Sequence[Mapping[str, str]]) -> None:
+def _validate_messages(messages: Sequence[Mapping[str, str]]) -> tuple[dict[str, str], ...]:
+    """Validate once and return a normalised copy; callers use only the copy."""
+
     if isinstance(messages, (str, bytes)) or not isinstance(messages, Sequence) or not messages:
         raise ValueError("messages must be a non-empty sequence")
+    copy: list[dict[str, str]] = []
     for message in messages:
         if not isinstance(message, Mapping):
             raise ValueError("each message must be a mapping with role and content")
-        if message.get("role") not in ("system", "user", "assistant"):
+        if set(message) != {"role", "content"}:
+            raise ValueError("each message must have exactly the keys role and content")
+        raw_role = message["role"]
+        raw_content = message["content"]
+        if not isinstance(raw_role, str) or str(raw_role) not in ("system", "user", "assistant"):
             raise ValueError("message role must be system, user or assistant")
-        content = message.get("content")
-        if not isinstance(content, str) or not content:
+        if not isinstance(raw_content, str) or not raw_content:
             raise ValueError("message content must be a non-empty string")
-    turns = messages[1:] if messages[0]["role"] == "system" else messages
+        role = str(raw_role)
+        content = str(raw_content)
+        if role != "system" and not content.strip():
+            raise ValueError("user and assistant content must not be whitespace-only")
+        copy.append({"role": role, "content": content})
+    turns = copy[1:] if copy[0]["role"] == "system" else copy
     if not turns:
         raise ValueError("messages need at least one user message")
     for index, message in enumerate(turns):
@@ -289,6 +308,7 @@ def _validate_messages(messages: Sequence[Mapping[str, str]]) -> None:
             raise ValueError("messages must alternate user/assistant after an optional leading system message")
     if turns[-1]["role"] != "user":
         raise ValueError("the last message must be from the user")
+    return tuple(copy)
 
 
 def _strip_channel_name(thought: str) -> str:
