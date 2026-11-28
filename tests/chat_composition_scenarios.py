@@ -115,7 +115,7 @@ def legacy_snapshot(tmp_path: Path) -> dict[str, Any]:
             "calls": [[normalize(s, labels), normalize(u, labels)] for s, u in provider.chat_calls],
             "debug_prompt": normalize(debug["prompt"], labels),
             "debug_keys": sorted(
-                key for key in debug if key not in {"composed_messages", "composition_report", "evidence_limit"}
+                key for key in debug
             ),
             "stored": [stored(client, first["episode_id"]), stored(client, second["episode_id"])],
             "session": client.app.state.main_loop.session_state.context_text(),

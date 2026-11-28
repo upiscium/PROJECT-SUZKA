@@ -187,11 +187,13 @@ def test_sentinels_never_reach_the_system_message(
         for sentinel in sentinels:
             assert sentinel not in system, (mode, sentinel)
     # They are in the model input, just not in the system role (the test is not vacuous).
-    everything = (
-        json.dumps(provider.message_calls) if mode != "legacy" else json.dumps(provider.chat_calls)
+    non_system = (
+        json.dumps([m for call in provider.message_calls for m in call[1:]])
+        if mode != "legacy"
+        else json.dumps([u for _s, u in provider.chat_calls])
     )
-    for sentinel in ("USER-SENTINEL", "RESP-SENTINEL", "VALUE-SENTINEL"):
-        assert sentinel in everything
+    for sentinel in ("USER-SENTINEL", "RESP-SENTINEL", "VALUE-SENTINEL", "WM-SENTINEL", "SESSION-SENTINEL"):
+        assert sentinel in non_system, (mode, sentinel)
 
 
 # ------------------------------------------------------------------ (d) per-turn fallbacks
@@ -382,45 +384,65 @@ def _wm_rows(text: str) -> int:
     return text.count('{"source_kind"')
 
 
-def test_evidence_limit_cuts_the_model_input_and_not_the_overcounted_double_recall(
-    tmp_path: Path,
-) -> None:
-    from suzka.runtime.main_loop import SuzkaMainLoop as Loop
+class _SpyHelper:
+    """Records the arguments/results of ``_episodes_in_working_memory_prompt`` for one test."""
 
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from suzka.runtime.main_loop import SuzkaMainLoop as Loop
+
+        self.real = Loop._episodes_in_working_memory_prompt
+        self.captured: list[tuple[Any, Any, Any, frozenset[str]]] = []
+        real, captured = self.real, self.captured
+
+        def spy(view, payload, row_limit=None):  # type: ignore[no-untyped-def]
+            result = real(view, payload, row_limit)
+            captured.append((view, payload, row_limit, result))
+            return result
+
+        monkeypatch.setattr(Loop, "_episodes_in_working_memory_prompt", staticmethod(spy))
+
+    def release(self) -> None:
+        self.captured.clear()  # keep no view/payload/provider reference after the test
+
+
+def _expected_kept_episodes(view: Any, payload: Any, rows_after: int) -> frozenset[str]:
+    """Episodes of the first ``rows_after`` rendered rows, found by TEXT (independent of any order)."""
+
+    text = payload.validated_copy().rendered_text
+    heading, stop = "WorkingMemory evidence:\n", "Current Motivations:\n"
+    rows = text.split(heading, 1)[1].split(stop, 1)[0].splitlines()
+    kept = [json.loads(line)["text"] for line in rows[:rows_after]]
+    return frozenset(
+        s.source_id
+        for s in view.selected
+        if s.source_kind.value == "episodic" and s.rendered_content in kept
+    )
+
+
+def test_evidence_limit_cuts_the_model_input_and_not_the_overcounted_double_recall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     settings = _settings(tmp_path, k=3, history_window=1, evidence_top_k=1, evidence_item_max_chars=30)
     provider = MessagesProvider()
-    captured: list[tuple[Any, Any, Any, frozenset[str]]] = []
-    real = Loop._episodes_in_working_memory_prompt
-
-    def spy(view, payload, row_limit=None):  # type: ignore[no-untyped-def]
-        result = real(view, payload, row_limit)
-        captured.append((view, payload, row_limit, result))
-        return result
-
-    Loop._episodes_in_working_memory_prompt = staticmethod(spy)  # type: ignore[method-assign]
-    try:
-        with _client(tmp_path, settings=settings, provider=provider) as client:
-            calls = spy_trace_writes(client)
-            results = [_chat(client, m) for m in (*TURNS, "and what is the weather?")]
-            debug = client.post(
-                "/api/chat/debug", json={"message": "dbg", "attachments": [], "debug": True}
-            ).json()
-    finally:
-        Loop._episodes_in_working_memory_prompt = staticmethod(real)  # type: ignore[method-assign]
+    spy = _SpyHelper(monkeypatch)
+    with _client(tmp_path, settings=settings, provider=provider) as client:
+        calls = spy_trace_writes(client)
+        results = [_chat(client, m) for m in (*TURNS, "and what is the weather?")]
+        debug = client.post(
+            "/api/chat/debug", json={"message": "dbg", "attachments": [], "debug": True}
+        ).json()
     # The model input holds one evidence row, cut to 30 characters (ellipsis counted).
     blocks = [m["content"] for call in provider.message_calls for m in call if RUNTIME_DATA_HEADING in m["content"]]
     assert all(_wm_rows(b) <= 1 for b in blocks)
     assert any(_wm_rows(b) == 1 for b in blocks)
-    # (view, payload, limit, result) of the last real chat turn that had rows to drop.
-    dropped = [c for c in captured if c[2] is not None and c[2][0] > c[2][1]]
+    dropped = [c for c in spy.captured if c[2] is not None and c[2][0] > c[2][1]]
     assert dropped
-    view, payload, limit, limited = dropped[-1]
-    full = real(view, payload, None)
-    assert limited < full  # rows the limit dropped are not counted as shown
-    assert len(limited) <= limit[1]
-    # The same rows are what the legacy counting would have added (the overcount being fixed).
-    assert full - limited
-    # Debug carries the numbers only (no text).
+    for view, payload, limit, limited in dropped:
+        full = spy.real(view, payload, None)
+        # Exactly the rows the limit kept still count as shown; the dropped rows' episodes do not.
+        assert limited == _expected_kept_episodes(view, payload, limit[1])
+        assert limited < full
+        assert full - limited  # what the legacy counting would have over-counted
     numbers = debug["evidence_limit"]
     assert numbers["skipped"] is None and numbers["rows_after"] <= 1
     assert set(numbers) == {
@@ -429,15 +451,99 @@ def test_evidence_limit_cuts_the_model_input_and_not_the_overcounted_double_reca
     }
     last_double = _reinforces(normalized_writes(calls, _labels(results)))[-1]["double"]
     assert all(isinstance(item, str) for item in last_double)
+    spy.release()
 
 
-def test_row_limit_helper_fails_closed_on_a_row_count_mismatch() -> None:
+def test_evidence_limit_skipped_applies_no_overcount_fix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, k=3, history_window=1, evidence_top_k=None, evidence_item_max_chars=None)
+    provider = MessagesProvider()
+    spy = _SpyHelper(monkeypatch)
+    with _client(tmp_path, settings=settings, provider=provider) as client:
+        for message in (*TURNS, "and what is the weather?"):
+            _chat(client, message)
+        debug = client.post(
+            "/api/chat/debug", json={"message": "dbg", "attachments": [], "debug": True}
+        ).json()
+    assert debug["evidence_limit"]["skipped"] == "limits_off"
+    assert debug["evidence_limit"]["rows_after"] == debug["evidence_limit"]["rows_before"]
+    assert spy.captured and all(c[2] is None for c in spy.captured)  # no row limit -> old counting
+    assert any(_wm_rows(m["content"]) >= 2 for call in provider.message_calls for m in call)  # not cut
+    spy.release()
+
+
+def test_row_limit_helper_fails_closed_when_rows_do_not_match_the_rendering(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import suzka.runtime.main_loop as main_loop_module
+    from suzka.attention.common import canonical_json
     from suzka.runtime.main_loop import SuzkaMainLoop as Loop
+    from suzka.working_memory_contracts import WorkingMemorySourceKind, working_memory_item_id
+    from suzka.attention.contracts import AttentionTarget, AttentionTargetKind
 
-    view = SimpleNamespace(selected=())
-    payload = SimpleNamespace(included_candidate_ids=())
-    # No Working Memory rows at all but the limit claims 2: nothing can count, nothing breaks.
-    assert Loop._episodes_in_working_memory_prompt(view, payload, (2, 1)) == frozenset()  # type: ignore[arg-type]
+    cid = AttentionTarget(
+        AttentionTargetKind.WORKING_MEMORY,
+        working_memory_item_id(WorkingMemorySourceKind.EPISODIC, "ep-1"),
+    ).candidate_id
+    selection = SimpleNamespace(
+        source_kind=WorkingMemorySourceKind.EPISODIC, source_id="ep-1", rendered_content="real text"
+    )
+    view = SimpleNamespace(selected=(selection,))
+
+    def payload(text: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            included_candidate_ids=(cid,), validated_copy=lambda: SimpleNamespace(rendered_text=text)
+        )
+
+    row = canonical_json({"source_kind": "episodic", "text": "real text"}).decode("ascii")
+    monkeypatch.setattr(main_loop_module, "_ROW_MISMATCH_LOGGED", set())
+    # Aligned: the row is the first of 1 and the limit keeps 1 -> it counts.
+    ok = Loop._episodes_in_working_memory_prompt(view, payload(f"x\n{row}\ny\n"), (1, 1))  # type: ignore[arg-type]
+    assert ok == frozenset({"ep-1"})
+    # The limit keeps 0 rows: the episode no longer counts.
+    cut = Loop._episodes_in_working_memory_prompt(view, payload(f"x\n{row}\ny\n"), (1, 0))  # type: ignore[arg-type]
+    assert cut == frozenset()
+    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+        # The rendered rows differ from the selections (order/text assumption broken): nothing counts.
+        for _ in range(3):
+            bad = Loop._episodes_in_working_memory_prompt(view, payload("x\nother row\ny\n"), (1, 1))  # type: ignore[arg-type]
+            assert bad == frozenset()
+        # Row count differs from the limit's: also fails closed.
+        assert Loop._episodes_in_working_memory_prompt(view, payload(f"{row}\n"), (2, 1)) == frozenset()  # type: ignore[arg-type]
+    warnings = [r for r in caplog.records if "do not match the Attention rows" in r.getMessage()]
+    assert len(warnings) == 1  # warn once
+
+
+def test_history_turns_with_a_blank_side_are_left_out_and_ids_stay_aligned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace as dc_replace
+
+    provider = MessagesProvider()
+    with _client(tmp_path, settings=_settings(tmp_path), provider=provider) as client:
+        loop = client.app.state.main_loop
+        calls = spy_trace_writes(client)
+        results = [_chat(client, m) for m in TURNS[:2]]
+        blank_id = results[0]["episode_id"]
+        real_read = loop._read_trace_episode
+
+        def read(episode_id):  # type: ignore[no-untyped-def]
+            status, record = real_read(episode_id)
+            if episode_id == blank_id and record is not None:
+                try:
+                    record = record.model_copy(update={"response": "  "})
+                except AttributeError:
+                    record = dc_replace(record, response="  ")
+            return status, record
+
+        monkeypatch.setattr(loop, "_read_trace_episode", read)
+        results.append(_chat(client, TURNS[2]))
+    last = provider.message_calls[-1]
+    assert [m["role"] for m in last] == ["system", "user", "assistant", "user"]  # E0 left out
+    assert last[1]["content"].endswith("User message:\n" + TURNS[1])
+    third = _reinforces(normalized_writes(calls, _labels(results)))[2]
+    assert third["shown"] == ["<E1>"]  # ids align with what was actually sent
 
 
 # --------------------------------------------------------------------- (h) debug and the API
@@ -469,17 +575,26 @@ def test_debug_turn_has_optional_fields_only_in_a_chat_mode_and_stays_read_only(
     assert {i["display"] for i in items.values()} <= {"history", "in_working_memory", "hidden_by_budget"}
 
 
-def test_legacy_debug_turn_leaves_the_optional_fields_empty(tmp_path: Path) -> None:
+def test_legacy_debug_response_has_exactly_the_old_key_set(tmp_path: Path) -> None:
     with _client(tmp_path, settings=_settings(tmp_path, "legacy"), provider=RoleProvider()) as client:
         _chat(client, "hello")
         data = client.post(
             "/api/chat/debug", json={"message": "dbg", "attachments": [], "debug": True}
         ).json()
-    assert data["composed_messages"] is None
-    assert data["composition_report"] is None
-    assert data["evidence_limit"] is None
-    legacy = json.loads(GOLDEN.read_text())["attn_roles"]["debug_keys"]
-    assert sorted(k for k in data if k not in {"composed_messages", "composition_report", "evidence_limit"}) == legacy
+    # Byte-compat: the three optional keys are omitted, legitimately-null keys (loss) stay.
+    assert sorted(data) == json.loads(GOLDEN.read_text())["attn_roles"]["debug_keys"]
+    assert not {"composed_messages", "composition_report", "evidence_limit"} & set(data)
+    assert "loss" in data
+
+
+def test_chat_mode_debug_response_has_the_three_optional_keys(tmp_path: Path) -> None:
+    with _client(tmp_path, settings=_settings(tmp_path), provider=MessagesProvider()) as client:
+        _chat(client, "hello")
+        data = client.post(
+            "/api/chat/debug", json={"message": "dbg", "attachments": [], "debug": True}
+        ).json()
+    legacy = set(json.loads(GOLDEN.read_text())["attn_roles"]["debug_keys"])
+    assert set(data) == legacy | {"composed_messages", "composition_report", "evidence_limit"}
 
 
 def test_private_interpretation_and_r15_lines_lead_the_system_message_in_legacy_order(
@@ -502,3 +617,180 @@ def test_private_interpretation_and_r15_lines_lead_the_system_message_in_legacy_
             provider.chat_calls[0][0] if mode == "legacy" else provider.message_calls[0][0]["content"]
         )
     assert systems["legacy"] == systems["chat_roles"] == prefix + R15_LINE + HEADER
+
+
+# ------------------------------------------------- never fail the request on a composition error
+
+
+def test_a_forced_composition_error_falls_back_to_the_legacy_bytes_with_one_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reference = MessagesProvider()
+    ref_results = _legacy_reference(tmp_path, reference)
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("forced composition failure")
+
+    monkeypatch.setattr(SuzkaMainLoop, "_compose_chat_messages", boom)
+    provider = MessagesProvider()
+    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+        results = _run(tmp_path / "x", _settings(tmp_path / "x"), provider)
+    assert provider.message_calls == []  # the model was called once per turn, via the legacy path
+    assert len(provider.chat_calls) == 3
+    assert _norm_calls(provider.chat_calls, results) == _norm_calls(reference.chat_calls, ref_results)
+    [message] = _fallbacks(caplog)
+    assert "composition_error" in message
+
+
+def test_the_model_call_itself_is_not_wrapped_or_repeated(tmp_path: Path) -> None:
+    class Failing(MessagesProvider):
+        def generate_messages(self, messages):  # type: ignore[no-untyped-def]
+            self.message_calls.append(list(messages))
+            raise ValueError("provider failure")
+
+    provider = Failing()
+    with _client(tmp_path, settings=_settings(tmp_path), provider=provider) as client:
+        with pytest.raises(ValueError):
+            client.post("/api/chat", json={"message": "hi", "attachments": []})
+    assert len(provider.message_calls) == 1 and provider.chat_calls == []
+
+
+def test_every_settings_bound_composes_without_error() -> None:
+    from pydantic import ValidationError
+
+    from suzka.attention.common import canonical_json
+    from suzka.attention.policy import (
+        ATTENTION_PROMPT_AUTHORITY_INTRO,
+        ATTENTION_PROMPT_SECTION_HEADERS,
+    )
+    from suzka.persona.chat_composition import (
+        CompositionCaps,
+        HistoryExchange,
+        compose_with_report,
+        composition_input_from_sections,
+    )
+    from suzka.persona.evidence_limit import limit_sections
+    from suzka.persona.prompt_builder import PromptSection, PromptSections
+
+    rows = [
+        canonical_json({"source_kind": "episodic", "text": "x" * n}).decode("ascii")
+        for n in (5, 300, 5000)
+    ] * 20
+    attention = ATTENTION_PROMPT_AUTHORITY_INTRO + "".join(
+        heading + ("".join(r + "\n" for r in rows) if index == 0 else "")
+        for index, (_kind, heading) in enumerate(ATTENTION_PROMPT_SECTION_HEADERS)
+    )
+    sections = PromptSections(
+        HEADER,
+        (PromptSection("attention", attention, "stored"), PromptSection("emotion", "Emotion:\n- v", "code")),
+        "hi",
+    )
+    history = tuple(HistoryExchange(f"u{i}" * 50, f"a{i}" * 50) for i in range(70))
+    count = 0
+    for window in (0, 1, 64):
+        for hist_bytes in (0, 1, 16_777_216):
+            for state_bytes in (0, 1, 16_777_216):
+                for top_k in (None, 1, 50):
+                    for chars in (None, 20, 2000):
+                        settings = PromptCompositionSettings(
+                            mode="chat_roles_split", history_window=window,
+                            max_history_bytes=hist_bytes, max_state_block_bytes=state_bytes,
+                            evidence_top_k=top_k, evidence_item_max_chars=chars,
+                        )
+                        limited, _numbers = limit_sections(
+                            sections, settings.evidence_top_k, settings.evidence_item_max_chars
+                        )
+                        inp = composition_input_from_sections(limited, history[-window:] if window else (), "hi")
+                        compose_with_report(
+                            settings.mode, inp,
+                            CompositionCaps(
+                                max_exchanges=settings.history_window,
+                                max_history_bytes=settings.max_history_bytes,
+                                max_state_block_bytes=settings.max_state_block_bytes,
+                            ),
+                        )
+                        count += 1
+    assert count == 3 * 3 * 3 * 3 * 3
+    # One step beyond each bound is refused by the settings schema (so it never reaches the caps).
+    for bad in (
+        {"history_window": 65}, {"history_window": -1}, {"max_history_bytes": 16_777_217},
+        {"max_state_block_bytes": 16_777_217}, {"evidence_top_k": 0}, {"evidence_top_k": 51},
+        {"evidence_item_max_chars": 19}, {"evidence_item_max_chars": 2001},
+    ):
+        with pytest.raises(ValidationError):
+            PromptCompositionSettings(**bad)
+
+
+# ------------------------------------------------ end-to-end fallbacks: builder / Attention / blank
+
+
+def _direct_chat(settings, provider, builder=None, message="hello"):  # type: ignore[no-untyped-def]
+    from test_main_loop import _materialize
+
+    from suzka.memory import DualMemorySystem
+
+    kwargs = {} if builder is None else {"prompt_builder": builder}
+    loop = SuzkaMainLoop(settings, provider, DualMemorySystem(settings), **kwargs)
+    return _materialize(loop.chat(message))
+
+
+def _direct_settings(tmp_path: Path, mode: str):  # type: ignore[no-untyped-def]
+    from test_main_loop import _settings_for_tmp_memory
+
+    base = _settings_for_tmp_memory(tmp_path)
+    return base.model_copy(
+        update={
+            "conversation_trace": base.conversation_trace.model_copy(update={"enabled": True}),
+            "prompt_composition": PromptCompositionSettings(mode=mode),
+        }
+    )
+
+
+def test_no_event_means_no_attention_and_the_legacy_bytes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    ref, provider = MessagesProvider(), MessagesProvider()
+    _direct_chat(_direct_settings(tmp_path / "r", "legacy"), ref)
+    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+        _direct_chat(_direct_settings(tmp_path / "x", "chat_roles"), provider)
+    assert provider.message_calls == []
+    assert [[normalize(s), normalize(u)] for s, u in provider.chat_calls] == [
+        [normalize(s), normalize(u)] for s, u in ref.chat_calls
+    ]
+    [message] = _fallbacks(caplog)
+    assert "no_attention_payload" in message
+
+
+def test_an_injected_builder_keeps_the_legacy_prompt(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from suzka.persona import PromptBuilder
+
+    class Injected:
+        def build(self, user_input, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return f"{PROMPT_HEADER[0]}\n{RUNTIME_DATA_HEADING}\ndata\n\nUser: {user_input}\nAssistant:"
+
+    assert type(Injected()) is not PromptBuilder
+    ref, provider = MessagesProvider(), MessagesProvider()
+    _direct_chat(_direct_settings(tmp_path / "r", "legacy"), ref, Injected())
+    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+        _direct_chat(_direct_settings(tmp_path / "x", "chat_roles"), provider, Injected())
+    assert provider.message_calls == []
+    assert provider.chat_calls == ref.chat_calls and len(provider.chat_calls) == 1
+    [message] = _fallbacks(caplog)
+    assert "custom_prompt_builder" in message
+
+
+def test_blank_user_text_falls_back_to_the_legacy_bytes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    ref = MessagesProvider()
+    ref_results = _legacy_reference(tmp_path, ref, messages=("hello there", "   "))
+    provider = MessagesProvider()
+    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+        results = _run(tmp_path / "x", _settings(tmp_path / "x"), provider, ("hello there", "   "))
+    # Turn 1 (no history yet) uses the chat path; the blank turn 2 takes the legacy path.
+    assert len(provider.message_calls) == 1 and len(provider.chat_calls) == 1
+    assert _norm_calls(provider.chat_calls, results[1:]) == _norm_calls(ref.chat_calls[1:], ref_results[1:])
+    [message] = _fallbacks(caplog)
+    assert "blank_user_input" in message

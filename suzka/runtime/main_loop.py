@@ -35,6 +35,7 @@ from suzka.cognition import (
     SurprisalCalculator,
     model_key,
 )
+from suzka.attention.common import canonical_json
 from suzka.config import Settings
 from suzka.config.schema import PromptCompositionSettings
 from suzka.identity import (
@@ -201,6 +202,7 @@ class ChatResult:
 
 
 LOGGER = logging.getLogger(__name__)
+_ROW_MISMATCH_LOGGED: set[str] = set()  # warn-once marker (static method has no instance)
 
 @dataclass(frozen=True)
 class ConversationTraceItemDiagnostic:
@@ -209,7 +211,7 @@ class ConversationTraceItemDiagnostic:
     episode_id: str
     retention: float
     stability_hours: float
-    display: str  # shown | faint | hidden_by_budget | in_working_memory | unreadable | hidden
+    display: str  # shown | faint | hidden_by_budget | in_working_memory | unreadable | hidden | history
     double_recall: bool
     read_status: str  # resolved | archived | missing | unavailable | malformed
 
@@ -1515,19 +1517,27 @@ class SuzkaMainLoop:
         composition_report: CompositionReport | None = None
         evidence_numbers: dict[str, int | str | None] | None = None
         if composition is not None and sections is not None and trace_view is not None:
-            (
-                composed_messages,
-                composition_report,
-                evidence_numbers,
-                trace_view,
-            ) = self._compose_chat_messages(
-                composition,
-                sections,
-                trace_view,
-                user_input,
-                system_prefix=private_prefix + r15_prefix,
-                memory_context=memory_context,
-            )
+            # Only the pre-model composition may fall back; the model call is never retried.
+            try:
+                (
+                    composed_messages,
+                    composition_report,
+                    evidence_numbers,
+                    trace_view,
+                ) = self._compose_chat_messages(
+                    composition,
+                    sections,
+                    trace_view,
+                    user_input,
+                    system_prefix=private_prefix + r15_prefix,
+                    memory_context=memory_context,
+                )
+            except (ValueError, TypeError):
+                self._warn_composition_fallback(composition.mode, "composition_error")
+                composed_messages = None
+                composition_report = None
+                evidence_numbers = None
+        if composed_messages is not None:
             raw_response = self.agent.generate_messages(
                 [{"role": m.role, "content": m.content} for m in composed_messages]
             )
@@ -2143,7 +2153,11 @@ class SuzkaMainLoop:
         supports = getattr(self.agent, "supports_messages", None)
         trace = self.conversation_trace
         reason: str | None = None
-        if not callable(supports) or not supports():
+        try:
+            can_send = callable(supports) and bool(supports())
+        except (ValueError, TypeError):
+            can_send = False
+        if not can_send:
             reason = "provider_without_messages_or_chat_template"
         elif type(self.prompt_builder) is not PromptBuilder:
             reason = "custom_prompt_builder"
@@ -2159,15 +2173,18 @@ class SuzkaMainLoop:
             reason = "blank_user_input"
         if reason is None:
             return composition
+        self._warn_composition_fallback(composition.mode, reason)
+        return None
+
+    def _warn_composition_fallback(self, mode: str, reason: str) -> None:
         if reason not in self._composition_fallbacks_logged:
             self._composition_fallbacks_logged.add(reason)
             LOGGER.warning(
                 "prompt_composition.mode=%s falls back to the legacy prompt (%s); "
                 "logged once per reason",
-                composition.mode,
+                mode,
                 reason,
             )
-        return None
 
     @staticmethod
     def _evidence_row_limit(
@@ -2182,11 +2199,14 @@ class SuzkaMainLoop:
 
         if composition is None or attention_payload is None:
             return None
-        _text, numbers = limit_attention_text(
-            attention_payload.validated_copy().rendered_text,
-            composition.evidence_top_k,
-            composition.evidence_item_max_chars,
-        )
+        try:
+            _text, numbers = limit_attention_text(
+                attention_payload.validated_copy().rendered_text,
+                composition.evidence_top_k,
+                composition.evidence_item_max_chars,
+            )
+        except (ValueError, TypeError):
+            return None  # the composition step hits the same error and falls back
         before, after = numbers["rows_before"], numbers["rows_after"]
         if numbers["skipped"] is not None or type(before) is not int or type(after) is not int:
             return None
@@ -2315,26 +2335,49 @@ class SuzkaMainLoop:
         included = set(payload.included_candidate_ids)
         if row_limit is not None:
             rows_before, rows_after = row_limit
-            working_memory_ids = {
+            by_candidate = {
                 AttentionTarget(
                     AttentionTargetKind.WORKING_MEMORY,
                     working_memory_item_id(selection.source_kind, selection.source_id),
-                ).candidate_id
+                ).candidate_id: selection
                 for selection in view.selected
             }
             rows = [
                 candidate_id
                 for candidate_id in payload.included_candidate_ids
-                if candidate_id in working_memory_ids
+                if candidate_id in by_candidate
             ]
-            if len(rows) == rows_before:
+            # The attention renderer writes the Working Memory rows in ``included_candidate_ids``
+            # order. Do not trust that: the rendered row lines must equal the rows rebuilt from
+            # the selections in this order, as one contiguous run, else fail closed.
+            expected = [
+                canonical_json(
+                    {
+                        "source_kind": by_candidate[c].source_kind.value,
+                        "text": by_candidate[c].rendered_content,
+                    }
+                ).decode("ascii")
+                for c in rows
+            ]
+            lines = payload.validated_copy().rendered_text.split("\n")
+            aligned = len(rows) == rows_before and (
+                not expected
+                or any(
+                    lines[i : i + len(expected)] == expected
+                    for i in range(len(lines) - len(expected) + 1)
+                )
+            )
+            if aligned:
                 included -= set(rows[rows_after:])
             else:
-                LOGGER.warning(
-                    "evidence limit row count (%d) differs from Attention rows (%d)",
-                    rows_before,
-                    len(rows),
-                )
+                if "evidence_row_mismatch" not in _ROW_MISMATCH_LOGGED:
+                    _ROW_MISMATCH_LOGGED.add("evidence_row_mismatch")
+                    LOGGER.warning(
+                        "evidence limit rows (%d) do not match the Attention rows (%d); "
+                        "no Working Memory row counts as shown (logged once)",
+                        rows_before,
+                        len(rows),
+                    )
                 included -= set(rows)
         return frozenset(
             selection.source_id
