@@ -39,6 +39,9 @@ _HEADING_LINES: Final[tuple[str, ...]] = tuple(
 )
 
 SKIP_LIMITS_OFF: Final[str] = "limits_off"
+SKIP_INTRO: Final[str] = "attention_intro"
+SKIP_TEXT_END: Final[str] = "attention_text_end"
+SKIP_HEADING_ORDER: Final[str] = "attention_heading_order"
 SKIP_HEADING: Final[str] = "wm_evidence_heading"
 SKIP_NOT_JSON: Final[str] = "wm_evidence_row_not_json"
 SKIP_SHAPE: Final[str] = "wm_evidence_row_shape"
@@ -46,6 +49,14 @@ SKIP_NOT_CANONICAL: Final[str] = "wm_evidence_row_not_canonical"
 SKIP_NO_ATTENTION: Final[str] = "attention_section_missing"
 SKIP_AMBIGUOUS: Final[str] = "attention_section_ambiguous"
 SKIP_LEGACY: Final[str] = "legacy_evidence_section"
+
+# Closed vocabulary of every skip label (``numbers["skipped"]`` is None or one of these).
+SKIP_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        SKIP_LIMITS_OFF, SKIP_INTRO, SKIP_TEXT_END, SKIP_HEADING_ORDER, SKIP_HEADING, SKIP_NOT_JSON,
+        SKIP_SHAPE, SKIP_NOT_CANONICAL, SKIP_NO_ATTENTION, SKIP_AMBIGUOUS, SKIP_LEGACY,
+    }
+)
 
 Numbers = dict[str, int | str | None]
 
@@ -67,17 +78,21 @@ def _numbers(text: str, *, skipped: str | None, rows: int | None = None) -> Numb
 def _split(text: str) -> tuple[list[str], list[str], list[str]] | str:
     """(the WM heading line, the WM row lines, the lines from the next heading on) or a skip reason."""
 
-    if not text.startswith(ATTENTION_PROMPT_AUTHORITY_INTRO) or not text.endswith("\n"):
-        return SKIP_HEADING
+    if not text.startswith(ATTENTION_PROMPT_AUTHORITY_INTRO):
+        return SKIP_INTRO
+    if not text.endswith("\n"):
+        return SKIP_TEXT_END
     lines = text[len(ATTENTION_PROMPT_AUTHORITY_INTRO):-1].split("\n")
     positions: list[int] = []
-    for heading in _HEADING_LINES:
+    for number, heading in enumerate(_HEADING_LINES):
         found = [index for index, line in enumerate(lines) if line == heading]
         if len(found) != 1:
-            return SKIP_HEADING
+            return SKIP_HEADING if number == 0 else SKIP_HEADING_ORDER
         positions.append(found[0])
-    if positions[0] != 0 or positions != sorted(positions):
+    if positions[0] != 0:
         return SKIP_HEADING
+    if positions != sorted(positions):
+        return SKIP_HEADING_ORDER
     return lines[:1], lines[1:positions[1]], lines[positions[1]:]
 
 
@@ -86,7 +101,7 @@ def _parse_rows(row_lines: list[str]) -> tuple[list[dict[str, str]], str | None]
     for line in row_lines:
         try:
             row = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):  # deeply nested JSON must fail closed, not escape
             return [], SKIP_NOT_JSON
         if (
             type(row) is not dict or set(row) != _WM_ROW_KEYS
@@ -107,7 +122,14 @@ def limit_attention_text(text: str, top_k: int | None, item_max_chars: int | Non
     """(the rendered Attention text with the WM evidence rows limited, numbers).
 
     ``ValueError`` only for an out-of-range limit; odd text is a skip (unchanged text + a reason label).
-    ``numbers`` holds counts and a skip label, never text.
+    ``numbers`` holds counts and a skip label (one of ``SKIP_REASONS``), never text.
+
+    Label priority: limit validation first, then ``limits_off`` (both limits None; no parsing at all), then
+    the structural labels in text order (intro, trailing newline, headings, rows).
+
+    The limit is on DECODED characters, not an input-size guarantee: output rows are canonical ASCII JSON, so
+    the ``…`` marker is written as the 6-byte escape ``\\u2026``.  A row of ``item_max_chars + 1`` ASCII
+    characters therefore gets 4 bytes LONGER, and ``chars_after`` can exceed ``chars_before``.
     """
 
     _check_bound("top_k", top_k, EVIDENCE_TOP_K_RANGE)
@@ -148,6 +170,8 @@ def limit_sections(
 
     _check_bound("top_k", top_k, EVIDENCE_TOP_K_RANGE)
     _check_bound("item_max_chars", item_max_chars, EVIDENCE_ITEM_CHARS_RANGE)
+    if top_k is None and item_max_chars is None:
+        return sections, _numbers("", skipped=SKIP_LIMITS_OFF)  # same priority as limit_attention_text
     names = [section.name for section in sections.sections]
     attention = [index for index, name in enumerate(names) if name == ATTENTION_SECTION_NAME]
     if len(attention) != 1:

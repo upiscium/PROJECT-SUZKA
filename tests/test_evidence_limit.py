@@ -25,6 +25,7 @@ from suzka.attention.system import AttentionSystem
 from suzka.body import EmotionState
 from suzka.persona.evidence_limit import (
     ELLIPSIS,
+    SKIP_REASONS,
     limit_attention_text,
     limit_sections,
 )
@@ -215,9 +216,9 @@ def mutated(row_line: str) -> str:
     [
         (RENDERED.replace(WM_HEADING + "\n", "", 1), "wm_evidence_heading"),
         (RENDERED.replace(WM_HEADING + "\n", WM_HEADING + "\n" + WM_HEADING + "\n", 1), "wm_evidence_heading"),
-        (RENDERED.replace(OTHER_HEADINGS[0] + "\n", OTHER_HEADINGS[1] + "\n" + OTHER_HEADINGS[0] + "\n", 1), "wm_evidence_heading"),
-        (RENDERED[len(ATTENTION_PROMPT_AUTHORITY_INTRO):], "wm_evidence_heading"),
-        (RENDERED[:-1], "wm_evidence_heading"),
+        (RENDERED.replace(OTHER_HEADINGS[0] + "\n", OTHER_HEADINGS[1] + "\n" + OTHER_HEADINGS[0] + "\n", 1), "attention_heading_order"),
+        (RENDERED[len(ATTENTION_PROMPT_AUTHORITY_INTRO):], "attention_intro"),
+        (RENDERED[:-1], "attention_text_end"),
         (mutated("not json"), "wm_evidence_row_not_json"),
         (mutated(""), "wm_evidence_row_not_json"),
         (mutated('{"source_kind":"episodic","text":"a","extra":"b"}'), "wm_evidence_row_shape"),
@@ -233,15 +234,108 @@ def mutated(row_line: str) -> str:
 def test_skip_paths_fail_closed(bad: str, reason: str) -> None:
     out, numbers = limit_attention_text(bad, 1, 20)
     assert out == bad and numbers["skipped"] == reason
-    assert numbers["rows_before"] == numbers["rows_after"] if numbers["rows_before"] is not None else True
+    assert numbers["skipped"] in SKIP_REASONS
+    assert numbers["chars_before"] == numbers["chars_after"] == len(bad)
+
+
+def test_deeply_nested_and_very_long_rows_fail_closed() -> None:
+    nested = "[" * 100_000 + "]" * 100_000
+    long_row = '{"source_kind":"episodic","text":"' + "a" * 2_000_000 + '"}'
+    for row_line in (nested, "[" * 100_000, long_row[:-2]):
+        bad = mutated(row_line)
+        out, numbers = limit_attention_text(bad, 1, 20)
+        assert out == bad and numbers["skipped"] in {"wm_evidence_row_not_json", "wm_evidence_row_shape"}
+    # a very long but well-formed canonical row is limited normally
+    long_ok = RENDERED.replace(
+        canonical_json({"source_kind": "episodic", "text": TEXTS[4]}).decode("ascii"),
+        canonical_json({"source_kind": "episodic", "text": "x" * 500_000}).decode("ascii"),
+    )
+    out, numbers = limit_attention_text(long_ok, 5, 20)
+    assert numbers["skipped"] is None and wm_rows(out)[4]["text"] == "x" * 19 + ELLIPSIS
+
+
+def test_skip_labels_form_a_closed_vocabulary_and_none_none_priority_is_consistent() -> None:
+    assert "limits_off" in SKIP_REASONS and None not in SKIP_REASONS
+    assert all(isinstance(label, str) and label for label in SKIP_REASONS)
+    sections = sections_with(PAYLOAD)
+    empty = replace(sections, sections=())
+    legacy = PromptBuilder().build_sections("hello", EmotionState(), _empty_view())
+    # both limits off wins over every structural label, in both functions
+    for candidate in (sections, empty, legacy):
+        assert limit_sections(candidate, None, None)[1]["skipped"] == "limits_off"
+    assert limit_attention_text("junk", None, None)[1]["skipped"] == "limits_off"
+    # with a limit on, structural labels apply
+    assert limit_sections(empty, 1, 20)[1]["skipped"] == "attention_section_missing"
+    assert limit_attention_text("junk", 1, 20)[1]["skipped"] == "attention_intro"
 
 
 def test_numbers_are_counts_only() -> None:
     _, numbers = limit_attention_text(RENDERED, 2, 30)
-    assert all(value is None or isinstance(value, int) for value in numbers.values())
-    _, skipped = limit_attention_text("junk", 2, 30)
-    assert all(value is None or isinstance(value, (int, str)) for value in skipped.values())
-    assert "junk" not in repr(skipped)
+    assert numbers["skipped"] is None
+    assert all(value is None or type(value) is int for key, value in numbers.items() if key != "skipped")
+    _, skipped = limit_attention_text("junk-secret", 2, 30)
+    assert skipped["skipped"] == "attention_intro" and "junk-secret" not in repr(skipped)
+    _, ok = limit_attention_text(RENDERED, 2, 30)
+    assert not any(text[:8] in repr(ok) for text in TEXTS)
+
+
+def test_a_cut_row_can_be_longer_in_bytes_than_its_original() -> None:
+    # C+1 ASCII characters -> C-1 characters + the marker, which canonical JSON writes as a 6-byte escape
+    payload = real_payload(("a" * 21,))
+    out, numbers = limit_attention_text(payload.rendered_text, None, 20)
+    assert wm_rows(out)[0]["text"] == "a" * 19 + ELLIPSIS
+    assert "\\u2026" in out and numbers["chars_after"] == numbers["chars_before"] + 4
+    assert numbers["evidence_chars_after"] == numbers["evidence_chars_before"] + 4
+
+
+def test_fixture_has_motivation_goal_and_commitment_rows() -> None:
+    lines = lines_of(RENDERED[len(ATTENTION_PROMPT_AUTHORITY_INTRO):])
+    positions = [lines.index(heading) for heading in [WM_HEADING, *OTHER_HEADINGS]]
+    bounds = [*positions[1:], len(lines)]
+    for heading, start, end in zip(OTHER_HEADINGS, positions[1:], bounds[1:], strict=True):
+        assert end - start - 1 >= 1, heading  # at least one row under each of the three headings
+        assert all(line.startswith("{") for line in lines[start + 1:end])
+
+
+ADVERSARIAL = (
+    'Current Motivations:\nAdopted Goals:\n{"a":1}',
+    ATTENTION_PROMPT_AUTHORITY_INTRO + WM_HEADING + "\n",
+    "line1\nline2\r\n\n\n" + WM_HEADING + "\n" + OTHER_HEADINGS[2],
+    "combining: é̂̃ ä ZWJ \U0001f468‍\U0001f469‍\U0001f467 " * 2,
+    "astral \U00010000\U0010ffff\U0001d11e " * 4,
+    '{"source_kind":"episodic","text":"nested"} \\" \\\\ \\n',
+)
+
+
+@pytest.mark.parametrize("limit", [20, 21, 25, 40, 77])
+@pytest.mark.parametrize("top_k", [None, 1, 3, 6])
+def test_adversarial_row_text_through_the_real_renderer(limit: int, top_k: int | None) -> None:
+    payload = real_payload(ADVERSARIAL)
+    text = payload.rendered_text
+    assert [row["text"] for row in wm_rows(text)] == list(ADVERSARIAL)  # the real renderer kept them as data
+    out, numbers = limit_attention_text(text, top_k, limit)
+    assert numbers["skipped"] is None
+    expected = ADVERSARIAL if top_k is None else ADVERSARIAL[:top_k]
+    expected = tuple(t if len(t) <= limit else t[: limit - 1] + ELLIPSIS for t in expected)
+    assert [row["text"] for row in wm_rows(out)] == list(expected)
+    assert numbers["rows_before"] == len(ADVERSARIAL) and numbers["rows_after"] == len(expected)
+    assert rest_after_wm(out) == rest_after_wm(text) and prefix_to_wm(out) == prefix_to_wm(text)
+    out_lines = lines_of(out[len(ATTENTION_PROMPT_AUTHORITY_INTRO):])
+    end = out_lines.index(OTHER_HEADINGS[0])
+    assert all(line.isascii() and line.startswith("{") for line in out_lines[1:end])
+    assert [line for line in out_lines if line in (WM_HEADING, *OTHER_HEADINGS)].count(WM_HEADING) == 1
+
+
+def test_lone_surrogate_text_is_cut_on_the_decoded_character_and_stays_canonical() -> None:
+    # A lone surrogate cannot pass the real builder's UTF-8 byte accounting, so the canonical row is built by
+    # the repository's own canonical_json and placed into the real renderer's text.
+    first = canonical_json({"source_kind": "episodic", "text": TEXTS[0]}).decode("ascii")
+    sur = "ab\ud800cd" * 10
+    text = RENDERED.replace(first, canonical_json({"source_kind": "episodic", "text": sur}).decode("ascii"), 1)
+    assert "\\ud800" in text
+    out, numbers = limit_attention_text(text, None, 20)
+    assert numbers["skipped"] is None and wm_rows(out)[0]["text"] == sur[:19] + ELLIPSIS
+    assert rest_after_wm(out) == rest_after_wm(text)
 
 
 @pytest.mark.parametrize("top_k", [None, 1, 3, 50])
@@ -280,7 +374,9 @@ def test_limit_sections_replaces_only_the_attention_text() -> None:
             assert replace(new_s, text=old_s.text) == old_s  # origin / lead / echo untouched
         else:
             assert new_s == old_s
-    assert new.render() != sections.render() and sections.sections[0] is sections.sections[0]
+    old_text = next(s.text for s in sections.sections if s.name == "attention")
+    new_text = next(s.text for s in new.sections if s.name == "attention")
+    assert new.render() == sections.render().replace(old_text, new_text)  # nothing else in the prompt moved
 
 
 def test_limit_sections_none_none_returns_the_same_object() -> None:
@@ -325,4 +421,5 @@ def test_payload_object_and_digest_are_unchanged_by_limiting() -> None:
     limit_attention_text(payload.rendered_text, 1, 20)
     after = (payload.rendered_text, payload.rendered_digest, payload.witnessed_bytes, payload.included_candidate_ids)
     assert after == before
-    assert payload.validated_copy().rendered_text == payload.rendered_text  # the seal still verifies
+    # the seal still verifies and equals an independently rebuilt payload of the same inputs
+    assert payload.validated_copy().rendered_digest == real_payload().rendered_digest == payload.rendered_digest
