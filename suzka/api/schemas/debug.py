@@ -1,6 +1,8 @@
 """Debug API schemas."""
 
-from pydantic import BaseModel
+from typing import Any
+
+from pydantic import BaseModel, SerializerFunctionWrapHandler, model_serializer
 
 from suzka.api.schemas.chat import ChatResponse, EmotionSchema
 from suzka.body import EmotionUpdateReasonCode
@@ -98,6 +100,22 @@ class ChatDiagnosticsSchema(BaseModel):
     emotion_update: EmotionUpdateSchema
 
 
+class ComposedMessageSchema(BaseModel):
+    role: str
+    content: str
+
+
+class CompositionReportSchema(BaseModel):
+    """#500 3b-5: numbers only; present on non-legacy turns."""
+
+    mode: str
+    exchanges_used: int
+    exchanges_dropped: int
+    state_block_bytes: int
+    system_bytes: int
+    sections_dropped: int
+
+
 class DebugChatResponse(ChatResponse):
     hidden_thought: str
     loss: float | None
@@ -106,6 +124,23 @@ class DebugChatResponse(ChatResponse):
     generation_params: GenerationParamsSchema
     diagnostics: ChatDiagnosticsSchema
     conversation_trace: ConversationTraceDiagnosticsSchema
+    # #500 3b-5: optional, only set on a non-legacy prompt_composition turn; `prompt` stays the
+    # legacy joined string.
+    composed_messages: list[ComposedMessageSchema] | None = None
+    composition_report: CompositionReportSchema | None = None
+    evidence_limit: dict[str, int | str | None] | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_composition_fields(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        # Legacy turns must serialise exactly as before: drop ONLY these three keys when None
+        # (other fields such as `loss` are legitimately null and stay).
+        data: dict[str, Any] = handler(self)
+        for name in ("composed_messages", "composition_report", "evidence_limit"):
+            if data.get(name, 0) is None:
+                del data[name]
+        return data
 
 
 class EmotionStateResponse(EmotionSchema):

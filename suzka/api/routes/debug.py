@@ -14,6 +14,8 @@ from suzka.api.routes.chat import (
 )
 from suzka.api.schemas.chat import ChatRequest
 from suzka.api.schemas.debug import (
+    ComposedMessageSchema,
+    CompositionReportSchema,
     ConversationTraceDiagnosticsSchema,
     ConversationTraceItemSchema,
     AppraisalSchema,
@@ -114,6 +116,27 @@ def debug_chat(
                 for item in trace.conversation_trace.items
             ],
         ),
+        composed_messages=(
+            None
+            if trace.composed_messages is None
+            else [
+                ComposedMessageSchema(role=message.role, content=message.content)
+                for message in trace.composed_messages
+            ]
+        ),
+        composition_report=(
+            None
+            if trace.composition_report is None
+            else CompositionReportSchema(
+                mode=trace.composition_report.mode,
+                exchanges_used=trace.composition_report.exchanges_used,
+                exchanges_dropped=trace.composition_report.exchanges_dropped,
+                state_block_bytes=trace.composition_report.state_block_bytes,
+                system_bytes=trace.composition_report.system_bytes,
+                sections_dropped=trace.composition_report.sections_dropped,
+            )
+        ),
+        evidence_limit=trace.evidence_limit,
     )
 
 
