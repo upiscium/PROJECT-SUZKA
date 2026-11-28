@@ -225,6 +225,29 @@ class ConversationTraceSettings(StrictBaseModel):
         return self
 
 
+class PromptCompositionSettings(StrictBaseModel):
+    """#500 slice 3b-1: the shape of the prompt-composition settings.
+
+    Nothing reads this section yet; it only fixes the configuration shape.
+    The default mode is ``legacy`` (today's single-string prompt). This
+    section has no AgentState or migration impact; enabling
+    ``conversation_trace`` is the one-way V10 -> V11 migration and is what a
+    non-legacy mode requires (checked in ``Settings``).
+
+    ``mode`` mirrors ``suzka.persona.chat_composition.CompositionMode`` (the
+    schema must not import persona; a test pins the values). ``evidence_top_k``
+    and ``evidence_item_max_chars`` are independent; ``None`` switches that
+    limit off. ALL DEFAULTS ARE PROVISIONAL: the Human has not fixed them.
+    """
+
+    mode: Literal["legacy", "chat_roles", "chat_roles_split"] = "legacy"
+    history_window: StrictInt = Field(default=6, ge=0, le=64)
+    max_history_bytes: StrictInt = Field(default=32_768, ge=0, le=16_777_216)
+    max_state_block_bytes: StrictInt = Field(default=32_768, ge=0, le=16_777_216)
+    evidence_top_k: StrictInt | None = Field(default=3, ge=1, le=50)
+    evidence_item_max_chars: StrictInt | None = Field(default=200, ge=20, le=2000)
+
+
 class SleepSettings(StrictBaseModel):
     enabled: bool
     dream_dataset_path: Path
@@ -758,6 +781,9 @@ class Settings(StrictBaseModel):
     conversation_trace: ConversationTraceSettings = Field(
         default_factory=ConversationTraceSettings
     )
+    prompt_composition: PromptCompositionSettings = Field(
+        default_factory=PromptCompositionSettings
+    )
     subject_history: SubjectHistorySettings = Field(
         default_factory=SubjectHistorySettings
     )
@@ -769,6 +795,26 @@ class Settings(StrictBaseModel):
     @model_validator(mode="after")
     def validate_approval_binding(self) -> "Settings":
         require_approval_binding(self.api.host, self.r18)
+        return self
+
+    @model_validator(mode="after")
+    def validate_prompt_composition(self) -> "Settings":
+        composition = self.prompt_composition
+        if composition.mode == "legacy":
+            return self
+        trace = self.conversation_trace
+        if not trace.enabled:
+            raise ValueError(
+                f"prompt_composition.mode={composition.mode!r} requires "
+                "conversation_trace.enabled to be true (the history comes from "
+                "the conversation trace); use mode 'legacy' or enable the trace"
+            )
+        if composition.history_window > trace.max_items_per_context:
+            raise ValueError(
+                f"prompt_composition.history_window ({composition.history_window}) "
+                "must not exceed conversation_trace.max_items_per_context "
+                f"({trace.max_items_per_context})"
+            )
         return self
 
 
