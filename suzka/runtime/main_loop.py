@@ -36,6 +36,7 @@ from suzka.cognition import (
     model_key,
 )
 from suzka.config import Settings
+from suzka.config.schema import PromptCompositionSettings
 from suzka.identity import (
     IdentityOrigin,
     OriginActor,
@@ -82,10 +83,20 @@ from suzka.persona import (
     PromptBuilder,
     ResponsePostprocessor,
 )
+from suzka.persona.prompt_builder import PromptSections
 from suzka.persona.attention_prompt import (
     AttentionPromptPayload,
     build_attention_prompt_payload,
 )
+from suzka.persona.chat_composition import (
+    ChatMessage,
+    CompositionCaps,
+    CompositionReport,
+    HistoryExchange,
+    compose_with_report,
+    composition_input_from_sections,
+)
+from suzka.persona.evidence_limit import limit_attention_text, limit_sections
 from suzka.runtime.chat_context import ChatContextSelectors, resolve_chat_context
 from suzka.runtime.agent_runtime import (
     AgentEvent,
@@ -243,6 +254,10 @@ class DebugChatTrace:
     working_memory_view: WorkingMemoryView
     diagnostics: ChatDiagnostics
     conversation_trace: ConversationTraceDiagnostics = ConversationTraceDiagnostics("disabled")
+    # #500 3b-5: only set on a non-legacy turn. ``prompt`` stays the legacy joined string.
+    composed_messages: tuple[ChatMessage, ...] | None = None
+    composition_report: CompositionReport | None = None
+    evidence_limit: dict[str, int | str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -422,6 +437,8 @@ class SuzkaMainLoop:
             enabled=trace_settings.enabled,
         )
         self._trace_defects_logged: set[str] = set()
+        # Reasons for which a non-legacy prompt_composition mode already fell back (warn once).
+        self._composition_fallbacks_logged: set[str] = set()
         self.working_memory = (
             working_memory
             if working_memory is not None
@@ -1393,6 +1410,13 @@ class SuzkaMainLoop:
             if event is not None
             else None
         )
+        # #500 3b-5: decided per turn, before any history read. None = legacy path.
+        composition = self._turn_composition(
+            event,
+            current_context,
+            attention_payload,
+            user_input,
+        )
         trace_view = self._conversation_trace_view(
             event,
             current_context,
@@ -1400,6 +1424,7 @@ class SuzkaMainLoop:
             working_memory_view=working_memory_view,
             attention_payload=attention_payload,
             memory_context=memory_context,
+            wm_row_limit=self._evidence_row_limit(attention_payload, composition),
         )
         if trace_view is not None and not self._builder_shows_trace(attention_payload):
             # The injected builder drops the block: nothing was shown, so only
@@ -1426,21 +1451,42 @@ class SuzkaMainLoop:
                 source_session_id=None,
                 participant_refs=(),
             )
-        prompt = self._build_prompt(
-            user_input,
-            emotion_state,
-            working_memory_view,
-            prompt_context_view,
-            value_view,
-            attention_payload=attention_payload,
-            conversation_trace_text=(
-                trace_view.rendered.text if trace_view is not None else ""
-            ),
-        )
+        sections: PromptSections | None = None
+        if composition is not None and trace_view is not None:
+            # The exact PromptBuilder with an Attention payload (checked in
+            # ``_turn_composition``); ``render()`` is what ``build`` returns.
+            sections = self.prompt_builder.build_sections(
+                user_input,
+                emotion_state,
+                working_memory_view,
+                prompt_context_view,
+                value_view,
+                attention_payload=attention_payload,
+                conversation_trace_text=trace_view.rendered.text,
+            )
+            prompt = sections.render()
+        else:
+            composition = None
+            prompt = self._build_prompt(
+                user_input,
+                emotion_state,
+                working_memory_view,
+                prompt_context_view,
+                value_view,
+                attention_payload=attention_payload,
+                conversation_trace_text=(
+                    trace_view.rendered.text if trace_view is not None else ""
+                ),
+            )
+        # Fixed code text that precedes the built prompt, kept separately so a
+        # non-legacy turn can put it in the system message (order: U6b, R15, header).
+        r15_prefix = ""
+        private_prefix = ""
         if scoped_interaction is not None:
             from suzka.r15.scoped_interaction import neutral_prompt_line
 
-            prompt = neutral_prompt_line(scoped_interaction) + prompt
+            r15_prefix = neutral_prompt_line(scoped_interaction)
+            prompt = r15_prefix + prompt
         # U6b: strictly current, source-qualified *private* interpretation.
         # Only an explicit request about the previous option warrants a
         # response-conditioning hint.  All other Chat/debug paths are unchanged.
@@ -1456,16 +1502,37 @@ class SuzkaMainLoop:
             )
             if proposed.qualified:
                 narrative_view = proposed
-                prompt = self._prepend_private_interpretation(
-                    prompt,
+                private_prefix = self._private_interpretation_prefix(
                     proposed.original_referent,
                     proposed.current_referent,
                     proposed.revision,
                     proposed.later_user_reported,
                     proposed.status_class,
                 )
+                prompt = private_prefix + prompt
 
-        raw_response = self.agent.generate(prompt, user_input=user_input)
+        composed_messages: tuple[ChatMessage, ...] | None = None
+        composition_report: CompositionReport | None = None
+        evidence_numbers: dict[str, int | str | None] | None = None
+        if composition is not None and sections is not None and trace_view is not None:
+            (
+                composed_messages,
+                composition_report,
+                evidence_numbers,
+                trace_view,
+            ) = self._compose_chat_messages(
+                composition,
+                sections,
+                trace_view,
+                user_input,
+                system_prefix=private_prefix + r15_prefix,
+                memory_context=memory_context,
+            )
+            raw_response = self.agent.generate_messages(
+                [{"role": m.role, "content": m.content} for m in composed_messages]
+            )
+        else:
+            raw_response = self.agent.generate(prompt, user_input=user_input)
         if scoped_interaction is not None:
             if (
                 self._r15_state_port is None
@@ -1641,6 +1708,9 @@ class SuzkaMainLoop:
                     if trace_view is not None
                     else self._conversation_trace_state_label(event, current_context)
                 ),
+                composed_messages=composed_messages,
+                composition_report=composition_report,
+                evidence_limit=evidence_numbers,
             )
         return _ComputedChat(
             response=processed_response.visible_response,
@@ -1806,6 +1876,23 @@ class SuzkaMainLoop:
         later_reported: bool,
         status_class: str | None,
     ) -> str:
+        """The legacy concatenation: the fixed prefix, then ``prompt`` (bytes unchanged)."""
+
+        return (
+            SuzkaMainLoop._private_interpretation_prefix(
+                original, current, revision, later_reported, status_class
+            )
+            + prompt
+        )
+
+    @staticmethod
+    def _private_interpretation_prefix(
+        original: str | None,
+        current: str | None,
+        revision: int | None,
+        later_reported: bool,
+        status_class: str | None,
+    ) -> str:
         """Finite public-safe semantics only; never append owner Source text.
 
         IP-8a (#374 D3 §2, D4 §6): an UNKNOWN class hides both options and
@@ -1845,7 +1932,7 @@ class SuzkaMainLoop:
             "The user's later report is not independently verified human intent. "
             "Do not claim competence, personal identity, trust, objective success, "
             "or certainty. No hidden history or Source IDs are available. "
-            "Use the current provisional option, not a stale earlier one.\n\n" + prompt
+            "Use the current provisional option, not a stale earlier one.\n\n"
         )
 
     def _build_prompt(
@@ -1935,6 +2022,7 @@ class SuzkaMainLoop:
         working_memory_view: WorkingMemoryView,
         attention_payload: AttentionPromptPayload | None,
         memory_context: MemoryContext,
+        wm_row_limit: tuple[int, int] | None = None,
     ) -> _TraceTurnView | None:
         """Forget, read and render this Context's trace for one Chat turn (#417 D1 §3-§5).
 
@@ -1955,7 +2043,7 @@ class SuzkaMainLoop:
                 )
         retrieved_ids = frozenset(record.id for record in memory_context.db1_results)
         in_working_memory = self._episodes_in_working_memory_prompt(
-            working_memory_view, attention_payload
+            working_memory_view, attention_payload, wm_row_limit
         )
         recalled: list[RecalledTurn] = []
         readable: list[RecalledTurn] = []
@@ -2034,6 +2122,155 @@ class SuzkaMainLoop:
             for parameter in parameters
         )
 
+    def _turn_composition(
+        self,
+        event: AgentEvent | None,
+        current_context: ContextFrame,
+        attention_payload: AttentionPromptPayload | None,
+        user_input: str,
+    ) -> PromptCompositionSettings | None:
+        """The prompt-composition settings if THIS turn may use a chat mode, else None (legacy).
+
+        Decided before any history read. ``legacy`` (the default) returns None silently and
+        touches nothing. For a chat mode every condition below must hold; otherwise the turn
+        takes the unchanged legacy path, with one warning per reason (never a failure).
+        Participant Contexts get no history (R15 ``context.withheld`` stays intact).
+        """
+
+        composition = self.settings.prompt_composition
+        if composition.mode == "legacy":
+            return None
+        supports = getattr(self.agent, "supports_messages", None)
+        trace = self.conversation_trace
+        reason: str | None = None
+        if not callable(supports) or not supports():
+            reason = "provider_without_messages_or_chat_template"
+        elif type(self.prompt_builder) is not PromptBuilder:
+            reason = "custom_prompt_builder"
+        elif event is None or attention_payload is None:
+            reason = "no_attention_payload"
+        elif trace.frozen:
+            reason = "conversation_trace_frozen"
+        elif not trace.enabled:
+            reason = "conversation_trace_disabled"
+        elif current_context.participant_refs:
+            reason = "participant_context"
+        elif not user_input.strip():
+            reason = "blank_user_input"
+        if reason is None:
+            return composition
+        if reason not in self._composition_fallbacks_logged:
+            self._composition_fallbacks_logged.add(reason)
+            LOGGER.warning(
+                "prompt_composition.mode=%s falls back to the legacy prompt (%s); "
+                "logged once per reason",
+                composition.mode,
+                reason,
+            )
+        return None
+
+    @staticmethod
+    def _evidence_row_limit(
+        attention_payload: AttentionPromptPayload | None,
+        composition: PromptCompositionSettings | None,
+    ) -> tuple[int, int] | None:
+        """``(rows_before, rows_after)`` of the evidence limit for this turn's Attention text.
+
+        None when no limit is applied (legacy, or the limit skipped on doubt: nothing is cut).
+        Computed on a copy of the rendered text; the same pure function the composition uses.
+        """
+
+        if composition is None or attention_payload is None:
+            return None
+        _text, numbers = limit_attention_text(
+            attention_payload.validated_copy().rendered_text,
+            composition.evidence_top_k,
+            composition.evidence_item_max_chars,
+        )
+        before, after = numbers["rows_before"], numbers["rows_after"]
+        if numbers["skipped"] is not None or type(before) is not int or type(after) is not int:
+            return None
+        return before, after
+
+    def _compose_chat_messages(
+        self,
+        settings: PromptCompositionSettings,
+        sections: PromptSections,
+        trace_view: _TraceTurnView,
+        user_input: str,
+        *,
+        system_prefix: str,
+        memory_context: MemoryContext,
+    ) -> tuple[
+        tuple[ChatMessage, ...],
+        CompositionReport,
+        dict[str, int | str | None],
+        _TraceTurnView,
+    ]:
+        """The model-input messages of a chat mode, plus the trace view the reinforce uses.
+
+        Only the model input is transformed here; nothing stored changes. ``system_prefix`` is
+        fixed code text only. History is the readable turns of this Context from DB1 (raw text);
+        turns with a blank side are left out because chat templates reject empty turns.
+
+        'Shown' for the trace means 'sent as history': when exchanges are sent, the last
+        ``exchanges_used`` history episodes are the shown ones (verbatim faint turns count as a
+        recall) and double recalls are retrieved & (sent | Working Memory rows that survived
+        the evidence limit). With no history sent the legacy trace block stays in the message
+        and the legacy view is kept as is.
+        """
+
+        limited, numbers = limit_sections(
+            sections, settings.evidence_top_k, settings.evidence_item_max_chars
+        )
+        usable = tuple(
+            turn
+            for turn in trace_view.readable_turns
+            if turn.user_text.strip() and turn.response_text.strip()
+        )
+        entries = recent_history(usable, settings.history_window)
+        composition_input = composition_input_from_sections(
+            limited,
+            tuple(HistoryExchange(e.user_text, e.assistant_text) for e in entries),
+            user_input,
+            system_prefix=system_prefix,
+        )
+        messages, report = compose_with_report(
+            settings.mode,
+            composition_input,
+            CompositionCaps(
+                max_exchanges=settings.history_window,
+                max_history_bytes=settings.max_history_bytes,
+                max_state_block_bytes=settings.max_state_block_bytes,
+            ),
+        )
+        if report.exchanges_used:
+            sent = tuple(entry.episode_id for entry in entries[len(entries) - report.exchanges_used :])
+            sent_ids = frozenset(sent)
+            retrieved = frozenset(record.id for record in memory_context.db1_results)
+            double = retrieved & (sent_ids | trace_view.in_working_memory_ids)
+            items = tuple(
+                replace(
+                    item,
+                    display=(
+                        "history"
+                        if item.episode_id in sent_ids and item.display in ("shown", "faint")
+                        else "hidden_by_budget"
+                        if item.display in ("shown", "faint")
+                        else item.display
+                    ),
+                    double_recall=item.episode_id in double,
+                )
+                for item in trace_view.diagnostics.items
+            )
+            trace_view = replace(
+                trace_view,
+                rendered=RenderedTrace("", sent, ()),
+                double_recall_ids=double,
+                diagnostics=ConversationTraceDiagnostics(trace_view.diagnostics.state, items),
+            )
+        return messages, report, dict(numbers), trace_view
+
     def _read_trace_episode(self, episode_id: str) -> tuple[str, EpisodicMemoryRecord | None]:
         """Read one DB1 episode, mapping each failure to a named status (D1 §4)."""
 
@@ -2053,9 +2290,20 @@ class SuzkaMainLoop:
 
     @staticmethod
     def _episodes_in_working_memory_prompt(
-        view: WorkingMemoryView, payload: AttentionPromptPayload | None
+        view: WorkingMemoryView,
+        payload: AttentionPromptPayload | None,
+        row_limit: tuple[int, int] | None = None,
     ) -> frozenset[str]:
-        """Episodes the prompt already shows through Working Memory (dedupe, D1 §5)."""
+        """Episodes the prompt already shows through Working Memory (dedupe, D1 §5).
+
+        ``row_limit`` is ``(rows_before, rows_after)`` of the evidence limit that a
+        non-legacy turn applies to the model input (#500 3b-5). The Attention text
+        lists the Working Memory rows in ``included_candidate_ids`` order and the
+        limit keeps the first ``rows_after`` of them, so rows it dropped are NOT
+        shown and must not count (no double-recall overcount). If the row count the
+        limit saw differs from the payload's, nothing from Working Memory counts
+        (fail closed). ``None`` (every legacy turn) keeps the exact old behaviour.
+        """
 
         episodic = [
             selection
@@ -2065,6 +2313,29 @@ class SuzkaMainLoop:
         if payload is None:
             return frozenset(selection.source_id for selection in episodic)
         included = set(payload.included_candidate_ids)
+        if row_limit is not None:
+            rows_before, rows_after = row_limit
+            working_memory_ids = {
+                AttentionTarget(
+                    AttentionTargetKind.WORKING_MEMORY,
+                    working_memory_item_id(selection.source_kind, selection.source_id),
+                ).candidate_id
+                for selection in view.selected
+            }
+            rows = [
+                candidate_id
+                for candidate_id in payload.included_candidate_ids
+                if candidate_id in working_memory_ids
+            ]
+            if len(rows) == rows_before:
+                included -= set(rows[rows_after:])
+            else:
+                LOGGER.warning(
+                    "evidence limit row count (%d) differs from Attention rows (%d)",
+                    rows_before,
+                    len(rows),
+                )
+                included -= set(rows)
         return frozenset(
             selection.source_id
             for selection in episodic

@@ -98,6 +98,22 @@ class ChatDiagnosticsSchema(BaseModel):
     emotion_update: EmotionUpdateSchema
 
 
+class ComposedMessageSchema(BaseModel):
+    role: str
+    content: str
+
+
+class CompositionReportSchema(BaseModel):
+    """#500 3b-5: numbers only; present on non-legacy turns."""
+
+    mode: str
+    exchanges_used: int
+    exchanges_dropped: int
+    state_block_bytes: int
+    system_bytes: int
+    sections_dropped: int
+
+
 class DebugChatResponse(ChatResponse):
     hidden_thought: str
     loss: float | None
@@ -106,6 +122,11 @@ class DebugChatResponse(ChatResponse):
     generation_params: GenerationParamsSchema
     diagnostics: ChatDiagnosticsSchema
     conversation_trace: ConversationTraceDiagnosticsSchema
+    # #500 3b-5: optional, only set on a non-legacy prompt_composition turn; `prompt` stays the
+    # legacy joined string.
+    composed_messages: list[ComposedMessageSchema] | None = None
+    composition_report: CompositionReportSchema | None = None
+    evidence_limit: dict[str, int | str | None] | None = None
 
 
 class EmotionStateResponse(EmotionSchema):

@@ -1185,6 +1185,10 @@ def test_ordinary_and_debug_apply_equivalent_working_memory_semantics(
         "working_memory_view",
         "diagnostics",
         "conversation_trace",
+        # #500 3b-5: optional, set only on non-legacy turns.
+        "composed_messages",
+        "composition_report",
+        "evidence_limit",
     )
 
 
