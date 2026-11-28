@@ -116,6 +116,18 @@ conversation_trace:
   max_items_per_context: 20
   max_rendered_bytes: 4096
 
+prompt_composition:
+  # #500 slice 3b-1: shape only; nothing reads this section yet. Default mode
+  # legacy. Modes other than legacy require conversation_trace.enabled and
+  # history_window <= conversation_trace.max_items_per_context. No AgentState
+  # impact from this section. All values below are provisional defaults.
+  mode: legacy  # legacy | chat_roles | chat_roles_split
+  history_window: 6  # 0..64
+  max_history_bytes: 32768  # 0..16777216
+  max_state_block_bytes: 32768  # 0..16777216
+  evidence_top_k: 3  # 1..50, null = no limit
+  evidence_item_max_chars: 200  # 20..2000, null = no limit
+
 chat_log:
   # Display-only Chat transcript for the Chat screen's sessions (#416). Never
   # read by the runtime, prompts, memory or learning.
