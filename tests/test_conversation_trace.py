@@ -23,6 +23,7 @@ from suzka.runtime.conversation_trace import (
     TraceRemovalReason,
     TraceTurnKind,
     conversation_trace_schema_max_bytes,
+    recent_history,
     render_trace,
 )
 
@@ -381,3 +382,52 @@ def _turn(n: int, at: datetime, *, retention: float, user: str, reply: str,
                         "last_reinforced_at": at, "event_sequence": n,
                         "last_reinforced_event_sequence": n, "turn_kind": kind})  # type: ignore[arg-type]
     return RecalledTurn(item=item, retention=retention, user_text=user, response_text=reply)
+
+
+# --- #500 slice 3b-3: chronological history from the trace index ------------
+
+
+def _hturn(n: int, *, at: datetime = T0, kind: TraceTurnKind = TraceTurnKind.CHAT,
+          retention: float = 1.0, user: str | None = None,
+          reply: str | None = None) -> RecalledTurn:
+    item = TraceItem(
+        episode_id=f"episode-h-{n:04d}", turn_kind=kind, requested_at=at,
+        event_sequence=n, surprise=0.0, surprise_measured=True, stability_hours=1.0,
+        last_reinforced_at=at, last_reinforced_event_sequence=n,
+    )
+    return RecalledTurn(item, retention, user or f"user {n}", reply or f"reply {n}")
+
+
+def test_history_orders_by_time_then_event_sequence_and_keeps_the_latest() -> None:
+    later = T0 + timedelta(minutes=5)
+    turns = [_hturn(7, at=later), _hturn(3, at=T0), _hturn(5, at=T0), _hturn(4, at=T0)]
+    history = recent_history(turns, 3)
+    assert [entry.episode_id for entry in history] == [
+        "episode-h-0004", "episode-h-0005", "episode-h-0007"
+    ]
+    assert recent_history(turns, 10)[0].episode_id == "episode-h-0003"
+    assert recent_history(turns, 0) == ()
+    assert recent_history([], 3) == ()
+    with pytest.raises(ValueError):
+        recent_history(turns, -1)
+
+
+def test_history_equal_timestamps_use_event_sequence_not_input_order() -> None:
+    turns = [_hturn(n) for n in (9, 2, 6)]
+    assert [e.episode_id for e in recent_history(turns, 3)] == [
+        "episode-h-0002", "episode-h-0006", "episode-h-0009"
+    ]
+
+
+def test_history_excludes_command_turns_before_cutting() -> None:
+    turns = [_hturn(1), _hturn(2, kind=TraceTurnKind.COMMAND), _hturn(3, kind=TraceTurnKind.COMMAND)]
+    assert [e.episode_id for e in recent_history(turns, 2)] == ["episode-h-0001"]
+
+
+def test_history_keeps_raw_text_for_long_and_faint_turns() -> None:
+    long_reply = "line one\n" + "x" * 500 + "  spaced   out"
+    faint = _hturn(1, retention=0.05, user="u" * 300 + "\nsecond", reply=long_reply)
+    [entry] = recent_history([faint], 1)
+    assert entry.user_text == "u" * 300 + "\nsecond"
+    assert entry.assistant_text == long_reply
+    assert "…" not in entry.assistant_text
